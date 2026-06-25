@@ -1,0 +1,18 @@
+# Секреты — НИКОГДА не коммитим
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# База данных (локальные данные)
+*.sqlite
+*.sqlite3
+*.db
+
+# IDE / система
+.vscode/
+.idea/
+.DS_Store
