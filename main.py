@@ -13,12 +13,11 @@ from aiogram.types import Document, Message
 from config import APP_NAME, BOT_TOKEN
 from features import extract_features
 from llm import build_cards, rewrite_message
-from parser import parse_chat
+from tg_parser import parse_chat
 from storage import (
     get_interaction_card,
     get_or_create_contact,
     get_style_card,
-    get_user,
     init_db,
     list_contacts,
     save_interaction_card,
@@ -33,10 +32,6 @@ dp = Dispatcher(storage=MemoryStorage())
 
 # ── FSM-состояния ─────────────────────────────────────────────────────────────
 
-class Registration(StatesGroup):
-    waiting_for_my_id = State()
-
-
 class Rewrite(StatesGroup):
     waiting_for_contact = State()
     waiting_for_draft = State()
@@ -45,41 +40,16 @@ class Rewrite(StatesGroup):
 # ── /start ────────────────────────────────────────────────────────────────────
 
 @dp.message(CommandStart())
-async def cmd_start(message: Message, state: FSMContext) -> None:
-    user = get_user(str(message.from_user.id))
-    if user:
-        await message.answer(
-            f"С возвращением! Отправь JSON-файл экспорта из Telegram Desktop, "
-            f"чтобы загрузить новый чат.\n\n"
-            f"Команды:\n"
-            f"/rewrite — переписать сообщение\n"
-            f"/me — мой стиль общения"
-        )
-        return
-
+async def cmd_start(message: Message) -> None:
     await message.answer(
         f"Привет! Это {APP_NAME}.\n\n"
-        f"Мне нужен твой Telegram ID из экспорта чата. "
-        f"Открой любой экспорт (result.json) и найди своё имя — "
-        f"рядом будет поле «from_id», например: user123456789.\n\n"
-        f"Отправь это значение:"
-    )
-    await state.set_state(Registration.waiting_for_my_id)
-
-
-@dp.message(Registration.waiting_for_my_id)
-async def handle_my_id(message: Message, state: FSMContext) -> None:
-    my_id = message.text.strip()
-    if not my_id:
-        await message.answer("Пришли from_id — строку вида user123456789.")
-        return
-
-    upsert_user(str(message.from_user.id), my_id)
-    await state.clear()
-    await message.answer(
-        f"Готово! Теперь отправь JSON-файл экспорта чата из Telegram Desktop.\n\n"
+        f"Отправь мне JSON-файл экспорта чата из Telegram Desktop — "
+        f"я разберу твой стиль общения и помогу писать сообщения.\n\n"
         f"Как экспортировать: открой нужный чат → ⋮ → Экспорт истории чата → "
-        f"формат JSON, без медиафайлов."
+        f"формат JSON, без медиафайлов.\n\n"
+        f"Команды:\n"
+        f"/rewrite — переписать сообщение\n"
+        f"/me — мой стиль общения"
     )
 
 
@@ -87,15 +57,15 @@ async def handle_my_id(message: Message, state: FSMContext) -> None:
 
 @dp.message(F.document)
 async def handle_document(message: Message, bot: Bot) -> None:
-    user = get_user(str(message.from_user.id))
-    if not user:
-        await message.answer("Сначала зарегистрируйся — отправь /start.")
-        return
-
     doc: Document = message.document
     if not doc.file_name.endswith(".json"):
         await message.answer("Нужен JSON-файл экспорта (result.json).")
         return
+
+    # from_id в экспорте всегда "user{telegram_id}"
+    telegram_id = str(message.from_user.id)
+    my_id = f"user{telegram_id}"
+    upsert_user(telegram_id, my_id)
 
     await message.answer("Получил файл, анализирую...")
 
@@ -104,14 +74,14 @@ async def handle_document(message: Message, bot: Bot) -> None:
         await bot.download(doc, destination=path)
 
         try:
-            chat = parse_chat(str(path), user["my_id"])
+            chat = parse_chat(str(path), my_id)
         except Exception as e:
             await message.answer(f"Не удалось разобрать файл: {e}")
             return
 
     features = extract_features(chat)
 
-    await message.answer("Считаю признаки... запускаю анализ (займёт ~30 секунд).")
+    await message.answer("Запускаю анализ — займёт ~30 секунд...")
 
     try:
         cards = await build_cards(chat, features)
@@ -119,7 +89,6 @@ async def handle_document(message: Message, bot: Bot) -> None:
         await message.answer(f"Ошибка LLM-анализа: {e}")
         return
 
-    telegram_id = str(message.from_user.id)
     contact_id = get_or_create_contact(
         telegram_id,
         chat.meta.contact_id,

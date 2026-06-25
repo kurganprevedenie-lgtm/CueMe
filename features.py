@@ -3,7 +3,7 @@ from dataclasses import dataclass
 from datetime import timedelta
 from typing import Optional
 
-from parser import Message, ParsedChat
+from tg_parser import Message, ParsedChat
 
 SESSION_GAP = timedelta(hours=4)
 

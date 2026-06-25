@@ -1,32 +1,51 @@
 import asyncio
 import json
+import os
 import random
 
-import google.generativeai as genai
+import httpx
+
+
+def _gemini_proxy() -> str | None:
+    """Читает системный прокси и переводит socks4:// → socks5:// для httpx."""
+    for var in ("ALL_PROXY", "HTTPS_PROXY", "HTTP_PROXY",
+                "all_proxy", "https_proxy", "http_proxy"):
+        url = os.environ.get(var)
+        if url:
+            return url.replace("socks4://", "socks5://", 1)
+    return None
 
 from config import LLM_API_KEY
 from features import ChatFeatures
-from parser import ParsedChat
+from tg_parser import ParsedChat
 
 _MODEL = "gemini-2.0-flash"
 _SAMPLE_SIZE = 30
-
-_ready = False
-
-
-def _init() -> None:
-    global _ready
-    if not _ready:
-        if not LLM_API_KEY:
-            raise RuntimeError("LLM_API_KEY не задан в .env — получи ключ на aistudio.google.com")
-        genai.configure(api_key=LLM_API_KEY)
-        _ready = True
+_GEMINI_URL = (
+    "https://generativelanguage.googleapis.com/v1beta/models/"
+    f"{_MODEL}:generateContent"
+)
 
 
-def _ask(prompt: str) -> str:
-    _init()
-    response = genai.GenerativeModel(_MODEL).generate_content(prompt)
-    return response.text.strip()
+async def _ask(prompt: str) -> str:
+    if not LLM_API_KEY:
+        raise RuntimeError("LLM_API_KEY не задан в .env")
+
+    async with httpx.AsyncClient(timeout=60.0, proxy=_gemini_proxy()) as client:
+        for attempt in range(2):
+            resp = await client.post(
+                _GEMINI_URL,
+                params={"key": LLM_API_KEY},
+                json={"contents": [{"parts": [{"text": prompt}]}]},
+            )
+            if resp.status_code == 429 and attempt == 0:
+                await asyncio.sleep(65)
+                continue
+            if not resp.is_success:
+                raise RuntimeError(
+                    f"Gemini API {resp.status_code}: {resp.text[:500]}"
+                )
+            return resp.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
 
 
 def _sample_texts(messages: list, n: int = _SAMPLE_SIZE) -> list[str]:
@@ -75,7 +94,7 @@ async def build_cards(chat: ParsedChat, features: ChatFeatures) -> dict:
         '}'
     )
 
-    raw = await asyncio.to_thread(_ask, prompt)
+    raw = await _ask(prompt)
 
     if raw.startswith("```"):
         raw = raw.split("```", 2)[1]
@@ -104,4 +123,4 @@ async def rewrite_message(draft: str, style_card: str, interaction_card: str) ->
         "Только итоговое сообщение, без пояснений и кавычек."
     )
 
-    return await asyncio.to_thread(_ask, prompt)
+    return await _ask(prompt)
