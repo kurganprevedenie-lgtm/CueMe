@@ -1,51 +1,41 @@
 import asyncio
 import json
-import os
 import random
 
 import httpx
-
-
-def _gemini_proxy() -> str | None:
-    """Читает системный прокси и переводит socks4:// → socks5:// для httpx."""
-    for var in ("ALL_PROXY", "HTTPS_PROXY", "HTTP_PROXY",
-                "all_proxy", "https_proxy", "http_proxy"):
-        url = os.environ.get(var)
-        if url:
-            return url.replace("socks4://", "socks5://", 1)
-    return None
 
 from config import LLM_API_KEY
 from features import ChatFeatures
 from tg_parser import ParsedChat
 
-_MODEL = "gemini-2.0-flash"
+_MODEL = "llama-3.3-70b-versatile"
 _SAMPLE_SIZE = 30
-_GEMINI_URL = (
-    "https://generativelanguage.googleapis.com/v1beta/models/"
-    f"{_MODEL}:generateContent"
-)
+_GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 
 
 async def _ask(prompt: str) -> str:
     if not LLM_API_KEY:
         raise RuntimeError("LLM_API_KEY не задан в .env")
 
-    async with httpx.AsyncClient(timeout=60.0, proxy=_gemini_proxy()) as client:
+    async with httpx.AsyncClient(timeout=60.0, trust_env=False) as client:
         for attempt in range(2):
             resp = await client.post(
-                _GEMINI_URL,
-                params={"key": LLM_API_KEY},
-                json={"contents": [{"parts": [{"text": prompt}]}]},
+                _GROQ_URL,
+                headers={"Authorization": f"Bearer {LLM_API_KEY}"},
+                json={
+                    "model": _MODEL,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "max_tokens": 1024,
+                },
             )
             if resp.status_code == 429 and attempt == 0:
                 await asyncio.sleep(65)
                 continue
             if not resp.is_success:
                 raise RuntimeError(
-                    f"Gemini API {resp.status_code}: {resp.text[:500]}"
+                    f"Groq API {resp.status_code}: {resp.text[:500]}"
                 )
-            return resp.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+            return resp.json()["choices"][0]["message"]["content"].strip()
 
 
 def _sample_texts(messages: list, n: int = _SAMPLE_SIZE) -> list[str]:
