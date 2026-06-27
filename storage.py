@@ -78,9 +78,24 @@ def init_db() -> None:
                 tg_message_id INTEGER,
                 raw_meta      TEXT NOT NULL DEFAULT '{}'
             );
+
+            CREATE TABLE IF NOT EXISTS business_chat_refs (
+                owner_user_id TEXT NOT NULL,
+                chat_ref      TEXT NOT NULL,
+                contact_id    INTEGER NOT NULL,
+                PRIMARY KEY (owner_user_id, chat_ref)
+            );
+
+            CREATE TABLE IF NOT EXISTS my_style_per_contact (
+                contact_id         INTEGER PRIMARY KEY,
+                card_text          TEXT NOT NULL,
+                updated_at         TEXT NOT NULL,
+                last_rebuild_count INTEGER NOT NULL DEFAULT 0
+            );
         """)
         _add_column_if_missing(conn, "users", "auto_mode", "INTEGER DEFAULT 0")
         _add_column_if_missing(conn, "users", "auto_contact_id", "INTEGER")
+        _add_column_if_missing(conn, "contacts", "username", "TEXT")
 
 
 def _now() -> str:
@@ -144,6 +159,14 @@ def get_contact_by_id(contact_id: int) -> sqlite3.Row | None:
         return conn.execute(
             "SELECT * FROM contacts WHERE id = ?", (contact_id,)
         ).fetchone()
+
+
+def update_contact_username(contact_id: int, username: str) -> None:
+    with _conn() as conn:
+        conn.execute(
+            "UPDATE contacts SET username = ? WHERE id = ?",
+            (username, contact_id),
+        )
 
 
 # ── style cards ───────────────────────────────────────────────────────────────
@@ -268,6 +291,144 @@ def get_any_user_samples(user_telegram_id: str) -> dict | None:
         "my_sample":             json.loads(row["my_sample"]),
         "user_features_summary": row["user_features_summary"],
     }
+
+
+# ── contacts (extra lookup) ───────────────────────────────────────────────────
+
+def find_contact_by_original_id(
+    user_telegram_id: str, original_from_id: str
+) -> sqlite3.Row | None:
+    with _conn() as conn:
+        return conn.execute(
+            "SELECT * FROM contacts WHERE user_telegram_id = ? AND original_from_id = ?",
+            (user_telegram_id, original_from_id),
+        ).fetchone()
+
+
+# ── business chat ref mapping ─────────────────────────────────────────────────
+
+def upsert_chat_ref_mapping(owner_user_id: str, chat_ref: str, contact_id: int) -> None:
+    with _conn() as conn:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO business_chat_refs (owner_user_id, chat_ref, contact_id)
+            VALUES (?, ?, ?)
+            """,
+            (owner_user_id, chat_ref, contact_id),
+        )
+
+
+def get_contact_id_for_chat_ref(owner_user_id: str, chat_ref: str) -> int | None:
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT contact_id FROM business_chat_refs WHERE owner_user_id = ? AND chat_ref = ?",
+            (owner_user_id, chat_ref),
+        ).fetchone()
+    return row["contact_id"] if row else None
+
+
+# ── my style per contact ──────────────────────────────────────────────────────
+
+def save_my_style_per_contact(
+    contact_id: int, card_text: str, rebuild_count: int
+) -> None:
+    with _conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO my_style_per_contact
+                (contact_id, card_text, updated_at, last_rebuild_count)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(contact_id) DO UPDATE SET
+                card_text          = excluded.card_text,
+                updated_at         = excluded.updated_at,
+                last_rebuild_count = excluded.last_rebuild_count
+            """,
+            (contact_id, card_text, _now(), rebuild_count),
+        )
+
+
+def get_my_style_per_contact(contact_id: int) -> str | None:
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT card_text FROM my_style_per_contact WHERE contact_id = ?",
+            (contact_id,),
+        ).fetchone()
+    return row["card_text"] if row else None
+
+
+def get_my_style_last_rebuild_count(contact_id: int) -> int:
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT last_rebuild_count FROM my_style_per_contact WHERE contact_id = ?",
+            (contact_id,),
+        ).fetchone()
+    return row["last_rebuild_count"] if row else 0
+
+
+def get_all_per_contact_style_cards(owner_user_id: str) -> list[dict]:
+    """Все per-contact карточки пользователя — для сборки агрегата."""
+    with _conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT ms.card_text, c.display_name, c.contact_alias
+            FROM my_style_per_contact ms
+            JOIN contacts c ON ms.contact_id = c.id
+            WHERE c.user_telegram_id = ?
+            """,
+            (owner_user_id,),
+        ).fetchall()
+    return [
+        {
+            "card_text":    row["card_text"],
+            "display_name": row["display_name"] or row["contact_alias"],
+        }
+        for row in rows
+    ]
+
+
+# ── business messages — аналитика ─────────────────────────────────────────────
+
+def get_biz_messages_for_contact(
+    owner_user_id: str, contact_id: int, direction: str, limit: int
+) -> list[str]:
+    """Тексты сообщений по контакту (date DESC), через маппинг chat_refs."""
+    with _conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT bm.text
+            FROM business_messages bm
+            JOIN business_chat_refs bcr
+                ON bm.chat_ref = bcr.chat_ref
+               AND bm.owner_user_id = bcr.owner_user_id
+            WHERE bcr.contact_id = ?
+              AND bm.owner_user_id = ?
+              AND bm.direction = ?
+              AND bm.text IS NOT NULL
+              AND bm.text != ''
+            ORDER BY bm.date DESC
+            LIMIT ?
+            """,
+            (contact_id, owner_user_id, direction, limit),
+        ).fetchall()
+    return [row["text"] for row in rows]
+
+
+def count_biz_messages_for_contact(owner_user_id: str, contact_id: int) -> int:
+    """Всего сообщений (в обе стороны) для контакта через маппинг."""
+    with _conn() as conn:
+        row = conn.execute(
+            """
+            SELECT COUNT(*) AS cnt
+            FROM business_messages bm
+            JOIN business_chat_refs bcr
+                ON bm.chat_ref = bcr.chat_ref
+               AND bm.owner_user_id = bcr.owner_user_id
+            WHERE bcr.contact_id = ?
+              AND bm.owner_user_id = ?
+            """,
+            (contact_id, owner_user_id),
+        ).fetchone()
+    return row["cnt"] if row else 0
 
 
 # ── business connections ──────────────────────────────────────────────────────

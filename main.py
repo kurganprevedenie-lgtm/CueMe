@@ -11,6 +11,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
+    BotCommand,
     BusinessConnection,
     CallbackQuery, Document, Message,
     InlineKeyboardMarkup,
@@ -18,10 +19,12 @@ from aiogram.types import (
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
 
-from config import APP_NAME, BOT_TOKEN
+from config import APP_NAME, BOT_TOKEN, REBUILD_THRESHOLD, SAMPLE_SIZE
 from features import extract_features
 from llm import (
     build_interaction_card,
+    build_my_style_for_contact,
+    build_overall_style,
     build_style_card,
     make_features_summary,
     make_user_features_summary,
@@ -30,13 +33,20 @@ from llm import (
 )
 from tg_parser import parse_chat
 from storage import (
+    count_biz_messages_for_contact,
     delete_style_card,
+    find_contact_by_original_id,
+    get_all_per_contact_style_cards,
     get_any_user_samples,
     get_auto_mode,
+    get_biz_messages_for_contact,
     get_business_connection,
     get_contact_by_id,
+    get_contact_id_for_chat_ref,
     get_interaction_card,
     get_message_samples,
+    get_my_style_last_rebuild_count,
+    get_my_style_per_contact,
     get_or_create_contact,
     get_style_card,
     init_db,
@@ -44,9 +54,12 @@ from storage import (
     save_business_message,
     save_interaction_card,
     save_message_samples,
+    save_my_style_per_contact,
     save_style_card,
     set_auto_mode,
+    update_contact_username,
     upsert_business_connection,
+    upsert_chat_ref_mapping,
     upsert_user,
 )
 
@@ -54,26 +67,40 @@ logging.basicConfig(level=logging.INFO)
 
 dp = Dispatcher(storage=MemoryStorage())
 
-BTN_REWRITE   = "📝 Переписать"
-BTN_ME        = "👤 Мой стиль"
-BTN_CONTACT   = "🔍 Стиль собеседника"
-BTN_AUTO      = "🔄 Авто-режим"
-BTN_CONTACTS  = "📋 Контакты"
-_ALL_BTNS     = {BTN_REWRITE, BTN_ME, BTN_CONTACT, BTN_AUTO, BTN_CONTACTS}
+BTN_REWRITE       = "📝 Переписать"
+BTN_ME            = "👤 Мой стиль"
+BTN_CONTACT       = "🔍 Стиль собеседника"
+BTN_AUTO          = "🔄 Авто-режим"
+BTN_MY_STYLE_FOR  = "🎯 Мой стиль с ним"
+BTN_CONTACTS      = "📋 Контакты"
+_ALL_BTNS = {BTN_REWRITE, BTN_ME, BTN_CONTACT, BTN_AUTO, BTN_MY_STYLE_FOR, BTN_CONTACTS}
+
+# Защита от параллельных пересборок одного контакта
+_rebuilding: set[int] = set()
+
+
+def _contact_name(c) -> str:
+    name     = c["display_name"] or ""
+    username = c["username"] or "" if "username" in c.keys() else ""
+    if name and username:
+        return f"{name} (@{username})"
+    if username:
+        return f"@{username}"
+    return name or c["contact_alias"]
 
 
 def main_kb() -> ReplyKeyboardMarkup:
     b = ReplyKeyboardBuilder()
     b.row(KeyboardButton(text=BTN_REWRITE), KeyboardButton(text=BTN_ME))
     b.row(KeyboardButton(text=BTN_CONTACT), KeyboardButton(text=BTN_AUTO))
-    b.row(KeyboardButton(text=BTN_CONTACTS))
+    b.row(KeyboardButton(text=BTN_MY_STYLE_FOR), KeyboardButton(text=BTN_CONTACTS))
     return b.as_markup(resize_keyboard=True)
 
 
 def contacts_kb(contacts: list, prefix: str) -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     for c in contacts:
-        name = c["display_name"] or c["contact_alias"]
+        name = _contact_name(c)
         b.button(text=name, callback_data=f"{prefix}:{c['id']}")
     b.adjust(1)
     return b.as_markup()
@@ -105,12 +132,93 @@ class Rewrite(StatesGroup):
     waiting_for_draft = State()
 
 
+# ── Выборка: biz-сообщения + fallback из JSON-семплов ─────────────────────────
+
+def _get_rebuild_sample(
+    owner_user_id: str, contact_id: int, direction: str, limit: int
+) -> list[str]:
+    msgs = get_biz_messages_for_contact(owner_user_id, contact_id, direction, limit)
+    if len(msgs) < 30:
+        json_s = get_message_samples(contact_id)
+        if json_s:
+            key = "my_sample" if direction == "out" else "contact_sample"
+            seen = set(msgs)
+            for t in json_s[key]:
+                if t not in seen and len(msgs) < limit:
+                    msgs.append(t)
+    return msgs
+
+
+# ── Ядро пересборки одного контакта ──────────────────────────────────────────
+
+async def _rebuild_contact(owner_user_id: str, contact_id: int) -> bool:
+    """Пересобирает my_style_per_contact и interaction_card. True если успешно."""
+    my_msgs      = _get_rebuild_sample(owner_user_id, contact_id, "out", SAMPLE_SIZE)
+    contact_msgs = _get_rebuild_sample(owner_user_id, contact_id, "in", SAMPLE_SIZE // 2)
+
+    if not my_msgs:
+        return False
+
+    total   = count_biz_messages_for_contact(owner_user_id, contact_id)
+    out_avg = sum(len(t) for t in my_msgs) / len(my_msgs)
+    in_avg  = sum(len(t) for t in contact_msgs) / len(contact_msgs) if contact_msgs else 0
+    stats = (
+        f"Я: {total} сообщений всего, {len(my_msgs)} в выборке, средн. {out_avg:.0f} симв.\n"
+        f"Собеседник: {len(contact_msgs)} в выборке, средн. {in_avg:.0f} симв."
+    )
+
+    my_style = await build_my_style_for_contact(my_msgs, stats)
+    save_my_style_per_contact(contact_id, my_style, total)
+
+    if contact_msgs:
+        interaction = await build_interaction_card(my_msgs, contact_msgs, stats)
+        save_interaction_card(contact_id, interaction)
+
+    return True
+
+
+# ── Авто-пересборка (fire-and-forget) ─────────────────────────────────────────
+
+async def _maybe_rebuild(owner_user_id: str, contact_id: int) -> None:
+    if contact_id in _rebuilding:
+        return
+
+    last = get_my_style_last_rebuild_count(contact_id)
+    total = count_biz_messages_for_contact(owner_user_id, contact_id)
+    if total - last < REBUILD_THRESHOLD:
+        return
+
+    _rebuilding.add(contact_id)
+    try:
+        logging.info("auto-rebuild start: contact_id=%s (new=%s)", contact_id, total - last)
+        ok = await _rebuild_contact(owner_user_id, contact_id)
+        if ok:
+            per_contact = get_all_per_contact_style_cards(owner_user_id)
+            if per_contact:
+                overall = await build_overall_style(per_contact)
+                save_style_card(owner_user_id, overall)
+        logging.info("auto-rebuild done: contact_id=%s ok=%s", contact_id, ok)
+    except Exception:
+        logging.exception("auto-rebuild failed: contact_id=%s", contact_id)
+    finally:
+        _rebuilding.discard(contact_id)
+
+
 # ── Ленивая генерация карточек ────────────────────────────────────────────────
 
 async def _gen_style_card(telegram_id: str) -> str | None:
+    """Общий агрегатный портрет. Приоритет: per-contact cards > JSON-семплы."""
     card = get_style_card(telegram_id)
     if card:
         return card
+
+    per_contact = get_all_per_contact_style_cards(telegram_id)
+    if per_contact:
+        card = await build_overall_style(per_contact)
+        save_style_card(telegram_id, card)
+        return card
+
+    # Fallback: старый подход через JSON-семплы
     samples = get_any_user_samples(telegram_id)
     if not samples:
         return None
@@ -133,7 +241,22 @@ async def _gen_interaction_card(contact_id: int) -> str | None:
     return card
 
 
-# ── Business API ─────────────────────────────────────────────────────────────
+async def _gen_my_style_per_contact(contact_id: int, owner_user_id: str) -> str | None:
+    card = get_my_style_per_contact(contact_id)
+    if card:
+        return card
+    my_msgs = _get_rebuild_sample(owner_user_id, contact_id, "out", SAMPLE_SIZE)
+    if not my_msgs:
+        return None
+    total   = count_biz_messages_for_contact(owner_user_id, contact_id)
+    out_avg = sum(len(t) for t in my_msgs) / len(my_msgs)
+    stats   = f"Я: {total} сообщений, {len(my_msgs)} в выборке, средн. {out_avg:.0f} симв."
+    card    = await build_my_style_for_contact(my_msgs, stats)
+    save_my_style_per_contact(contact_id, card, total)
+    return card
+
+
+# ── Business API ──────────────────────────────────────────────────────────────
 
 @dp.business_connection()
 async def handle_business_connection(event: BusinessConnection) -> None:
@@ -183,6 +306,22 @@ async def handle_business_message(event: Message) -> None:
         conn_id, chat_ref, direction,
     )
 
+    # Попытка зарегистрировать маппинг chat_ref → contact_id
+    contact_id_for_rebuild: int | None = None
+    if direction == "in":
+        original_id = f"user{sender_id}"
+        contact_row = find_contact_by_original_id(owner_id, original_id)
+        if contact_row:
+            upsert_chat_ref_mapping(owner_id, chat_ref, contact_row["id"])
+            contact_id_for_rebuild = contact_row["id"]
+            if event.from_user.username:
+                update_contact_username(contact_row["id"], event.from_user.username)
+    else:
+        contact_id_for_rebuild = get_contact_id_for_chat_ref(owner_id, chat_ref)
+
+    if contact_id_for_rebuild:
+        asyncio.create_task(_maybe_rebuild(owner_id, contact_id_for_rebuild))
+
 
 # ── /start ────────────────────────────────────────────────────────────────────
 
@@ -214,13 +353,15 @@ async def handle_menu_button(message: Message, state: FSMContext) -> None:
         await _start_rewrite(message, state)
     elif message.text == BTN_CONTACT:
         await _show_contact_style(message)
+    elif message.text == BTN_MY_STYLE_FOR:
+        await _show_my_style_for(message)
     elif message.text == BTN_CONTACTS:
         await _show_contacts(message)
     elif message.text == BTN_AUTO:
         await _toggle_auto(message)
 
 
-# ── Загрузка JSON-файла (без LLM) ────────────────────────────────────────────
+# ── Загрузка JSON-файла ───────────────────────────────────────────────────────
 
 @dp.message(F.document)
 async def handle_document(message: Message, bot: Bot, state: FSMContext) -> None:
@@ -248,17 +389,14 @@ async def handle_document(message: Message, bot: Bot, state: FSMContext) -> None
             return
 
     features = extract_features(chat)
-
     contact_id = get_or_create_contact(telegram_id, chat.meta.contact_id, chat.meta.contact_name)
 
-    # Сохраняем выборку — LLM вызовем позже, по требованию
-    my_s       = sample_texts(chat.my_messages, 100)
-    contact_s  = sample_texts(chat.contact_messages, 50)
-    feat_full  = make_features_summary(features)
-    feat_user  = make_user_features_summary(features)
+    my_s      = sample_texts(chat.my_messages, 100)
+    contact_s = sample_texts(chat.contact_messages, 50)
+    feat_full = make_features_summary(features)
+    feat_user = make_user_features_summary(features)
     save_message_samples(contact_id, my_s, contact_s, feat_full, feat_user)
 
-    # При новом чате — сбрасываем style_card чтобы пересчитать из актуальных данных
     delete_style_card(telegram_id)
 
     name = chat.meta.contact_name
@@ -271,7 +409,7 @@ async def handle_document(message: Message, bot: Bot, state: FSMContext) -> None
                 f"✓ Файл загружен — {name} ({chat.meta.total_messages} сообщений).\n\n"
                 "◉ Шаг 2 из 2 — генерирую анализ, подожди ~20 секунд..."
             )
-            style_card    = await _gen_style_card(telegram_id)
+            style_card       = await _gen_style_card(telegram_id)
             interaction_card = await _gen_interaction_card(contact_id)
             if style_card and interaction_card:
                 set_auto_mode(telegram_id, True, contact_id)
@@ -288,8 +426,7 @@ async def handle_document(message: Message, bot: Bot, state: FSMContext) -> None
         else:
             await state.set_state(Setup.waiting_for_contact)
             await message.answer(
-                f"✓ Файл загружен.\n\n"
-                "◉ Шаг 2 из 2 — с кем хочешь работать?",
+                "✓ Файл загружен.\n\n◉ Шаг 2 из 2 — с кем хочешь работать?",
                 reply_markup=contacts_kb(contacts, "setup"),
             )
     else:
@@ -304,7 +441,7 @@ async def handle_document(message: Message, bot: Bot, state: FSMContext) -> None
 
 @dp.callback_query(F.data.startswith("setup:"))
 async def cb_setup_contact(call: CallbackQuery, state: FSMContext) -> None:
-    contact_id = int(call.data.split(":")[1])
+    contact_id  = int(call.data.split(":")[1])
     telegram_id = str(call.from_user.id)
 
     contact = get_contact_by_id(contact_id)
@@ -313,7 +450,7 @@ async def cb_setup_contact(call: CallbackQuery, state: FSMContext) -> None:
         return
 
     await call.answer()
-    name = contact["display_name"] or contact["contact_alias"]
+    name = _contact_name(contact)
     await call.message.edit_text(f"Выбран — {name}. Генерирую анализ...")
 
     style_card       = await _gen_style_card(telegram_id)
@@ -342,11 +479,9 @@ async def cmd_connect(message: Message) -> None:
         "1. Открой Telegram → Настройки → Автоматизация чатов\n"
         "2. Найди этого бота в списке или введи его @username\n"
         "3. Выбери, к каким чатам дать доступ\n"
-        "   (можно: все, кроме контактов, только новые и т.д.)\n"
         "4. Подтверди подключение\n\n"
         "После этого бот начнёт получать сообщения из выбранных чатов "
         "и накапливать данные о твоём стиле общения.\n\n"
-        "Данные хранятся только на нашем сервере. "
         "Имена и контакты собеседников не сохраняются — только анонимизированные паттерны."
     )
 
@@ -358,7 +493,7 @@ async def cmd_me(message: Message) -> None:
     await _show_style(message)
 
 
-# ── Мой стиль ─────────────────────────────────────────────────────────────────
+# ── Мой общий стиль (агрегат) ─────────────────────────────────────────────────
 
 async def _show_style(message: Message) -> None:
     telegram_id = str(message.from_user.id)
@@ -369,7 +504,7 @@ async def _show_style(message: Message) -> None:
 
     style_card = get_style_card(telegram_id)
     if not style_card:
-        await message.answer("Генерирую анализ твоего стиля — займёт ~20 секунд...")
+        await message.answer("Генерирую общий портрет — займёт ~20 секунд...")
         style_card = await _gen_style_card(telegram_id)
 
     if not style_card:
@@ -378,24 +513,21 @@ async def _show_style(message: Message) -> None:
 
     if len(contacts) == 1:
         c = contacts[0]
-        name = c["display_name"] or c["contact_alias"]
-        interaction = get_interaction_card(c["id"]) or "Нажми «🔍 Стиль собеседника» для анализа."
-        await message.answer(
-            f"Твой стиль общения:\n\n{style_card}\n\n"
-            f"── Как писать {name} ──\n\n{interaction}"
-        )
+        name = _contact_name(c)
+        per_contact = get_my_style_per_contact(c["id"])
+        extra = f"\n\n── Мой стиль с {name} ──\n\n{per_contact}" if per_contact else ""
+        await message.answer(f"Твой общий портрет:\n\n{style_card}{extra}")
         return
 
     await message.answer(
-        f"Твой стиль общения:\n\n{style_card}\n\n"
-        "Выбери контакт чтобы увидеть советы:",
-        reply_markup=contacts_kb(contacts, "style"),
+        f"Твой общий портрет:\n\n{style_card}\n\n"
+        "Стиль с конкретным собеседником — кнопка «🎯 Мой стиль с ним»."
     )
 
 
 @dp.callback_query(F.data.startswith("style:"))
 async def cb_style_contact(call: CallbackQuery) -> None:
-    contact_id = int(call.data.split(":")[1])
+    contact_id  = int(call.data.split(":")[1])
     telegram_id = str(call.from_user.id)
 
     style_card = get_style_card(telegram_id)
@@ -405,12 +537,67 @@ async def cb_style_contact(call: CallbackQuery) -> None:
         return
 
     await call.answer()
-    name        = contact["display_name"] or contact["contact_alias"]
+    name        = _contact_name(contact)
     interaction = get_interaction_card(contact_id) or "Нажми «🔍 Стиль собеседника» для анализа."
     await call.message.edit_text(
-        f"Твой стиль общения:\n\n{style_card}\n\n"
-        f"── Как писать {name} ──\n\n{interaction}"
+        f"Твой стиль:\n\n{style_card}\n\n── Как писать {name} ──\n\n{interaction}"
     )
+
+
+# ── 🎯 Мой стиль с конкретным человеком ──────────────────────────────────────
+
+async def _show_my_style_for(message: Message) -> None:
+    telegram_id = str(message.from_user.id)
+    contacts = list_contacts(telegram_id)
+    if not contacts:
+        await message.answer("Сначала загрузи JSON-файл чата.")
+        return
+
+    if len(contacts) == 1:
+        c = contacts[0]
+        name = _contact_name(c)
+        card = get_my_style_per_contact(c["id"])
+        if not card:
+            await message.answer(f"Генерирую мой стиль с {name} — займёт ~20 секунд...")
+            card = await _gen_my_style_per_contact(c["id"], telegram_id)
+        if not card:
+            await message.answer(
+                "Нет данных. Загрузи JSON-экспорт переписки или накопи сообщения "
+                "через Автоматизацию чатов."
+            )
+            return
+        await message.answer(f"Мой стиль с {name}:\n\n{card}")
+        return
+
+    await message.answer("С кем показать стиль?", reply_markup=contacts_kb(contacts, "mystyle"))
+
+
+@dp.callback_query(F.data.startswith("mystyle:"))
+async def cb_my_style_for_contact(call: CallbackQuery) -> None:
+    contact_id  = int(call.data.split(":")[1])
+    telegram_id = str(call.from_user.id)
+
+    contact = get_contact_by_id(contact_id)
+    if not contact:
+        await call.answer("Контакт не найден.")
+        return
+
+    await call.answer()
+    name = _contact_name(contact)
+
+    card = get_my_style_per_contact(contact_id)
+    if not card:
+        await call.message.edit_text(f"Генерирую мой стиль с {name} — займёт ~20 секунд...")
+        card = await _gen_my_style_per_contact(contact_id, telegram_id)
+
+    if not card:
+        await call.message.edit_text(
+            "Нет данных. Загрузи JSON-экспорт переписки или накопи сообщения "
+            "через Автоматизацию чатов."
+        )
+        return
+
+    await call.message.edit_text(f"Мой стиль с {name}:\n\n{card}")
 
 
 # ── Контакты ──────────────────────────────────────────────────────────────────
@@ -423,7 +610,7 @@ async def _show_contacts(message: Message) -> None:
         return
     auto_on, _ = get_auto_mode(telegram_id)
     status = "🟢 Авто-режим включён" if auto_on else "⚫ Авто-режим выключен"
-    lines = "\n".join(f"• {c['display_name'] or c['contact_alias']}" for c in contacts)
+    lines  = "\n".join(f"• {_contact_name(c)}" for c in contacts)
     await message.answer(f"{status}\n\nЗагруженные чаты:\n{lines}")
 
 
@@ -432,7 +619,7 @@ async def cmd_contacts(message: Message) -> None:
     await _show_contacts(message)
 
 
-# ── Стиль собеседника ──────────────────────────────────────────────────────────
+# ── 🔍 Стиль собеседника ──────────────────────────────────────────────────────
 
 async def _show_contact_style(message: Message) -> None:
     telegram_id = str(message.from_user.id)
@@ -443,7 +630,7 @@ async def _show_contact_style(message: Message) -> None:
 
     if len(contacts) == 1:
         c = contacts[0]
-        name = c["display_name"] or c["contact_alias"]
+        name = _contact_name(c)
         card = get_interaction_card(c["id"])
         if not card:
             await message.answer(f"Генерирую анализ {name} — займёт ~20 секунд...")
@@ -460,13 +647,13 @@ async def _show_contact_style(message: Message) -> None:
 @dp.callback_query(F.data.startswith("cstyle:"))
 async def cb_contact_style(call: CallbackQuery) -> None:
     contact_id = int(call.data.split(":")[1])
-    contact = get_contact_by_id(contact_id)
+    contact    = get_contact_by_id(contact_id)
     if not contact:
         await call.answer("Контакт не найден.")
         return
 
     await call.answer()
-    name = contact["display_name"] or contact["contact_alias"]
+    name = _contact_name(contact)
 
     card = get_interaction_card(contact_id)
     if not card:
@@ -480,11 +667,20 @@ async def cb_contact_style(call: CallbackQuery) -> None:
     await call.message.edit_text(f"Как писать {name}:\n\n{card}")
 
 
+# ── Хелпер: стиль для перезаписи (per-contact → global fallback) ──────────────
+
+async def _style_for_rewrite(telegram_id: str, contact_id: int) -> str | None:
+    """Предпочитаем per-contact карточку чтобы не смешивать данные разных чатов."""
+    card = get_my_style_per_contact(contact_id)
+    if card:
+        return card
+    return await _gen_style_card(telegram_id)
+
+
 # ── Переписать ────────────────────────────────────────────────────────────────
 
 async def _start_rewrite(message: Message, state: FSMContext) -> None:
     telegram_id = str(message.from_user.id)
-
     contacts = list_contacts(telegram_id)
     if not contacts:
         await message.answer("Сначала загрузи JSON-файл чата.")
@@ -492,20 +688,20 @@ async def _start_rewrite(message: Message, state: FSMContext) -> None:
 
     if len(contacts) == 1:
         c = contacts[0]
-        style_card    = get_style_card(telegram_id)
+        style_card       = await _style_for_rewrite(telegram_id, c["id"])
         interaction_card = get_interaction_card(c["id"])
         if not style_card or not interaction_card:
             await message.answer("Генерирую анализ — займёт ~20 секунд...")
-            if not style_card:
-                style_card = await _gen_style_card(telegram_id)
             if not interaction_card:
                 interaction_card = await _gen_interaction_card(c["id"])
+            if not style_card:
+                style_card = await _gen_style_card(telegram_id)
         if not style_card or not interaction_card:
             await message.answer("Не удалось сгенерировать анализ.")
             return
         await state.update_data(style_card=style_card, interaction_card=interaction_card)
         await state.set_state(Rewrite.waiting_for_draft)
-        name = c["display_name"] or c["contact_alias"]
+        name = _contact_name(c)
         await message.answer(f"Напиши черновик для {name}:")
         return
 
@@ -519,7 +715,7 @@ async def cmd_rewrite(message: Message, state: FSMContext) -> None:
 
 @dp.callback_query(F.data.startswith("rw:"))
 async def cb_rewrite_contact(call: CallbackQuery, state: FSMContext) -> None:
-    contact_id = int(call.data.split(":")[1])
+    contact_id  = int(call.data.split(":")[1])
     telegram_id = str(call.from_user.id)
 
     contact = get_contact_by_id(contact_id)
@@ -529,14 +725,14 @@ async def cb_rewrite_contact(call: CallbackQuery, state: FSMContext) -> None:
 
     await call.answer()
 
-    style_card    = get_style_card(telegram_id)
+    style_card       = await _style_for_rewrite(telegram_id, contact_id)
     interaction_card = get_interaction_card(contact_id)
     if not style_card or not interaction_card:
         await call.message.edit_text("Генерирую анализ — займёт ~20 секунд...")
-        if not style_card:
-            style_card = await _gen_style_card(telegram_id)
         if not interaction_card:
             interaction_card = await _gen_interaction_card(contact_id)
+        if not style_card:
+            style_card = await _gen_style_card(telegram_id)
 
     if not style_card or not interaction_card:
         await call.message.edit_text("Не удалось сгенерировать анализ.")
@@ -544,7 +740,7 @@ async def cb_rewrite_contact(call: CallbackQuery, state: FSMContext) -> None:
 
     await state.update_data(style_card=style_card, interaction_card=interaction_card)
     await state.set_state(Rewrite.waiting_for_draft)
-    name = contact["display_name"] or contact["contact_alias"]
+    name = _contact_name(contact)
     await call.message.edit_text(f"Напиши черновик для {name}:")
 
 
@@ -571,7 +767,6 @@ async def handle_draft(message: Message, state: FSMContext) -> None:
 
 async def _toggle_auto(message: Message) -> None:
     telegram_id = str(message.from_user.id)
-
     contacts = list_contacts(telegram_id)
     if not contacts:
         await message.answer("Сначала загрузи JSON-файл чата.")
@@ -585,7 +780,7 @@ async def _toggle_auto(message: Message) -> None:
 
     if len(contacts) == 1:
         c = contacts[0]
-        style_card    = get_style_card(telegram_id)
+        style_card       = get_style_card(telegram_id)
         interaction_card = get_interaction_card(c["id"])
         if not style_card or not interaction_card:
             await message.answer("Генерирую анализ...")
@@ -597,7 +792,7 @@ async def _toggle_auto(message: Message) -> None:
             await message.answer("Не удалось сгенерировать анализ.")
             return
         set_auto_mode(telegram_id, True, c["id"])
-        name = c["display_name"] or c["contact_alias"]
+        name = _contact_name(c)
         await message.answer(
             f"🟢 Авто-режим включён — {name}.\n"
             "Каждое твоё сообщение будет автоматически переписываться."
@@ -609,7 +804,7 @@ async def _toggle_auto(message: Message) -> None:
 
 @dp.callback_query(F.data.startswith("auto:"))
 async def cb_auto_contact(call: CallbackQuery) -> None:
-    contact_id = int(call.data.split(":")[1])
+    contact_id  = int(call.data.split(":")[1])
     telegram_id = str(call.from_user.id)
 
     contact = get_contact_by_id(contact_id)
@@ -620,7 +815,7 @@ async def cb_auto_contact(call: CallbackQuery) -> None:
     await call.answer()
     await call.message.edit_text("Генерирую анализ...")
 
-    style_card    = get_style_card(telegram_id)
+    style_card       = get_style_card(telegram_id)
     interaction_card = get_interaction_card(contact_id)
     if not style_card:
         style_card = await _gen_style_card(telegram_id)
@@ -632,10 +827,97 @@ async def cb_auto_contact(call: CallbackQuery) -> None:
         return
 
     set_auto_mode(telegram_id, True, contact_id)
-    name = contact["display_name"] or contact["contact_alias"]
+    name = _contact_name(contact)
     await call.message.edit_text(
         f"🟢 Авто-режим включён — {name}.\n"
         "Каждое твоё сообщение будет автоматически переписываться."
+    )
+
+
+# ── /rebuild_all — принудительная пересборка всего (для теста) ───────────────
+
+@dp.message(Command("rebuild_all"))
+async def cmd_rebuild_all(message: Message) -> None:
+    telegram_id = str(message.from_user.id)
+    contacts = list_contacts(telegram_id)
+    if not contacts:
+        await message.answer("Нет контактов для пересборки.")
+        return
+
+    n = len(contacts)
+    await message.answer(
+        f"Запускаю пересборку для {n} контактов — ~{n * 20} секунд..."
+    )
+
+    rebuilt = 0
+    for c in contacts:
+        try:
+            ok = await _rebuild_contact(telegram_id, c["id"])
+            if ok:
+                rebuilt += 1
+        except Exception:
+            logging.exception("rebuild_all failed for contact_id=%s", c["id"])
+
+    per_contact = get_all_per_contact_style_cards(telegram_id)
+    if per_contact:
+        overall = await build_overall_style(per_contact)
+        save_style_card(telegram_id, overall)
+        await message.answer(
+            f"Готово. Пересобрано: {rebuilt}/{n}. Общий портрет обновлён."
+        )
+    else:
+        await message.answer(
+            f"Пересобрано: {rebuilt}/{n}. "
+            "Пока нет данных для общего портрета (нужны сообщения в обе стороны)."
+        )
+
+
+# ── /reset_cards — сброс закешированных карточек (при смешивании данных) ──────
+
+@dp.message(Command("reset_cards"))
+async def cmd_reset_cards(message: Message) -> None:
+    telegram_id = str(message.from_user.id)
+    contacts = list_contacts(telegram_id)
+
+    delete_style_card(telegram_id)
+
+    with __import__("sqlite3").connect("bot.db") as conn:
+        for c in contacts:
+            conn.execute(
+                "DELETE FROM interaction_cards WHERE contact_id = ?", (c["id"],)
+            )
+            conn.execute(
+                "DELETE FROM my_style_per_contact WHERE contact_id = ?", (c["id"],)
+            )
+
+    n = len(contacts)
+    await message.answer(
+        f"Сброшено. Удалены: style_card, {n} interaction_card, {n} my_style_per_contact.\n\n"
+        "Карточки пересоберутся заново при следующем запросе (на основе чистых данных)."
+    )
+
+
+# ── /help ────────────────────────────────────────────────────────────────────
+
+@dp.message(Command("help"))
+async def cmd_help(message: Message) -> None:
+    await message.answer(
+        "Доступные команды:\n\n"
+        "/start — начало работы / онбординг\n"
+        "/help — список команд\n"
+        "/connect — как подключить Автоматизацию чатов\n"
+        "/me — твой общий стиль общения\n"
+        "/rewrite — переписать сообщение\n"
+        "/contacts — список загруженных чатов\n"
+        "/rebuild_all — принудительно пересобрать все карточки\n"
+        "/reset_cards — сбросить кеш карточек (если данные перепутались)\n\n"
+        "Кнопки в меню:\n"
+        "📝 Переписать — черновик → готовое сообщение\n"
+        "👤 Мой стиль — как ты общаешься в целом\n"
+        "🎯 Мой стиль с ним — твой стиль с конкретным человеком\n"
+        "🔍 Стиль собеседника — паттерны и советы по нему\n"
+        "🔄 Авто-режим — каждое сообщение переписывается автоматически\n"
+        "📋 Контакты — загруженные переписки"
     )
 
 
@@ -651,7 +933,7 @@ async def auto_rewrite_handler(message: Message, state: FSMContext) -> None:
     if not auto_on or not contact_id:
         return
 
-    style_card = get_style_card(telegram_id)
+    style_card       = await _style_for_rewrite(telegram_id, contact_id)
     interaction_card = get_interaction_card(contact_id)
     if not style_card or not interaction_card:
         return
@@ -668,6 +950,16 @@ async def auto_rewrite_handler(message: Message, state: FSMContext) -> None:
 async def main() -> None:
     init_db()
     bot = Bot(token=BOT_TOKEN)
+    await bot.set_my_commands([
+        BotCommand(command="start",       description="Начало работы"),
+        BotCommand(command="help",        description="Список команд"),
+        BotCommand(command="connect",     description="Подключить Автоматизацию чатов"),
+        BotCommand(command="me",          description="Мой стиль общения"),
+        BotCommand(command="rewrite",     description="Переписать сообщение"),
+        BotCommand(command="contacts",    description="Загруженные чаты"),
+        BotCommand(command="rebuild_all", description="Пересобрать все карточки"),
+        BotCommand(command="reset_cards", description="Сбросить кеш карточек"),
+    ])
     await dp.start_polling(
         bot,
         allowed_updates=[

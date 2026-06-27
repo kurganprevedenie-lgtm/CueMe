@@ -17,3 +17,8 @@ if not BOT_TOKEN:
 
 # Ключ LLM-API понадобится позже, на этапе анализа. Пока может быть пустым.
 LLM_API_KEY = os.getenv("LLM_API_KEY")
+
+# Порог накопления сообщений для автоматической пересборки карточек.
+REBUILD_THRESHOLD = int(os.getenv("REBUILD_THRESHOLD", "50"))
+# Размер выборки для LLM-анализа.
+SAMPLE_SIZE = int(os.getenv("SAMPLE_SIZE", "150"))
