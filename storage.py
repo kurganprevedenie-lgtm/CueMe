@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 import uuid
 from datetime import datetime, timezone
@@ -12,6 +13,12 @@ def _conn() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
+
+
+def _add_column_if_missing(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
+    existing = [row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()]
+    if column not in existing:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
 
 def init_db() -> None:
@@ -43,7 +50,37 @@ def init_db() -> None:
                 card_text  TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS message_samples (
+                contact_id           INTEGER PRIMARY KEY,
+                my_sample            TEXT NOT NULL,
+                contact_sample       TEXT NOT NULL,
+                features_summary     TEXT NOT NULL,
+                user_features_summary TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS business_connections (
+                connection_id TEXT PRIMARY KEY,
+                owner_user_id TEXT NOT NULL,
+                can_reply     INTEGER NOT NULL DEFAULT 0,
+                is_enabled    INTEGER NOT NULL DEFAULT 1,
+                created_at    TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS business_messages (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                connection_id TEXT NOT NULL,
+                owner_user_id TEXT NOT NULL,
+                chat_ref      TEXT NOT NULL,
+                direction     TEXT NOT NULL,
+                text          TEXT,
+                date          TEXT NOT NULL,
+                tg_message_id INTEGER,
+                raw_meta      TEXT NOT NULL DEFAULT '{}'
+            );
         """)
+        _add_column_if_missing(conn, "users", "auto_mode", "INTEGER DEFAULT 0")
+        _add_column_if_missing(conn, "users", "auto_contact_id", "INTEGER")
 
 
 def _now() -> str:
@@ -134,6 +171,13 @@ def get_style_card(user_telegram_id: str) -> str | None:
         return row["card_text"] if row else None
 
 
+def delete_style_card(user_telegram_id: str) -> None:
+    with _conn() as conn:
+        conn.execute(
+            "DELETE FROM style_cards WHERE user_telegram_id = ?", (user_telegram_id,)
+        )
+
+
 # ── interaction cards ─────────────────────────────────────────────────────────
 
 def save_interaction_card(contact_id: int, card_text: str) -> None:
@@ -157,3 +201,160 @@ def get_interaction_card(contact_id: int) -> str | None:
             (contact_id,),
         ).fetchone()
         return row["card_text"] if row else None
+
+
+# ── message samples (для ленивой генерации карточек) ──────────────────────────
+
+def save_message_samples(
+    contact_id: int,
+    my_sample: list[str],
+    contact_sample: list[str],
+    features_summary: str,
+    user_features_summary: str,
+) -> None:
+    with _conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO message_samples
+                (contact_id, my_sample, contact_sample, features_summary, user_features_summary)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(contact_id) DO UPDATE SET
+                my_sample             = excluded.my_sample,
+                contact_sample        = excluded.contact_sample,
+                features_summary      = excluded.features_summary,
+                user_features_summary = excluded.user_features_summary
+            """,
+            (
+                contact_id,
+                json.dumps(my_sample, ensure_ascii=False),
+                json.dumps(contact_sample, ensure_ascii=False),
+                features_summary,
+                user_features_summary,
+            ),
+        )
+
+
+def get_message_samples(contact_id: int) -> dict | None:
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM message_samples WHERE contact_id = ?", (contact_id,)
+        ).fetchone()
+    if not row:
+        return None
+    return {
+        "my_sample":             json.loads(row["my_sample"]),
+        "contact_sample":        json.loads(row["contact_sample"]),
+        "features_summary":      row["features_summary"],
+        "user_features_summary": row["user_features_summary"],
+    }
+
+
+def get_any_user_samples(user_telegram_id: str) -> dict | None:
+    """Первые доступные семплы для генерации style_card пользователя."""
+    with _conn() as conn:
+        row = conn.execute(
+            """
+            SELECT ms.my_sample, ms.user_features_summary
+            FROM message_samples ms
+            JOIN contacts c ON ms.contact_id = c.id
+            WHERE c.user_telegram_id = ?
+            LIMIT 1
+            """,
+            (user_telegram_id,),
+        ).fetchone()
+    if not row:
+        return None
+    return {
+        "my_sample":             json.loads(row["my_sample"]),
+        "user_features_summary": row["user_features_summary"],
+    }
+
+
+# ── business connections ──────────────────────────────────────────────────────
+
+def upsert_business_connection(
+    connection_id: str,
+    owner_user_id: str,
+    can_reply: bool,
+    is_enabled: bool,
+) -> None:
+    with _conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO business_connections
+                (connection_id, owner_user_id, can_reply, is_enabled, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(connection_id) DO UPDATE SET
+                can_reply  = excluded.can_reply,
+                is_enabled = excluded.is_enabled
+            """,
+            (
+                connection_id,
+                owner_user_id,
+                1 if can_reply else 0,
+                1 if is_enabled else 0,
+                _now(),
+            ),
+        )
+
+
+def get_business_connection(connection_id: str) -> sqlite3.Row | None:
+    with _conn() as conn:
+        return conn.execute(
+            "SELECT * FROM business_connections WHERE connection_id = ?",
+            (connection_id,),
+        ).fetchone()
+
+
+# ── business messages ─────────────────────────────────────────────────────────
+
+def save_business_message(
+    connection_id: str,
+    owner_user_id: str,
+    chat_ref: str,
+    direction: str,
+    text: str | None,
+    date: str,
+    tg_message_id: int | None,
+    raw_meta: dict,
+) -> None:
+    with _conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO business_messages
+                (connection_id, owner_user_id, chat_ref, direction,
+                 text, date, tg_message_id, raw_meta)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                connection_id,
+                owner_user_id,
+                chat_ref,
+                direction,
+                text,
+                date,
+                tg_message_id,
+                json.dumps(raw_meta, ensure_ascii=False),
+            ),
+        )
+
+
+# ── auto mode ─────────────────────────────────────────────────────────────────
+
+def get_auto_mode(telegram_id: str) -> tuple[bool, int | None]:
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT auto_mode, auto_contact_id FROM users WHERE telegram_id = ?",
+            (telegram_id,),
+        ).fetchone()
+    if not row:
+        return False, None
+    return bool(row["auto_mode"]), row["auto_contact_id"]
+
+
+def set_auto_mode(telegram_id: str, enabled: bool, contact_id: int | None = None) -> None:
+    with _conn() as conn:
+        conn.execute(
+            "UPDATE users SET auto_mode = ?, auto_contact_id = ? WHERE telegram_id = ?",
+            (1 if enabled else 0, contact_id, telegram_id),
+        )
