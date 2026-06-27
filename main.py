@@ -42,7 +42,6 @@ from storage import (
     get_biz_messages_for_contact,
     get_business_connection,
     get_contact_by_id,
-    get_contact_id_for_chat_ref,
     get_interaction_card,
     get_imported_messages,
     get_message_samples,
@@ -147,6 +146,15 @@ def _get_rebuild_sample(
     return msgs
 
 
+def _refresh_samples(owner_user_id: str, contact_id: int) -> None:
+    """Освежает message_samples из текущих business + imported данных. Без LLM."""
+    my_s  = _get_rebuild_sample(owner_user_id, contact_id, "out", SAMPLE_SIZE)[:100]
+    ct_s  = _get_rebuild_sample(owner_user_id, contact_id, "in", SAMPLE_SIZE)[:50]
+    c     = get_contact_by_id(contact_id)
+    label = _contact_name(c) if c else ""
+    save_message_samples(contact_id, my_s, ct_s, "", "", contact_label=label)
+
+
 # ── Ядро пересборки одного контакта ──────────────────────────────────────────
 
 async def _rebuild_contact(owner_user_id: str, contact_id: int) -> bool:
@@ -163,6 +171,18 @@ async def _rebuild_contact(owner_user_id: str, contact_id: int) -> bool:
     stats = (
         f"Я: {total} сообщений всего, {len(my_msgs)} в выборке, средн. {out_avg:.0f} симв.\n"
         f"Собеседник: {len(contact_msgs)} в выборке, средн. {in_avg:.0f} симв."
+    )
+
+    # Обновляем message_samples объединёнными данными (JSON + business)
+    contact_row = get_contact_by_id(contact_id)
+    label = (contact_row["display_name"] or contact_row["contact_alias"]) if contact_row else ""
+    save_message_samples(
+        contact_id,
+        my_msgs[:100],
+        contact_msgs[:50],
+        stats,
+        stats,
+        contact_label=label,
     )
 
     my_style = await build_my_style_for_contact(my_msgs, stats)
@@ -225,16 +245,28 @@ async def _gen_style_card(telegram_id: str) -> str | None:
     return card
 
 
-async def _gen_interaction_card(contact_id: int) -> str | None:
+async def _gen_interaction_card(contact_id: int, owner_user_id: str = "") -> str | None:
     card = get_interaction_card(contact_id)
     if card:
         return card
+
     samples = get_message_samples(contact_id)
-    if not samples:
+    if samples:
+        my_msgs      = samples["my_sample"]
+        contact_msgs = samples["contact_sample"]
+        stats        = samples["features_summary"]
+    elif owner_user_id:
+        my_msgs      = _get_rebuild_sample(owner_user_id, contact_id, "out", SAMPLE_SIZE)
+        contact_msgs = _get_rebuild_sample(owner_user_id, contact_id, "in", SAMPLE_SIZE // 2)
+        if not contact_msgs:
+            return None
+        out_avg = sum(len(t) for t in my_msgs) / len(my_msgs) if my_msgs else 0
+        in_avg  = sum(len(t) for t in contact_msgs) / len(contact_msgs)
+        stats   = f"Мои: {len(my_msgs)} сообщ., средн. {out_avg:.0f} симв. | Собеседника: {len(contact_msgs)} сообщ., средн. {in_avg:.0f} симв."
+    else:
         return None
-    card = await build_interaction_card(
-        samples["my_sample"], samples["contact_sample"], samples["features_summary"]
-    )
+
+    card = await build_interaction_card(my_msgs, contact_msgs, stats)
     save_interaction_card(contact_id, card)
     return card
 
@@ -304,20 +336,35 @@ async def handle_business_message(event: Message) -> None:
         conn_id, chat_ref, direction,
     )
 
-    # Попытка зарегистрировать маппинг chat_ref → contact_id
-    contact_id_for_rebuild: int | None = None
-    if direction == "in":
-        original_id = f"user{sender_id}"
-        contact_row = find_contact_by_original_id(owner_id, original_id)
-        if contact_row:
-            upsert_chat_ref_mapping(owner_id, chat_ref, contact_row["id"])
-            contact_id_for_rebuild = contact_row["id"]
-            if event.from_user.username:
-                update_contact_username(contact_row["id"], event.from_user.username)
+    upsert_user(owner_id, f"user{owner_id}")
+
+    # Для приватного чата event.chat.id всегда равен ID собеседника
+    contact_tg_id = str(event.chat.id)
+    if contact_tg_id == owner_id:
+        # edge-case: избегаем создания контакта «сам с собой»
+        return
+    original_id = f"user{contact_tg_id}"
+
+    contact_row = find_contact_by_original_id(owner_id, original_id)
+    if not contact_row:
+        # Контакт ещё не создан — создаём автоматически из данных чата
+        parts = [event.chat.first_name or "", event.chat.last_name or ""]
+        display_name = " ".join(p for p in parts if p).strip()
+        new_cid = get_or_create_contact(owner_id, original_id, display_name)
+        if getattr(event.chat, "username", None):
+            update_contact_username(new_cid, event.chat.username)
+        upsert_chat_ref_mapping(owner_id, chat_ref, new_cid)
+        contact_id_for_rebuild = new_cid
+        logging.info("auto-created contact: id=%s name=%s", new_cid, display_name)
     else:
-        contact_id_for_rebuild = get_contact_id_for_chat_ref(owner_id, chat_ref)
+        upsert_chat_ref_mapping(owner_id, chat_ref, contact_row["id"])
+        contact_id_for_rebuild = contact_row["id"]
+        if direction == "in" and event.from_user and event.from_user.username:
+            update_contact_username(contact_row["id"], event.from_user.username)
 
     if contact_id_for_rebuild:
+        # Освежаем message_samples при каждом сообщении (без LLM, дёшево)
+        _refresh_samples(owner_id, contact_id_for_rebuild)
         asyncio.create_task(_maybe_rebuild(owner_id, contact_id_for_rebuild))
 
 
@@ -393,7 +440,8 @@ async def handle_document(message: Message, bot: Bot, state: FSMContext) -> None
     feat_user = make_user_features_summary(features)
     my_s      = sample_texts(chat.my_messages, 100)
     contact_s = sample_texts(chat.contact_messages, 50)
-    save_message_samples(contact_id, my_s, contact_s, feat_full, feat_user)
+    label = chat.meta.contact_name or chat.meta.contact_id
+    save_message_samples(contact_id, my_s, contact_s, feat_full, feat_user, contact_label=label)
 
     all_imported = [
         {"direction": "out", "text": m.text, "date": m.date.isoformat()}
@@ -417,7 +465,7 @@ async def handle_document(message: Message, bot: Bot, state: FSMContext) -> None
                 "◉ Шаг 2 из 2 — генерирую анализ, подожди ~20 секунд..."
             )
             style_card       = await _gen_style_card(telegram_id)
-            interaction_card = await _gen_interaction_card(contact_id)
+            interaction_card = await _gen_interaction_card(contact_id, telegram_id)
             if style_card and interaction_card:
                 set_auto_mode(telegram_id, True, contact_id)
                 await message.answer(
@@ -461,7 +509,7 @@ async def cb_setup_contact(call: CallbackQuery, state: FSMContext) -> None:
     await call.message.edit_text(f"Выбран — {name}. Генерирую анализ...")
 
     style_card       = await _gen_style_card(telegram_id)
-    interaction_card = await _gen_interaction_card(contact_id)
+    interaction_card = await _gen_interaction_card(contact_id, telegram_id)
 
     if style_card and interaction_card:
         set_auto_mode(telegram_id, True, contact_id)
@@ -641,7 +689,7 @@ async def _show_contact_style(message: Message) -> None:
         card = get_interaction_card(c["id"])
         if not card:
             await message.answer(f"Генерирую анализ {name} — займёт ~20 секунд...")
-            card = await _gen_interaction_card(c["id"])
+            card = await _gen_interaction_card(c["id"], telegram_id)
         if not card:
             await message.answer("Не удалось сгенерировать анализ.")
             return
@@ -665,7 +713,7 @@ async def cb_contact_style(call: CallbackQuery) -> None:
     card = get_interaction_card(contact_id)
     if not card:
         await call.message.edit_text(f"Генерирую анализ {name} — займёт ~20 секунд...")
-        card = await _gen_interaction_card(contact_id)
+        card = await _gen_interaction_card(contact_id, str(call.from_user.id))
 
     if not card:
         await call.message.edit_text("Не удалось сгенерировать анализ.")
@@ -700,7 +748,7 @@ async def _start_rewrite(message: Message, state: FSMContext) -> None:
         if not style_card or not interaction_card:
             await message.answer("Генерирую анализ — займёт ~20 секунд...")
             if not interaction_card:
-                interaction_card = await _gen_interaction_card(c["id"])
+                interaction_card = await _gen_interaction_card(c["id"], telegram_id)
             if not style_card:
                 style_card = await _gen_style_card(telegram_id)
         if not style_card or not interaction_card:
@@ -737,7 +785,7 @@ async def cb_rewrite_contact(call: CallbackQuery, state: FSMContext) -> None:
     if not style_card or not interaction_card:
         await call.message.edit_text("Генерирую анализ — займёт ~20 секунд...")
         if not interaction_card:
-            interaction_card = await _gen_interaction_card(contact_id)
+            interaction_card = await _gen_interaction_card(contact_id, telegram_id)
         if not style_card:
             style_card = await _gen_style_card(telegram_id)
 
@@ -794,7 +842,7 @@ async def _toggle_auto(message: Message) -> None:
             if not style_card:
                 style_card = await _gen_style_card(telegram_id)
             if not interaction_card:
-                interaction_card = await _gen_interaction_card(c["id"])
+                interaction_card = await _gen_interaction_card(c["id"], telegram_id)
         if not style_card or not interaction_card:
             await message.answer("Не удалось сгенерировать анализ.")
             return
@@ -827,7 +875,7 @@ async def cb_auto_contact(call: CallbackQuery) -> None:
     if not style_card:
         style_card = await _gen_style_card(telegram_id)
     if not interaction_card:
-        interaction_card = await _gen_interaction_card(contact_id)
+        interaction_card = await _gen_interaction_card(contact_id, telegram_id)
 
     if not style_card or not interaction_card:
         await call.message.edit_text("Не удалось сгенерировать анализ.")

@@ -104,6 +104,7 @@ def init_db() -> None:
         _add_column_if_missing(conn, "users", "auto_mode", "INTEGER DEFAULT 0")
         _add_column_if_missing(conn, "users", "auto_contact_id", "INTEGER")
         _add_column_if_missing(conn, "contacts", "username", "TEXT")
+        _add_column_if_missing(conn, "message_samples", "contact_label", "TEXT")
 
 
 def _now() -> str:
@@ -242,18 +243,20 @@ def save_message_samples(
     contact_sample: list[str],
     features_summary: str,
     user_features_summary: str,
+    contact_label: str = "",
 ) -> None:
     with _conn() as conn:
         conn.execute(
             """
             INSERT INTO message_samples
-                (contact_id, my_sample, contact_sample, features_summary, user_features_summary)
-            VALUES (?, ?, ?, ?, ?)
+                (contact_id, my_sample, contact_sample, features_summary, user_features_summary, contact_label)
+            VALUES (?, ?, ?, ?, ?, ?)
             ON CONFLICT(contact_id) DO UPDATE SET
                 my_sample             = excluded.my_sample,
                 contact_sample        = excluded.contact_sample,
                 features_summary      = excluded.features_summary,
-                user_features_summary = excluded.user_features_summary
+                user_features_summary = excluded.user_features_summary,
+                contact_label         = excluded.contact_label
             """,
             (
                 contact_id,
@@ -261,6 +264,7 @@ def save_message_samples(
                 json.dumps(contact_sample, ensure_ascii=False),
                 features_summary,
                 user_features_summary,
+                contact_label,
             ),
         )
 
