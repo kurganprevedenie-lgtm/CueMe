@@ -79,6 +79,14 @@ def init_db() -> None:
                 raw_meta      TEXT NOT NULL DEFAULT '{}'
             );
 
+            CREATE TABLE IF NOT EXISTS imported_messages (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                contact_id INTEGER NOT NULL,
+                direction  TEXT NOT NULL,
+                text       TEXT NOT NULL,
+                date       TEXT NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS business_chat_refs (
                 owner_user_id TEXT NOT NULL,
                 chat_ref      TEXT NOT NULL,
@@ -291,6 +299,45 @@ def get_any_user_samples(user_telegram_id: str) -> dict | None:
         "my_sample":             json.loads(row["my_sample"]),
         "user_features_summary": row["user_features_summary"],
     }
+
+
+# ── imported messages (полный архив из JSON-экспорта) ─────────────────────────
+
+def save_imported_messages(contact_id: int, messages: list[dict]) -> None:
+    """messages: [{"direction": "in"/"out", "text": str, "date": str}]"""
+    with _conn() as conn:
+        conn.execute(
+            "DELETE FROM imported_messages WHERE contact_id = ?", (contact_id,)
+        )
+        conn.executemany(
+            "INSERT INTO imported_messages (contact_id, direction, text, date) VALUES (?, ?, ?, ?)",
+            [(contact_id, m["direction"], m["text"], m["date"]) for m in messages],
+        )
+
+
+def get_imported_messages(contact_id: int, direction: str, limit: int = 0) -> list[str]:
+    """limit=0 → все сообщения."""
+    with _conn() as conn:
+        if limit:
+            rows = conn.execute(
+                "SELECT text FROM imported_messages WHERE contact_id = ? AND direction = ? ORDER BY date DESC LIMIT ?",
+                (contact_id, direction, limit),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT text FROM imported_messages WHERE contact_id = ? AND direction = ? ORDER BY date DESC",
+                (contact_id, direction),
+            ).fetchall()
+    return [row["text"] for row in rows]
+
+
+def count_imported_messages(contact_id: int) -> int:
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) AS cnt FROM imported_messages WHERE contact_id = ?",
+            (contact_id,),
+        ).fetchone()
+    return row["cnt"] if row else 0
 
 
 # ── contacts (extra lookup) ───────────────────────────────────────────────────

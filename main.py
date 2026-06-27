@@ -44,7 +44,9 @@ from storage import (
     get_contact_by_id,
     get_contact_id_for_chat_ref,
     get_interaction_card,
+    get_imported_messages,
     get_message_samples,
+    save_imported_messages,
     get_my_style_last_rebuild_count,
     get_my_style_per_contact,
     get_or_create_contact,
@@ -138,14 +140,10 @@ def _get_rebuild_sample(
     owner_user_id: str, contact_id: int, direction: str, limit: int
 ) -> list[str]:
     msgs = get_biz_messages_for_contact(owner_user_id, contact_id, direction, limit)
-    if len(msgs) < 30:
-        json_s = get_message_samples(contact_id)
-        if json_s:
-            key = "my_sample" if direction == "out" else "contact_sample"
-            seen = set(msgs)
-            for t in json_s[key]:
-                if t not in seen and len(msgs) < limit:
-                    msgs.append(t)
+    seen = set(msgs)
+    for t in get_imported_messages(contact_id, direction):  # всё из JSON без лимита
+        if t not in seen:
+            msgs.append(t)
     return msgs
 
 
@@ -391,11 +389,20 @@ async def handle_document(message: Message, bot: Bot, state: FSMContext) -> None
     features = extract_features(chat)
     contact_id = get_or_create_contact(telegram_id, chat.meta.contact_id, chat.meta.contact_name)
 
-    my_s      = sample_texts(chat.my_messages, 100)
-    contact_s = sample_texts(chat.contact_messages, 50)
     feat_full = make_features_summary(features)
     feat_user = make_user_features_summary(features)
+    my_s      = sample_texts(chat.my_messages, 100)
+    contact_s = sample_texts(chat.contact_messages, 50)
     save_message_samples(contact_id, my_s, contact_s, feat_full, feat_user)
+
+    all_imported = [
+        {"direction": "out", "text": m.text, "date": m.date.isoformat()}
+        for m in chat.my_messages if m.text
+    ] + [
+        {"direction": "in", "text": m.text, "date": m.date.isoformat()}
+        for m in chat.contact_messages if m.text
+    ]
+    save_imported_messages(contact_id, all_imported)
 
     delete_style_card(telegram_id)
 
@@ -872,31 +879,6 @@ async def cmd_rebuild_all(message: Message) -> None:
         )
 
 
-# ── /reset_cards — сброс закешированных карточек (при смешивании данных) ──────
-
-@dp.message(Command("reset_cards"))
-async def cmd_reset_cards(message: Message) -> None:
-    telegram_id = str(message.from_user.id)
-    contacts = list_contacts(telegram_id)
-
-    delete_style_card(telegram_id)
-
-    with __import__("sqlite3").connect("bot.db") as conn:
-        for c in contacts:
-            conn.execute(
-                "DELETE FROM interaction_cards WHERE contact_id = ?", (c["id"],)
-            )
-            conn.execute(
-                "DELETE FROM my_style_per_contact WHERE contact_id = ?", (c["id"],)
-            )
-
-    n = len(contacts)
-    await message.answer(
-        f"Сброшено. Удалены: style_card, {n} interaction_card, {n} my_style_per_contact.\n\n"
-        "Карточки пересоберутся заново при следующем запросе (на основе чистых данных)."
-    )
-
-
 # ── /help ────────────────────────────────────────────────────────────────────
 
 @dp.message(Command("help"))
@@ -909,8 +891,7 @@ async def cmd_help(message: Message) -> None:
         "/me — твой общий стиль общения\n"
         "/rewrite — переписать сообщение\n"
         "/contacts — список загруженных чатов\n"
-        "/rebuild_all — принудительно пересобрать все карточки\n"
-        "/reset_cards — сбросить кеш карточек (если данные перепутались)\n\n"
+        "/rebuild_all — принудительно пересобрать все карточки\n\n"
         "Кнопки в меню:\n"
         "📝 Переписать — черновик → готовое сообщение\n"
         "👤 Мой стиль — как ты общаешься в целом\n"
@@ -958,7 +939,6 @@ async def main() -> None:
         BotCommand(command="rewrite",     description="Переписать сообщение"),
         BotCommand(command="contacts",    description="Загруженные чаты"),
         BotCommand(command="rebuild_all", description="Пересобрать все карточки"),
-        BotCommand(command="reset_cards", description="Сбросить кеш карточек"),
     ])
     await dp.start_polling(
         bot,

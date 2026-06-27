@@ -38,6 +38,21 @@ def sample_texts(messages: list, n: int = 30) -> list[str]:
     return random.sample(texts, min(n, len(texts)))
 
 
+# 128k токенов ≈ 512k символов. Оставляем ~100k на промпт и ответ.
+_MSG_BUDGET = 400_000
+
+
+def _fit(msgs: list[str]) -> list[str]:
+    """Берёт максимум сообщений, влезающих в символьный бюджет."""
+    result, total = [], 0
+    for t in msgs:
+        total += len(t) + 3  # "- " + text + "\n"
+        if total > _MSG_BUDGET:
+            break
+        result.append(t)
+    return result
+
+
 def make_features_summary(f: ChatFeatures) -> str:
     """Полная статистика — для interaction_card."""
     m, c = f.my, f.contact
@@ -72,11 +87,13 @@ def make_user_features_summary(f: ChatFeatures) -> str:
 
 async def build_style_card(my_sample: list[str], user_features_summary: str) -> str:
     """Анализ голоса пользователя. Возвращает plain text."""
+    my_sample = _fit(my_sample)
     prompt = (
         "Проанализируй сообщения пользователя.\n"
         "Верни ТОЛЬКО текст анализа — без JSON, без кавычек, без markdown.\n"
         "Просто текст с заголовками секций и пунктами через •.\n\n"
         f"СТАТИСТИКА:\n{user_features_summary}\n\n"
+        f"ВСЕГО СООБЩЕНИЙ В АНАЛИЗЕ: {len(my_sample)}\n\n"
         "СООБЩЕНИЯ ПОЛЬЗОВАТЕЛЯ:\n"
         + "\n".join(f"- {t}" for t in my_sample)
         + "\n\n"
@@ -109,11 +126,15 @@ async def build_interaction_card(
     features_summary: str,
 ) -> str:
     """Наблюдения о собеседнике. Возвращает plain text."""
+    # Делим бюджет пополам между сторонами
+    my_sample      = _fit(my_sample)
+    contact_sample = _fit(contact_sample)
     prompt = (
         "Проанализируй как СОБЕСЕДНИК общается в этой переписке.\n"
         "Верни ТОЛЬКО текст анализа — без JSON, без кавычек, без markdown.\n"
         "Просто текст с заголовками секций и пунктами через •.\n\n"
         f"СТАТИСТИКА:\n{features_summary}\n\n"
+        f"ВСЕГО В АНАЛИЗЕ: мои — {len(my_sample)}, собеседника — {len(contact_sample)}\n\n"
         "СООБЩЕНИЯ ПОЛЬЗОВАТЕЛЯ:\n"
         + "\n".join(f"- {t}" for t in my_sample)
         + "\n\nСООБЩЕНИЯ СОБЕСЕДНИКА:\n"
@@ -147,10 +168,12 @@ async def build_interaction_card(
 
 async def build_my_style_for_contact(my_msgs: list[str], stats_summary: str) -> str:
     """Как пользователь пишет конкретному собеседнику. Plain text."""
+    my_msgs = _fit(my_msgs)
     prompt = (
         "Проанализируй как пользователь пишет ЭТОМУ конкретному человеку.\n"
         "Верни ТОЛЬКО текст — без JSON, без кавычек, без markdown.\n\n"
         f"СТАТИСТИКА:\n{stats_summary}\n\n"
+        f"ВСЕГО СООБЩЕНИЙ В АНАЛИЗЕ: {len(my_msgs)}\n\n"
         "МОИ СООБЩЕНИЯ К ЭТОМУ ЧЕЛОВЕКУ:\n"
         + "\n".join(f"- {t}" for t in my_msgs)
         + "\n\n"
