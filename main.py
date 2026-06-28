@@ -3,6 +3,7 @@ import hashlib
 import logging
 import re
 import tempfile
+import time
 from pathlib import Path
 
 from aiogram import Bot, Dispatcher, F
@@ -22,10 +23,13 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
 from config import APP_NAME, BOT_TOKEN, REBUILD_THRESHOLD, SAMPLE_SIZE
 from features import extract_features
 from llm import (
+    RateLimitError,
+    adjust_message,
     build_interaction_card,
     build_my_style_for_contact,
     build_overall_style,
     build_style_card,
+    compare_my_styles,
     make_features_summary,
     rewrite_message,
     rewrite_message_explained,
@@ -35,6 +39,8 @@ from llm import (
 from tg_parser import parse_chat
 from storage import (
     count_biz_messages_for_contact,
+    delete_all_user_data,
+    delete_contact_data,
     delete_style_card,
     find_contact_by_original_id,
     get_all_per_contact_style_cards,
@@ -83,6 +89,10 @@ _rebuilding: set[int] = set()
 # Контекст последнего действия для кнопки «🔄 Ещё вариант» (по user_id)
 _last_action: dict[int, dict] = {}
 
+# После лимита Groq фоновые авто-пересборки молчат до этого момента (monotonic-время),
+# чтобы не дёргать API обречёнными запросами на каждое сообщение.
+_rebuild_cooldown_until: float = 0.0
+
 
 def _contact_name(c) -> str:
     name     = c["display_name"] or ""
@@ -102,10 +112,26 @@ def main_kb() -> ReplyKeyboardMarkup:
     return b.as_markup(resize_keyboard=True)
 
 
-def again_kb() -> InlineKeyboardMarkup:
+def result_kb() -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     b.button(text="🔄 Ещё вариант", callback_data="again")
+    b.button(text="✂️ Короче",     callback_data="adj:short")
+    b.button(text="🔥 Теплее",     callback_data="adj:warm")
+    b.button(text="👔 Формальнее", callback_data="adj:formal")
+    b.adjust(1, 3)
     return b.as_markup()
+
+
+async def _send_result(msg: Message, result: str, expl: str = "", rating: str = "") -> None:
+    """Отправляет переписанный текст с кнопками, пояснение и оценку — отдельным сообщением."""
+    await msg.answer(result, reply_markup=result_kb())
+    tail = ""
+    if expl:
+        tail += f"💡 {expl}"
+    if rating:
+        tail += ("\n\n" if tail else "") + rating
+    if tail:
+        await msg.answer(tail)
 
 
 def contacts_kb(contacts: list, prefix: str) -> InlineKeyboardMarkup:
@@ -222,8 +248,11 @@ async def _rebuild_contact(owner_user_id: str, contact_id: int) -> bool:
 # ── Авто-пересборка (fire-and-forget) ─────────────────────────────────────────
 
 async def _maybe_rebuild(owner_user_id: str, contact_id: int) -> None:
+    global _rebuild_cooldown_until
     if contact_id in _rebuilding:
         return
+    if time.monotonic() < _rebuild_cooldown_until:
+        return  # лимит Groq недавно исчерпан — не дёргаем API на каждое сообщение
 
     last = get_my_style_last_rebuild_count(contact_id)
     total = count_biz_messages_for_contact(owner_user_id, contact_id)
@@ -240,6 +269,10 @@ async def _maybe_rebuild(owner_user_id: str, contact_id: int) -> None:
                 overall = await build_overall_style(per_contact)
                 save_style_card(owner_user_id, overall)
         logging.info("auto-rebuild done: contact_id=%s ok=%s", contact_id, ok)
+    except RateLimitError:
+        # Дневной лимит исчерпан — молчим 30 мин, пересоберём позже. Без трейсбека.
+        _rebuild_cooldown_until = time.monotonic() + 1800
+        logging.warning("auto-rebuild отложена на 30 мин (лимит Groq): contact_id=%s", contact_id)
     except Exception:
         logging.exception("auto-rebuild failed: contact_id=%s", contact_id)
     finally:
@@ -838,21 +871,19 @@ async def handle_draft(message: Message, state: FSMContext) -> None:
     await message.answer("Переписываю...")
 
     try:
-        result, expl = await rewrite_message_explained(
+        result, expl, rating = await rewrite_message_explained(
             draft, data["style_card"], data["interaction_card"]
         )
         _last_action[message.from_user.id] = {
-            "kind": "rewrite", "text": draft,
+            "kind": "rewrite", "text": draft, "result": result,
             "style_card": data["style_card"], "interaction_card": data["interaction_card"],
         }
-        await message.answer(result, reply_markup=again_kb())
-        if expl:
-            await message.answer(f"💡 Что изменил: {expl}")
+        await _send_result(message, result, expl, rating)
     except Exception as e:
         await message.answer(f"Ошибка: {e}")
 
 
-# ── 🔄 Ещё вариант ────────────────────────────────────────────────────────────
+# ── 🔄 Ещё вариант / подстройка тона ──────────────────────────────────────────
 
 @dp.callback_query(F.data == "again")
 async def cb_again(call: CallbackQuery) -> None:
@@ -863,16 +894,31 @@ async def cb_again(call: CallbackQuery) -> None:
     await call.answer("Генерирую другой вариант...")
     try:
         if ctx["kind"] == "rewrite":
-            result, expl = await rewrite_message_explained(
+            result, expl, rating = await rewrite_message_explained(
                 ctx["text"], ctx["style_card"], ctx["interaction_card"]
             )
         else:
-            result, expl = await suggest_reply(
+            result, expl, rating = await suggest_reply(
                 ctx["text"], ctx["style_card"], ctx["interaction_card"]
             )
-        await call.message.answer(result, reply_markup=again_kb())
-        if expl:
-            await call.message.answer(f"💡 {expl}")
+        ctx["result"] = result
+        await _send_result(call.message, result, expl, rating)
+    except Exception as e:
+        await call.message.answer(f"Ошибка: {e}")
+
+
+@dp.callback_query(F.data.startswith("adj:"))
+async def cb_adjust(call: CallbackQuery) -> None:
+    ctx = _last_action.get(call.from_user.id)
+    if not ctx or not ctx.get("result"):
+        await call.answer("Контекст устарел — начни заново.", show_alert=True)
+        return
+    mode = call.data.split(":")[1]
+    await call.answer("Подстраиваю...")
+    try:
+        result, expl = await adjust_message(ctx["result"], ctx["style_card"], mode)
+        ctx["result"] = result
+        await _send_result(call.message, result, expl)
     except Exception as e:
         await call.message.answer(f"Ошибка: {e}")
 
@@ -955,16 +1001,14 @@ async def handle_incoming(message: Message, state: FSMContext) -> None:
     await message.answer("Думаю как ответить...")
 
     try:
-        result, expl = await suggest_reply(
+        result, expl, rating = await suggest_reply(
             incoming, data["style_card"], data["interaction_card"]
         )
         _last_action[message.from_user.id] = {
-            "kind": "reply", "text": incoming,
+            "kind": "reply", "text": incoming, "result": result,
             "style_card": data["style_card"], "interaction_card": data["interaction_card"],
         }
-        await message.answer(result, reply_markup=again_kb())
-        if expl:
-            await message.answer(f"💡 {expl}")
+        await _send_result(message, result, expl, rating)
     except Exception as e:
         await message.answer(f"Ошибка: {e}")
 
@@ -985,30 +1029,52 @@ async def cmd_rebuild_all(message: Message) -> None:
         return
 
     n = len(contacts)
-    await message.answer(
-        f"Запускаю пересборку для {n} контактов — ~{n * 20} секунд..."
-    )
+    names = [_contact_name(c) for c in contacts]
+
+    def _progress(done: int, current: str = "", mark: str = "⏳") -> str:
+        lines = [f"Пересборка {done}/{n}\n"]
+        for i, nm in enumerate(names):
+            if i < done:
+                lines.append(f"✅ {nm}")
+            elif nm == current:
+                lines.append(f"{mark} {nm} — обрабатываю...")
+            else:
+                lines.append(f"⬜ {nm}")
+        return "\n".join(lines)
+
+    status = await message.answer(_progress(0, names[0]))
 
     rebuilt = 0
-    for c in contacts:
+    for i, c in enumerate(contacts):
         try:
+            await status.edit_text(_progress(rebuilt, names[i]))
             ok = await _rebuild_contact(telegram_id, c["id"])
             if ok:
                 rebuilt += 1
+        except RateLimitError as e:
+            await status.edit_text(_progress(rebuilt) + f"\n\n⛔ Дальше упёрлись в лимит.\n{e}")
+            return
         except Exception:
             logging.exception("rebuild_all failed for contact_id=%s", c["id"])
 
+    await status.edit_text(_progress(rebuilt))
+
     per_contact = get_all_per_contact_style_cards(telegram_id)
-    if per_contact:
-        overall = await build_overall_style(per_contact)
-        save_style_card(telegram_id, overall)
-        await message.answer(
-            f"Готово. Пересобрано: {rebuilt}/{n}. Общий портрет обновлён."
-        )
-    else:
+    if not per_contact:
         await message.answer(
             f"Пересобрано: {rebuilt}/{n}. "
             "Пока нет данных для общего портрета (нужны сообщения в обе стороны)."
+        )
+        return
+
+    try:
+        await message.answer("Собираю общий портрет...")
+        overall = await build_overall_style(per_contact)
+        save_style_card(telegram_id, overall)
+        await message.answer(f"✅ Готово. Пересобрано: {rebuilt}/{n}. Общий портрет обновлён.")
+    except RateLimitError as e:
+        await message.answer(
+            f"Контакты пересобраны ({rebuilt}/{n}), но общий портрет не успел — {e}"
         )
 
 
@@ -1023,9 +1089,11 @@ async def cmd_help(message: Message) -> None:
         "/connect — как подключить Автоматизацию чатов\n"
         "/me — твой общий стиль общения\n"
         "/stats — твой портрет в цифрах\n"
+        "/compare — как ты пишешь разным людям (сравнение)\n"
         "/rewrite — переписать сообщение\n"
         "/reply — помочь ответить на сообщение собеседника\n"
         "/contacts — список загруженных чатов\n"
+        "/delete — удалить свои данные\n"
         "/rebuild_all — принудительно пересобрать все карточки\n\n"
         "Кнопки в меню:\n"
         "📝 Переписать — черновик → готовое сообщение\n"
@@ -1117,6 +1185,108 @@ async def cmd_stats(message: Message) -> None:
     await message.answer(stats)
 
 
+# ── /compare — сравнение стиля с разными людьми ──────────────────────────────
+
+@dp.message(Command("compare"))
+async def cmd_compare(message: Message) -> None:
+    telegram_id = str(message.from_user.id)
+    cards = get_all_per_contact_style_cards(telegram_id)
+    if len(cards) < 2:
+        await message.answer(
+            "Нужно минимум 2 разобранных собеседника. "
+            "Загрузи ещё чат или дай боту накопить сообщения."
+        )
+        return
+    await message.answer("Сравниваю как ты пишешь разным людям — ~20 секунд...")
+    try:
+        result = await compare_my_styles(cards)
+        await message.answer(result)
+    except Exception as e:
+        await message.answer(f"Ошибка: {e}")
+
+
+# ── /delete — удалить данные (152-ФЗ) ────────────────────────────────────────
+
+def _delete_kb(contacts: list) -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    for c in contacts:
+        b.button(text=f"🗑 {_contact_name(c)}", callback_data=f"del:{c['id']}")
+    b.button(text="‼️ Удалить ВСЕ данные", callback_data="delall")
+    b.adjust(1)
+    return b.as_markup()
+
+
+@dp.message(Command("delete"))
+async def cmd_delete(message: Message) -> None:
+    telegram_id = str(message.from_user.id)
+    contacts = list_contacts(telegram_id)
+    if not contacts:
+        await message.answer("У тебя нет сохранённых данных.")
+        return
+    await message.answer(
+        "Что удалить? Действие необратимо.",
+        reply_markup=_delete_kb(contacts),
+    )
+
+
+@dp.callback_query(F.data.startswith("del:"))
+async def cb_delete_contact(call: CallbackQuery) -> None:
+    contact_id = int(call.data.split(":")[1])
+    contact = get_contact_by_id(contact_id)
+    if not contact:
+        await call.answer("Контакт не найден.")
+        return
+    await call.answer()
+    name = _contact_name(contact)
+    b = InlineKeyboardBuilder()
+    b.button(text=f"Да, удалить {name}", callback_data=f"delyes:{contact_id}")
+    b.button(text="Отмена", callback_data="delno")
+    b.adjust(1)
+    await call.message.edit_text(
+        f"Удалить все данные по «{name}»? Это необратимо.",
+        reply_markup=b.as_markup(),
+    )
+
+
+@dp.callback_query(F.data.startswith("delyes:"))
+async def cb_delete_contact_confirm(call: CallbackQuery) -> None:
+    contact_id  = int(call.data.split(":")[1])
+    telegram_id = str(call.from_user.id)
+    contact = get_contact_by_id(contact_id)
+    name = _contact_name(contact) if contact else "контакт"
+    delete_contact_data(telegram_id, contact_id)
+    await call.answer("Удалено")
+    await call.message.edit_text(f"✓ Данные по «{name}» удалены.")
+
+
+@dp.callback_query(F.data == "delall")
+async def cb_delete_all(call: CallbackQuery) -> None:
+    await call.answer()
+    b = InlineKeyboardBuilder()
+    b.button(text="Да, удалить ВСЁ", callback_data="delallyes")
+    b.button(text="Отмена", callback_data="delno")
+    b.adjust(1)
+    await call.message.edit_text(
+        "Удалить ВСЕ твои данные — все чаты, стили, переписки? Это необратимо.",
+        reply_markup=b.as_markup(),
+    )
+
+
+@dp.callback_query(F.data == "delallyes")
+async def cb_delete_all_confirm(call: CallbackQuery) -> None:
+    delete_all_user_data(str(call.from_user.id))
+    await call.answer("Удалено")
+    await call.message.edit_text(
+        "✓ Все твои данные удалены. Чтобы начать заново — /start."
+    )
+
+
+@dp.callback_query(F.data == "delno")
+async def cb_delete_cancel(call: CallbackQuery) -> None:
+    await call.answer("Отменено")
+    await call.message.edit_text("Удаление отменено.")
+
+
 # ── Авто-переписка (catch-all, должен быть последним) ─────────────────────────
 
 @dp.message(F.text & ~F.text.in_(_ALL_BTNS))
@@ -1143,10 +1313,10 @@ async def auto_rewrite_handler(message: Message, state: FSMContext) -> None:
         draft = message.text.strip()
         result = await rewrite_message(draft, style_card, interaction_card)
         _last_action[message.from_user.id] = {
-            "kind": "rewrite", "text": draft,
+            "kind": "rewrite", "text": draft, "result": result,
             "style_card": style_card, "interaction_card": interaction_card,
         }
-        await message.answer(result, reply_markup=again_kb())
+        await message.answer(result, reply_markup=result_kb())
     except Exception as e:
         await message.answer(f"Ошибка: {e}")
 
@@ -1162,9 +1332,11 @@ async def main() -> None:
         BotCommand(command="connect",     description="Подключить Автоматизацию чатов"),
         BotCommand(command="me",          description="Мой стиль общения"),
         BotCommand(command="stats",       description="Портрет в цифрах"),
+        BotCommand(command="compare",     description="Сравнить стиль с разными людьми"),
         BotCommand(command="rewrite",     description="Переписать сообщение"),
         BotCommand(command="reply",       description="Помочь ответить собеседнику"),
         BotCommand(command="contacts",    description="Загруженные чаты"),
+        BotCommand(command="delete",      description="Удалить свои данные"),
         BotCommand(command="rebuild_all", description="Пересобрать все карточки"),
     ])
     await dp.start_polling(

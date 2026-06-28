@@ -569,3 +569,59 @@ def set_auto_mode(telegram_id: str, enabled: bool, contact_id: int | None = None
             "UPDATE users SET auto_mode = ?, auto_contact_id = ? WHERE telegram_id = ?",
             (1 if enabled else 0, contact_id, telegram_id),
         )
+
+
+# ── удаление данных (152-ФЗ: пользователь может стереть свои данные) ───────────
+
+def delete_contact_data(telegram_id: str, contact_id: int) -> None:
+    """Полностью удаляет один контакт и все производные данные."""
+    with _conn() as conn:
+        # business-сообщения этого контакта — через привязанные chat_ref
+        refs = [
+            r["chat_ref"] for r in conn.execute(
+                "SELECT chat_ref FROM business_chat_refs WHERE owner_user_id = ? AND contact_id = ?",
+                (telegram_id, contact_id),
+            ).fetchall()
+        ]
+        for ref in refs:
+            conn.execute(
+                "DELETE FROM business_messages WHERE owner_user_id = ? AND chat_ref = ?",
+                (telegram_id, ref),
+            )
+        conn.execute(
+            "DELETE FROM business_chat_refs WHERE owner_user_id = ? AND contact_id = ?",
+            (telegram_id, contact_id),
+        )
+        conn.execute("DELETE FROM interaction_cards    WHERE contact_id = ?", (contact_id,))
+        conn.execute("DELETE FROM my_style_per_contact WHERE contact_id = ?", (contact_id,))
+        conn.execute("DELETE FROM message_samples      WHERE contact_id = ?", (contact_id,))
+        conn.execute("DELETE FROM imported_messages    WHERE contact_id = ?", (contact_id,))
+        conn.execute("DELETE FROM contacts             WHERE id = ?",         (contact_id,))
+        # сбрасываем агрегатный портрет — пересоберётся без удалённого контакта
+        conn.execute("DELETE FROM style_cards WHERE user_telegram_id = ?", (telegram_id,))
+        # если контакт был активным для авто-режима — снимаем привязку
+        conn.execute(
+            "UPDATE users SET auto_contact_id = NULL WHERE telegram_id = ? AND auto_contact_id = ?",
+            (telegram_id, contact_id),
+        )
+
+
+def delete_all_user_data(telegram_id: str) -> None:
+    """Полностью стирает все данные пользователя."""
+    with _conn() as conn:
+        cids = [
+            r["id"] for r in conn.execute(
+                "SELECT id FROM contacts WHERE user_telegram_id = ?", (telegram_id,)
+            ).fetchall()
+        ]
+        if cids:
+            inlist = ",".join("?" * len(cids))
+            conn.execute(f"DELETE FROM interaction_cards    WHERE contact_id IN ({inlist})", cids)
+            conn.execute(f"DELETE FROM my_style_per_contact WHERE contact_id IN ({inlist})", cids)
+            conn.execute(f"DELETE FROM message_samples      WHERE contact_id IN ({inlist})", cids)
+            conn.execute(f"DELETE FROM imported_messages    WHERE contact_id IN ({inlist})", cids)
+        conn.execute("DELETE FROM contacts           WHERE user_telegram_id = ?", (telegram_id,))
+        conn.execute("DELETE FROM style_cards        WHERE user_telegram_id = ?", (telegram_id,))
+        conn.execute("DELETE FROM business_messages  WHERE owner_user_id = ?",    (telegram_id,))
+        conn.execute("DELETE FROM business_chat_refs WHERE owner_user_id = ?",    (telegram_id,))
+        conn.execute("DELETE FROM users              WHERE telegram_id = ?",      (telegram_id,))
