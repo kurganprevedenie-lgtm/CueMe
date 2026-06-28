@@ -55,8 +55,7 @@ def init_db() -> None:
                 contact_id           INTEGER PRIMARY KEY,
                 my_sample            TEXT NOT NULL,
                 contact_sample       TEXT NOT NULL,
-                features_summary     TEXT NOT NULL,
-                user_features_summary TEXT NOT NULL
+                features_summary     TEXT NOT NULL DEFAULT ''
             );
 
             CREATE TABLE IF NOT EXISTS business_connections (
@@ -105,6 +104,10 @@ def init_db() -> None:
         _add_column_if_missing(conn, "users", "auto_contact_id", "INTEGER")
         _add_column_if_missing(conn, "contacts", "username", "TEXT")
         _add_column_if_missing(conn, "message_samples", "contact_label", "TEXT")
+        # user_features_summary — подмножество features_summary, убираем дубль
+        ms_cols = [r[1] for r in conn.execute("PRAGMA table_info(message_samples)").fetchall()]
+        if "user_features_summary" in ms_cols:
+            conn.execute("ALTER TABLE message_samples DROP COLUMN user_features_summary")
 
 
 def _now() -> str:
@@ -242,28 +245,25 @@ def save_message_samples(
     my_sample: list[str],
     contact_sample: list[str],
     features_summary: str,
-    user_features_summary: str,
     contact_label: str = "",
 ) -> None:
     with _conn() as conn:
         conn.execute(
             """
             INSERT INTO message_samples
-                (contact_id, my_sample, contact_sample, features_summary, user_features_summary, contact_label)
-            VALUES (?, ?, ?, ?, ?, ?)
+                (contact_id, my_sample, contact_sample, features_summary, contact_label)
+            VALUES (?, ?, ?, ?, ?)
             ON CONFLICT(contact_id) DO UPDATE SET
-                my_sample             = excluded.my_sample,
-                contact_sample        = excluded.contact_sample,
-                features_summary      = excluded.features_summary,
-                user_features_summary = excluded.user_features_summary,
-                contact_label         = excluded.contact_label
+                my_sample        = excluded.my_sample,
+                contact_sample   = excluded.contact_sample,
+                features_summary = excluded.features_summary,
+                contact_label    = excluded.contact_label
             """,
             (
                 contact_id,
                 json.dumps(my_sample, ensure_ascii=False),
                 json.dumps(contact_sample, ensure_ascii=False),
                 features_summary,
-                user_features_summary,
                 contact_label,
             ),
         )
@@ -277,10 +277,9 @@ def get_message_samples(contact_id: int) -> dict | None:
     if not row:
         return None
     return {
-        "my_sample":             json.loads(row["my_sample"]),
-        "contact_sample":        json.loads(row["contact_sample"]),
-        "features_summary":      row["features_summary"],
-        "user_features_summary": row["user_features_summary"],
+        "my_sample":        json.loads(row["my_sample"]),
+        "contact_sample":   json.loads(row["contact_sample"]),
+        "features_summary": row["features_summary"],
     }
 
 
@@ -289,7 +288,7 @@ def get_any_user_samples(user_telegram_id: str) -> dict | None:
     with _conn() as conn:
         row = conn.execute(
             """
-            SELECT ms.my_sample, ms.user_features_summary
+            SELECT ms.my_sample, ms.features_summary
             FROM message_samples ms
             JOIN contacts c ON ms.contact_id = c.id
             WHERE c.user_telegram_id = ?
@@ -300,8 +299,8 @@ def get_any_user_samples(user_telegram_id: str) -> dict | None:
     if not row:
         return None
     return {
-        "my_sample":             json.loads(row["my_sample"]),
-        "user_features_summary": row["user_features_summary"],
+        "my_sample":        json.loads(row["my_sample"]),
+        "features_summary": row["features_summary"],
     }
 
 

@@ -27,9 +27,10 @@ from llm import (
     build_overall_style,
     build_style_card,
     make_features_summary,
-    make_user_features_summary,
     rewrite_message,
+    rewrite_message_explained,
     sample_texts,
+    suggest_reply,
 )
 from tg_parser import parse_chat
 from storage import (
@@ -69,15 +70,18 @@ logging.basicConfig(level=logging.INFO)
 dp = Dispatcher(storage=MemoryStorage())
 
 BTN_REWRITE       = "📝 Переписать"
+BTN_REPLY         = "💬 Ответить за меня"
 BTN_ME            = "👤 Мой стиль"
 BTN_CONTACT       = "🔍 Стиль собеседника"
-BTN_AUTO          = "🔄 Авто-режим"
 BTN_MY_STYLE_FOR  = "🎯 Мой стиль с ним"
 BTN_CONTACTS      = "📋 Контакты"
-_ALL_BTNS = {BTN_REWRITE, BTN_ME, BTN_CONTACT, BTN_AUTO, BTN_MY_STYLE_FOR, BTN_CONTACTS}
+_ALL_BTNS = {BTN_REWRITE, BTN_REPLY, BTN_ME, BTN_CONTACT, BTN_MY_STYLE_FOR, BTN_CONTACTS}
 
 # Защита от параллельных пересборок одного контакта
 _rebuilding: set[int] = set()
+
+# Контекст последнего действия для кнопки «🔄 Ещё вариант» (по user_id)
+_last_action: dict[int, dict] = {}
 
 
 def _contact_name(c) -> str:
@@ -92,10 +96,16 @@ def _contact_name(c) -> str:
 
 def main_kb() -> ReplyKeyboardMarkup:
     b = ReplyKeyboardBuilder()
-    b.row(KeyboardButton(text=BTN_REWRITE), KeyboardButton(text=BTN_ME))
-    b.row(KeyboardButton(text=BTN_CONTACT), KeyboardButton(text=BTN_AUTO))
-    b.row(KeyboardButton(text=BTN_MY_STYLE_FOR), KeyboardButton(text=BTN_CONTACTS))
+    b.row(KeyboardButton(text=BTN_REWRITE), KeyboardButton(text=BTN_REPLY))
+    b.row(KeyboardButton(text=BTN_ME), KeyboardButton(text=BTN_MY_STYLE_FOR))
+    b.row(KeyboardButton(text=BTN_CONTACT), KeyboardButton(text=BTN_CONTACTS))
     return b.as_markup(resize_keyboard=True)
+
+
+def again_kb() -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    b.button(text="🔄 Ещё вариант", callback_data="again")
+    return b.as_markup()
 
 
 def contacts_kb(contacts: list, prefix: str) -> InlineKeyboardMarkup:
@@ -132,6 +142,9 @@ class Setup(StatesGroup):
 class Rewrite(StatesGroup):
     waiting_for_draft = State()
 
+class ReplyHelp(StatesGroup):
+    waiting_for_incoming = State()
+
 
 # ── Выборка: biz-сообщения + fallback из JSON-семплов ─────────────────────────
 
@@ -146,13 +159,25 @@ def _get_rebuild_sample(
     return msgs
 
 
+def _quick_stats(my_msgs: list[str], contact_msgs: list[str]) -> str:
+    """Лёгкая статистика без LLM — для поля features_summary."""
+    out_avg = sum(len(t) for t in my_msgs) / len(my_msgs) if my_msgs else 0
+    in_avg  = sum(len(t) for t in contact_msgs) / len(contact_msgs) if contact_msgs else 0
+    return (
+        f"Я: {len(my_msgs)} сообщ., средн. длина {out_avg:.0f} симв.\n"
+        f"Собеседник: {len(contact_msgs)} сообщ., средн. длина {in_avg:.0f} симв."
+    )
+
+
 def _refresh_samples(owner_user_id: str, contact_id: int) -> None:
     """Освежает message_samples из текущих business + imported данных. Без LLM."""
-    my_s  = _get_rebuild_sample(owner_user_id, contact_id, "out", SAMPLE_SIZE)[:100]
-    ct_s  = _get_rebuild_sample(owner_user_id, contact_id, "in", SAMPLE_SIZE)[:50]
+    my_full = _get_rebuild_sample(owner_user_id, contact_id, "out", SAMPLE_SIZE)
+    ct_full = _get_rebuild_sample(owner_user_id, contact_id, "in", SAMPLE_SIZE)
     c     = get_contact_by_id(contact_id)
     label = _contact_name(c) if c else ""
-    save_message_samples(contact_id, my_s, ct_s, "", "", contact_label=label)
+    save_message_samples(
+        contact_id, my_full[:100], ct_full[:50], _quick_stats(my_full, ct_full), contact_label=label
+    )
 
 
 # ── Ядро пересборки одного контакта ──────────────────────────────────────────
@@ -180,7 +205,6 @@ async def _rebuild_contact(owner_user_id: str, contact_id: int) -> bool:
         contact_id,
         my_msgs[:100],
         contact_msgs[:50],
-        stats,
         stats,
         contact_label=label,
     )
@@ -240,7 +264,7 @@ async def _gen_style_card(telegram_id: str) -> str | None:
     samples = get_any_user_samples(telegram_id)
     if not samples:
         return None
-    card = await build_style_card(samples["my_sample"], samples["user_features_summary"])
+    card = await build_style_card(samples["my_sample"], samples["features_summary"])
     save_style_card(telegram_id, card)
     return card
 
@@ -396,14 +420,14 @@ async def handle_menu_button(message: Message, state: FSMContext) -> None:
         await _show_style(message)
     elif message.text == BTN_REWRITE:
         await _start_rewrite(message, state)
+    elif message.text == BTN_REPLY:
+        await _start_reply(message, state)
     elif message.text == BTN_CONTACT:
         await _show_contact_style(message)
     elif message.text == BTN_MY_STYLE_FOR:
         await _show_my_style_for(message)
     elif message.text == BTN_CONTACTS:
         await _show_contacts(message)
-    elif message.text == BTN_AUTO:
-        await _toggle_auto(message)
 
 
 # ── Загрузка JSON-файла ───────────────────────────────────────────────────────
@@ -437,11 +461,10 @@ async def handle_document(message: Message, bot: Bot, state: FSMContext) -> None
     contact_id = get_or_create_contact(telegram_id, chat.meta.contact_id, chat.meta.contact_name)
 
     feat_full = make_features_summary(features)
-    feat_user = make_user_features_summary(features)
     my_s      = sample_texts(chat.my_messages, 100)
     contact_s = sample_texts(chat.contact_messages, 50)
     label = chat.meta.contact_name or chat.meta.contact_id
-    save_message_samples(contact_id, my_s, contact_s, feat_full, feat_user, contact_label=label)
+    save_message_samples(contact_id, my_s, contact_s, feat_full, contact_label=label)
 
     all_imported = [
         {"direction": "out", "text": m.text, "date": m.date.isoformat()}
@@ -663,10 +686,14 @@ async def _show_contacts(message: Message) -> None:
     if not contacts:
         await message.answer("Нет загруженных чатов. Отправь JSON-файл.")
         return
-    auto_on, _ = get_auto_mode(telegram_id)
-    status = "🟢 Авто-режим включён" if auto_on else "⚫ Авто-режим выключен"
-    lines  = "\n".join(f"• {_contact_name(c)}" for c in contacts)
-    await message.answer(f"{status}\n\nЗагруженные чаты:\n{lines}")
+    _, auto_cid = get_auto_mode(telegram_id)
+    lines = []
+    for c in contacts:
+        mark = " 🟢" if c["id"] == auto_cid else ""
+        lines.append(f"• {_contact_name(c)}{mark}")
+    await message.answer(
+        "Загруженные чаты (🟢 — активный для авто-переписки):\n" + "\n".join(lines)
+    )
 
 
 @dp.message(Command("contacts"))
@@ -807,58 +834,84 @@ async def handle_draft(message: Message, state: FSMContext) -> None:
         return
 
     data = await state.get_data()
+    await state.clear()
     await message.answer("Переписываю...")
 
     try:
-        result = await rewrite_message(draft, data["style_card"], data["interaction_card"])
-        await message.answer(result)
+        result, expl = await rewrite_message_explained(
+            draft, data["style_card"], data["interaction_card"]
+        )
+        _last_action[message.from_user.id] = {
+            "kind": "rewrite", "text": draft,
+            "style_card": data["style_card"], "interaction_card": data["interaction_card"],
+        }
+        await message.answer(result, reply_markup=again_kb())
+        if expl:
+            await message.answer(f"💡 Что изменил: {expl}")
     except Exception as e:
         await message.answer(f"Ошибка: {e}")
-    finally:
-        await state.clear()
 
 
-# ── Авто-режим ────────────────────────────────────────────────────────────────
+# ── 🔄 Ещё вариант ────────────────────────────────────────────────────────────
 
-async def _toggle_auto(message: Message) -> None:
+@dp.callback_query(F.data == "again")
+async def cb_again(call: CallbackQuery) -> None:
+    ctx = _last_action.get(call.from_user.id)
+    if not ctx:
+        await call.answer("Контекст устарел — начни заново.", show_alert=True)
+        return
+    await call.answer("Генерирую другой вариант...")
+    try:
+        if ctx["kind"] == "rewrite":
+            result, expl = await rewrite_message_explained(
+                ctx["text"], ctx["style_card"], ctx["interaction_card"]
+            )
+        else:
+            result, expl = await suggest_reply(
+                ctx["text"], ctx["style_card"], ctx["interaction_card"]
+            )
+        await call.message.answer(result, reply_markup=again_kb())
+        if expl:
+            await call.message.answer(f"💡 {expl}")
+    except Exception as e:
+        await call.message.answer(f"Ошибка: {e}")
+
+
+# ── 💬 Ответить за меня ───────────────────────────────────────────────────────
+
+async def _start_reply(message: Message, state: FSMContext) -> None:
     telegram_id = str(message.from_user.id)
     contacts = list_contacts(telegram_id)
     if not contacts:
         await message.answer("Сначала загрузи JSON-файл чата.")
         return
 
-    auto_on, _ = get_auto_mode(telegram_id)
-    if auto_on:
-        set_auto_mode(telegram_id, False)
-        await message.answer("⚫ Авто-режим выключен.")
-        return
-
     if len(contacts) == 1:
         c = contacts[0]
-        style_card       = get_style_card(telegram_id)
+        style_card       = await _style_for_rewrite(telegram_id, c["id"])
         interaction_card = get_interaction_card(c["id"])
         if not style_card or not interaction_card:
-            await message.answer("Генерирую анализ...")
-            if not style_card:
-                style_card = await _gen_style_card(telegram_id)
+            await message.answer("Генерирую анализ — займёт ~20 секунд...")
             if not interaction_card:
                 interaction_card = await _gen_interaction_card(c["id"], telegram_id)
+            if not style_card:
+                style_card = await _gen_style_card(telegram_id)
         if not style_card or not interaction_card:
             await message.answer("Не удалось сгенерировать анализ.")
             return
-        set_auto_mode(telegram_id, True, c["id"])
+        await state.update_data(style_card=style_card, interaction_card=interaction_card)
+        await state.set_state(ReplyHelp.waiting_for_incoming)
         name = _contact_name(c)
         await message.answer(
-            f"🟢 Авто-режим включён — {name}.\n"
-            "Каждое твоё сообщение будет автоматически переписываться."
+            f"Перешли или вставь сообщение от {name}, на которое нужно ответить:"
         )
         return
 
-    await message.answer("Для кого включить авто-режим?", reply_markup=contacts_kb(contacts, "auto"))
+    await message.answer("Кому отвечаешь?", reply_markup=contacts_kb(contacts, "reply"))
 
 
-@dp.callback_query(F.data.startswith("auto:"))
-async def cb_auto_contact(call: CallbackQuery) -> None:
+@dp.callback_query(F.data.startswith("reply:"))
+async def cb_reply_contact(call: CallbackQuery, state: FSMContext) -> None:
     contact_id  = int(call.data.split(":")[1])
     telegram_id = str(call.from_user.id)
 
@@ -868,25 +921,57 @@ async def cb_auto_contact(call: CallbackQuery) -> None:
         return
 
     await call.answer()
-    await call.message.edit_text("Генерирую анализ...")
 
-    style_card       = get_style_card(telegram_id)
+    style_card       = await _style_for_rewrite(telegram_id, contact_id)
     interaction_card = get_interaction_card(contact_id)
-    if not style_card:
-        style_card = await _gen_style_card(telegram_id)
-    if not interaction_card:
-        interaction_card = await _gen_interaction_card(contact_id, telegram_id)
+    if not style_card or not interaction_card:
+        await call.message.edit_text("Генерирую анализ — займёт ~20 секунд...")
+        if not interaction_card:
+            interaction_card = await _gen_interaction_card(contact_id, telegram_id)
+        if not style_card:
+            style_card = await _gen_style_card(telegram_id)
 
     if not style_card or not interaction_card:
         await call.message.edit_text("Не удалось сгенерировать анализ.")
         return
 
-    set_auto_mode(telegram_id, True, contact_id)
+    await state.update_data(style_card=style_card, interaction_card=interaction_card)
+    await state.set_state(ReplyHelp.waiting_for_incoming)
     name = _contact_name(contact)
     await call.message.edit_text(
-        f"🟢 Авто-режим включён — {name}.\n"
-        "Каждое твоё сообщение будет автоматически переписываться."
+        f"Перешли или вставь сообщение от {name}, на которое нужно ответить:"
     )
+
+
+@dp.message(ReplyHelp.waiting_for_incoming)
+async def handle_incoming(message: Message, state: FSMContext) -> None:
+    incoming = message.text.strip() if message.text else ""
+    if not incoming:
+        await message.answer("Пришли текст сообщения собеседника.")
+        return
+
+    data = await state.get_data()
+    await state.clear()
+    await message.answer("Думаю как ответить...")
+
+    try:
+        result, expl = await suggest_reply(
+            incoming, data["style_card"], data["interaction_card"]
+        )
+        _last_action[message.from_user.id] = {
+            "kind": "reply", "text": incoming,
+            "style_card": data["style_card"], "interaction_card": data["interaction_card"],
+        }
+        await message.answer(result, reply_markup=again_kb())
+        if expl:
+            await message.answer(f"💡 {expl}")
+    except Exception as e:
+        await message.answer(f"Ошибка: {e}")
+
+
+@dp.message(Command("reply"))
+async def cmd_reply(message: Message, state: FSMContext) -> None:
+    await _start_reply(message, state)
 
 
 # ── /rebuild_all — принудительная пересборка всего (для теста) ───────────────
@@ -937,17 +1022,99 @@ async def cmd_help(message: Message) -> None:
         "/help — список команд\n"
         "/connect — как подключить Автоматизацию чатов\n"
         "/me — твой общий стиль общения\n"
+        "/stats — твой портрет в цифрах\n"
         "/rewrite — переписать сообщение\n"
+        "/reply — помочь ответить на сообщение собеседника\n"
         "/contacts — список загруженных чатов\n"
         "/rebuild_all — принудительно пересобрать все карточки\n\n"
         "Кнопки в меню:\n"
         "📝 Переписать — черновик → готовое сообщение\n"
+        "💬 Ответить за меня — подскажу ответ на сообщение собеседника\n"
         "👤 Мой стиль — как ты общаешься в целом\n"
         "🎯 Мой стиль с ним — твой стиль с конкретным человеком\n"
         "🔍 Стиль собеседника — паттерны и советы по нему\n"
-        "🔄 Авто-режим — каждое сообщение переписывается автоматически\n"
-        "📋 Контакты — загруженные переписки"
+        "📋 Контакты — загруженные переписки\n\n"
+        "Любое сообщение, которое ты просто напишешь боту, автоматически "
+        "переписывается под активного собеседника (🟢 в /contacts)."
     )
+
+
+# ── /stats — портрет в цифрах (без LLM) ──────────────────────────────────────
+
+def _all_my_messages(telegram_id: str, contact_id: int) -> list[str]:
+    biz      = get_biz_messages_for_contact(telegram_id, contact_id, "out", 100000)
+    imported = get_imported_messages(contact_id, "out")
+    seen, out = set(), []
+    for t in biz + imported:
+        if t not in seen:
+            seen.add(t)
+            out.append(t)
+    return out
+
+
+def _compute_stats(telegram_id: str) -> str | None:
+    contacts = list_contacts(telegram_id)
+    if not contacts:
+        return None
+
+    per, all_my = [], []
+    for c in contacts:
+        my = _all_my_messages(telegram_id, c["id"])
+        if not my:
+            continue
+        all_my += my
+        per.append({
+            "name": _contact_name(c),
+            "n":    len(my),
+            "avg":  sum(len(t) for t in my) / len(my),
+            "q":    sum(1 for t in my if t.rstrip().endswith("?")) / len(my),
+            "em":   sum(1 for t in my if _EMOJI_RE.search(t)) / len(my),
+        })
+
+    if not all_my:
+        return None
+
+    total = len(all_my)
+    g_avg = sum(len(t) for t in all_my) / total
+    g_q   = sum(1 for t in all_my if t.rstrip().endswith("?")) / total
+    g_em  = sum(1 for t in all_my if _EMOJI_RE.search(t)) / total
+
+    lines = [
+        "📊 Твой портрет в цифрах\n",
+        f"Всего твоих сообщений: {total}",
+        f"Средняя длина: {g_avg:.0f} символов",
+        f"Доля вопросов: {g_q:.0%}",
+        f"Эмодзи в сообщениях: {g_em:.0%}",
+    ]
+
+    if len(per) > 1:
+        longest  = max(per, key=lambda x: x["avg"])
+        shortest = min(per, key=lambda x: x["avg"])
+        most_em  = max(per, key=lambda x: x["em"])
+        lines += [
+            "",
+            f"Длиннее всего пишешь — {longest['name']} ({longest['avg']:.0f} симв.)",
+            f"Короче всего — {shortest['name']} ({shortest['avg']:.0f} симв.)",
+            f"Больше всего эмодзи — {most_em['name']} ({most_em['em']:.0%})",
+        ]
+
+    lines.append("\nПо собеседникам:")
+    for p in sorted(per, key=lambda x: -x["n"]):
+        lines.append(
+            f"• {p['name']}: {p['n']} сообщ., {p['avg']:.0f} симв., "
+            f"вопросы {p['q']:.0%}, эмодзи {p['em']:.0%}"
+        )
+
+    return "\n".join(lines)
+
+
+@dp.message(Command("stats"))
+async def cmd_stats(message: Message) -> None:
+    stats = _compute_stats(str(message.from_user.id))
+    if not stats:
+        await message.answer("Пока нет данных. Загрузи JSON-чат или накопи сообщения.")
+        return
+    await message.answer(stats)
 
 
 # ── Авто-переписка (catch-all, должен быть последним) ─────────────────────────
@@ -958,9 +1125,14 @@ async def auto_rewrite_handler(message: Message, state: FSMContext) -> None:
         return
 
     telegram_id = str(message.from_user.id)
-    auto_on, contact_id = get_auto_mode(telegram_id)
-    if not auto_on or not contact_id:
-        return
+    # Авто-режим всегда активен. Цель — выбранный контакт, иначе единственный.
+    _, contact_id = get_auto_mode(telegram_id)
+    if not contact_id:
+        contacts = list_contacts(telegram_id)
+        if len(contacts) == 1:
+            contact_id = contacts[0]["id"]
+        else:
+            return  # несколько контактов и не выбран целевой — не угадываем
 
     style_card       = await _style_for_rewrite(telegram_id, contact_id)
     interaction_card = get_interaction_card(contact_id)
@@ -968,8 +1140,13 @@ async def auto_rewrite_handler(message: Message, state: FSMContext) -> None:
         return
 
     try:
-        result = await rewrite_message(message.text.strip(), style_card, interaction_card)
-        await message.answer(result)
+        draft = message.text.strip()
+        result = await rewrite_message(draft, style_card, interaction_card)
+        _last_action[message.from_user.id] = {
+            "kind": "rewrite", "text": draft,
+            "style_card": style_card, "interaction_card": interaction_card,
+        }
+        await message.answer(result, reply_markup=again_kb())
     except Exception as e:
         await message.answer(f"Ошибка: {e}")
 
@@ -984,7 +1161,9 @@ async def main() -> None:
         BotCommand(command="help",        description="Список команд"),
         BotCommand(command="connect",     description="Подключить Автоматизацию чатов"),
         BotCommand(command="me",          description="Мой стиль общения"),
+        BotCommand(command="stats",       description="Портрет в цифрах"),
         BotCommand(command="rewrite",     description="Переписать сообщение"),
+        BotCommand(command="reply",       description="Помочь ответить собеседнику"),
         BotCommand(command="contacts",    description="Загруженные чаты"),
         BotCommand(command="rebuild_all", description="Пересобрать все карточки"),
     ])
