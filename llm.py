@@ -1,58 +1,212 @@
+"""
+llm.py — обёртки над LLM-провайдерами с каскадным fallback.
+
+Порядок попыток:
+  1. Groq        (llama-3.3-70b-versatile)   — основной, бесплатный, быстрый
+  2. Gemini      (gemini-2.5-flash)           — fallback 1
+  3. OpenRouter  (meta-llama/llama-3.1-8b-instruct:free) — fallback 2
+
+Если все три провайдера недоступны — пробрасывается последнее исключение.
+"""
+
 import asyncio
+import logging
 import random
+from abc import ABC, abstractmethod
 
 import httpx
 
-from config import LLM_API_KEY
+from config import GEMINI_API_KEY, GROQ_API_KEY, OPENROUTER_API_KEY
 from features import ChatFeatures
 
-_MODEL    = "llama-3.3-70b-versatile"
-_GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
+log = logging.getLogger(__name__)
 
+# ── Исключения ────────────────────────────────────────────────────────────────
 
 class RateLimitError(RuntimeError):
-    """Лимит Groq исчерпан (429). Хендлеры показывают понятное сообщение."""
+    """Все провайдеры вернули 429 / дневной лимит исчерпан."""
 
 
-async def _ask(prompt: str, max_tokens: int = 1024) -> str:
-    if not LLM_API_KEY:
-        raise RuntimeError("LLM_API_KEY не задан в .env")
+class ProviderError(RuntimeError):
+    """Временная ошибка одного провайдера (5xx, таймаут). Триггерит fallback."""
 
-    async with httpx.AsyncClient(timeout=90.0, trust_env=False) as client:
-        for attempt in range(2):
+
+# ── Абстрактный провайдер ─────────────────────────────────────────────────────
+
+class LLMProvider(ABC):
+    name: str
+
+    @abstractmethod
+    async def ask(self, prompt: str, max_tokens: int) -> str:
+        """Отправляет prompt, возвращает текст ответа.
+
+        Raises:
+            RateLimitError: лимит исчерпан, повтор бесполезен.
+            ProviderError:  временная ошибка, следующий провайдер может помочь.
+        """
+
+
+# ── Groq ──────────────────────────────────────────────────────────────────────
+
+class GroqProvider(LLMProvider):
+    name = "Groq"
+    _URL   = "https://api.groq.com/openai/v1/chat/completions"
+    _MODEL = "llama-3.3-70b-versatile"
+
+    async def ask(self, prompt: str, max_tokens: int) -> str:
+        if not GROQ_API_KEY:
+            raise ProviderError("GROQ_API_KEY не задан")
+
+        async with httpx.AsyncClient(timeout=90.0, trust_env=False) as client:
+            for attempt in range(2):
+                resp = await client.post(
+                    self._URL,
+                    headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+                    json={
+                        "model": self._MODEL,
+                        "messages": [{"role": "user", "content": prompt}],
+                        "max_tokens": max_tokens,
+                    },
+                )
+
+                if resp.status_code == 429:
+                    body = resp.text
+                    if "per day" in body or "TPD" in body or attempt == 1:
+                        raise RateLimitError(
+                            "Лимит Groq исчерпан. Дневной лимит сбрасывается раз в сутки."
+                        )
+                    log.warning("Groq: минутный лимит (429), ждём 65 с...")
+                    await asyncio.sleep(65)
+                    continue
+
+                if resp.status_code in (500, 502, 503):
+                    raise ProviderError(f"Groq {resp.status_code}: {resp.text[:200]}")
+
+                if not resp.is_success:
+                    raise ProviderError(f"Groq {resp.status_code}: {resp.text[:200]}")
+
+                return resp.json()["choices"][0]["message"]["content"].strip()
+
+        raise ProviderError("Groq: исчерпаны попытки")
+
+
+# ── Google Gemini ─────────────────────────────────────────────────────────────
+
+class GeminiProvider(LLMProvider):
+    name = "Gemini"
+    _MODEL = "gemini-2.5-flash"
+
+    @property
+    def _url(self) -> str:
+        return (
+            f"https://generativelanguage.googleapis.com/v1beta/models/"
+            f"{self._MODEL}:generateContent?key={GEMINI_API_KEY}"
+        )
+
+    async def ask(self, prompt: str, max_tokens: int) -> str:
+        if not GEMINI_API_KEY:
+            raise ProviderError("GEMINI_API_KEY не задан")
+
+        payload = {
+            "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+            "generationConfig": {"maxOutputTokens": max_tokens},
+        }
+
+        async with httpx.AsyncClient(timeout=90.0, trust_env=False) as client:
+            resp = await client.post(self._url, json=payload)
+
+        if resp.status_code == 429:
+            raise RateLimitError("Лимит Gemini исчерпан.")
+
+        if resp.status_code in (500, 502, 503):
+            raise ProviderError(f"Gemini {resp.status_code}: {resp.text[:200]}")
+
+        if not resp.is_success:
+            raise ProviderError(f"Gemini {resp.status_code}: {resp.text[:200]}")
+
+        data = resp.json()
+        try:
+            return data["candidates"][0]["content"]["parts"][0]["text"].strip()
+        except (KeyError, IndexError) as e:
+            raise ProviderError(f"Gemini: неожиданный формат ответа — {e}") from e
+
+
+# ── OpenRouter ────────────────────────────────────────────────────────────────
+
+class OpenRouterProvider(LLMProvider):
+    name = "OpenRouter"
+    _URL   = "https://openrouter.ai/api/v1/chat/completions"
+    _MODEL = "meta-llama/llama-3.1-8b-instruct:free"
+
+    async def ask(self, prompt: str, max_tokens: int) -> str:
+        if not OPENROUTER_API_KEY:
+            raise ProviderError("OPENROUTER_API_KEY не задан")
+
+        async with httpx.AsyncClient(timeout=90.0, trust_env=False) as client:
             resp = await client.post(
-                _GROQ_URL,
-                headers={"Authorization": f"Bearer {LLM_API_KEY}"},
+                self._URL,
+                headers={
+                    "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                    "HTTP-Referer": "https://github.com/kurganprevedenie-lgtm/CueMe",
+                    "X-Title": "CueMe",
+                },
                 json={
-                    "model": _MODEL,
+                    "model": self._MODEL,
                     "messages": [{"role": "user", "content": prompt}],
                     "max_tokens": max_tokens,
                 },
             )
-            if resp.status_code == 429:
-                body = resp.text
-                # Дневной лимит (TPD) короткой паузой не лечится — сразу понятная ошибка
-                if "per day" in body or "TPD" in body or attempt == 1:
-                    raise RateLimitError(
-                        "Лимит Groq исчерпан. Дневной лимит токенов сбрасывается раз в "
-                        "сутки — попробуй позже."
-                    )
-                await asyncio.sleep(65)  # минутный лимит — ждём и повторяем один раз
-                continue
-            if not resp.is_success:
-                raise RuntimeError(f"Groq API {resp.status_code}: {resp.text[:500]}")
-            return resp.json()["choices"][0]["message"]["content"].strip()
 
+        if resp.status_code == 429:
+            raise RateLimitError("Лимит OpenRouter исчерпан.")
+
+        if resp.status_code in (500, 502, 503):
+            raise ProviderError(f"OpenRouter {resp.status_code}: {resp.text[:200]}")
+
+        if not resp.is_success:
+            raise ProviderError(f"OpenRouter {resp.status_code}: {resp.text[:200]}")
+
+        return resp.json()["choices"][0]["message"]["content"].strip()
+
+
+# ── Каскадный вызов ───────────────────────────────────────────────────────────
+
+_PROVIDERS: list[LLMProvider] = [
+    GroqProvider(),
+    GeminiProvider(),
+    OpenRouterProvider(),
+]
+
+
+async def _ask(prompt: str, max_tokens: int = 1024) -> str:
+    """Пробует провайдеров по цепочке. Пробрасывает ошибку только если все упали."""
+    last_exc: Exception = RuntimeError("Нет доступных LLM-провайдеров")
+
+    for provider in _PROVIDERS:
+        try:
+            result = await provider.ask(prompt, max_tokens)
+            if provider is not _PROVIDERS[0]:
+                log.info("LLM: ответил fallback-провайдер %s", provider.name)
+            return result
+        except RateLimitError as e:
+            log.warning("LLM [%s]: лимит исчерпан (%s), переключаемся дальше", provider.name, e)
+            last_exc = e
+        except (ProviderError, httpx.TimeoutException, httpx.NetworkError) as e:
+            log.warning("LLM [%s]: временная ошибка (%s), переключаемся дальше", provider.name, e)
+            last_exc = e
+
+    if isinstance(last_exc, RateLimitError):
+        raise last_exc
+    raise RuntimeError(f"Все LLM-провайдеры недоступны. Последняя ошибка: {last_exc}") from last_exc
+
+
+# ── Вспомогательные функции ───────────────────────────────────────────────────
 
 def sample_texts(messages: list, n: int = 30) -> list[str]:
     texts = [m.text for m in messages if m.text and m.text.strip()]
     return random.sample(texts, min(n, len(texts)))
 
 
-# Символьный бюджет на выборку в один промпт. ~12k символов ≈ 3k токенов ≈ сотни
-# сообщений — этого с запасом хватает чтобы уловить стиль, и это по карману дневному
-# лимиту Groq (бесплатный тариф ~100k токенов/сутки). Раньше было 400k — один разбор
-# съедал весь дневной лимит.
 _MSG_BUDGET = 12_000
 
 
@@ -60,7 +214,7 @@ def _fit(msgs: list[str]) -> list[str]:
     """Берёт максимум сообщений, влезающих в символьный бюджет."""
     result, total = [], 0
     for t in msgs:
-        total += len(t) + 3  # "- " + text + "\n"
+        total += len(t) + 3
         if total > _MSG_BUDGET:
             break
         result.append(t)
@@ -128,7 +282,6 @@ async def build_interaction_card(
     features_summary: str,
 ) -> str:
     """Наблюдения о собеседнике. Возвращает plain text."""
-    # Делим бюджет пополам между сторонами
     my_sample      = _fit(my_sample)
     contact_sample = _fit(contact_sample)
     prompt = (
@@ -347,7 +500,6 @@ async def suggest_reply(
     return _split_rated(await _ask(prompt))
 
 
-# Готовые инструкции для кнопок быстрой подстройки тона
 ADJUSTMENTS = {
     "short":  "Сделай ЗАМЕТНО короче — выкинь лишнее, оставь суть.",
     "warm":   "Сделай теплее и мягче по тону, дружелюбнее.",
