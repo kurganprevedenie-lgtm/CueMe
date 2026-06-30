@@ -81,7 +81,8 @@ BTN_ME            = "👤 Мой стиль"
 BTN_CONTACT       = "🔍 Стиль собеседника"
 BTN_MY_STYLE_FOR  = "🎯 Мой стиль с ним"
 BTN_CONTACTS      = "📋 Контакты"
-_ALL_BTNS = {BTN_REWRITE, BTN_REPLY, BTN_ME, BTN_CONTACT, BTN_MY_STYLE_FOR, BTN_CONTACTS}
+BTN_HELP          = "❓ Помощь"
+_ALL_BTNS = {BTN_REWRITE, BTN_REPLY, BTN_ME, BTN_CONTACT, BTN_MY_STYLE_FOR, BTN_CONTACTS, BTN_HELP}
 
 # Защита от параллельных пересборок одного контакта
 _rebuilding: set[int] = set()
@@ -109,6 +110,7 @@ def main_kb() -> ReplyKeyboardMarkup:
     b.row(KeyboardButton(text=BTN_REWRITE), KeyboardButton(text=BTN_REPLY))
     b.row(KeyboardButton(text=BTN_ME), KeyboardButton(text=BTN_MY_STYLE_FOR))
     b.row(KeyboardButton(text=BTN_CONTACT), KeyboardButton(text=BTN_CONTACTS))
+    b.row(KeyboardButton(text=BTN_HELP))
     return b.as_markup(resize_keyboard=True)
 
 
@@ -140,6 +142,12 @@ def contacts_kb(contacts: list, prefix: str) -> InlineKeyboardMarkup:
         name = _contact_name(c)
         b.button(text=name, callback_data=f"{prefix}:{c['id']}")
     b.adjust(1)
+    return b.as_markup()
+
+
+def demo_kb() -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    b.button(text="🎬 Попробовать на примере", callback_data="demo")
     return b.as_markup()
 
 
@@ -427,21 +435,110 @@ async def handle_business_message(event: Message) -> None:
 
 # ── /start ────────────────────────────────────────────────────────────────────
 
+def _capabilities_text() -> str:
+    return (
+        "Вот что я умею:\n\n"
+        "📝 Переписать — твой черновик → готовое под собеседника\n"
+        "💬 Ответить за меня — подскажу ответ на его сообщение\n"
+        "👤 Мой стиль · 🎯 Мой стиль с ним — как пишешь ты\n"
+        "🔍 Стиль собеседника — как писать ему\n"
+        "📋 Контакты · /stats — портрет в цифрах · /compare — сравнить стили\n\n"
+        "Полный список команд — /help"
+    )
+
+
+# ── Демо-режим: готовые примеры-собеседники без загрузки данных ───────────────
+
+_DEMO_STYLE = (
+    "🎙️ Голос и тон\n"
+    "• пишешь дружелюбно и по делу, без официоза\n\n"
+    "✍️ Как ты строишь сообщения\n"
+    "• законченные мысли средней длины\n\n"
+    "🔤 Регистр и инициатива\n"
+    "• с маленькой буквы, на «ты», эмодзи почти не используешь"
+)
+
+_DEMO_BOSS = (
+    "🎯 Как писать этому человеку\n"
+    "• коротко и по делу, без воды\n"
+    "• на «Вы», вежливо и формально\n"
+    "• конкретика: сроки, цифры, факты\n"
+    "• без сленга и эмодзи\n\n"
+    "🔤 Регистр и язык\n"
+    "• Вы, с большой буквы, деловой тон"
+)
+
+_DEMO_FRIEND = (
+    "🎯 Как писать этому человеку\n"
+    "• неформально, на «ты», тепло\n"
+    "• можно с лёгким юмором, коротко\n"
+    "• сленг ок, эмодзи изредка\n\n"
+    "🔤 Регистр и язык\n"
+    "• ты, с маленькой буквы, расслабленно"
+)
+
+
+def _setup_demo(telegram_id: str) -> None:
+    """Создаёт двух примеров-собеседников с готовыми карточками. Без LLM."""
+    upsert_user(telegram_id, f"user{telegram_id}")
+    save_style_card(telegram_id, _DEMO_STYLE)
+    for orig, name, card in [
+        ("demo_boss",   "Босс (демо)", _DEMO_BOSS),
+        ("demo_friend", "Друг (демо)", _DEMO_FRIEND),
+    ]:
+        cid = get_or_create_contact(telegram_id, orig, name)
+        save_interaction_card(cid, card)
+        save_my_style_per_contact(cid, _DEMO_STYLE, 0)
+
+
+async def _run_demo(telegram_id: str, target: Message) -> None:
+    _setup_demo(telegram_id)
+    await target.answer(
+        "Готово! Создал двух примеров-собеседников:\n"
+        "• Босс (демо) — формальный, на «Вы»\n"
+        "• Друг (демо) — неформальный, на «ты»\n\n"
+        "Нажми «📝 Переписать», выбери одного и напиши любой черновик "
+        "(например: «напомнить про встречу в пятницу») — увидишь, как одно и то же "
+        "сообщение меняется под каждого.\n\n"
+        "ℹ️ В демо голос условный. На твоих данных бот будет писать твоим голосом — "
+        "загрузи экспорт чата, когда захочешь.",
+        reply_markup=main_kb(),
+    )
+
+
 @dp.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext) -> None:
     await state.clear()
-    if list_contacts(str(message.from_user.id)):
-        await message.answer("С возвращением! Чем могу помочь?", reply_markup=main_kb())
+    telegram_id = str(message.from_user.id)
+    caps = _capabilities_text()
+
+    if list_contacts(telegram_id):
+        await message.answer(f"С возвращением!\n\n{caps}", reply_markup=main_kb())
         return
 
     await state.set_state(Setup.waiting_for_json)
     await message.answer(
-        f"Привет! Я {APP_NAME}.\n\n"
-        "Помогу писать сообщения в твоём стиле — под конкретного человека.\n\n"
-        "◉ Шаг 1 из 2 — загрузи переписку\n\n"
-        "Открой нужный чат в Telegram Desktop → ⋮ → Экспорт истории чата → "
-        "формат JSON, без медиафайлов. Отправь файл сюда 👇",
+        f"Привет! Я {APP_NAME} — помогаю писать сообщения в твоём стиле, "
+        "под конкретного человека.\n\n"
+        f"{caps}\n\n"
+        "Чтобы начать на своих данных — загрузи переписку: Telegram Desktop → ⋮ → "
+        "Экспорт истории чата → формат JSON (без медиа), пришли файл сюда.\n\n"
+        "Или попробуй прямо сейчас на примере 👇",
+        reply_markup=demo_kb(),
     )
+
+
+@dp.callback_query(F.data == "demo")
+async def cb_demo(call: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    await call.answer()
+    await _run_demo(str(call.from_user.id), call.message)
+
+
+@dp.message(Command("demo"))
+async def cmd_demo(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    await _run_demo(str(message.from_user.id), message)
 
 
 # ── Кнопки главного меню ──────────────────────────────────────────────────────
@@ -461,6 +558,8 @@ async def handle_menu_button(message: Message, state: FSMContext) -> None:
         await _show_my_style_for(message)
     elif message.text == BTN_CONTACTS:
         await _show_contacts(message)
+    elif message.text == BTN_HELP:
+        await _show_help(message)
 
 
 # ── Загрузка JSON-файла ───────────────────────────────────────────────────────
@@ -1080,12 +1179,12 @@ async def cmd_rebuild_all(message: Message) -> None:
 
 # ── /help ────────────────────────────────────────────────────────────────────
 
-@dp.message(Command("help"))
-async def cmd_help(message: Message) -> None:
+async def _show_help(message: Message) -> None:
     await message.answer(
         "Доступные команды:\n\n"
         "/start — начало работы / онбординг\n"
         "/help — список команд\n"
+        "/demo — попробовать на готовом примере\n"
         "/connect — как подключить Автоматизацию чатов\n"
         "/me — твой общий стиль общения\n"
         "/stats — твой портрет в цифрах\n"
@@ -1101,10 +1200,16 @@ async def cmd_help(message: Message) -> None:
         "👤 Мой стиль — как ты общаешься в целом\n"
         "🎯 Мой стиль с ним — твой стиль с конкретным человеком\n"
         "🔍 Стиль собеседника — паттерны и советы по нему\n"
-        "📋 Контакты — загруженные переписки\n\n"
+        "📋 Контакты — загруженные переписки\n"
+        "❓ Помощь — это сообщение\n\n"
         "Любое сообщение, которое ты просто напишешь боту, автоматически "
         "переписывается под активного собеседника (🟢 в /contacts)."
     )
+
+
+@dp.message(Command("help"))
+async def cmd_help(message: Message) -> None:
+    await _show_help(message)
 
 
 # ── /stats — портрет в цифрах (без LLM) ──────────────────────────────────────
@@ -1329,6 +1434,7 @@ async def main() -> None:
     await bot.set_my_commands([
         BotCommand(command="start",       description="Начало работы"),
         BotCommand(command="help",        description="Список команд"),
+        BotCommand(command="demo",        description="Попробовать на примере"),
         BotCommand(command="connect",     description="Подключить Автоматизацию чатов"),
         BotCommand(command="me",          description="Мой стиль общения"),
         BotCommand(command="stats",       description="Портрет в цифрах"),
