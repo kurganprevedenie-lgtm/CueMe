@@ -2,14 +2,13 @@
 llm.py — обёртки над LLM-провайдерами с каскадным fallback.
 
 Порядок попыток:
-  1. Groq        (llama-3.3-70b-versatile)   — основной, бесплатный, быстрый
-  2. Gemini      (gemini-2.5-flash)           — fallback 1
+  1. Gemini      (gemini-2.5-flash)           — основной
+  2. Groq        (llama-3.3-70b-versatile)    — fallback 1
   3. OpenRouter  (meta-llama/llama-3.1-8b-instruct:free) — fallback 2
 
 Если все три провайдера недоступны — пробрасывается последнее исключение.
 """
 
-import asyncio
 import logging
 import random
 from abc import ABC, abstractmethod
@@ -58,36 +57,28 @@ class GroqProvider(LLMProvider):
             raise ProviderError("GROQ_API_KEY не задан")
 
         async with httpx.AsyncClient(timeout=90.0, trust_env=False) as client:
-            for attempt in range(2):
-                resp = await client.post(
-                    self._URL,
-                    headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
-                    json={
-                        "model": self._MODEL,
-                        "messages": [{"role": "user", "content": prompt}],
-                        "max_tokens": max_tokens,
-                    },
-                )
+            resp = await client.post(
+                self._URL,
+                headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+                json={
+                    "model": self._MODEL,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "max_tokens": max_tokens,
+                },
+            )
 
-                if resp.status_code == 429:
-                    body = resp.text
-                    if "per day" in body or "TPD" in body or attempt == 1:
-                        raise RateLimitError(
-                            "Лимит Groq исчерпан. Дневной лимит сбрасывается раз в сутки."
-                        )
-                    log.warning("Groq: минутный лимит (429), ждём 65 с...")
-                    await asyncio.sleep(65)
-                    continue
+        # На ЛЮБОЙ 429 не ждём — сразу уходим на следующего провайдера (Gemini).
+        # Раньше на минутный лимит спали 65 с; с появлением fallback это не нужно.
+        if resp.status_code == 429:
+            raise RateLimitError("Groq: лимит исчерпан (429) — переключаюсь на следующего.")
 
-                if resp.status_code in (500, 502, 503):
-                    raise ProviderError(f"Groq {resp.status_code}: {resp.text[:200]}")
+        if resp.status_code in (500, 502, 503):
+            raise ProviderError(f"Groq {resp.status_code}: {resp.text[:200]}")
 
-                if not resp.is_success:
-                    raise ProviderError(f"Groq {resp.status_code}: {resp.text[:200]}")
+        if not resp.is_success:
+            raise ProviderError(f"Groq {resp.status_code}: {resp.text[:200]}")
 
-                return resp.json()["choices"][0]["message"]["content"].strip()
-
-        raise ProviderError("Groq: исчерпаны попытки")
+        return resp.json()["choices"][0]["message"]["content"].strip()
 
 
 # ── Google Gemini ─────────────────────────────────────────────────────────────
@@ -109,7 +100,12 @@ class GeminiProvider(LLMProvider):
 
         payload = {
             "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-            "generationConfig": {"maxOutputTokens": max_tokens},
+            "generationConfig": {
+                "maxOutputTokens": max_tokens,
+                # Отключаем «thinking» — иначе flash тратит бюджет на размышления
+                # и возвращает ответ без текста, из-за чего провайдер пропускался зря.
+                "thinkingConfig": {"thinkingBudget": 0},
+            },
         }
 
         async with httpx.AsyncClient(timeout=90.0, trust_env=False) as client:
@@ -125,8 +121,15 @@ class GeminiProvider(LLMProvider):
             raise ProviderError(f"Gemini {resp.status_code}: {resp.text[:200]}")
 
         data = resp.json()
+        # Достаём текст из всех частей (на случай нескольких parts)
         try:
-            return data["candidates"][0]["content"]["parts"][0]["text"].strip()
+            cand = data["candidates"][0]
+            parts = cand.get("content", {}).get("parts") or []
+            text = "".join(p.get("text", "") for p in parts).strip()
+            if text:
+                return text
+            reason = cand.get("finishReason", "?")
+            raise ProviderError(f"Gemini: пустой ответ (finishReason={reason})")
         except (KeyError, IndexError) as e:
             raise ProviderError(f"Gemini: неожиданный формат ответа — {e}") from e
 
@@ -172,21 +175,54 @@ class OpenRouterProvider(LLMProvider):
 # ── Каскадный вызов ───────────────────────────────────────────────────────────
 
 _PROVIDERS: list[LLMProvider] = [
-    GroqProvider(),
     GeminiProvider(),
+    GroqProvider(),
     OpenRouterProvider(),
 ]
+
+# Имя принудительно выбранного провайдера (для отладки через /provider). None = авто.
+_forced: str | None = None
+
+PROVIDER_NAMES = [p.name for p in _PROVIDERS]
+
+
+def set_forced_provider(name: str | None) -> str:
+    """Ставит провайдера первым в цепочке. None — вернуть авто-каскад. Возвращает статус."""
+    global _forced
+    if not name or name.lower() == "auto":
+        _forced = None
+        return "auto"
+    by_lower = {p.name.lower(): p.name for p in _PROVIDERS}
+    if name.lower() not in by_lower:
+        raise ValueError(
+            f"Неизвестный провайдер «{name}». Доступны: {', '.join(PROVIDER_NAMES)}, auto."
+        )
+    _forced = by_lower[name.lower()]
+    return _forced
+
+
+def get_forced_provider() -> str:
+    return _forced or "auto"
+
+
+def _ordered_providers() -> list[LLMProvider]:
+    if not _forced:
+        return _PROVIDERS
+    forced = [p for p in _PROVIDERS if p.name == _forced]
+    rest   = [p for p in _PROVIDERS if p.name != _forced]
+    return forced + rest
 
 
 async def _ask(prompt: str, max_tokens: int = 1024) -> str:
     """Пробует провайдеров по цепочке. Пробрасывает ошибку только если все упали."""
     last_exc: Exception = RuntimeError("Нет доступных LLM-провайдеров")
+    chain = _ordered_providers()
 
-    for provider in _PROVIDERS:
+    for provider in chain:
         try:
             result = await provider.ask(prompt, max_tokens)
-            if provider is not _PROVIDERS[0]:
-                log.info("LLM: ответил fallback-провайдер %s", provider.name)
+            if _forced or provider is not chain[0]:
+                log.info("LLM: ответил %s", provider.name)
             return result
         except RateLimitError as e:
             log.warning("LLM [%s]: лимит исчерпан (%s), переключаемся дальше", provider.name, e)

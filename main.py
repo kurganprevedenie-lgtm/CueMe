@@ -23,6 +23,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
 from config import APP_NAME, BOT_TOKEN, REBUILD_THRESHOLD, SAMPLE_SIZE
 from features import extract_features
 from llm import (
+    PROVIDER_NAMES,
     RateLimitError,
     adjust_message,
     build_interaction_card,
@@ -30,10 +31,12 @@ from llm import (
     build_overall_style,
     build_style_card,
     compare_my_styles,
+    get_forced_provider,
     make_features_summary,
     rewrite_message,
     rewrite_message_explained,
     sample_texts,
+    set_forced_provider,
     suggest_reply,
 )
 from tg_parser import parse_chat
@@ -694,6 +697,34 @@ async def cmd_connect(message: Message) -> None:
         "и накапливать данные о твоём стиле общения.\n\n"
         "Имена и контакты собеседников не сохраняются — только анонимизированные паттерны."
     )
+
+
+# ── /provider — переключить LLM-провайдера (для теста) ───────────────────────
+
+@dp.message(Command("provider"))
+async def cmd_provider(message: Message) -> None:
+    parts = (message.text or "").split(maxsplit=1)
+    variants = " · ".join(p.lower() for p in PROVIDER_NAMES) + " · auto"
+    if len(parts) < 2:
+        await message.answer(
+            f"Сейчас активен: {get_forced_provider()}\n\n"
+            f"Переключить: /provider <{variants}>\n"
+            "После выбора просто что-нибудь перепиши — в логах будет «LLM: ответил ...».\n"
+            "/provider auto — вернуть обычный каскад."
+        )
+        return
+    try:
+        result = set_forced_provider(parts[1].strip())
+    except ValueError as e:
+        await message.answer(str(e))
+        return
+    if result == "auto":
+        await message.answer("✅ Провайдер: авто-каскад (Groq → Gemini → OpenRouter).")
+    else:
+        await message.answer(
+            f"✅ Принудительно выбран: {result}.\n"
+            "Перепиши любое сообщение для проверки. /provider auto — вернуть каскад."
+        )
 
 
 # ── /me ───────────────────────────────────────────────────────────────────────
