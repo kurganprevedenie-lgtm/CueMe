@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+import html
 import logging
 import re
 import tempfile
@@ -20,9 +21,10 @@ from aiogram.types import (
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
 
-from config import APP_NAME, BOT_TOKEN, REBUILD_THRESHOLD, SAMPLE_SIZE
+from config import APP_NAME, BOT_TOKEN, REBUILD_THRESHOLD, REPLY_STYLES, SAMPLE_SIZE
 from features import extract_features
 from llm import (
+    ILLEGIBLE_MARKER,
     PROVIDER_NAMES,
     RateLimitError,
     adjust_message,
@@ -31,6 +33,7 @@ from llm import (
     build_overall_style,
     build_style_card,
     compare_my_styles,
+    extract_chat_from_image,
     get_forced_provider,
     make_features_summary,
     rewrite_message,
@@ -38,6 +41,7 @@ from llm import (
     sample_texts,
     set_forced_provider,
     suggest_reply,
+    suggest_reply_from_screenshot,
     transcribe_audio,
 )
 from tg_parser import parse_chat
@@ -80,13 +84,14 @@ logging.basicConfig(level=logging.INFO)
 dp = Dispatcher(storage=MemoryStorage())
 
 BTN_REWRITE       = "📝 Переписать"
+BTN_SCREENSHOT    = "📸 По скриншоту"
 BTN_REPLY         = "💬 Ответить за меня"
 BTN_ME            = "👤 Мой стиль"
 BTN_CONTACT       = "🔍 Стиль собеседника"
 BTN_MY_STYLE_FOR  = "🎯 Мой стиль с ним"
 BTN_CONTACTS      = "📋 Контакты"
 BTN_HELP          = "❓ Помощь"
-_ALL_BTNS = {BTN_REWRITE, BTN_REPLY, BTN_ME, BTN_CONTACT, BTN_MY_STYLE_FOR, BTN_CONTACTS, BTN_HELP}
+_ALL_BTNS = {BTN_REWRITE, BTN_SCREENSHOT, BTN_REPLY, BTN_ME, BTN_CONTACT, BTN_MY_STYLE_FOR, BTN_CONTACTS, BTN_HELP}
 
 # Защита от параллельных пересборок одного контакта
 _rebuilding: set[int] = set()
@@ -111,7 +116,7 @@ def _contact_name(c) -> str:
 
 def main_kb() -> ReplyKeyboardMarkup:
     b = ReplyKeyboardBuilder()
-    b.row(KeyboardButton(text=BTN_REWRITE), KeyboardButton(text=BTN_REPLY))
+    b.row(KeyboardButton(text=BTN_REWRITE), KeyboardButton(text=BTN_SCREENSHOT), KeyboardButton(text=BTN_REPLY))
     b.row(KeyboardButton(text=BTN_ME), KeyboardButton(text=BTN_MY_STYLE_FOR))
     b.row(KeyboardButton(text=BTN_CONTACT), KeyboardButton(text=BTN_CONTACTS))
     b.row(KeyboardButton(text=BTN_HELP))
@@ -131,6 +136,39 @@ def result_kb() -> InlineKeyboardMarkup:
 async def _send_result(msg: Message, result: str, expl: str = "", rating: str = "") -> None:
     """Отправляет переписанный текст с кнопками, пояснение и оценку — отдельным сообщением."""
     await msg.answer(result, reply_markup=result_kb())
+    tail = ""
+    if expl:
+        tail += f"💡 {expl}"
+    if rating:
+        tail += ("\n\n" if tail else "") + rating
+    if tail:
+        await msg.answer(tail)
+
+
+def screenshot_style_kb() -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    for key, (label, _desc) in REPLY_STYLES.items():
+        b.button(text=label, callback_data=f"shotstyle:{key}")
+    b.adjust(2)
+    return b.as_markup()
+
+
+def screenshot_result_kb() -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    b.button(text="🎭 Другой стиль", callback_data="shotother")
+    b.button(text="🔄 Перегенерировать", callback_data="shotregen")
+    b.button(text="📋 Скопировать", callback_data="shotcopy")
+    b.adjust(1, 2)
+    return b.as_markup()
+
+
+async def _send_screenshot_result(msg: Message, result: str, expl: str, rating: str) -> None:
+    """Как _send_result, но с HTML-выделением ответа (моноширинный блок —
+    тап копирует). parse_mode указан ТОЛЬКО в этом вызове, остальной проект
+    остаётся plain-text (чтобы не ловить поломки markdown-парсинга на
+    непредсказуемом LLM-выводе)."""
+    safe = html.escape(result)
+    await msg.answer(f"<code>{safe}</code>", parse_mode="HTML", reply_markup=screenshot_result_kb())
     tail = ""
     if expl:
         tail += f"💡 {expl}"
@@ -202,6 +240,9 @@ class Rewrite(StatesGroup):
 
 class ReplyHelp(StatesGroup):
     waiting_for_incoming = State()
+
+class Screenshot(StatesGroup):
+    waiting_for_image = State()
 
 
 # ── Выборка: biz-сообщения + fallback из JSON-семплов ─────────────────────────
@@ -463,6 +504,7 @@ def _capabilities_text() -> str:
     return (
         "Вот что я умею:\n\n"
         "📝 Переписать — твой черновик → готовое под собеседника\n"
+        "📸 По скриншоту — пришли скриншот переписки → выберу стиль ответа\n"
         "💬 Ответить за меня — подскажу ответ на его сообщение\n"
         "👤 Мой стиль · 🎯 Мой стиль с ним — как пишешь ты\n"
         "🔍 Стиль собеседника — как писать ему\n"
@@ -574,6 +616,8 @@ async def handle_menu_button(message: Message, state: FSMContext) -> None:
         await _show_style(message)
     elif message.text == BTN_REWRITE:
         await _start_rewrite(message, state)
+    elif message.text == BTN_SCREENSHOT:
+        await _start_screenshot(message, state)
     elif message.text == BTN_REPLY:
         await _start_reply(message, state)
     elif message.text == BTN_CONTACT:
@@ -1171,6 +1215,169 @@ async def cmd_reply(message: Message, state: FSMContext) -> None:
     await _start_reply(message, state)
 
 
+# ── 📸 Ответить по скриншоту ──────────────────────────────────────────────────
+
+async def _start_screenshot(message: Message, state: FSMContext) -> None:
+    telegram_id = str(message.from_user.id)
+    if not list_contacts(telegram_id):
+        await message.answer("Сначала загрузи JSON-файл чата.")
+        return
+    await state.set_state(Screenshot.waiting_for_image)
+    await message.answer("Пришли скриншот переписки (или вставь текст диалога), на который нужно ответить:")
+
+
+@dp.message(Command("screenshot"))
+async def cmd_screenshot(message: Message, state: FSMContext) -> None:
+    await _start_screenshot(message, state)
+
+
+@dp.message(Screenshot.waiting_for_image, F.photo)
+async def handle_screenshot_photo(message: Message, state: FSMContext, bot: Bot) -> None:
+    await message.answer("Читаю скриншот...")
+    try:
+        buf = await bot.download(message.photo[-1])
+        chat_text = await extract_chat_from_image(buf.read())
+    except Exception:
+        logging.exception("screenshot: не удалось скачать/распознать")
+        chat_text = ""
+
+    if not chat_text or chat_text.strip() == ILLEGIBLE_MARKER:
+        await message.answer("Не смог прочитать скриншот — пришли текст переписки сообщением.")
+        return  # остаёмся в Screenshot.waiting_for_image
+
+    await _proceed_screenshot_style_pick(message, state, chat_text)
+
+
+@dp.message(Screenshot.waiting_for_image, F.text)
+async def handle_screenshot_text(message: Message, state: FSMContext) -> None:
+    chat_text = (message.text or "").strip()
+    if not chat_text:
+        await message.answer("Пришли скриншот или текст переписки.")
+        return
+    await _proceed_screenshot_style_pick(message, state, chat_text)
+
+
+async def _proceed_screenshot_style_pick(message: Message, state: FSMContext, chat_text: str) -> None:
+    await state.clear()
+    telegram_id = str(message.from_user.id)
+    contacts = list_contacts(telegram_id)
+
+    if len(contacts) == 1:
+        await _ask_screenshot_style(message, message.from_user.id, telegram_id, contacts[0]["id"], chat_text)
+        return
+
+    _last_action[message.from_user.id] = {"kind": "screenshot_pending", "chat_text": chat_text}
+    await message.answer("Чья это переписка?", reply_markup=contacts_kb(contacts, "shotcontact"))
+
+
+@dp.callback_query(F.data.startswith("shotcontact:"))
+async def cb_screenshot_contact(call: CallbackQuery) -> None:
+    contact_id = int(call.data.split(":")[1])
+    telegram_id = str(call.from_user.id)
+    contact = get_contact_by_id(contact_id)
+    if not contact:
+        await call.answer("Контакт не найден.")
+        return
+
+    ctx = _last_action.get(call.from_user.id)
+    if not ctx or ctx.get("kind") != "screenshot_pending":
+        await call.answer("Контекст устарел — начни заново через «📸 По скриншоту».", show_alert=True)
+        return
+
+    await call.answer()
+    await _ask_screenshot_style(call.message, call.from_user.id, telegram_id, contact_id, ctx["chat_text"], edit=True)
+
+
+async def _ask_screenshot_style(
+    target: Message, user_id: int, telegram_id: str, contact_id: int, chat_text: str, edit: bool = False
+) -> None:
+    # ВАЖНО: user_id передаётся отдельным параметром, а не берётся из
+    # target.from_user — при edit=True target это call.message, чей
+    # .from_user это БОТ, а не пользователь (стандартная ловушка aiogram).
+    style_card = await _style_for_rewrite(telegram_id, contact_id)
+    if not style_card:
+        text = "Не удалось получить твой стиль — сначала загрузи JSON чата или дай накопить сообщений."
+        await (target.edit_text(text) if edit else target.answer(text))
+        return
+    interaction_card = await _gen_interaction_card(contact_id, telegram_id) or ""
+
+    _last_action[user_id] = {
+        "kind": "screenshot", "chat_text": chat_text, "contact_id": contact_id,
+        "style_card": style_card, "interaction_card": interaction_card,
+    }
+    text = "В каком стиле ответить?"
+    kb = screenshot_style_kb()
+    if edit:
+        await target.edit_text(text, reply_markup=kb)
+    else:
+        await target.answer(text, reply_markup=kb)
+
+
+@dp.callback_query(F.data.startswith("shotstyle:"))
+async def cb_screenshot_style(call: CallbackQuery) -> None:
+    style_key = call.data.split(":", 1)[1]
+    ctx = _last_action.get(call.from_user.id)
+    if not ctx or ctx.get("kind") != "screenshot" or style_key not in REPLY_STYLES:
+        await call.answer("Контекст устарел — начни заново через «📸 По скриншоту».", show_alert=True)
+        return
+
+    await call.answer()
+    ctx["style"] = style_key
+    # reply_markup=None — явно снимаем клавиатуру выбора стиля (Telegram может
+    # сохранить старую клавиатуру, если reply_markup не передан явным None).
+    await call.message.edit_text(f"Генерирую ответ в стиле «{REPLY_STYLES[style_key][0]}»...", reply_markup=None)
+
+    try:
+        result, expl, rating = await suggest_reply_from_screenshot(
+            ctx["chat_text"], style_key, ctx["style_card"], ctx["interaction_card"], REPLY_STYLES[style_key][1],
+        )
+        ctx["result"] = result
+        await _send_screenshot_result(call.message, result, expl, rating)
+    except RateLimitError:
+        await call.message.answer("Лимит исчерпан, попробуй позже.")
+    except Exception:
+        logging.exception("screenshot: ошибка генерации ответа")
+        await call.message.answer("Не получилось сгенерировать ответ — попробуй ещё раз.")
+
+
+@dp.callback_query(F.data == "shotother")
+async def cb_screenshot_other_style(call: CallbackQuery) -> None:
+    ctx = _last_action.get(call.from_user.id)
+    if not ctx or ctx.get("kind") != "screenshot":
+        await call.answer("Контекст устарел — начни заново.", show_alert=True)
+        return
+    await call.answer()
+    await call.message.answer("В каком стиле ответить?", reply_markup=screenshot_style_kb())
+
+
+@dp.callback_query(F.data == "shotregen")
+async def cb_screenshot_regen(call: CallbackQuery) -> None:
+    ctx = _last_action.get(call.from_user.id)
+    if not ctx or ctx.get("kind") != "screenshot" or not ctx.get("style"):
+        await call.answer("Контекст устарел — начни заново.", show_alert=True)
+        return
+    await call.answer("Перегенерирую...")
+    try:
+        result, expl, rating = await suggest_reply_from_screenshot(
+            ctx["chat_text"], ctx["style"], ctx["style_card"], ctx["interaction_card"],
+            REPLY_STYLES[ctx["style"]][1],
+        )
+        ctx["result"] = result
+        await _send_screenshot_result(call.message, result, expl, rating)
+    except RateLimitError:
+        await call.message.answer("Лимит исчерпан, попробуй позже.")
+    except Exception:
+        logging.exception("screenshot: ошибка перегенерации")
+        await call.message.answer("Не получилось перегенерировать — попробуй ещё раз.")
+
+
+@dp.callback_query(F.data == "shotcopy")
+async def cb_screenshot_copy(call: CallbackQuery) -> None:
+    # Bot API не даёт программного доступа к буферу обмена пользователя —
+    # реальный способ скопировать: тап по <code>-блоку в сообщении выше.
+    await call.answer("Текст уже в сообщении выше — зажми блок и скопируй.", show_alert=True)
+
+
 # ── /rebuild_all — принудительная пересборка всего (для теста) ───────────────
 
 @dp.message(Command("rebuild_all"))
@@ -1244,12 +1451,14 @@ async def _show_help(message: Message) -> None:
         "/stats — твой портрет в цифрах\n"
         "/compare — как ты пишешь разным людям (сравнение)\n"
         "/rewrite — переписать сообщение\n"
+        "/screenshot — ответить по скриншоту переписки\n"
         "/reply — помочь ответить на сообщение собеседника\n"
         "/contacts — список загруженных чатов\n"
         "/delete — удалить свои данные\n"
         "/rebuild_all — принудительно пересобрать все карточки\n\n"
         "Кнопки в меню:\n"
         "📝 Переписать — черновик → готовое сообщение\n"
+        "📸 По скриншоту — пришли скриншот переписки, выбери стиль ответа\n"
         "💬 Ответить за меня — подскажу ответ на сообщение собеседника\n"
         "👤 Мой стиль — как ты общаешься в целом\n"
         "🎯 Мой стиль с ним — твой стиль с конкретным человеком\n"
@@ -1494,6 +1703,7 @@ async def main() -> None:
         BotCommand(command="stats",       description="Портрет в цифрах"),
         BotCommand(command="compare",     description="Сравнить стиль с разными людьми"),
         BotCommand(command="rewrite",     description="Переписать сообщение"),
+        BotCommand(command="screenshot",  description="Ответить по скриншоту"),
         BotCommand(command="reply",       description="Помочь ответить собеседнику"),
         BotCommand(command="contacts",    description="Загруженные чаты"),
         BotCommand(command="delete",      description="Удалить свои данные"),
