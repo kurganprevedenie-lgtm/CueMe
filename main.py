@@ -38,6 +38,7 @@ from llm import (
     sample_texts,
     set_forced_provider,
     suggest_reply,
+    transcribe_audio,
 )
 from tg_parser import parse_chat
 from storage import (
@@ -164,10 +165,30 @@ def _chat_ref(chat_id: int) -> str:
     return hashlib.sha256(str(chat_id).encode()).hexdigest()[:16]
 
 
-def _msg_meta(text: str | None) -> dict:
-    if not text:
-        return {"length": 0, "has_emoji": False}
-    return {"length": len(text), "has_emoji": bool(_EMOJI_RE.search(text))}
+def _msg_meta(text: str | None, is_voice: bool = False) -> dict:
+    meta = {"length": len(text) if text else 0, "has_emoji": bool(text) and bool(_EMOJI_RE.search(text))}
+    if is_voice:
+        meta["voice"] = True
+    return meta
+
+
+async def _message_text(bot: Bot, event: Message) -> tuple[str | None, bool]:
+    """Возвращает (текст, было_голосовое). Голосовое расшифровывается через Whisper."""
+    text = event.text or event.caption
+    if text:
+        return text, False
+    media = event.voice or event.audio
+    if media:
+        try:
+            buf = await bot.download(media)
+            transcript = await transcribe_audio(buf.read(), "voice.ogg")
+            if transcript:
+                logging.info("voice transcribed: %d символов", len(transcript))
+                return transcript, True
+            logging.warning("voice: пустая транскрипция")
+        except Exception:
+            logging.exception("voice: не удалось скачать/расшифровать")
+    return None, False
 
 
 # ── FSM ───────────────────────────────────────────────────────────────────────
@@ -369,7 +390,7 @@ async def handle_business_connection(event: BusinessConnection) -> None:
 
 
 @dp.business_message()
-async def handle_business_message(event: Message) -> None:
+async def handle_business_message(event: Message, bot: Bot) -> None:
     conn_id = event.business_connection_id
     if not conn_id:
         return
@@ -386,7 +407,7 @@ async def handle_business_message(event: Message) -> None:
     owner_id  = conn_row["owner_user_id"]
     direction = "out" if sender_id == owner_id else "in"
     chat_ref  = _chat_ref(event.chat.id)
-    text      = event.text or event.caption or None
+    text, is_voice = await _message_text(bot, event)  # голосовое → текст через Whisper
     date      = event.date.isoformat()
 
     save_business_message(
@@ -397,7 +418,7 @@ async def handle_business_message(event: Message) -> None:
         text=text,
         date=date,
         tg_message_id=event.message_id,
-        raw_meta=_msg_meta(text),
+        raw_meta=_msg_meta(text, is_voice),
     )
     logging.info(
         "business_message saved: conn=%s chat_ref=%s direction=%s",
@@ -990,10 +1011,11 @@ async def cb_rewrite_contact(call: CallbackQuery, state: FSMContext) -> None:
 
 
 @dp.message(Rewrite.waiting_for_draft)
-async def handle_draft(message: Message, state: FSMContext) -> None:
-    draft = message.text.strip() if message.text else ""
+async def handle_draft(message: Message, state: FSMContext, bot: Bot) -> None:
+    txt, _ = await _message_text(bot, message)
+    draft = (txt or "").strip()
     if not draft:
-        await message.answer("Пришли черновик сообщения.")
+        await message.answer("Пришли черновик текстом или голосовым.")
         return
 
     data = await state.get_data()
@@ -1120,10 +1142,11 @@ async def cb_reply_contact(call: CallbackQuery, state: FSMContext) -> None:
 
 
 @dp.message(ReplyHelp.waiting_for_incoming)
-async def handle_incoming(message: Message, state: FSMContext) -> None:
-    incoming = message.text.strip() if message.text else ""
+async def handle_incoming(message: Message, state: FSMContext, bot: Bot) -> None:
+    txt, _ = await _message_text(bot, message)
+    incoming = (txt or "").strip()
     if not incoming:
-        await message.answer("Пришли текст сообщения собеседника.")
+        await message.answer("Пришли сообщение собеседника текстом или голосовым.")
         return
 
     data = await state.get_data()
