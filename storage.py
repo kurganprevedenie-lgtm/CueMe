@@ -99,6 +99,24 @@ def init_db() -> None:
                 updated_at         TEXT NOT NULL,
                 last_rebuild_count INTEGER NOT NULL DEFAULT 0
             );
+
+            CREATE TABLE IF NOT EXISTS deep_analysis (
+                contact_id         INTEGER PRIMARY KEY,
+                compatibility_text TEXT NOT NULL,
+                history_text       TEXT NOT NULL,
+                swot_text          TEXT NOT NULL,
+                gifts_text         TEXT NOT NULL,
+                updated_at         TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS deep_style_analysis (
+                user_telegram_id TEXT PRIMARY KEY,
+                profile_text     TEXT NOT NULL,
+                history_text     TEXT NOT NULL,
+                swot_text        TEXT NOT NULL,
+                tips_text        TEXT NOT NULL,
+                updated_at       TEXT NOT NULL
+            );
         """)
         _add_column_if_missing(conn, "users", "auto_mode", "INTEGER DEFAULT 0")
         _add_column_if_missing(conn, "users", "auto_contact_id", "INTEGER")
@@ -436,6 +454,136 @@ def get_all_per_contact_style_cards(owner_user_id: str) -> list[dict]:
     ]
 
 
+# ── deep analysis (кэш глубокого анализа пары) ────────────────────────────────
+
+def save_deep_analysis(
+    contact_id: int,
+    compatibility_text: str,
+    history_text: str,
+    swot_text: str,
+    gifts_text: str,
+) -> None:
+    with _conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO deep_analysis
+                (contact_id, compatibility_text, history_text, swot_text, gifts_text, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(contact_id) DO UPDATE SET
+                compatibility_text = excluded.compatibility_text,
+                history_text       = excluded.history_text,
+                swot_text          = excluded.swot_text,
+                gifts_text         = excluded.gifts_text,
+                updated_at         = excluded.updated_at
+            """,
+            (contact_id, compatibility_text, history_text, swot_text, gifts_text, _now()),
+        )
+
+
+def get_deep_analysis(contact_id: int) -> dict | None:
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM deep_analysis WHERE contact_id = ?", (contact_id,)
+        ).fetchone()
+    if not row:
+        return None
+    return {
+        "compatibility_text": row["compatibility_text"],
+        "history_text":       row["history_text"],
+        "swot_text":          row["swot_text"],
+        "gifts_text":         row["gifts_text"],
+    }
+
+
+def delete_deep_analysis(contact_id: int) -> None:
+    with _conn() as conn:
+        conn.execute("DELETE FROM deep_analysis WHERE contact_id = ?", (contact_id,))
+
+
+# ── deep style analysis (кэш глубокого анализа своего стиля, агрегат) ─────────
+
+def save_deep_style_analysis(
+    user_telegram_id: str,
+    profile_text: str,
+    history_text: str,
+    swot_text: str,
+    tips_text: str,
+) -> None:
+    with _conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO deep_style_analysis
+                (user_telegram_id, profile_text, history_text, swot_text, tips_text, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(user_telegram_id) DO UPDATE SET
+                profile_text = excluded.profile_text,
+                history_text = excluded.history_text,
+                swot_text    = excluded.swot_text,
+                tips_text    = excluded.tips_text,
+                updated_at   = excluded.updated_at
+            """,
+            (user_telegram_id, profile_text, history_text, swot_text, tips_text, _now()),
+        )
+
+
+def get_deep_style_analysis(user_telegram_id: str) -> dict | None:
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM deep_style_analysis WHERE user_telegram_id = ?",
+            (user_telegram_id,),
+        ).fetchone()
+    if not row:
+        return None
+    return {
+        "profile_text": row["profile_text"],
+        "history_text": row["history_text"],
+        "swot_text":    row["swot_text"],
+        "tips_text":    row["tips_text"],
+    }
+
+
+def delete_deep_style_analysis(user_telegram_id: str) -> None:
+    with _conn() as conn:
+        conn.execute(
+            "DELETE FROM deep_style_analysis WHERE user_telegram_id = ?", (user_telegram_id,)
+        )
+
+
+def get_all_dated_my_messages(owner_user_id: str) -> list[dict]:
+    """Все исходящие сообщения пользователя (business + imported) по ВСЕМ его
+    контактам, с датами — для агрегатного глубокого анализа собственного стиля."""
+    with _conn() as conn:
+        biz_rows = conn.execute(
+            """
+            SELECT date, text, 'out' AS direction
+            FROM business_messages
+            WHERE owner_user_id = ? AND direction = 'out'
+              AND text IS NOT NULL AND text != ''
+            """,
+            (owner_user_id,),
+        ).fetchall()
+        imp_rows = conn.execute(
+            """
+            SELECT im.date, im.text, 'out' AS direction
+            FROM imported_messages im
+            JOIN contacts c ON im.contact_id = c.id
+            WHERE c.user_telegram_id = ? AND im.direction = 'out'
+              AND im.text IS NOT NULL AND im.text != ''
+            """,
+            (owner_user_id,),
+        ).fetchall()
+
+    seen: set[tuple[str, str]] = set()
+    out: list[dict] = []
+    for row in list(biz_rows) + list(imp_rows):
+        key = (row["date"], row["text"])
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append({"date": row["date"], "direction": row["direction"], "text": row["text"]})
+    return out
+
+
 # ── business messages — аналитика ─────────────────────────────────────────────
 
 def get_biz_messages_for_contact(
@@ -461,6 +609,45 @@ def get_biz_messages_for_contact(
             (contact_id, owner_user_id, direction, limit),
         ).fetchall()
     return [row["text"] for row in rows]
+
+
+def get_all_dated_messages(owner_user_id: str, contact_id: int) -> list[dict]:
+    """Все сообщения контакта (business + imported) с датами — для глубокого
+    анализа (совместимость, история по периодам). Без сортировки — сортировка
+    и семплирование на стороне вызывающего."""
+    with _conn() as conn:
+        biz_rows = conn.execute(
+            """
+            SELECT bm.date, bm.direction, bm.text
+            FROM business_messages bm
+            JOIN business_chat_refs bcr
+                ON bm.chat_ref = bcr.chat_ref
+               AND bm.owner_user_id = bcr.owner_user_id
+            WHERE bcr.contact_id = ?
+              AND bm.owner_user_id = ?
+              AND bm.text IS NOT NULL
+              AND bm.text != ''
+            """,
+            (contact_id, owner_user_id),
+        ).fetchall()
+        imp_rows = conn.execute(
+            """
+            SELECT date, direction, text
+            FROM imported_messages
+            WHERE contact_id = ? AND text IS NOT NULL AND text != ''
+            """,
+            (contact_id,),
+        ).fetchall()
+
+    seen: set[tuple[str, str, str]] = set()
+    out: list[dict] = []
+    for row in list(biz_rows) + list(imp_rows):
+        key = (row["date"], row["direction"], row["text"])
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append({"date": row["date"], "direction": row["direction"], "text": row["text"]})
+    return out
 
 
 def count_biz_messages_for_contact(owner_user_id: str, contact_id: int) -> int:
@@ -594,11 +781,13 @@ def delete_contact_data(telegram_id: str, contact_id: int) -> None:
         )
         conn.execute("DELETE FROM interaction_cards    WHERE contact_id = ?", (contact_id,))
         conn.execute("DELETE FROM my_style_per_contact WHERE contact_id = ?", (contact_id,))
+        conn.execute("DELETE FROM deep_analysis        WHERE contact_id = ?", (contact_id,))
         conn.execute("DELETE FROM message_samples      WHERE contact_id = ?", (contact_id,))
         conn.execute("DELETE FROM imported_messages    WHERE contact_id = ?", (contact_id,))
         conn.execute("DELETE FROM contacts             WHERE id = ?",         (contact_id,))
-        # сбрасываем агрегатный портрет — пересоберётся без удалённого контакта
-        conn.execute("DELETE FROM style_cards WHERE user_telegram_id = ?", (telegram_id,))
+        # сбрасываем агрегатные портреты — пересоберутся без удалённого контакта
+        conn.execute("DELETE FROM style_cards         WHERE user_telegram_id = ?", (telegram_id,))
+        conn.execute("DELETE FROM deep_style_analysis WHERE user_telegram_id = ?", (telegram_id,))
         # если контакт был активным для авто-режима — снимаем привязку
         conn.execute(
             "UPDATE users SET auto_contact_id = NULL WHERE telegram_id = ? AND auto_contact_id = ?",
@@ -618,10 +807,12 @@ def delete_all_user_data(telegram_id: str) -> None:
             inlist = ",".join("?" * len(cids))
             conn.execute(f"DELETE FROM interaction_cards    WHERE contact_id IN ({inlist})", cids)
             conn.execute(f"DELETE FROM my_style_per_contact WHERE contact_id IN ({inlist})", cids)
+            conn.execute(f"DELETE FROM deep_analysis        WHERE contact_id IN ({inlist})", cids)
             conn.execute(f"DELETE FROM message_samples      WHERE contact_id IN ({inlist})", cids)
             conn.execute(f"DELETE FROM imported_messages    WHERE contact_id IN ({inlist})", cids)
-        conn.execute("DELETE FROM contacts           WHERE user_telegram_id = ?", (telegram_id,))
-        conn.execute("DELETE FROM style_cards        WHERE user_telegram_id = ?", (telegram_id,))
-        conn.execute("DELETE FROM business_messages  WHERE owner_user_id = ?",    (telegram_id,))
+        conn.execute("DELETE FROM contacts             WHERE user_telegram_id = ?", (telegram_id,))
+        conn.execute("DELETE FROM style_cards          WHERE user_telegram_id = ?", (telegram_id,))
+        conn.execute("DELETE FROM deep_style_analysis  WHERE user_telegram_id = ?", (telegram_id,))
+        conn.execute("DELETE FROM business_messages    WHERE owner_user_id = ?",    (telegram_id,))
         conn.execute("DELETE FROM business_chat_refs WHERE owner_user_id = ?",    (telegram_id,))
         conn.execute("DELETE FROM users              WHERE telegram_id = ?",      (telegram_id,))

@@ -28,6 +28,8 @@ from llm import (
     PROVIDER_NAMES,
     RateLimitError,
     adjust_message,
+    build_deep_analysis,
+    build_deep_style_analysis,
     build_interaction_card,
     build_my_style_for_contact,
     build_overall_style,
@@ -49,14 +51,19 @@ from storage import (
     count_biz_messages_for_contact,
     delete_all_user_data,
     delete_contact_data,
+    delete_deep_analysis,
     delete_style_card,
     find_contact_by_original_id,
+    get_all_dated_messages,
+    get_all_dated_my_messages,
     get_all_per_contact_style_cards,
     get_any_user_samples,
     get_auto_mode,
     get_biz_messages_for_contact,
     get_business_connection,
     get_contact_by_id,
+    get_deep_analysis,
+    get_deep_style_analysis,
     get_interaction_card,
     get_imported_messages,
     get_message_samples,
@@ -65,9 +72,12 @@ from storage import (
     get_my_style_per_contact,
     get_or_create_contact,
     get_style_card,
+    delete_deep_style_analysis,
     init_db,
     list_contacts,
     save_business_message,
+    save_deep_analysis,
+    save_deep_style_analysis,
     save_interaction_card,
     save_message_samples,
     save_my_style_per_contact,
@@ -90,8 +100,13 @@ BTN_ME            = "👤 Мой стиль"
 BTN_CONTACT       = "🔍 Стиль собеседника"
 BTN_MY_STYLE_FOR  = "🎯 Мой стиль с ним"
 BTN_CONTACTS      = "📋 Контакты"
+BTN_DEEP          = "🔬 Глубокий анализ"
+BTN_DEEP_STYLE    = "🪞 Глубокий анализ стиля"
 BTN_HELP          = "❓ Помощь"
-_ALL_BTNS = {BTN_REWRITE, BTN_SCREENSHOT, BTN_REPLY, BTN_ME, BTN_CONTACT, BTN_MY_STYLE_FOR, BTN_CONTACTS, BTN_HELP}
+_ALL_BTNS = {
+    BTN_REWRITE, BTN_SCREENSHOT, BTN_REPLY, BTN_ME, BTN_CONTACT,
+    BTN_MY_STYLE_FOR, BTN_CONTACTS, BTN_DEEP, BTN_DEEP_STYLE, BTN_HELP,
+}
 
 # Защита от параллельных пересборок одного контакта
 _rebuilding: set[int] = set()
@@ -119,6 +134,7 @@ def main_kb() -> ReplyKeyboardMarkup:
     b.row(KeyboardButton(text=BTN_REWRITE), KeyboardButton(text=BTN_SCREENSHOT), KeyboardButton(text=BTN_REPLY))
     b.row(KeyboardButton(text=BTN_ME), KeyboardButton(text=BTN_MY_STYLE_FOR))
     b.row(KeyboardButton(text=BTN_CONTACT), KeyboardButton(text=BTN_CONTACTS))
+    b.row(KeyboardButton(text=BTN_DEEP), KeyboardButton(text=BTN_DEEP_STYLE))
     b.row(KeyboardButton(text=BTN_HELP))
     return b.as_markup(resize_keyboard=True)
 
@@ -416,6 +432,259 @@ async def _gen_my_style_per_contact(contact_id: int, owner_user_id: str) -> str 
     return card
 
 
+# ── 🔬 Глубокий анализ ────────────────────────────────────────────────────────
+
+DEEP_ANALYSIS_MIN_MSGS = 10  # минимум сообщений с каждой стороны, иначе анализ бессмысленен
+
+
+def _periodized_dated_lines(rows: list[dict], target_total: int = 220, buckets: int = 6) -> list[str]:
+    """Хронологический семпл с равномерным охватом всей истории (не только
+    последних сообщений) — бьём на буквенных бакетов по времени и берём
+    равномерные срезы внутри каждого, чтобы LLM видел динамику по периодам."""
+    rows = sorted((r for r in rows if r["text"] and r["text"].strip()), key=lambda r: r["date"])
+    if not rows:
+        return []
+
+    per_bucket  = max(1, target_total // buckets)
+    bucket_size = max(1, len(rows) // buckets)
+    lines: list[str] = []
+    for i in range(0, len(rows), bucket_size):
+        chunk = rows[i:i + bucket_size]
+        step  = max(1, len(chunk) // per_bucket)
+        for r in chunk[::step][:per_bucket]:
+            who = "Я" if r["direction"] == "out" else "Собеседник"
+            lines.append(f"{r['date'][:10]} {who}: {r['text']}")
+    return lines
+
+
+def _deep_stats_summary(rows: list[dict]) -> str:
+    my = [r for r in rows if r["direction"] == "out" and r["text"]]
+    ct = [r for r in rows if r["direction"] == "in" and r["text"]]
+    dates = sorted(r["date"] for r in rows if r["text"])
+    date_from = dates[0][:10] if dates else "?"
+    date_to   = dates[-1][:10] if dates else "?"
+    my_avg = sum(len(t["text"]) for t in my) / len(my) if my else 0
+    ct_avg = sum(len(t["text"]) for t in ct) / len(ct) if ct else 0
+    return (
+        f"Период переписки: {date_from} — {date_to}\n"
+        f"Я: {len(my)} сообщ., средн. {my_avg:.0f} симв.\n"
+        f"Собеседник: {len(ct)} сообщ., средн. {ct_avg:.0f} симв."
+    )
+
+
+async def _gen_deep_analysis(contact_id: int, owner_user_id: str) -> dict | None:
+    """Ленивая генерация с кэшем в deep_analysis. None — данных мало."""
+    cached = get_deep_analysis(contact_id)
+    if cached:
+        return cached
+
+    rows = get_all_dated_messages(owner_user_id, contact_id)
+    my_count = sum(1 for r in rows if r["direction"] == "out" and r["text"])
+    ct_count = sum(1 for r in rows if r["direction"] == "in" and r["text"])
+    if my_count < DEEP_ANALYSIS_MIN_MSGS or ct_count < DEEP_ANALYSIS_MIN_MSGS:
+        return None
+
+    dated_lines = _periodized_dated_lines(rows)
+    stats       = _deep_stats_summary(rows)
+    compat, history, swot, gifts = await build_deep_analysis(dated_lines, stats)
+    save_deep_analysis(contact_id, compat, history, swot, gifts)
+    return {
+        "compatibility_text": compat, "history_text": history,
+        "swot_text": swot, "gifts_text": gifts,
+    }
+
+
+def _format_deep_analysis(name: str, data: dict) -> tuple[str, str]:
+    msg1 = (
+        f"🔬 Глубокий анализ — {name}\n\n"
+        f"💞 Совместимость\n\n{data['compatibility_text']}\n\n"
+        f"📖 История отношений\n\n{data['history_text']}"
+    )
+    msg2 = (
+        f"🧭 Сильные стороны, проблемы и точки роста\n\n{data['swot_text']}\n\n"
+        f"🎁 Рекомендации подарков\n\n{data['gifts_text']}"
+    )
+    return msg1, msg2
+
+
+def deep_analysis_result_kb(contact_id: int) -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    b.button(text="🔄 Обновить анализ", callback_data=f"deepan_refresh:{contact_id}")
+    return b.as_markup()
+
+
+async def _run_deep_analysis(target: Message, telegram_id: str, contact_id: int, edit: bool = False) -> None:
+    contact = get_contact_by_id(contact_id)
+    if not contact:
+        text = "Контакт не найден."
+        await (target.edit_text(text) if edit else target.answer(text))
+        return
+    name = _contact_name(contact)
+
+    wait_text = f"Готовлю глубокий анализ — {name}. Это займёт ~30 секунд..."
+    await (target.edit_text(wait_text) if edit else target.answer(wait_text))
+
+    try:
+        data = await _gen_deep_analysis(contact_id, telegram_id)
+    except RateLimitError:
+        await target.answer("Лимит LLM исчерпан, попробуй позже.")
+        return
+    except Exception:
+        logging.exception("deep_analysis: ошибка генерации")
+        await target.answer("Не удалось сгенерировать анализ — попробуй ещё раз.")
+        return
+
+    if not data:
+        await target.answer(
+            f"Пока маловато данных по {name} для глубокого анализа — нужно минимум "
+            f"{DEEP_ANALYSIS_MIN_MSGS} сообщений с обеих сторон (JSON-экспорт или "
+            "накопление через Автоматизацию чатов)."
+        )
+        return
+
+    msg1, msg2 = _format_deep_analysis(name, data)
+    await target.answer(msg1)
+    await target.answer(msg2, reply_markup=deep_analysis_result_kb(contact_id))
+
+
+async def _show_deep_analysis(message: Message) -> None:
+    telegram_id = str(message.from_user.id)
+    contacts = list_contacts(telegram_id)
+    if not contacts:
+        await message.answer("Сначала загрузи JSON-файл чата.")
+        return
+
+    if len(contacts) == 1:
+        await _run_deep_analysis(message, telegram_id, contacts[0]["id"])
+        return
+
+    await message.answer("Для кого сделать глубокий анализ?", reply_markup=contacts_kb(contacts, "deepan"))
+
+
+@dp.message(Command("deep_analysis"))
+async def cmd_deep_analysis(message: Message) -> None:
+    await _show_deep_analysis(message)
+
+
+@dp.callback_query(F.data.startswith("deepan_refresh:"))
+async def cb_deep_analysis_refresh(call: CallbackQuery) -> None:
+    contact_id  = int(call.data.split(":")[1])
+    telegram_id = str(call.from_user.id)
+    await call.answer("Пересобираю анализ...")
+    delete_deep_analysis(contact_id)
+    await _run_deep_analysis(call.message, telegram_id, contact_id)
+
+
+@dp.callback_query(F.data.startswith("deepan:"))
+async def cb_deep_analysis_contact(call: CallbackQuery) -> None:
+    contact_id  = int(call.data.split(":")[1])
+    telegram_id = str(call.from_user.id)
+    await call.answer()
+    await _run_deep_analysis(call.message, telegram_id, contact_id, edit=True)
+
+
+# ── 🪞 Глубокий анализ моего стиля (агрегат по всем контактам) ────────────────
+
+DEEP_STYLE_MIN_MSGS = 20  # минимум своих сообщений суммарно, иначе анализ бессмысленен
+
+
+def _deep_style_stats_summary(rows: list[dict]) -> str:
+    dates = sorted(r["date"] for r in rows if r["text"])
+    date_from = dates[0][:10] if dates else "?"
+    date_to   = dates[-1][:10] if dates else "?"
+    avg = sum(len(r["text"]) for r in rows) / len(rows) if rows else 0
+    return (
+        f"Период: {date_from} — {date_to}\n"
+        f"Всего сообщений: {len(rows)}, средняя длина {avg:.0f} симв."
+    )
+
+
+async def _gen_deep_style_analysis(telegram_id: str) -> dict | None:
+    """Ленивая генерация с кэшем в deep_style_analysis. None — данных мало."""
+    cached = get_deep_style_analysis(telegram_id)
+    if cached:
+        return cached
+
+    rows = get_all_dated_my_messages(telegram_id)
+    if len(rows) < DEEP_STYLE_MIN_MSGS:
+        return None
+
+    dated_lines = _periodized_dated_lines(rows)
+    stats       = _deep_style_stats_summary(rows)
+    profile, history, swot, tips = await build_deep_style_analysis(dated_lines, stats)
+    save_deep_style_analysis(telegram_id, profile, history, swot, tips)
+    return {
+        "profile_text": profile, "history_text": history,
+        "swot_text": swot, "tips_text": tips,
+    }
+
+
+def _format_deep_style_analysis(data: dict) -> tuple[str, str]:
+    msg1 = (
+        "🪞 Глубокий анализ твоего стиля\n\n"
+        f"🎙️ Коммуникативный профиль\n\n{data['profile_text']}\n\n"
+        f"📖 Как менялся твой стиль\n\n{data['history_text']}"
+    )
+    msg2 = (
+        f"🧭 Сильные стороны, проблемы и точки роста\n\n{data['swot_text']}\n\n"
+        f"🎯 Рекомендации для дейтинга\n\n{data['tips_text']}"
+    )
+    return msg1, msg2
+
+
+def deep_style_result_kb() -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    b.button(text="🔄 Обновить анализ", callback_data="deepstyle_refresh")
+    return b.as_markup()
+
+
+async def _run_deep_style_analysis(target: Message, telegram_id: str) -> None:
+    await target.answer("Готовлю глубокий анализ твоего стиля. Это займёт ~30 секунд...")
+
+    try:
+        data = await _gen_deep_style_analysis(telegram_id)
+    except RateLimitError:
+        await target.answer("Лимит LLM исчерпан, попробуй позже.")
+        return
+    except Exception:
+        logging.exception("deep_style_analysis: ошибка генерации")
+        await target.answer("Не удалось сгенерировать анализ — попробуй ещё раз.")
+        return
+
+    if not data:
+        await target.answer(
+            f"Пока маловато данных для глубокого анализа стиля — нужно минимум "
+            f"{DEEP_STYLE_MIN_MSGS} твоих сообщений суммарно (JSON-экспорт или "
+            "накопление через Автоматизацию чатов)."
+        )
+        return
+
+    msg1, msg2 = _format_deep_style_analysis(data)
+    await target.answer(msg1)
+    await target.answer(msg2, reply_markup=deep_style_result_kb())
+
+
+async def _show_deep_style_analysis(message: Message) -> None:
+    telegram_id = str(message.from_user.id)
+    if not list_contacts(telegram_id):
+        await message.answer("Сначала загрузи JSON-файл чата.")
+        return
+    await _run_deep_style_analysis(message, telegram_id)
+
+
+@dp.message(Command("deep_style_analysis"))
+async def cmd_deep_style_analysis(message: Message) -> None:
+    await _show_deep_style_analysis(message)
+
+
+@dp.callback_query(F.data == "deepstyle_refresh")
+async def cb_deep_style_analysis_refresh(call: CallbackQuery) -> None:
+    telegram_id = str(call.from_user.id)
+    await call.answer("Пересобираю анализ...")
+    delete_deep_style_analysis(telegram_id)
+    await _run_deep_style_analysis(call.message, telegram_id)
+
+
 # ── Business API ──────────────────────────────────────────────────────────────
 
 @dp.business_connection()
@@ -508,6 +777,8 @@ def _capabilities_text() -> str:
         "💬 Ответить за меня — подскажу ответ на его сообщение\n"
         "👤 Мой стиль · 🎯 Мой стиль с ним — как пишешь ты\n"
         "🔍 Стиль собеседника — как писать ему\n"
+        "🔬 Глубокий анализ — совместимость, история отношений, подарки\n"
+        "🪞 Глубокий анализ стиля — твой коммуникативный профиль и советы для дейтинга\n"
         "📋 Контакты · /stats — портрет в цифрах · /compare — сравнить стили\n\n"
         "Полный список команд — /help"
     )
@@ -626,6 +897,10 @@ async def handle_menu_button(message: Message, state: FSMContext) -> None:
         await _show_my_style_for(message)
     elif message.text == BTN_CONTACTS:
         await _show_contacts(message)
+    elif message.text == BTN_DEEP:
+        await _show_deep_analysis(message)
+    elif message.text == BTN_DEEP_STYLE:
+        await _show_deep_style_analysis(message)
     elif message.text == BTN_HELP:
         await _show_help(message)
 
@@ -676,6 +951,7 @@ async def handle_document(message: Message, bot: Bot, state: FSMContext) -> None
     save_imported_messages(contact_id, all_imported)
 
     delete_style_card(telegram_id)
+    delete_deep_style_analysis(telegram_id)
 
     name = chat.meta.contact_name
 
@@ -1454,6 +1730,8 @@ async def _show_help(message: Message) -> None:
         "/screenshot — ответить по скриншоту переписки\n"
         "/reply — помочь ответить на сообщение собеседника\n"
         "/contacts — список загруженных чатов\n"
+        "/deep_analysis — глубокий анализ: совместимость, история, подарки\n"
+        "/deep_style_analysis — глубокий анализ твоего стиля (агрегат по всем)\n"
         "/delete — удалить свои данные\n"
         "/rebuild_all — принудительно пересобрать все карточки\n\n"
         "Кнопки в меню:\n"
@@ -1463,6 +1741,10 @@ async def _show_help(message: Message) -> None:
         "👤 Мой стиль — как ты общаешься в целом\n"
         "🎯 Мой стиль с ним — твой стиль с конкретным человеком\n"
         "🔍 Стиль собеседника — паттерны и советы по нему\n"
+        "🔬 Глубокий анализ — совместимость, история отношений по периодам, "
+        "сильные стороны/проблемы/точки роста, идеи подарков\n"
+        "🪞 Глубокий анализ стиля — твой коммуникативный профиль, как менялся стиль "
+        "по периодам, сильные/слабые стороны как собеседника, советы для дейтинга\n"
         "📋 Контакты — загруженные переписки\n"
         "❓ Помощь — это сообщение\n\n"
         "Любое сообщение, которое ты просто напишешь боту, автоматически "
@@ -1706,6 +1988,8 @@ async def main() -> None:
         BotCommand(command="screenshot",  description="Ответить по скриншоту"),
         BotCommand(command="reply",       description="Помочь ответить собеседнику"),
         BotCommand(command="contacts",    description="Загруженные чаты"),
+        BotCommand(command="deep_analysis", description="Глубокий анализ отношений"),
+        BotCommand(command="deep_style_analysis", description="Глубокий анализ моего стиля"),
         BotCommand(command="delete",      description="Удалить свои данные"),
         BotCommand(command="rebuild_all", description="Пересобрать все карточки"),
     ])
