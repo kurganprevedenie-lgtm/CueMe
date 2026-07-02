@@ -1,6 +1,5 @@
 import asyncio
 import hashlib
-import html
 import logging
 import re
 import tempfile
@@ -27,7 +26,6 @@ from llm import (
     ILLEGIBLE_MARKER,
     PROVIDER_NAMES,
     RateLimitError,
-    adjust_message,
     build_deep_analysis,
     build_deep_style_analysis,
     build_interaction_card,
@@ -38,7 +36,6 @@ from llm import (
     extract_chat_from_image,
     get_forced_provider,
     make_features_summary,
-    rewrite_message,
     rewrite_message_explained,
     sample_texts,
     set_forced_provider,
@@ -96,22 +93,23 @@ dp = Dispatcher(storage=MemoryStorage())
 BTN_REWRITE       = "📝 Переписать"
 BTN_SCREENSHOT    = "📸 По скриншоту"
 BTN_REPLY         = "💬 Ответить за меня"
-BTN_ME            = "👤 Мой стиль"
 BTN_CONTACT       = "🔍 Стиль собеседника"
-BTN_MY_STYLE_FOR  = "🎯 Мой стиль с ним"
 BTN_CONTACTS      = "📋 Контакты"
 BTN_DEEP          = "🔬 Глубокий анализ"
 BTN_DEEP_STYLE    = "🪞 Глубокий анализ стиля"
 BTN_HELP          = "❓ Помощь"
+# BTN_ME («👤 Мой стиль») и BTN_MY_STYLE_FOR («🎯 Мой стиль с ним») временно
+# убраны из меню — дублируют BTN_DEEP_STYLE/BTN_DEEP. Функции (_show_style,
+# _show_my_style_for, /me) не удалены — можно вернуть кнопки одной правкой.
 _ALL_BTNS = {
-    BTN_REWRITE, BTN_SCREENSHOT, BTN_REPLY, BTN_ME, BTN_CONTACT,
-    BTN_MY_STYLE_FOR, BTN_CONTACTS, BTN_DEEP, BTN_DEEP_STYLE, BTN_HELP,
+    BTN_REWRITE, BTN_SCREENSHOT, BTN_REPLY, BTN_CONTACT,
+    BTN_CONTACTS, BTN_DEEP, BTN_DEEP_STYLE, BTN_HELP,
 }
 
 # Защита от параллельных пересборок одного контакта
 _rebuilding: set[int] = set()
 
-# Контекст последнего действия для кнопки «🔄 Ещё вариант» (по user_id)
+# Контекст последнего действия (черновик/входящее/скриншот + выбранный стиль) — по user_id
 _last_action: dict[int, dict] = {}
 
 # После лимита Groq фоновые авто-пересборки молчат до этого момента (monotonic-время),
@@ -129,69 +127,181 @@ def _contact_name(c) -> str:
     return name or c["contact_alias"]
 
 
+TELEGRAM_MAX_LEN = 4096  # лимит Telegram на длину одного сообщения
+
+
+def _split_long_text(text: str, limit: int = TELEGRAM_MAX_LEN) -> list[str]:
+    """Режет текст на части ≤ limit символов, по возможности по границам
+    абзацев/строк — LLM-карточки (style_card и т.п.) иногда длиннее лимита
+    Telegram и без этого падают с TelegramBadRequest «message is too long»."""
+    if len(text) <= limit:
+        return [text]
+    parts: list[str] = []
+    while len(text) > limit:
+        cut = text.rfind("\n\n", 0, limit)
+        if cut <= 0:
+            cut = text.rfind("\n", 0, limit)
+        if cut <= 0:
+            cut = limit
+        parts.append(text[:cut].rstrip())
+        text = text[cut:].lstrip()
+    if text:
+        parts.append(text)
+    return parts
+
+
+async def _answer_long(
+    message: Message, text: str, reply_markup: InlineKeyboardMarkup | None = None
+) -> None:
+    """Как message.answer(), но безопасно для текста длиннее лимита Telegram —
+    клавиатура (если есть) уходит с последним куском."""
+    chunks = _split_long_text(text)
+    for i, chunk in enumerate(chunks):
+        last = i == len(chunks) - 1
+        await message.answer(chunk, reply_markup=reply_markup if last else None)
+
+
+async def _edit_or_answer_long(message: Message, text: str) -> None:
+    """Как call.message.edit_text(), но при переполнении лимита Telegram первый
+    кусок идёт в edit, а остальные — отдельными сообщениями (edit не может
+    «раздвоиться» на несколько сообщений)."""
+    chunks = _split_long_text(text)
+    await message.edit_text(chunks[0])
+    for chunk in chunks[1:]:
+        await message.answer(chunk)
+
+
 def main_kb() -> ReplyKeyboardMarkup:
     b = ReplyKeyboardBuilder()
     b.row(KeyboardButton(text=BTN_REWRITE), KeyboardButton(text=BTN_SCREENSHOT), KeyboardButton(text=BTN_REPLY))
-    b.row(KeyboardButton(text=BTN_ME), KeyboardButton(text=BTN_MY_STYLE_FOR))
     b.row(KeyboardButton(text=BTN_CONTACT), KeyboardButton(text=BTN_CONTACTS))
     b.row(KeyboardButton(text=BTN_DEEP), KeyboardButton(text=BTN_DEEP_STYLE))
     b.row(KeyboardButton(text=BTN_HELP))
     return b.as_markup(resize_keyboard=True)
 
 
-def result_kb() -> InlineKeyboardMarkup:
-    b = InlineKeyboardBuilder()
-    b.button(text="🔄 Ещё вариант", callback_data="again")
-    b.button(text="✂️ Короче",     callback_data="adj:short")
-    b.button(text="🔥 Теплее",     callback_data="adj:warm")
-    b.button(text="👔 Формальнее", callback_data="adj:formal")
-    b.adjust(1, 3)
-    return b.as_markup()
-
-
-async def _send_result(msg: Message, result: str, expl: str = "", rating: str = "") -> None:
-    """Отправляет переписанный текст с кнопками, пояснение и оценку — отдельным сообщением."""
-    await msg.answer(result, reply_markup=result_kb())
-    tail = ""
-    if expl:
-        tail += f"💡 {expl}"
-    if rating:
-        tail += ("\n\n" if tail else "") + rating
-    if tail:
-        await msg.answer(tail)
-
-
-def screenshot_style_kb() -> InlineKeyboardMarkup:
+def style_pick_kb() -> InlineKeyboardMarkup:
+    """Единая клавиатура выбора стиля — общая для «Переписать», «Ответить за
+    меня» и «По скриншоту». Какая фича сейчас активна — определяется по
+    _last_action[user_id]["kind"], а не по callback_data (слот один на юзера)."""
     b = InlineKeyboardBuilder()
     for key, (label, _desc) in REPLY_STYLES.items():
-        b.button(text=label, callback_data=f"shotstyle:{key}")
+        b.button(text=label, callback_data=f"stylepick:{key}")
     b.adjust(2)
     return b.as_markup()
 
 
-def screenshot_result_kb() -> InlineKeyboardMarkup:
+def style_result_kb() -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
-    b.button(text="🎭 Другой стиль", callback_data="shotother")
-    b.button(text="🔄 Перегенерировать", callback_data="shotregen")
-    b.button(text="📋 Скопировать", callback_data="shotcopy")
+    b.button(text="✏️ Другой стиль", callback_data="styleother")
+    b.button(text="🔄 Перегенерировать", callback_data="styleregen")
+    b.button(text="📋 Скопировать", callback_data="stylecopy")
     b.adjust(1, 2)
     return b.as_markup()
 
 
-async def _send_screenshot_result(msg: Message, result: str, expl: str, rating: str) -> None:
-    """Как _send_result, но с HTML-выделением ответа (моноширинный блок —
-    тап копирует). parse_mode указан ТОЛЬКО в этом вызове, остальной проект
-    остаётся plain-text (чтобы не ловить поломки markdown-парсинга на
-    непредсказуемом LLM-выводе)."""
-    safe = html.escape(result)
-    await msg.answer(f"<code>{safe}</code>", parse_mode="HTML", reply_markup=screenshot_result_kb())
+async def _run_style_generation(target: Message, ctx: dict, state: FSMContext | None = None) -> None:
+    """Общий шаг генерации для всех трёх фич переписывания (rewrite/reply/screenshot)
+    после того как стиль выбран. Шлёт результат + пояснение/оценку отдельным
+    сообщением; для «Ответить за меня» и «По скриншоту» — ещё и напоминание
+    как продолжить (авто-режим: следующее сообщение/скриншот без повторного
+    нажатия кнопки меню)."""
+    kind      = ctx.get("kind")
+    style_key = ctx.get("style")
+    text      = ctx.get("text") if kind in ("rewrite", "reply") else ctx.get("chat_text")
+    if not style_key or text is None:
+        await target.answer("Контекст устарел — начни заново.")
+        return
+
+    try:
+        if kind == "rewrite":
+            result, expl, rating = await rewrite_message_explained(
+                text, ctx["style_card"], ctx["interaction_card"], style_key
+            )
+        elif kind == "reply":
+            result, expl, rating = await suggest_reply(
+                text, ctx["style_card"], ctx["interaction_card"], style_key
+            )
+        else:  # screenshot
+            result, expl, rating = await suggest_reply_from_screenshot(
+                text, ctx["style_card"], ctx["interaction_card"], style_key
+            )
+    except RateLimitError:
+        await target.answer("Лимит исчерпан, попробуй позже.")
+        return
+    except Exception:
+        logging.exception("%s: ошибка генерации (стиль %s)", kind, style_key)
+        await target.answer("Не получилось сгенерировать — попробуй ещё раз.")
+        return
+
+    ctx["result"] = result
+    await _answer_long(target, result, reply_markup=style_result_kb())
     tail = ""
     if expl:
         tail += f"💡 {expl}"
     if rating:
         tail += ("\n\n" if tail else "") + rating
     if tail:
-        await msg.answer(tail)
+        await target.answer(tail)
+
+    if kind == "reply":
+        await target.answer(
+            "Пришли следующее сообщение собеседника, чтобы ответить и на него. "
+            "Чтобы выйти из режима — нажми любую кнопку меню."
+        )
+    elif kind == "screenshot" and state is not None:
+        await state.set_state(Screenshot.waiting_for_image)
+        await target.answer(
+            "Пришли следующий скриншот (или текст переписки), чтобы продолжить. "
+            "Чтобы выйти из режима — нажми любую кнопку меню."
+        )
+
+
+_STYLE_KINDS = ("rewrite", "reply", "screenshot")
+
+
+@dp.callback_query(F.data.startswith("stylepick:"))
+async def cb_style_pick(call: CallbackQuery, state: FSMContext) -> None:
+    style_key = call.data.split(":", 1)[1]
+    ctx = _last_action.get(call.from_user.id)
+    if not ctx or ctx.get("kind") not in _STYLE_KINDS or style_key not in REPLY_STYLES:
+        await call.answer("Контекст устарел — начни заново.", show_alert=True)
+        return
+    await call.answer()
+    ctx["style"] = style_key
+    label = REPLY_STYLES[style_key][0]
+    await call.message.edit_text(f"Генерирую в стиле «{label}»...", reply_markup=None)
+    await _run_style_generation(call.message, ctx, state)
+
+
+@dp.callback_query(F.data == "styleother")
+async def cb_style_other(call: CallbackQuery) -> None:
+    ctx = _last_action.get(call.from_user.id)
+    if not ctx or ctx.get("kind") not in _STYLE_KINDS:
+        await call.answer("Контекст устарел — начни заново.", show_alert=True)
+        return
+    await call.answer()
+    await call.message.answer("В каком стиле?", reply_markup=style_pick_kb())
+
+
+@dp.callback_query(F.data == "styleregen")
+async def cb_style_regen(call: CallbackQuery, state: FSMContext) -> None:
+    ctx = _last_action.get(call.from_user.id)
+    if not ctx or ctx.get("kind") not in _STYLE_KINDS or not ctx.get("style"):
+        await call.answer("Контекст устарел — начни заново.", show_alert=True)
+        return
+    await call.answer("Перегенерирую...")
+    await _run_style_generation(call.message, ctx, state)
+
+
+@dp.callback_query(F.data == "stylecopy")
+async def cb_style_copy(call: CallbackQuery) -> None:
+    ctx = _last_action.get(call.from_user.id)
+    if not ctx or not ctx.get("result"):
+        await call.answer("Текст не найден — начни заново.", show_alert=True)
+        return
+    await call.answer()
+    await _answer_long(call.message, ctx["result"])
 
 
 def contacts_kb(contacts: list, prefix: str) -> InlineKeyboardMarkup:
@@ -543,8 +653,8 @@ async def _run_deep_analysis(target: Message, telegram_id: str, contact_id: int,
         return
 
     msg1, msg2 = _format_deep_analysis(name, data)
-    await target.answer(msg1)
-    await target.answer(msg2, reply_markup=deep_analysis_result_kb(contact_id))
+    await _answer_long(target, msg1)
+    await _answer_long(target, msg2, reply_markup=deep_analysis_result_kb(contact_id))
 
 
 async def _show_deep_analysis(message: Message) -> None:
@@ -660,8 +770,8 @@ async def _run_deep_style_analysis(target: Message, telegram_id: str) -> None:
         return
 
     msg1, msg2 = _format_deep_style_analysis(data)
-    await target.answer(msg1)
-    await target.answer(msg2, reply_markup=deep_style_result_kb())
+    await _answer_long(target, msg1)
+    await _answer_long(target, msg2, reply_markup=deep_style_result_kb())
 
 
 async def _show_deep_style_analysis(message: Message) -> None:
@@ -772,10 +882,10 @@ async def handle_business_message(event: Message, bot: Bot) -> None:
 def _capabilities_text() -> str:
     return (
         "Вот что я умею:\n\n"
-        "📝 Переписать — твой черновик → готовое под собеседника\n"
-        "📸 По скриншоту — пришли скриншот переписки → выберу стиль ответа\n"
-        "💬 Ответить за меня — подскажу ответ на его сообщение\n"
-        "👤 Мой стиль · 🎯 Мой стиль с ним — как пишешь ты\n"
+        "📝 Переписать — твой черновик → выбери стиль → готовое под собеседника\n"
+        "📸 По скриншоту — пришли скриншот переписки → выбери стиль ответа. "
+        "Можно слать скриншоты один за другим без повторного нажатия кнопки\n"
+        "💬 Ответить за меня — подскажу ответ на его сообщение, с выбором стиля\n"
         "🔍 Стиль собеседника — как писать ему\n"
         "🔬 Глубокий анализ — совместимость, история отношений, подарки\n"
         "🪞 Глубокий анализ стиля — твой коммуникативный профиль и советы для дейтинга\n"
@@ -883,9 +993,7 @@ async def cmd_demo(message: Message, state: FSMContext) -> None:
 @dp.message(F.text.in_(_ALL_BTNS))
 async def handle_menu_button(message: Message, state: FSMContext) -> None:
     await state.clear()
-    if message.text == BTN_ME:
-        await _show_style(message)
-    elif message.text == BTN_REWRITE:
+    if message.text == BTN_REWRITE:
         await _start_rewrite(message, state)
     elif message.text == BTN_SCREENSHOT:
         await _start_screenshot(message, state)
@@ -893,8 +1001,6 @@ async def handle_menu_button(message: Message, state: FSMContext) -> None:
         await _start_reply(message, state)
     elif message.text == BTN_CONTACT:
         await _show_contact_style(message)
-    elif message.text == BTN_MY_STYLE_FOR:
-        await _show_my_style_for(message)
     elif message.text == BTN_CONTACTS:
         await _show_contacts(message)
     elif message.text == BTN_DEEP:
@@ -1098,32 +1204,10 @@ async def _show_style(message: Message) -> None:
         name = _contact_name(c)
         per_contact = get_my_style_per_contact(c["id"])
         extra = f"\n\n── Мой стиль с {name} ──\n\n{per_contact}" if per_contact else ""
-        await message.answer(f"Твой общий портрет:\n\n{style_card}{extra}")
+        await _answer_long(message, f"Твой общий портрет:\n\n{style_card}{extra}")
         return
 
-    await message.answer(
-        f"Твой общий портрет:\n\n{style_card}\n\n"
-        "Стиль с конкретным собеседником — кнопка «🎯 Мой стиль с ним»."
-    )
-
-
-@dp.callback_query(F.data.startswith("style:"))
-async def cb_style_contact(call: CallbackQuery) -> None:
-    contact_id  = int(call.data.split(":")[1])
-    telegram_id = str(call.from_user.id)
-
-    style_card = get_style_card(telegram_id)
-    contact    = get_contact_by_id(contact_id)
-    if not contact:
-        await call.answer("Контакт не найден.")
-        return
-
-    await call.answer()
-    name        = _contact_name(contact)
-    interaction = get_interaction_card(contact_id) or "Нажми «🔍 Стиль собеседника» для анализа."
-    await call.message.edit_text(
-        f"Твой стиль:\n\n{style_card}\n\n── Как писать {name} ──\n\n{interaction}"
-    )
+    await _answer_long(message, f"Твой общий портрет:\n\n{style_card}")
 
 
 # ── 🎯 Мой стиль с конкретным человеком ──────────────────────────────────────
@@ -1148,7 +1232,7 @@ async def _show_my_style_for(message: Message) -> None:
                 "через Автоматизацию чатов."
             )
             return
-        await message.answer(f"Мой стиль с {name}:\n\n{card}")
+        await _answer_long(message, f"Мой стиль с {name}:\n\n{card}")
         return
 
     await message.answer("С кем показать стиль?", reply_markup=contacts_kb(contacts, "mystyle"))
@@ -1179,7 +1263,7 @@ async def cb_my_style_for_contact(call: CallbackQuery) -> None:
         )
         return
 
-    await call.message.edit_text(f"Мой стиль с {name}:\n\n{card}")
+    await _edit_or_answer_long(call.message, f"Мой стиль с {name}:\n\n{card}")
 
 
 # ── Контакты ──────────────────────────────────────────────────────────────────
@@ -1224,7 +1308,7 @@ async def _show_contact_style(message: Message) -> None:
         if not card:
             await message.answer("Не удалось сгенерировать анализ.")
             return
-        await message.answer(f"Как писать {name}:\n\n{card}")
+        await _answer_long(message, f"Как писать {name}:\n\n{card}")
         return
 
     await message.answer("Чей стиль показать?", reply_markup=contacts_kb(contacts, "cstyle"))
@@ -1250,7 +1334,7 @@ async def cb_contact_style(call: CallbackQuery) -> None:
         await call.message.edit_text("Не удалось сгенерировать анализ.")
         return
 
-    await call.message.edit_text(f"Как писать {name}:\n\n{card}")
+    await _edit_or_answer_long(call.message, f"Как писать {name}:\n\n{card}")
 
 
 # ── Хелпер: стиль для перезаписи (per-contact → global fallback) ──────────────
@@ -1340,59 +1424,12 @@ async def handle_draft(message: Message, state: FSMContext, bot: Bot) -> None:
 
     data = await state.get_data()
     await state.clear()
-    await message.answer("Переписываю...")
 
-    try:
-        result, expl, rating = await rewrite_message_explained(
-            draft, data["style_card"], data["interaction_card"]
-        )
-        _last_action[message.from_user.id] = {
-            "kind": "rewrite", "text": draft, "result": result,
-            "style_card": data["style_card"], "interaction_card": data["interaction_card"],
-        }
-        await _send_result(message, result, expl, rating)
-    except Exception as e:
-        await message.answer(f"Ошибка: {e}")
-
-
-# ── 🔄 Ещё вариант / подстройка тона ──────────────────────────────────────────
-
-@dp.callback_query(F.data == "again")
-async def cb_again(call: CallbackQuery) -> None:
-    ctx = _last_action.get(call.from_user.id)
-    if not ctx:
-        await call.answer("Контекст устарел — начни заново.", show_alert=True)
-        return
-    await call.answer("Генерирую другой вариант...")
-    try:
-        if ctx["kind"] == "rewrite":
-            result, expl, rating = await rewrite_message_explained(
-                ctx["text"], ctx["style_card"], ctx["interaction_card"]
-            )
-        else:
-            result, expl, rating = await suggest_reply(
-                ctx["text"], ctx["style_card"], ctx["interaction_card"]
-            )
-        ctx["result"] = result
-        await _send_result(call.message, result, expl, rating)
-    except Exception as e:
-        await call.message.answer(f"Ошибка: {e}")
-
-
-@dp.callback_query(F.data.startswith("adj:"))
-async def cb_adjust(call: CallbackQuery) -> None:
-    ctx = _last_action.get(call.from_user.id)
-    if not ctx or not ctx.get("result"):
-        await call.answer("Контекст устарел — начни заново.", show_alert=True)
-        return
-    mode = call.data.split(":")[1]
-    await call.answer("Подстраиваю...")
-    try:
-        result, expl = await adjust_message(ctx["result"], ctx["style_card"], mode)
-        ctx["result"] = result
-        await _send_result(call.message, result, expl)
-    except Exception as e:
-        await call.message.answer(f"Ошибка: {e}")
+    _last_action[message.from_user.id] = {
+        "kind": "rewrite", "text": draft, "result": None, "style": None,
+        "style_card": data["style_card"], "interaction_card": data["interaction_card"],
+    }
+    await message.answer("В каком стиле переписать?", reply_markup=style_pick_kb())
 
 
 # ── 💬 Ответить за меня ───────────────────────────────────────────────────────
@@ -1470,20 +1507,15 @@ async def handle_incoming(message: Message, state: FSMContext, bot: Bot) -> None
         return
 
     data = await state.get_data()
-    await state.clear()
-    await message.answer("Думаю как ответить...")
+    # Состояние НЕ сбрасываем — иначе следующее сообщение улетит в общий
+    # авто-режим («Переписать») вместо продолжения «Ответить за меня».
+    # Выйти из режима — любая кнопка меню (handle_menu_button сбрасывает state).
 
-    try:
-        result, expl, rating = await suggest_reply(
-            incoming, data["style_card"], data["interaction_card"]
-        )
-        _last_action[message.from_user.id] = {
-            "kind": "reply", "text": incoming, "result": result,
-            "style_card": data["style_card"], "interaction_card": data["interaction_card"],
-        }
-        await _send_result(message, result, expl, rating)
-    except Exception as e:
-        await message.answer(f"Ошибка: {e}")
+    _last_action[message.from_user.id] = {
+        "kind": "reply", "text": incoming, "result": None, "style": None,
+        "style_card": data["style_card"], "interaction_card": data["interaction_card"],
+    }
+    await message.answer("В каком стиле ответить?", reply_markup=style_pick_kb())
 
 
 @dp.message(Command("reply"))
@@ -1533,38 +1565,52 @@ async def handle_screenshot_text(message: Message, state: FSMContext) -> None:
     await _proceed_screenshot_style_pick(message, state, chat_text)
 
 
+def screenshot_contact_pick_kb(contacts: list) -> InlineKeyboardMarkup:
+    """Как contacts_kb, но с кнопкой для человека, которого ещё нет в базе —
+    для него используется общий (агрегатный) стиль, без interaction_card."""
+    b = InlineKeyboardBuilder()
+    for c in contacts:
+        b.button(text=_contact_name(c), callback_data=f"shotcontact:{c['id']}")
+    b.button(text="🆕 Новый человек (нет в базе)", callback_data="shotcontact:new")
+    b.adjust(1)
+    return b.as_markup()
+
+
 async def _proceed_screenshot_style_pick(message: Message, state: FSMContext, chat_text: str) -> None:
     await state.clear()
     telegram_id = str(message.from_user.id)
     contacts = list_contacts(telegram_id)
 
-    if len(contacts) == 1:
-        await _ask_screenshot_style(message, message.from_user.id, telegram_id, contacts[0]["id"], chat_text)
-        return
-
     _last_action[message.from_user.id] = {"kind": "screenshot_pending", "chat_text": chat_text}
-    await message.answer("Чья это переписка?", reply_markup=contacts_kb(contacts, "shotcontact"))
+    await message.answer("Чья это переписка?", reply_markup=screenshot_contact_pick_kb(contacts))
 
 
 @dp.callback_query(F.data.startswith("shotcontact:"))
 async def cb_screenshot_contact(call: CallbackQuery) -> None:
-    contact_id = int(call.data.split(":")[1])
+    raw_id = call.data.split(":", 1)[1]
     telegram_id = str(call.from_user.id)
-    contact = get_contact_by_id(contact_id)
-    if not contact:
-        await call.answer("Контакт не найден.")
-        return
 
     ctx = _last_action.get(call.from_user.id)
     if not ctx or ctx.get("kind") != "screenshot_pending":
         await call.answer("Контекст устарел — начни заново через «📸 По скриншоту».", show_alert=True)
         return
 
+    if raw_id == "new":
+        await call.answer()
+        await _prompt_screenshot_style_no_contact(call.message, call.from_user.id, telegram_id, ctx["chat_text"], edit=True)
+        return
+
+    contact_id = int(raw_id)
+    contact = get_contact_by_id(contact_id)
+    if not contact:
+        await call.answer("Контакт не найден.")
+        return
+
     await call.answer()
-    await _ask_screenshot_style(call.message, call.from_user.id, telegram_id, contact_id, ctx["chat_text"], edit=True)
+    await _prompt_screenshot_style(call.message, call.from_user.id, telegram_id, contact_id, ctx["chat_text"], edit=True)
 
 
-async def _ask_screenshot_style(
+async def _prompt_screenshot_style(
     target: Message, user_id: int, telegram_id: str, contact_id: int, chat_text: str, edit: bool = False
 ) -> None:
     # ВАЖНО: user_id передаётся отдельным параметром, а не берётся из
@@ -1578,80 +1624,38 @@ async def _ask_screenshot_style(
     interaction_card = await _gen_interaction_card(contact_id, telegram_id) or ""
 
     _last_action[user_id] = {
-        "kind": "screenshot", "chat_text": chat_text, "contact_id": contact_id,
+        "kind": "screenshot", "chat_text": chat_text, "result": None, "style": None,
         "style_card": style_card, "interaction_card": interaction_card,
     }
     text = "В каком стиле ответить?"
-    kb = screenshot_style_kb()
+    kb = style_pick_kb()
     if edit:
         await target.edit_text(text, reply_markup=kb)
     else:
         await target.answer(text, reply_markup=kb)
 
 
-@dp.callback_query(F.data.startswith("shotstyle:"))
-async def cb_screenshot_style(call: CallbackQuery) -> None:
-    style_key = call.data.split(":", 1)[1]
-    ctx = _last_action.get(call.from_user.id)
-    if not ctx or ctx.get("kind") != "screenshot" or style_key not in REPLY_STYLES:
-        await call.answer("Контекст устарел — начни заново через «📸 По скриншоту».", show_alert=True)
+async def _prompt_screenshot_style_no_contact(
+    target: Message, user_id: int, telegram_id: str, chat_text: str, edit: bool = False
+) -> None:
+    """Для человека, которого ещё нет в базе — общий (агрегатный) стиль автора,
+    без per-contact interaction_card (промпт сам подставит нейтральный фолбэк)."""
+    style_card = await _gen_style_card(telegram_id)
+    if not style_card:
+        text = "Не удалось получить твой стиль — сначала загрузи JSON чата или дай накопить сообщений."
+        await (target.edit_text(text) if edit else target.answer(text))
         return
 
-    await call.answer()
-    ctx["style"] = style_key
-    # reply_markup=None — явно снимаем клавиатуру выбора стиля (Telegram может
-    # сохранить старую клавиатуру, если reply_markup не передан явным None).
-    await call.message.edit_text(f"Генерирую ответ в стиле «{REPLY_STYLES[style_key][0]}»...", reply_markup=None)
-
-    try:
-        result, expl, rating = await suggest_reply_from_screenshot(
-            ctx["chat_text"], style_key, ctx["style_card"], ctx["interaction_card"], REPLY_STYLES[style_key][1],
-        )
-        ctx["result"] = result
-        await _send_screenshot_result(call.message, result, expl, rating)
-    except RateLimitError:
-        await call.message.answer("Лимит исчерпан, попробуй позже.")
-    except Exception:
-        logging.exception("screenshot: ошибка генерации ответа")
-        await call.message.answer("Не получилось сгенерировать ответ — попробуй ещё раз.")
-
-
-@dp.callback_query(F.data == "shotother")
-async def cb_screenshot_other_style(call: CallbackQuery) -> None:
-    ctx = _last_action.get(call.from_user.id)
-    if not ctx or ctx.get("kind") != "screenshot":
-        await call.answer("Контекст устарел — начни заново.", show_alert=True)
-        return
-    await call.answer()
-    await call.message.answer("В каком стиле ответить?", reply_markup=screenshot_style_kb())
-
-
-@dp.callback_query(F.data == "shotregen")
-async def cb_screenshot_regen(call: CallbackQuery) -> None:
-    ctx = _last_action.get(call.from_user.id)
-    if not ctx or ctx.get("kind") != "screenshot" or not ctx.get("style"):
-        await call.answer("Контекст устарел — начни заново.", show_alert=True)
-        return
-    await call.answer("Перегенерирую...")
-    try:
-        result, expl, rating = await suggest_reply_from_screenshot(
-            ctx["chat_text"], ctx["style"], ctx["style_card"], ctx["interaction_card"],
-            REPLY_STYLES[ctx["style"]][1],
-        )
-        ctx["result"] = result
-        await _send_screenshot_result(call.message, result, expl, rating)
-    except RateLimitError:
-        await call.message.answer("Лимит исчерпан, попробуй позже.")
-    except Exception:
-        logging.exception("screenshot: ошибка перегенерации")
-        await call.message.answer("Не получилось перегенерировать — попробуй ещё раз.")
-
-
-@dp.callback_query(F.data == "shotcopy")
-async def cb_screenshot_copy(call: CallbackQuery) -> None:
-    # Bot API не даёт программного доступа к буферу обмена пользователя —
-    # реальный способ скопировать: тап по <code>-блоку в сообщении выше.
-    await call.answer("Текст уже в сообщении выше — зажми блок и скопируй.", show_alert=True)
+    _last_action[user_id] = {
+        "kind": "screenshot", "chat_text": chat_text, "result": None, "style": None,
+        "style_card": style_card, "interaction_card": "",
+    }
+    text = "В каком стиле ответить?"
+    kb = style_pick_kb()
+    if edit:
+        await target.edit_text(text, reply_markup=kb)
+    else:
+        await target.answer(text, reply_markup=kb)
 
 
 # ── /rebuild_all — принудительная пересборка всего (для теста) ───────────────
@@ -1735,11 +1739,13 @@ async def _show_help(message: Message) -> None:
         "/delete — удалить свои данные\n"
         "/rebuild_all — принудительно пересобрать все карточки\n\n"
         "Кнопки в меню:\n"
-        "📝 Переписать — черновик → готовое сообщение\n"
-        "📸 По скриншоту — пришли скриншот переписки, выбери стиль ответа\n"
-        "💬 Ответить за меня — подскажу ответ на сообщение собеседника\n"
-        "👤 Мой стиль — как ты общаешься в целом\n"
-        "🎯 Мой стиль с ним — твой стиль с конкретным человеком\n"
+        "📝 Переписать — черновик → выбор стиля (флирт/юмор/нежно/уверенно/"
+        "дружески/формально) → готовое сообщение\n"
+        "📸 По скриншоту — пришли скриншот переписки, выбери чей это диалог "
+        "(можно выбрать «🆕 Новый человек», если его ещё нет в базе) и стиль ответа. "
+        "После ответа можно сразу прислать следующий скриншот — без повторного "
+        "нажатия кнопки, пока не выйдешь через меню\n"
+        "💬 Ответить за меня — подскажу ответ на сообщение собеседника, с выбором стиля\n"
         "🔍 Стиль собеседника — паттерны и советы по нему\n"
         "🔬 Глубокий анализ — совместимость, история отношений по периодам, "
         "сильные стороны/проблемы/точки роста, идеи подарков\n"
@@ -1850,7 +1856,7 @@ async def cmd_compare(message: Message) -> None:
     await message.answer("Сравниваю как ты пишешь разным людям — ~20 секунд...")
     try:
         result = await compare_my_styles(cards)
-        await message.answer(result)
+        await _answer_long(message, result)
     except Exception as e:
         await message.answer(f"Ошибка: {e}")
 
@@ -1959,16 +1965,12 @@ async def auto_rewrite_handler(message: Message, state: FSMContext) -> None:
     if not style_card or not interaction_card:
         return
 
-    try:
-        draft = message.text.strip()
-        result = await rewrite_message(draft, style_card, interaction_card)
-        _last_action[message.from_user.id] = {
-            "kind": "rewrite", "text": draft, "result": result,
-            "style_card": style_card, "interaction_card": interaction_card,
-        }
-        await message.answer(result, reply_markup=result_kb())
-    except Exception as e:
-        await message.answer(f"Ошибка: {e}")
+    draft = message.text.strip()
+    _last_action[message.from_user.id] = {
+        "kind": "rewrite", "text": draft, "result": None, "style": None,
+        "style_card": style_card, "interaction_card": interaction_card,
+    }
+    await message.answer("В каком стиле переписать?", reply_markup=style_pick_kb())
 
 
 # ── запуск ────────────────────────────────────────────────────────────────────
