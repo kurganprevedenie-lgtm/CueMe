@@ -29,6 +29,19 @@ VISION_MODEL = os.getenv("VISION_MODEL", "qwen/qwen3.6-27b")
 REBUILD_THRESHOLD = int(os.getenv("REBUILD_THRESHOLD", "50"))
 SAMPLE_SIZE = int(os.getenv("SAMPLE_SIZE", "150"))
 
+# ── Подписка (Tribute) ──────────────────────────────────────────────────────
+# Приватный канал-пропуск: Tribute сам добавляет/убирает участников по оплате,
+# бот только проверяет членство через get_chat_member. ID вида "-100...",
+# известен после создания канала и добавления бота туда админом.
+PREMIUM_CHANNEL_ID = os.getenv("PREMIUM_CHANNEL_ID")
+# Ссылка на оформление подписки (со страницы канала в Tribute) — показываем в пейволле.
+PREMIUM_SUBSCRIBE_URL = os.getenv("PREMIUM_SUBSCRIBE_URL", "")
+# Сколько бесплатных генераций (Переписать/Ответить за меня/По скриншоту) даём
+# до пейволла. Остальные функции (глубокий анализ и т.п.) только по подписке.
+FREE_TRIAL_REQUESTS = int(os.getenv("FREE_TRIAL_REQUESTS", "5"))
+# Кэш проверки членства в канале (сек) — не дёргать Telegram API на каждое сообщение.
+PREMIUM_CACHE_TTL = int(os.getenv("PREMIUM_CACHE_TTL", "300"))
+
 # Стили ответа для фичи «Ответить по скриншоту».
 # [0] — подпись на кнопке, [1] — инструкция стиля для промпта генерации.
 REPLY_STYLES = {

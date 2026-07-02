@@ -20,7 +20,17 @@ from aiogram.types import (
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
 
-from config import APP_NAME, BOT_TOKEN, REBUILD_THRESHOLD, REPLY_STYLES, SAMPLE_SIZE
+from config import (
+    APP_NAME,
+    BOT_TOKEN,
+    FREE_TRIAL_REQUESTS,
+    PREMIUM_CACHE_TTL,
+    PREMIUM_CHANNEL_ID,
+    PREMIUM_SUBSCRIBE_URL,
+    REBUILD_THRESHOLD,
+    REPLY_STYLES,
+    SAMPLE_SIZE,
+)
 from features import extract_features
 from llm import (
     ILLEGIBLE_MARKER,
@@ -64,6 +74,8 @@ from storage import (
     get_interaction_card,
     get_imported_messages,
     get_message_samples,
+    get_trial_used,
+    increment_trial_used,
     save_imported_messages,
     get_my_style_last_rebuild_count,
     get_my_style_per_contact,
@@ -169,6 +181,76 @@ async def _edit_or_answer_long(message: Message, text: str) -> None:
     await message.edit_text(chunks[0])
     for chunk in chunks[1:]:
         await message.answer(chunk)
+
+
+# ── Подписка (Tribute) ──────────────────────────────────────────────────────
+# Пропуск — членство в приватном канале, которым управляет Tribute (добавляет
+# при оплате, убирает при отмене/неоплате). Бот только читает текущий статус.
+
+_premium_cache: dict[str, tuple[bool, float]] = {}  # telegram_id -> (is_premium, checked_at)
+
+
+async def _is_premium(bot: Bot, telegram_id: str) -> bool:
+    """Проверяет членство в PREMIUM_CHANNEL_ID с кэшем на PREMIUM_CACHE_TTL сек,
+    чтобы не дёргать Telegram API на каждое сообщение. Пока PREMIUM_CHANNEL_ID
+    не настроен — всегда False (только бесплатные попытки)."""
+    if not PREMIUM_CHANNEL_ID:
+        return False
+
+    cached = _premium_cache.get(telegram_id)
+    if cached and time.monotonic() - cached[1] < PREMIUM_CACHE_TTL:
+        return cached[0]
+
+    try:
+        member = await bot.get_chat_member(PREMIUM_CHANNEL_ID, int(telegram_id))
+        is_prem = member.status in ("member", "administrator", "creator")
+    except Exception:
+        is_prem = False
+
+    _premium_cache[telegram_id] = (is_prem, time.monotonic())
+    return is_prem
+
+
+def paywall_kb() -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    if PREMIUM_SUBSCRIBE_URL:
+        b.button(text="💎 Оформить подписку", url=PREMIUM_SUBSCRIBE_URL)
+    b.adjust(1)
+    return b.as_markup()
+
+
+async def _send_paywall(target: Message, text: str) -> None:
+    await target.answer(text, reply_markup=paywall_kb())
+
+
+async def _consume_trial_or_paywall(bot: Bot, target: Message, telegram_id: str) -> bool:
+    """Гейт для «Переписать»/«Ответить за меня»/«По скриншоту»: премиум — всегда
+    можно, иначе тратит одну из FREE_TRIAL_REQUESTS бесплатных попыток.
+    True — можно генерировать, False — уже показан пейволл."""
+    if await _is_premium(bot, telegram_id):
+        return True
+
+    used = get_trial_used(telegram_id)
+    if used < FREE_TRIAL_REQUESTS:
+        increment_trial_used(telegram_id)
+        return True
+
+    await _send_paywall(
+        target,
+        f"Бесплатные попытки закончились ({FREE_TRIAL_REQUESTS} использовано). "
+        "Дальше — по подписке CueMe Premium."
+    )
+    return False
+
+
+async def _require_premium(bot: Bot, target: Message, telegram_id: str) -> bool:
+    """Гейт для функций без бесплатного триала (глубокий анализ, стиль
+    собеседника, /compare и т.п.) — доступ только по активной подписке."""
+    if await _is_premium(bot, telegram_id):
+        return True
+
+    await _send_paywall(target, "Эта функция доступна только по подписке CueMe Premium.")
+    return False
 
 
 def main_kb() -> ReplyKeyboardMarkup:
@@ -623,7 +705,11 @@ def deep_analysis_result_kb(contact_id: int) -> InlineKeyboardMarkup:
     return b.as_markup()
 
 
-async def _run_deep_analysis(target: Message, telegram_id: str, contact_id: int, edit: bool = False) -> None:
+async def _run_deep_analysis(
+    bot: Bot, target: Message, telegram_id: str, contact_id: int, edit: bool = False
+) -> None:
+    if not await _require_premium(bot, target, telegram_id):
+        return
     contact = get_contact_by_id(contact_id)
     if not contact:
         text = "Контакт не найден."
@@ -657,7 +743,7 @@ async def _run_deep_analysis(target: Message, telegram_id: str, contact_id: int,
     await _answer_long(target, msg2, reply_markup=deep_analysis_result_kb(contact_id))
 
 
-async def _show_deep_analysis(message: Message) -> None:
+async def _show_deep_analysis(message: Message, bot: Bot) -> None:
     telegram_id = str(message.from_user.id)
     contacts = list_contacts(telegram_id)
     if not contacts:
@@ -665,32 +751,32 @@ async def _show_deep_analysis(message: Message) -> None:
         return
 
     if len(contacts) == 1:
-        await _run_deep_analysis(message, telegram_id, contacts[0]["id"])
+        await _run_deep_analysis(bot, message, telegram_id, contacts[0]["id"])
         return
 
     await message.answer("Для кого сделать глубокий анализ?", reply_markup=contacts_kb(contacts, "deepan"))
 
 
 @dp.message(Command("deep_analysis"))
-async def cmd_deep_analysis(message: Message) -> None:
-    await _show_deep_analysis(message)
+async def cmd_deep_analysis(message: Message, bot: Bot) -> None:
+    await _show_deep_analysis(message, bot)
 
 
 @dp.callback_query(F.data.startswith("deepan_refresh:"))
-async def cb_deep_analysis_refresh(call: CallbackQuery) -> None:
+async def cb_deep_analysis_refresh(call: CallbackQuery, bot: Bot) -> None:
     contact_id  = int(call.data.split(":")[1])
     telegram_id = str(call.from_user.id)
     await call.answer("Пересобираю анализ...")
     delete_deep_analysis(contact_id)
-    await _run_deep_analysis(call.message, telegram_id, contact_id)
+    await _run_deep_analysis(bot, call.message, telegram_id, contact_id)
 
 
 @dp.callback_query(F.data.startswith("deepan:"))
-async def cb_deep_analysis_contact(call: CallbackQuery) -> None:
+async def cb_deep_analysis_contact(call: CallbackQuery, bot: Bot) -> None:
     contact_id  = int(call.data.split(":")[1])
     telegram_id = str(call.from_user.id)
     await call.answer()
-    await _run_deep_analysis(call.message, telegram_id, contact_id, edit=True)
+    await _run_deep_analysis(bot, call.message, telegram_id, contact_id, edit=True)
 
 
 # ── 🪞 Глубокий анализ моего стиля (агрегат по всем контактам) ────────────────
@@ -748,7 +834,9 @@ def deep_style_result_kb() -> InlineKeyboardMarkup:
     return b.as_markup()
 
 
-async def _run_deep_style_analysis(target: Message, telegram_id: str) -> None:
+async def _run_deep_style_analysis(bot: Bot, target: Message, telegram_id: str) -> None:
+    if not await _require_premium(bot, target, telegram_id):
+        return
     await target.answer("Готовлю глубокий анализ твоего стиля. Это займёт ~30 секунд...")
 
     try:
@@ -774,25 +862,25 @@ async def _run_deep_style_analysis(target: Message, telegram_id: str) -> None:
     await _answer_long(target, msg2, reply_markup=deep_style_result_kb())
 
 
-async def _show_deep_style_analysis(message: Message) -> None:
+async def _show_deep_style_analysis(message: Message, bot: Bot) -> None:
     telegram_id = str(message.from_user.id)
     if not list_contacts(telegram_id):
         await message.answer("Сначала загрузи JSON-файл чата.")
         return
-    await _run_deep_style_analysis(message, telegram_id)
+    await _run_deep_style_analysis(bot, message, telegram_id)
 
 
 @dp.message(Command("deep_style_analysis"))
-async def cmd_deep_style_analysis(message: Message) -> None:
-    await _show_deep_style_analysis(message)
+async def cmd_deep_style_analysis(message: Message, bot: Bot) -> None:
+    await _show_deep_style_analysis(message, bot)
 
 
 @dp.callback_query(F.data == "deepstyle_refresh")
-async def cb_deep_style_analysis_refresh(call: CallbackQuery) -> None:
+async def cb_deep_style_analysis_refresh(call: CallbackQuery, bot: Bot) -> None:
     telegram_id = str(call.from_user.id)
     await call.answer("Пересобираю анализ...")
     delete_deep_style_analysis(telegram_id)
-    await _run_deep_style_analysis(call.message, telegram_id)
+    await _run_deep_style_analysis(bot, call.message, telegram_id)
 
 
 # ── Business API ──────────────────────────────────────────────────────────────
@@ -890,6 +978,8 @@ def _capabilities_text() -> str:
         "🔬 Глубокий анализ — совместимость, история отношений, подарки\n"
         "🪞 Глубокий анализ стиля — твой коммуникативный профиль и советы для дейтинга\n"
         "📋 Контакты · /stats — портрет в цифрах · /compare — сравнить стили\n\n"
+        f"💎 {FREE_TRIAL_REQUESTS} бесплатных попыток на переписать/ответить/скриншот, "
+        "дальше и остальные функции — по подписке. Статус — /premium.\n\n"
         "Полный список команд — /help"
     )
 
@@ -991,7 +1081,7 @@ async def cmd_demo(message: Message, state: FSMContext) -> None:
 # ── Кнопки главного меню ──────────────────────────────────────────────────────
 
 @dp.message(F.text.in_(_ALL_BTNS))
-async def handle_menu_button(message: Message, state: FSMContext) -> None:
+async def handle_menu_button(message: Message, state: FSMContext, bot: Bot) -> None:
     await state.clear()
     if message.text == BTN_REWRITE:
         await _start_rewrite(message, state)
@@ -1000,13 +1090,13 @@ async def handle_menu_button(message: Message, state: FSMContext) -> None:
     elif message.text == BTN_REPLY:
         await _start_reply(message, state)
     elif message.text == BTN_CONTACT:
-        await _show_contact_style(message)
+        await _show_contact_style(message, bot)
     elif message.text == BTN_CONTACTS:
         await _show_contacts(message)
     elif message.text == BTN_DEEP:
-        await _show_deep_analysis(message)
+        await _show_deep_analysis(message, bot)
     elif message.text == BTN_DEEP_STYLE:
-        await _show_deep_style_analysis(message)
+        await _show_deep_style_analysis(message, bot)
     elif message.text == BTN_HELP:
         await _show_help(message)
 
@@ -1291,11 +1381,14 @@ async def cmd_contacts(message: Message) -> None:
 
 # ── 🔍 Стиль собеседника ──────────────────────────────────────────────────────
 
-async def _show_contact_style(message: Message) -> None:
+async def _show_contact_style(message: Message, bot: Bot) -> None:
     telegram_id = str(message.from_user.id)
     contacts = list_contacts(telegram_id)
     if not contacts:
         await message.answer("Нет загруженных чатов. Отправь JSON-файл.")
+        return
+
+    if not await _require_premium(bot, message, telegram_id):
         return
 
     if len(contacts) == 1:
@@ -1315,11 +1408,16 @@ async def _show_contact_style(message: Message) -> None:
 
 
 @dp.callback_query(F.data.startswith("cstyle:"))
-async def cb_contact_style(call: CallbackQuery) -> None:
+async def cb_contact_style(call: CallbackQuery, bot: Bot) -> None:
     contact_id = int(call.data.split(":")[1])
     contact    = get_contact_by_id(contact_id)
     if not contact:
         await call.answer("Контакт не найден.")
+        return
+
+    telegram_id = str(call.from_user.id)
+    if not await _require_premium(bot, call.message, telegram_id):
+        await call.answer()
         return
 
     await call.answer()
@@ -1425,6 +1523,9 @@ async def handle_draft(message: Message, state: FSMContext, bot: Bot) -> None:
     data = await state.get_data()
     await state.clear()
 
+    if not await _consume_trial_or_paywall(bot, message, str(message.from_user.id)):
+        return
+
     _last_action[message.from_user.id] = {
         "kind": "rewrite", "text": draft, "result": None, "style": None,
         "style_card": data["style_card"], "interaction_card": data["interaction_card"],
@@ -1511,6 +1612,9 @@ async def handle_incoming(message: Message, state: FSMContext, bot: Bot) -> None
     # авто-режим («Переписать») вместо продолжения «Ответить за меня».
     # Выйти из режима — любая кнопка меню (handle_menu_button сбрасывает state).
 
+    if not await _consume_trial_or_paywall(bot, message, str(message.from_user.id)):
+        return
+
     _last_action[message.from_user.id] = {
         "kind": "reply", "text": incoming, "result": None, "style": None,
         "style_card": data["style_card"], "interaction_card": data["interaction_card"],
@@ -1586,7 +1690,7 @@ async def _proceed_screenshot_style_pick(message: Message, state: FSMContext, ch
 
 
 @dp.callback_query(F.data.startswith("shotcontact:"))
-async def cb_screenshot_contact(call: CallbackQuery) -> None:
+async def cb_screenshot_contact(call: CallbackQuery, bot: Bot) -> None:
     raw_id = call.data.split(":", 1)[1]
     telegram_id = str(call.from_user.id)
 
@@ -1597,7 +1701,7 @@ async def cb_screenshot_contact(call: CallbackQuery) -> None:
 
     if raw_id == "new":
         await call.answer()
-        await _prompt_screenshot_style_no_contact(call.message, call.from_user.id, telegram_id, ctx["chat_text"], edit=True)
+        await _prompt_screenshot_style_no_contact(bot, call.message, call.from_user.id, telegram_id, ctx["chat_text"], edit=True)
         return
 
     contact_id = int(raw_id)
@@ -1607,15 +1711,17 @@ async def cb_screenshot_contact(call: CallbackQuery) -> None:
         return
 
     await call.answer()
-    await _prompt_screenshot_style(call.message, call.from_user.id, telegram_id, contact_id, ctx["chat_text"], edit=True)
+    await _prompt_screenshot_style(bot, call.message, call.from_user.id, telegram_id, contact_id, ctx["chat_text"], edit=True)
 
 
 async def _prompt_screenshot_style(
-    target: Message, user_id: int, telegram_id: str, contact_id: int, chat_text: str, edit: bool = False
+    bot: Bot, target: Message, user_id: int, telegram_id: str, contact_id: int, chat_text: str, edit: bool = False
 ) -> None:
     # ВАЖНО: user_id передаётся отдельным параметром, а не берётся из
     # target.from_user — при edit=True target это call.message, чей
     # .from_user это БОТ, а не пользователь (стандартная ловушка aiogram).
+    if not await _consume_trial_or_paywall(bot, target, telegram_id):
+        return
     style_card = await _style_for_rewrite(telegram_id, contact_id)
     if not style_card:
         text = "Не удалось получить твой стиль — сначала загрузи JSON чата или дай накопить сообщений."
@@ -1636,10 +1742,12 @@ async def _prompt_screenshot_style(
 
 
 async def _prompt_screenshot_style_no_contact(
-    target: Message, user_id: int, telegram_id: str, chat_text: str, edit: bool = False
+    bot: Bot, target: Message, user_id: int, telegram_id: str, chat_text: str, edit: bool = False
 ) -> None:
     """Для человека, которого ещё нет в базе — общий (агрегатный) стиль автора,
     без per-contact interaction_card (промпт сам подставит нейтральный фолбэк)."""
+    if not await _consume_trial_or_paywall(bot, target, telegram_id):
+        return
     style_card = await _gen_style_card(telegram_id)
     if not style_card:
         text = "Не удалось получить твой стиль — сначала загрузи JSON чата или дай накопить сообщений."
@@ -1661,8 +1769,10 @@ async def _prompt_screenshot_style_no_contact(
 # ── /rebuild_all — принудительная пересборка всего (для теста) ───────────────
 
 @dp.message(Command("rebuild_all"))
-async def cmd_rebuild_all(message: Message) -> None:
+async def cmd_rebuild_all(message: Message, bot: Bot) -> None:
     telegram_id = str(message.from_user.id)
+    if not await _require_premium(bot, message, telegram_id):
+        return
     contacts = list_contacts(telegram_id)
     if not contacts:
         await message.answer("Нет контактов для пересборки.")
@@ -1736,6 +1846,7 @@ async def _show_help(message: Message) -> None:
         "/contacts — список загруженных чатов\n"
         "/deep_analysis — глубокий анализ: совместимость, история, подарки\n"
         "/deep_style_analysis — глубокий анализ твоего стиля (агрегат по всем)\n"
+        "/premium — статус подписки и ссылка на оформление\n"
         "/delete — удалить свои данные\n"
         "/rebuild_all — принудительно пересобрать все карточки\n\n"
         "Кнопки в меню:\n"
@@ -1754,13 +1865,34 @@ async def _show_help(message: Message) -> None:
         "📋 Контакты — загруженные переписки\n"
         "❓ Помощь — это сообщение\n\n"
         "Любое сообщение, которое ты просто напишешь боту, автоматически "
-        "переписывается под активного собеседника (🟢 в /contacts)."
+        "переписывается под активного собеседника (🟢 в /contacts).\n\n"
+        f"💎 Переписать/Ответить/Скриншот — {FREE_TRIAL_REQUESTS} бесплатных попыток, "
+        "дальше и весь остальной функционал — по подписке CueMe Premium. Статус — /premium."
     )
 
 
 @dp.message(Command("help"))
 async def cmd_help(message: Message) -> None:
     await _show_help(message)
+
+
+# ── /premium — статус подписки ────────────────────────────────────────────────
+
+@dp.message(Command("premium"))
+async def cmd_premium(message: Message, bot: Bot) -> None:
+    telegram_id = str(message.from_user.id)
+    if await _is_premium(bot, telegram_id):
+        await message.answer("💎 Подписка CueMe Premium активна — весь функционал без ограничений.")
+        return
+
+    used = get_trial_used(telegram_id)
+    left = max(0, FREE_TRIAL_REQUESTS - used)
+    await message.answer(
+        f"Бесплатных попыток осталось: {left} из {FREE_TRIAL_REQUESTS} "
+        "(Переписать / Ответить за меня / По скриншоту).\n"
+        "Глубокий анализ, стиль собеседника и сравнение стилей — только по подписке.",
+        reply_markup=paywall_kb(),
+    )
 
 
 # ── /stats — портрет в цифрах (без LLM) ──────────────────────────────────────
@@ -1844,8 +1976,10 @@ async def cmd_stats(message: Message) -> None:
 # ── /compare — сравнение стиля с разными людьми ──────────────────────────────
 
 @dp.message(Command("compare"))
-async def cmd_compare(message: Message) -> None:
+async def cmd_compare(message: Message, bot: Bot) -> None:
     telegram_id = str(message.from_user.id)
+    if not await _require_premium(bot, message, telegram_id):
+        return
     cards = get_all_per_contact_style_cards(telegram_id)
     if len(cards) < 2:
         await message.answer(
@@ -1946,7 +2080,7 @@ async def cb_delete_cancel(call: CallbackQuery) -> None:
 # ── Авто-переписка (catch-all, должен быть последним) ─────────────────────────
 
 @dp.message(F.text & ~F.text.in_(_ALL_BTNS))
-async def auto_rewrite_handler(message: Message, state: FSMContext) -> None:
+async def auto_rewrite_handler(message: Message, state: FSMContext, bot: Bot) -> None:
     if await state.get_state() is not None:
         return
 
@@ -1963,6 +2097,9 @@ async def auto_rewrite_handler(message: Message, state: FSMContext) -> None:
     style_card       = await _style_for_rewrite(telegram_id, contact_id)
     interaction_card = get_interaction_card(contact_id)
     if not style_card or not interaction_card:
+        return
+
+    if not await _consume_trial_or_paywall(bot, message, telegram_id):
         return
 
     draft = message.text.strip()
@@ -1992,6 +2129,7 @@ async def main() -> None:
         BotCommand(command="contacts",    description="Загруженные чаты"),
         BotCommand(command="deep_analysis", description="Глубокий анализ отношений"),
         BotCommand(command="deep_style_analysis", description="Глубокий анализ моего стиля"),
+        BotCommand(command="premium",     description="Статус подписки"),
         BotCommand(command="delete",      description="Удалить свои данные"),
         BotCommand(command="rebuild_all", description="Пересобрать все карточки"),
     ])
