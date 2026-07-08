@@ -19,6 +19,14 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 # OpenRouter — llama-3.1-8b-instruct:free.
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 
+# Порядок каскада LLM (через запятую). Дефолт — Gemini основной. На сервере без
+# GEMINI_PROXY имеет смысл поставить groq первым: "groq,gemini,openrouter".
+LLM_PROVIDER_ORDER = os.getenv("LLM_PROVIDER_ORDER", "gemini,groq,openrouter")
+
+# TTL кэша LLM-ответов (сек). Ключ контент-адресный (включает карточки стиля),
+# поэтому смена карточек инвалидирует запись сама; TTL — страховка от разрастания.
+LLM_CACHE_TTL_SEC = int(os.getenv("LLM_CACHE_TTL_SEC", str(7 * 24 * 3600)))  # 7 дней
+
 # Прокси ТОЛЬКО для Gemini (в РФ и др. регионах его API заблокирован по гео).
 # Напр. http://127.0.0.1:10809 или socks5://127.0.0.1:10808. Пусто = напрямую.
 GEMINI_PROXY = os.getenv("GEMINI_PROXY")
@@ -28,6 +36,9 @@ VISION_MODEL = os.getenv("VISION_MODEL", "qwen/qwen3.6-27b")
 
 REBUILD_THRESHOLD = int(os.getenv("REBUILD_THRESHOLD", "50"))
 SAMPLE_SIZE = int(os.getenv("SAMPLE_SIZE", "150"))
+# Троттлинг обновления message_samples: не чаще, чем раз в N business-сообщений на контакт
+# (перед реальной пересборкой карточек делается принудительный refresh).
+REFRESH_SAMPLES_EVERY_N = int(os.getenv("REFRESH_SAMPLES_EVERY_N", "5"))
 # Порог ПЕРВОЙ сборки карточек контакта (когда их ещё нет вообще) — ниже
 # обычного REBUILD_THRESHOLD, чтобы новый юзер быстрее увидел первый результат.
 FIRST_BUILD_THRESHOLD = int(os.getenv("FIRST_BUILD_THRESHOLD", "15"))
