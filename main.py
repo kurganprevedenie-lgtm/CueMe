@@ -45,6 +45,7 @@ from llm import (
     build_style_card,
     compare_my_styles,
     extract_chat_from_image,
+    analyze_reply_dynamics,
     get_forced_provider,
     make_features_summary,
     rewrite_message_explained,
@@ -1645,7 +1646,9 @@ async def _start_reply(message: Message, state: FSMContext) -> None:
         if not style_card or not interaction_card:
             await message.answer("Не удалось сгенерировать анализ.")
             return
-        await state.update_data(style_card=style_card, interaction_card=interaction_card)
+        await state.update_data(
+            style_card=style_card, interaction_card=interaction_card, contact_id=c["id"]
+        )
         await state.set_state(ReplyHelp.waiting_for_incoming)
         name = _contact_name(c)
         await message.answer(
@@ -1681,12 +1684,44 @@ async def cb_reply_contact(call: CallbackQuery, state: FSMContext) -> None:
         await call.message.edit_text("Не удалось сгенерировать анализ.")
         return
 
-    await state.update_data(style_card=style_card, interaction_card=interaction_card)
+    await state.update_data(
+        style_card=style_card, interaction_card=interaction_card, contact_id=contact_id
+    )
     await state.set_state(ReplyHelp.waiting_for_incoming)
     name = _contact_name(contact)
     await call.message.edit_text(
         f"Перешли или вставь сообщение от {name}, на которое нужно ответить:"
     )
+
+
+def _format_blocks(blocks: list[dict]) -> str:
+    """Собирает блоки observation/mechanism/action в читаемое сообщение."""
+    return "\n\n".join(
+        f"🔍 {b['observation']}\n⚙️ {b['mechanism']}\n🎯 {b['action']}" for b in blocks
+    )
+
+
+async def _send_reply_analysis(message: Message, contact_id, incoming: str) -> None:
+    """Короткий разбор динамики переписки перед выбором стиля.
+    Дополняет готовый ответ, не заменяет его. При любой проблеме — молча пропускаем,
+    чтобы не ломать основной flow ответа."""
+    if not contact_id:
+        return
+    samples = get_message_samples(contact_id)
+    if not samples:
+        return
+    try:
+        blocks = await analyze_reply_dynamics(
+            incoming,
+            samples["my_sample"],
+            samples["contact_sample"],
+            samples["features_summary"],
+        )
+    except Exception:
+        logging.exception("reply-analysis: не удалось сгенерировать разбор")
+        return
+    if blocks:
+        await message.answer("🧭 Разбор переписки:\n\n" + _format_blocks(blocks))
 
 
 @dp.message(ReplyHelp.waiting_for_incoming)
@@ -1704,6 +1739,10 @@ async def handle_incoming(message: Message, state: FSMContext, bot: Bot) -> None
 
     if not await _consume_trial_or_paywall(bot, message, str(message.from_user.id)):
         return
+
+    # Короткий разбор динамики (один вызов LLM на сообщение) — до выбора стиля,
+    # чтобы не пересчитывать его на каждой смене стиля/регенерации.
+    await _send_reply_analysis(message, data.get("contact_id"), incoming)
 
     _last_action[message.from_user.id] = {
         "kind": "reply", "text": incoming, "result": None, "style": None,

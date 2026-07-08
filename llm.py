@@ -579,6 +579,88 @@ def _split_rated(raw: str) -> tuple[str, str, str]:
     return msg, expl, rating
 
 
+_BLOCK_RE = re.compile(
+    r"<observation>(.*?)</observation>\s*"
+    r"<mechanism>(.*?)</mechanism>\s*"
+    r"<action>(.*?)</action>",
+    re.DOTALL | re.IGNORECASE,
+)
+
+
+def _parse_blocks(raw: str) -> list[dict]:
+    """Разбирает ответ-аналитик в блоки observation/mechanism/action (максимум 3)."""
+    blocks = [
+        {
+            "observation": m.group(1).strip(),
+            "mechanism":   m.group(2).strip(),
+            "action":      m.group(3).strip(),
+        }
+        for m in _BLOCK_RE.finditer(raw)
+    ]
+    return blocks[:3]
+
+
+def _format_samples(my_sample: list[str], contact_sample: list[str]) -> str:
+    """Собирает message_samples в текст с указанием автора."""
+    lines: list[str] = []
+    for text in (my_sample or []):
+        lines.append(f"[автор] {text}")
+    for text in (contact_sample or []):
+        lines.append(f"[собеседник] {text}")
+    return "\n".join(lines) if lines else "(нет сохранённых сообщений)"
+
+
+async def analyze_reply_dynamics(
+    incoming_msg: str,
+    my_sample: list[str],
+    contact_sample: list[str],
+    features_summary: str,
+) -> list[dict]:
+    """Короткий разбор динамики переписки: до 3 блоков observation/mechanism/action.
+    Дополняет (не заменяет) готовый стилевой ответ. Возвращает список блоков."""
+    message_samples = _format_samples(my_sample, contact_sample)
+    incoming = (incoming_msg or "").strip() or "(нет нового сообщения)"
+    prompt = (
+        "Ты — аналитик переписок в дейтинге. Твоя экспертиза узкая и конкретная: ты замечаешь\n"
+        "- дисбаланс инициативы (кто чаще пишет первым, предлагает встречу, задаёт вопросы);\n"
+        "- темп ответов (задержки, ускорения, «остывание» переписки);\n"
+        "- длину сообщений (динамика — растёт/падает, кто пишет короче);\n"
+        "- эмоциональные маркеры (эмодзи, восклицательные знаки, вопросы к собеседнику, "
+        "сухие односложные ответы, сарказм).\n\n"
+        "ВХОДНЫЕ ДАННЫЕ\n"
+        f"message_samples — конкретные сообщения из переписки (с автором):\n{message_samples}\n\n"
+        f"features_summary — агрегированные метрики:\n{features_summary}\n\n"
+        f"история диалога — последнее сообщение собеседника:\n{incoming}\n\n"
+        "Опирайся ТОЛЬКО на эти данные. Любое утверждение привязывается к конкретной фразе, "
+        "сообщению или метрике из входных данных. Если данных недостаточно — так и скажи, "
+        "не додумывай.\n\n"
+        "ЗАПРЕЩЕНО\n"
+        "- Общие фразы: «будь собой», «главное искренность», «не переживай» и их аналоги.\n"
+        "- Советы, применимые к любой переписке в мире. Если совет не привязан к конкретной "
+        "цитате или метрике — не пиши его.\n"
+        "- Утверждения о мыслях/чувствах человека без опоры на текст. Делаешь предположение — "
+        "помечай его тегом [гипотеза] и указывай, на какой фразе оно основано.\n\n"
+        "ЯЗЫК: только по-русски, простыми словами. Не упоминай технические названия "
+        "(«message_samples», «features_summary») и внутреннюю кухню.\n\n"
+        "ФОРМАТ ОТВЕТА\n"
+        "Максимум 3 блока. Лимиты на каждый тег: observation ≤ 30 слов, mechanism ≤ 30 слов, "
+        "action ≤ 40 слов. Строго теги, без текста вне них:\n\n"
+        "<observation>Конкретное наблюдение с точной цитатой из переписки</observation>\n"
+        "<mechanism>Почему это важно — конкретный механизм, а не общие слова</mechanism>\n"
+        "<action>Что конкретно сделать: готовый текст сообщения или точная тактика</action>\n\n"
+        "ПРИМЕР (образец глубины, не копируй тему):\n"
+        "<observation>За последние 5 сообщений она отвечает фразами из 3-4 слов («Ок», "
+        "«Ага, увидимся»), хотя раньше писала абзацами</observation>\n"
+        "<mechanism>Резкое сокращение длины при той же частоте — признак снижения "
+        "вовлечённости, а не занятости: отвечает быстро, но формально</mechanism>\n"
+        "<action>Не задавай очередной открытый вопрос. Напиши: «Чувствую, тебе сейчас не до "
+        "долгих переписок — может, просто договоримся на кофе в четверг?»</action>\n\n"
+        "ПРОВЕРКА: мысленно убери имена и цитаты. Если текст применим к любой другой паре — "
+        "перепиши конкретнее, с опорой на данные выше."
+    )
+    return _parse_blocks(await _ask(prompt))
+
+
 async def rewrite_message_explained(
     draft: str, style_card: str, interaction_card: str, style: str | None = None
 ) -> tuple[str, str, str]:
