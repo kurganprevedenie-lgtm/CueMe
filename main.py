@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+import html
 import logging
 import re
 import tempfile
@@ -15,6 +16,7 @@ from aiogram.types import (
     BotCommand,
     BusinessConnection,
     CallbackQuery, Document, Message,
+    CopyTextButton,
     InlineKeyboardMarkup,
     ReplyKeyboardMarkup, KeyboardButton,
 )
@@ -276,11 +278,20 @@ def style_pick_kb() -> InlineKeyboardMarkup:
     return b.as_markup()
 
 
-def style_result_kb() -> InlineKeyboardMarkup:
+# Telegram ограничивает CopyTextButton.text 256 символами.
+_COPY_TEXT_LIMIT = 256
+
+
+def style_result_kb(copy_text: str | None = None) -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     b.button(text="✏️ Другой стиль", callback_data="styleother")
     b.button(text="🔄 Перегенерировать", callback_data="styleregen")
-    b.button(text="📋 Скопировать", callback_data="stylecopy")
+    # Нативная кнопка Telegram копирует текст в буфер прямо на клиенте.
+    # Если текст длиннее лимита — fallback на callback (шлём копируемым блоком).
+    if copy_text and len(copy_text) <= _COPY_TEXT_LIMIT:
+        b.button(text="📋 Скопировать", copy_text=CopyTextButton(text=copy_text))
+    else:
+        b.button(text="📋 Скопировать", callback_data="stylecopy")
     b.adjust(1, 2)
     return b.as_markup()
 
@@ -320,7 +331,7 @@ async def _run_style_generation(target: Message, ctx: dict, state: FSMContext | 
         return
 
     ctx["result"] = result
-    await _answer_long(target, result, reply_markup=style_result_kb())
+    await _answer_long(target, result, reply_markup=style_result_kb(result))
     tail = ""
     if expl:
         tail += f"💡 {expl}"
@@ -381,12 +392,18 @@ async def cb_style_regen(call: CallbackQuery, state: FSMContext) -> None:
 
 @dp.callback_query(F.data == "stylecopy")
 async def cb_style_copy(call: CallbackQuery) -> None:
+    """Fallback для текста длиннее лимита CopyTextButton (256): шлём его
+    моноширинным блоком — по тапу Telegram копирует содержимое в буфер."""
     ctx = _last_action.get(call.from_user.id)
     if not ctx or not ctx.get("result"):
         await call.answer("Текст не найден — начни заново.", show_alert=True)
         return
-    await call.answer()
-    await _answer_long(call.message, ctx["result"])
+    await call.answer("Нажми на текст, чтобы скопировать")
+    wrapped = f"<code>{html.escape(ctx['result'])}</code>"
+    if len(wrapped) <= 4096:
+        await call.message.answer(wrapped, parse_mode="HTML")
+    else:
+        await _answer_long(call.message, ctx["result"])
 
 
 def contacts_kb(contacts: list, prefix: str) -> InlineKeyboardMarkup:
