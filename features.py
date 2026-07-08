@@ -115,7 +115,7 @@ def extract_features(chat: ParsedChat) -> ChatFeatures:
             total_messages=total,
             avg_message_length=_avg([len(m.text) for m in text_msgs]) or 0.0,
             avg_response_latency_sec=_avg(latencies),
-            question_ratio=sum(1 for m in text_msgs if m.text.rstrip().endswith("?")) / total if total else 0.0,
+            question_ratio=(sum(1 for m in text_msgs if m.text.rstrip().endswith("?")) / len(text_msgs)) if text_msgs else 0.0,
             emoji_per_message=_avg([_count_emojis(m.text) for m in text_msgs]) or 0.0,
             initiative_ratio=_initiative(side_id),
             photo_ratio=sum(1 for m in msgs if m.media_type == "photo") / total if total else 0.0,
