@@ -10,8 +10,12 @@ DB_PATH = Path("bot.db")
 
 
 def _conn() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
+    # timeout=30 — ждать снятия блокировки до 30 с вместо мгновенного "database is locked"
+    # (актуально при живом Business-потоке + фоновых пересборках).
+    conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.row_factory = sqlite3.Row
+    # WAL — параллельные чтения не блокируются записью; настройка персистентная на файле БД.
+    conn.execute("PRAGMA journal_mode=WAL")
     return conn
 
 
@@ -19,6 +23,15 @@ def _add_column_if_missing(conn: sqlite3.Connection, table: str, column: str, de
     existing = [row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()]
     if column not in existing:
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+
+def _create_index_if_missing(
+    conn: sqlite3.Connection, name: str, table: str, columns: str, unique: bool = False
+) -> None:
+    """Идемпотентно создаёт индекс. CREATE INDEX IF NOT EXISTS сам по себе безопасен,
+    обёртка — для единообразия с _add_column_if_missing и читаемости миграций."""
+    kind = "UNIQUE INDEX" if unique else "INDEX"
+    conn.execute(f"CREATE {kind} IF NOT EXISTS {name} ON {table} ({columns})")
 
 
 def init_db() -> None:
@@ -117,6 +130,12 @@ def init_db() -> None:
                 tips_text        TEXT NOT NULL,
                 updated_at       TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS llm_cache (
+                cache_key  TEXT PRIMARY KEY,
+                result     TEXT NOT NULL,   -- JSON-сериализованный результат
+                created_at TEXT NOT NULL
+            );
         """)
         _add_column_if_missing(conn, "users", "auto_mode", "INTEGER DEFAULT 0")
         _add_column_if_missing(conn, "users", "auto_contact_id", "INTEGER")
@@ -127,6 +146,33 @@ def init_db() -> None:
         ms_cols = [r[1] for r in conn.execute("PRAGMA table_info(message_samples)").fetchall()]
         if "user_features_summary" in ms_cols:
             conn.execute("ALTER TABLE message_samples DROP COLUMN user_features_summary")
+
+        # Индексы под горячие выборки (пересборка карточек, чтение истории)
+        _create_index_if_missing(
+            conn, "idx_biz_msgs_lookup", "business_messages",
+            "owner_user_id, chat_ref, direction, date",
+        )
+        _create_index_if_missing(
+            conn, "idx_imported_lookup", "imported_messages",
+            "contact_id, direction",
+        )
+        # Дедуп business-сообщений: убираем существующие дубли (по connection_id+chat_ref+
+        # tg_message_id), затем ставим UNIQUE-индекс. NULL-id не трогаем (у них нет ключа).
+        conn.execute(
+            """
+            DELETE FROM business_messages
+            WHERE tg_message_id IS NOT NULL
+              AND id NOT IN (
+                  SELECT MIN(id) FROM business_messages
+                  WHERE tg_message_id IS NOT NULL
+                  GROUP BY connection_id, chat_ref, tg_message_id
+              )
+            """
+        )
+        _create_index_if_missing(
+            conn, "idx_biz_msg_unique", "business_messages",
+            "connection_id, chat_ref, tg_message_id", unique=True,
+        )
 
 
 def _now() -> str:
@@ -566,6 +612,33 @@ def delete_deep_style_analysis(user_telegram_id: str) -> None:
         )
 
 
+# ── LLM cache (контент-адресный кэш ответов генерации) ────────────────────────
+
+def get_llm_cache(cache_key: str, max_age_sec: int) -> str | None:
+    """Кэшированный результат по ключу или None (нет записи / протухла по TTL)."""
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT result, created_at FROM llm_cache WHERE cache_key = ?", (cache_key,)
+        ).fetchone()
+    if not row:
+        return None
+    try:
+        age = (datetime.now(timezone.utc) - datetime.fromisoformat(row["created_at"])).total_seconds()
+    except (ValueError, TypeError):
+        return None
+    if age > max_age_sec:
+        return None
+    return row["result"]
+
+
+def set_llm_cache(cache_key: str, result: str) -> None:
+    with _conn() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO llm_cache (cache_key, result, created_at) VALUES (?, ?, ?)",
+            (cache_key, result, _now()),
+        )
+
+
 def get_all_dated_my_messages(owner_user_id: str) -> list[dict]:
     """Все исходящие сообщения пользователя (business + imported) по ВСЕМ его
     контактам, с датами — для агрегатного глубокого анализа собственного стиля."""
@@ -732,11 +805,13 @@ def save_business_message(
     date: str,
     tg_message_id: int | None,
     raw_meta: dict,
-) -> None:
+) -> bool:
+    """Сохраняет business-сообщение. Возвращает True, если ряд вставлен, и False,
+    если это дубль (повторная доставка того же connection_id+chat_ref+tg_message_id)."""
     with _conn() as conn:
-        conn.execute(
+        cur = conn.execute(
             """
-            INSERT INTO business_messages
+            INSERT OR IGNORE INTO business_messages
                 (connection_id, owner_user_id, chat_ref, direction,
                  text, date, tg_message_id, raw_meta)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -752,6 +827,7 @@ def save_business_message(
                 json.dumps(raw_meta, ensure_ascii=False),
             ),
         )
+        return cur.rowcount > 0
 
 
 # ── auto mode ─────────────────────────────────────────────────────────────────
