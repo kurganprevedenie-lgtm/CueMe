@@ -13,6 +13,7 @@ import base64
 import logging
 import random
 import re
+import time
 from abc import ABC, abstractmethod
 
 import httpx
@@ -21,6 +22,7 @@ from config import (
     GEMINI_API_KEY,
     GEMINI_PROXY,
     GROQ_API_KEY,
+    LLM_PROVIDER_ORDER,
     OPENROUTER_API_KEY,
     REPLY_STYLES,
     VISION_MODEL,
@@ -58,12 +60,50 @@ class LLMProvider(ABC):
 
 _WHISPER_URL   = "https://api.groq.com/openai/v1/audio/transcriptions"
 _WHISPER_MODEL = "whisper-large-v3-turbo"
+# Gemini flash — мультимодальный резерв для vision и транскрипции (когда Groq недоступен).
+_GEMINI_MM_MODEL = "gemini-2.5-flash"
 
 
-async def transcribe_audio(data: bytes, filename: str = "voice.ogg") -> str:
-    """Расшифровывает голосовое в текст через Groq Whisper. Пусто при ошибке/без ключа."""
+def _gemini_mm_kwargs() -> dict:
+    """httpx-параметры для Gemini: через прокси только его запросы (гео-блок в РФ)."""
+    kwargs = {"timeout": 120.0, "trust_env": False}
+    if GEMINI_PROXY:
+        kwargs["proxy"] = GEMINI_PROXY
+    return kwargs
+
+
+async def _gemini_generate_with_media(
+    text_prompt: str, mime_type: str, media_b64: str, max_tokens: int
+) -> str:
+    """Один запрос к Gemini generateContent с inline-медиа (image/audio). Пусто при ошибке."""
+    if not GEMINI_API_KEY:
+        return ""
+    url = (
+        f"https://generativelanguage.googleapis.com/v1beta/models/"
+        f"{_GEMINI_MM_MODEL}:generateContent?key={GEMINI_API_KEY}"
+    )
+    payload = {
+        "contents": [{"role": "user", "parts": [
+            {"text": text_prompt},
+            {"inline_data": {"mime_type": mime_type, "data": media_b64}},
+        ]}],
+        "generationConfig": {"maxOutputTokens": max_tokens, "thinkingConfig": {"thinkingBudget": 0}},
+    }
+    try:
+        async with httpx.AsyncClient(**_gemini_mm_kwargs()) as client:
+            resp = await client.post(url, json=payload)
+        if resp.is_success:
+            parts = resp.json()["candidates"][0].get("content", {}).get("parts") or []
+            return "".join(p.get("text", "") for p in parts).strip()
+        log.warning("Gemini media %s: %s", resp.status_code, resp.text[:200])
+    except Exception as e:
+        log.warning("Gemini media: ошибка запроса — %s", e)
+    return ""
+
+
+async def _groq_transcribe(data: bytes, filename: str) -> str:
+    """Groq Whisper. Пусто при ошибке/без ключа."""
     if not GROQ_API_KEY:
-        log.warning("Whisper: GROQ_API_KEY не задан — транскрипция недоступна")
         return ""
     try:
         async with httpx.AsyncClient(timeout=120.0, trust_env=False) as client:
@@ -81,6 +121,20 @@ async def transcribe_audio(data: bytes, filename: str = "voice.ogg") -> str:
     return ""
 
 
+async def transcribe_audio(data: bytes, filename: str = "voice.ogg") -> str:
+    """Голосовое → текст. Основной путь — Groq Whisper, резерв — Gemini audio.
+    Пусто, если оба не смогли."""
+    text = await _groq_transcribe(data, filename)
+    if text:
+        return text
+    log.info("Whisper: Groq не дал результат — пробую Gemini audio")
+    mime = "audio/ogg" if filename.lower().endswith(".ogg") else "audio/mpeg"
+    return await _gemini_generate_with_media(
+        "Транскрибируй это аудио дословно. Верни ТОЛЬКО текст речи, без комментариев.",
+        mime, base64.b64encode(data).decode(), max_tokens=1024,
+    )
+
+
 # ── Распознавание скриншотов (Groq Vision) ───────────────────────────────────
 
 _VISION_URL = "https://api.groq.com/openai/v1/chat/completions"
@@ -88,30 +142,26 @@ ILLEGIBLE_MARKER = "ТЕКСТ_НЕЧИТАЕМ"
 _MAX_IMAGE_B64_BYTES = 4 * 1024 * 1024  # лимит Groq на base64 image_url
 
 
-async def extract_chat_from_image(image_bytes: bytes) -> str:
-    """Распознаёт диалог со скриншота через Groq Vision. Пусто при ошибке/без ключа."""
-    if not GROQ_API_KEY:
-        log.warning("Vision: GROQ_API_KEY не задан")
-        return ""
-    b64 = base64.b64encode(image_bytes).decode()
-    if len(b64) > _MAX_IMAGE_B64_BYTES:
-        log.warning("Vision: изображение больше лимита Groq (4MB base64)")
-        return ""
+_VISION_PROMPT = (
+    "На скриншоте — переписка в мессенджере. Извлеки текст диалога строго "
+    "в хронологическом порядке (сверху вниз), различая кто автор реплики.\n"
+    "Формат вывода — построчно, без заголовков и пояснений:\n"
+    "Собеседник: <текст>\n"
+    "Я: <текст>\n"
+    f"Если на изображении нет читаемого текста переписки — верни СТРОГО и "
+    f"ТОЛЬКО одно слово: {ILLEGIBLE_MARKER}, без кавычек и пояснений.\n"
+    "Не добавляй ничего от себя — только то, что реально написано на скриншоте."
+)
 
-    prompt = (
-        "На скриншоте — переписка в мессенджере. Извлеки текст диалога строго "
-        "в хронологическом порядке (сверху вниз), различая кто автор реплики.\n"
-        "Формат вывода — построчно, без заголовков и пояснений:\n"
-        "Собеседник: <текст>\n"
-        "Я: <текст>\n"
-        f"Если на изображении нет читаемого текста переписки — верни СТРОГО и "
-        f"ТОЛЬКО одно слово: {ILLEGIBLE_MARKER}, без кавычек и пояснений.\n"
-        "Не добавляй ничего от себя — только то, что реально написано на скриншоте."
-    )
+
+async def _groq_vision(b64: str) -> str:
+    """Распознавание через Groq Vision. Пусто при ошибке/без ключа."""
+    if not GROQ_API_KEY:
+        return ""
     messages = [{
         "role": "user",
         "content": [
-            {"type": "text", "text": prompt},
+            {"type": "text", "text": _VISION_PROMPT},
             {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
         ],
     }]
@@ -129,13 +179,38 @@ async def extract_chat_from_image(image_bytes: bytes) -> str:
             )
         if resp.is_success:
             text = resp.json()["choices"][0]["message"]["content"].strip()
-            # Защитная зачистка на случай, если reasoning_effort не подавил thinking полностью.
-            text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
-            return text
-        log.warning("Vision %s: %s", resp.status_code, resp.text[:200])
+            return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+        log.warning("Vision(Groq) %s: %s", resp.status_code, resp.text[:200])
     except Exception as e:
-        log.warning("Vision: ошибка запроса — %s", e)
+        log.warning("Vision(Groq): ошибка запроса — %s", e)
     return ""
+
+
+async def _gemini_vision(b64: str) -> str:
+    """Распознавание через Gemini multimodal — резерв, когда Groq недоступен."""
+    raw = await _gemini_generate_with_media(_VISION_PROMPT, "image/jpeg", b64, max_tokens=2000)
+    return re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
+
+
+async def extract_chat_from_image(image_bytes: bytes) -> str:
+    """Распознаёт диалог со скриншота. Основной путь — Groq Vision, резерв — Gemini.
+    Если ни один провайдер не смог распознать — возвращает ILLEGIBLE_MARKER."""
+    b64 = base64.b64encode(image_bytes).decode()
+
+    if len(b64) <= _MAX_IMAGE_B64_BYTES:
+        text = await _groq_vision(b64)
+        if text and text != ILLEGIBLE_MARKER:
+            return text
+    else:
+        log.warning("Vision: изображение больше лимита Groq (4MB base64) — сразу Gemini")
+
+    log.info("Vision: Groq не распознал — пробую Gemini")
+    text = await _gemini_vision(b64)
+    if text and text != ILLEGIBLE_MARKER:
+        return text
+
+    # Никто не смог распознать текст переписки.
+    return ILLEGIBLE_MARKER
 
 
 # ── Groq ──────────────────────────────────────────────────────────────────────
@@ -274,11 +349,46 @@ class OpenRouterProvider(LLMProvider):
 
 # ── Каскадный вызов ───────────────────────────────────────────────────────────
 
-_PROVIDERS: list[LLMProvider] = [
-    GeminiProvider(),
-    GroqProvider(),
-    OpenRouterProvider(),
-]
+_PROVIDER_REGISTRY = {
+    "gemini":     GeminiProvider,
+    "groq":       GroqProvider,
+    "openrouter": OpenRouterProvider,
+}
+_DEFAULT_ORDER = ["gemini", "groq", "openrouter"]
+
+
+def _build_providers() -> list[LLMProvider]:
+    """Строит каскад из LLM_PROVIDER_ORDER. Неизвестные/повторные имена — пропуск
+    (с warning для неизвестных), пустой результат — дефолтный порядок. Плюс warning
+    о вероятном гео-блоке, если Gemini первый, но GEMINI_PROXY не задан."""
+    ordered: list[LLMProvider] = []
+    seen: set[str] = set()
+    for raw in LLM_PROVIDER_ORDER.split(","):
+        name = raw.strip().lower()
+        if not name or name in seen:
+            continue
+        cls = _PROVIDER_REGISTRY.get(name)
+        if cls is None:
+            log.warning("LLM_PROVIDER_ORDER: неизвестный провайдер «%s» — пропущен", name)
+            continue
+        seen.add(name)
+        ordered.append(cls())
+
+    if not ordered:
+        log.warning("LLM_PROVIDER_ORDER пуст/некорректен — использую дефолтный каскад")
+        ordered = [_PROVIDER_REGISTRY[n]() for n in _DEFAULT_ORDER]
+
+    if ordered[0].name.lower() == "gemini" and not GEMINI_PROXY:
+        log.warning(
+            "Gemini стоит первым в каскаде, но GEMINI_PROXY не задан — в ряде регионов "
+            "(РФ) его API заблокирован по гео: каждый запрос будет впустую падать и "
+            "фолбэчиться. Задай GEMINI_PROXY или поставь groq первым в LLM_PROVIDER_ORDER."
+        )
+    log.info("LLM-каскад: %s", " → ".join(p.name for p in ordered))
+    return ordered
+
+
+_PROVIDERS: list[LLMProvider] = _build_providers()
 
 # Имя принудительно выбранного провайдера (для отладки через /provider). None = авто.
 _forced: str | None = None
@@ -313,22 +423,58 @@ def _ordered_providers() -> list[LLMProvider]:
     return forced + rest
 
 
+# Наблюдаемость каскада: счётчики по провайдерам (in-memory, сбрасываются при рестарте).
+_provider_stats: dict[str, dict] = {}
+
+
+def _record_stat(name: str, outcome: str, elapsed_ms: float) -> None:
+    s = _provider_stats.setdefault(
+        name, {"ok": 0, "rate_limit": 0, "error": 0, "calls": 0, "total_ms": 0.0}
+    )
+    s[outcome] += 1
+    s["calls"] += 1
+    s["total_ms"] += elapsed_ms
+
+
+def get_provider_stats() -> dict:
+    """Снимок статистики вызовов провайдеров (для диагностики, напр. в /provider)."""
+    out = {}
+    for name, s in _provider_stats.items():
+        out[name] = {
+            "ok": s["ok"], "rate_limit": s["rate_limit"], "error": s["error"],
+            "calls": s["calls"],
+            "avg_ms": round(s["total_ms"] / s["calls"], 1) if s["calls"] else 0.0,
+        }
+    return out
+
+
 async def _ask(prompt: str, max_tokens: int = 1024) -> str:
-    """Пробует провайдеров по цепочке. Пробрасывает ошибку только если все упали."""
+    """Пробует провайдеров по цепочке. Пробрасывает ошибку только если все упали.
+    Логирует по каждой попытке: провайдер, исход, тип ошибки, время ответа."""
     last_exc: Exception = RuntimeError("Нет доступных LLM-провайдеров")
     chain = _ordered_providers()
 
     for provider in chain:
+        t0 = time.monotonic()
         try:
             result = await provider.ask(prompt, max_tokens)
-            if _forced or provider is not chain[0]:
-                log.info("LLM: ответил %s", provider.name)
+            elapsed = (time.monotonic() - t0) * 1000
+            _record_stat(provider.name, "ok", elapsed)
+            tag = "" if (not _forced and provider is chain[0]) else " (fallback)"
+            log.info("LLM [%s]: ok за %.0f мс%s", provider.name, elapsed, tag)
             return result
         except RateLimitError as e:
-            log.warning("LLM [%s]: лимит исчерпан (%s), переключаемся дальше", provider.name, e)
+            elapsed = (time.monotonic() - t0) * 1000
+            _record_stat(provider.name, "rate_limit", elapsed)
+            log.warning("LLM [%s]: лимит (429) за %.0f мс — переключаюсь дальше", provider.name, elapsed)
             last_exc = e
         except (ProviderError, httpx.TimeoutException, httpx.NetworkError) as e:
-            log.warning("LLM [%s]: временная ошибка (%s), переключаемся дальше", provider.name, e)
+            elapsed = (time.monotonic() - t0) * 1000
+            _record_stat(provider.name, "error", elapsed)
+            log.warning(
+                "LLM [%s]: %s за %.0f мс (%s) — переключаюсь дальше",
+                provider.name, type(e).__name__, elapsed, str(e)[:120],
+            )
             last_exc = e
 
     if isinstance(last_exc, RateLimitError):
