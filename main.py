@@ -1710,11 +1710,16 @@ async def _send_reply_analysis(message: Message, contact_id, incoming: str) -> N
     samples = get_message_samples(contact_id)
     if not samples:
         return
+    my_sample      = samples["my_sample"] or []
+    contact_sample = samples["contact_sample"] or []
+    # Слишком мало сообщений — разбор был бы «на воде». Не тратим вызов LLM.
+    if len(my_sample) + len(contact_sample) < 4:
+        return
     try:
         blocks = await analyze_reply_dynamics(
             incoming,
-            samples["my_sample"],
-            samples["contact_sample"],
+            my_sample,
+            contact_sample,
             samples["features_summary"],
         )
     except Exception:
