@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import html
+import json
 import logging
 import re
 import tempfile
@@ -27,10 +28,15 @@ from config import (
     BOT_TOKEN,
     FIRST_BUILD_THRESHOLD,
     FREE_TRIAL_REQUESTS,
+    GEMINI_API_KEY,
+    GROQ_API_KEY,
+    OPENROUTER_API_KEY,
     PREMIUM_CACHE_TTL,
     PREMIUM_CHANNEL_ID,
     PREMIUM_SUBSCRIBE_URL,
+    LLM_CACHE_TTL_SEC,
     REBUILD_THRESHOLD,
+    REFRESH_SAMPLES_EVERY_N,
     REPLY_STYLES,
     SAMPLE_SIZE,
 )
@@ -49,6 +55,7 @@ from llm import (
     extract_chat_from_image,
     analyze_reply_dynamics,
     get_forced_provider,
+    get_provider_stats,
     make_features_summary,
     rewrite_message_explained,
     sample_texts,
@@ -76,6 +83,7 @@ from storage import (
     get_contact_by_id,
     get_deep_analysis,
     get_deep_style_analysis,
+    get_llm_cache,
     get_interaction_card,
     get_imported_messages,
     get_message_samples,
@@ -97,6 +105,7 @@ from storage import (
     save_my_style_per_contact,
     save_style_card,
     set_auto_mode,
+    set_llm_cache,
     update_contact_username,
     upsert_business_connection,
     upsert_chat_ref_mapping,
@@ -228,24 +237,32 @@ async def _send_paywall(target: Message, text: str) -> None:
     await target.answer(text, reply_markup=paywall_kb())
 
 
-async def _consume_trial_or_paywall(bot: Bot, target: Message, telegram_id: str) -> bool:
-    """Гейт для «Переписать»/«Ответить за меня»/«По скриншоту»: премиум — всегда
-    можно, иначе тратит одну из FREE_TRIAL_REQUESTS бесплатных попыток.
-    True — можно генерировать, False — уже показан пейволл."""
+async def _has_quota(bot: Bot, telegram_id: str) -> bool:
+    """Есть ли доступ к генерации: premium или остались бесплатные попытки. Без списания."""
     if await _is_premium(bot, telegram_id):
         return True
+    return get_trial_used(telegram_id) < FREE_TRIAL_REQUESTS
 
-    used = get_trial_used(telegram_id)
-    if used < FREE_TRIAL_REQUESTS:
-        increment_trial_used(telegram_id)
+
+async def _quota_gate(bot: Bot, target: Message, telegram_id: str) -> bool:
+    """Проверка доступа БЕЗ списания. Если попытки кончились — показывает пейволл.
+    Списание делает _charge_trial_if_needed уже ПОСЛЕ успешной генерации."""
+    if await _has_quota(bot, telegram_id):
         return True
-
     await _send_paywall(
         target,
         f"Бесплатные попытки закончились ({FREE_TRIAL_REQUESTS} использовано). "
         "Дальше — по подписке CueMe Premium."
     )
     return False
+
+
+async def _charge_trial_if_needed(bot: Bot, telegram_id: str) -> None:
+    """Списывает одну попытку триала. Вызывать ТОЛЬКО после успешного ответа LLM.
+    Premium попытки не тратит."""
+    if await _is_premium(bot, telegram_id):
+        return
+    increment_trial_used(telegram_id)
 
 
 async def _require_premium(bot: Bot, target: Message, telegram_id: str) -> bool:
@@ -296,12 +313,26 @@ def style_result_kb(copy_text: str | None = None) -> InlineKeyboardMarkup:
     return b.as_markup()
 
 
-async def _run_style_generation(target: Message, ctx: dict, state: FSMContext | None = None) -> None:
+def _style_cache_key(kind: str, style: str, text: str, style_card: str, interaction_card: str) -> str:
+    """Контент-адресный ключ кэша: включает карточки стиля, поэтому при их пересборке
+    ключ меняется сам (авто-инвалидация без TTL-гонок)."""
+    raw = "\x00".join([kind or "", style or "", text or "", style_card or "", interaction_card or ""])
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+async def _run_style_generation(
+    target: Message, ctx: dict, telegram_id: int, bot: Bot,
+    state: FSMContext | None = None, force_fresh: bool = False,
+) -> None:
     """Общий шаг генерации для всех трёх фич переписывания (rewrite/reply/screenshot)
     после того как стиль выбран. Шлёт результат + пояснение/оценку отдельным
     сообщением; для «Ответить за меня» и «По скриншоту» — ещё и напоминание
     как продолжить (авто-режим: следующее сообщение/скриншот без повторного
-    нажатия кнопки меню)."""
+    нажатия кнопки меню).
+
+    Гейт монетизации: проверка ДО вызова LLM, списание — только ПОСЛЕ успешного
+    ответа. Кэш: попадание = НЕ вызов LLM → попытку не тратим. force_fresh=True
+    (регенерация) обходит кэш, чтобы дать новый вариант, и обновляет запись."""
     kind      = ctx.get("kind")
     style_key = ctx.get("style")
     text      = ctx.get("text") if kind in ("rewrite", "reply") else ctx.get("chat_text")
@@ -309,26 +340,47 @@ async def _run_style_generation(target: Message, ctx: dict, state: FSMContext | 
         await target.answer("Контекст устарел — начни заново.")
         return
 
-    try:
-        if kind == "rewrite":
-            result, expl, rating = await rewrite_message_explained(
-                text, ctx["style_card"], ctx["interaction_card"], style_key
-            )
-        elif kind == "reply":
-            result, expl, rating = await suggest_reply(
-                text, ctx["style_card"], ctx["interaction_card"], style_key
-            )
-        else:  # screenshot
-            result, expl, rating = await suggest_reply_from_screenshot(
-                text, ctx["style_card"], ctx["interaction_card"], style_key
-            )
-    except RateLimitError:
-        await target.answer("Лимит исчерпан, попробуй позже.")
-        return
-    except Exception:
-        logging.exception("%s: ошибка генерации (стиль %s)", kind, style_key)
-        await target.answer("Не получилось сгенерировать — попробуй ещё раз.")
-        return
+    style_card, interaction_card = ctx["style_card"], ctx["interaction_card"]
+    cache_key = _style_cache_key(kind, style_key, text, style_card, interaction_card)
+
+    result = expl = rating = None
+    if not force_fresh:
+        cached = get_llm_cache(cache_key, LLM_CACHE_TTL_SEC)
+        if cached:
+            try:
+                result, expl, rating = json.loads(cached)
+                logging.info("style-gen: cache hit (%s/%s)", kind, style_key)
+            except (ValueError, TypeError):
+                result = None
+
+    if result is None:
+        # Реальный вызов LLM — здесь и только здесь гейт + списание.
+        if not await _quota_gate(bot, target, str(telegram_id)):
+            return
+        try:
+            if kind == "rewrite":
+                result, expl, rating = await rewrite_message_explained(
+                    text, style_card, interaction_card, style_key
+                )
+            elif kind == "reply":
+                result, expl, rating = await suggest_reply(
+                    text, style_card, interaction_card, style_key
+                )
+            else:  # screenshot
+                result, expl, rating = await suggest_reply_from_screenshot(
+                    text, style_card, interaction_card, style_key
+                )
+        except RateLimitError:
+            await target.answer("Лимит исчерпан, попробуй позже.")
+            return
+        except Exception:
+            logging.exception("%s: ошибка генерации (стиль %s)", kind, style_key)
+            await target.answer("Не получилось сгенерировать — попробуй ещё раз.")
+            return
+
+        # Успех — списываем попытку (premium не тратит) и кэшируем.
+        await _charge_trial_if_needed(bot, str(telegram_id))
+        set_llm_cache(cache_key, json.dumps([result, expl, rating], ensure_ascii=False))
 
     ctx["result"] = result
     await _answer_long(target, result, reply_markup=style_result_kb(result))
@@ -367,7 +419,7 @@ async def cb_style_pick(call: CallbackQuery, state: FSMContext) -> None:
     ctx["style"] = style_key
     label = REPLY_STYLES[style_key][0]
     await call.message.edit_text(f"Генерирую в стиле «{label}»...", reply_markup=None)
-    await _run_style_generation(call.message, ctx, state)
+    await _run_style_generation(call.message, ctx, call.from_user.id, call.bot, state)
 
 
 @dp.callback_query(F.data == "styleother")
@@ -387,7 +439,8 @@ async def cb_style_regen(call: CallbackQuery, state: FSMContext) -> None:
         await call.answer("Контекст устарел — начни заново.", show_alert=True)
         return
     await call.answer("Перегенерирую...")
-    await _run_style_generation(call.message, ctx, state)
+    # force_fresh: реген должен дать НОВЫЙ вариант, а не вернуть тот же из кэша.
+    await _run_style_generation(call.message, ctx, call.from_user.id, call.bot, state, force_fresh=True)
 
 
 @dp.callback_query(F.data == "stylecopy")
@@ -490,6 +543,22 @@ def _quick_stats(my_msgs: list[str], contact_msgs: list[str]) -> str:
     )
 
 
+# Троттлинг _refresh_samples: считаем business-сообщения на контакт и обновляем
+# message_samples не чаще, чем раз в REFRESH_SAMPLES_EVERY_N. In-memory — при рестарте
+# сбрасывается, тогда первый refresh просто случится раньше (не критично).
+_refresh_pending: dict[int, int] = {}
+
+
+def _should_refresh_samples(contact_id: int) -> bool:
+    """True раз в REFRESH_SAMPLES_EVERY_N сообщений на контакт (и сбрасывает счётчик)."""
+    n = _refresh_pending.get(contact_id, 0) + 1
+    if n >= REFRESH_SAMPLES_EVERY_N:
+        _refresh_pending[contact_id] = 0
+        return True
+    _refresh_pending[contact_id] = n
+    return False
+
+
 def _refresh_samples(owner_user_id: str, contact_id: int) -> None:
     """Освежает message_samples из текущих business + imported данных. Без LLM."""
     my_full = _get_rebuild_sample(owner_user_id, contact_id, "out", SAMPLE_SIZE)
@@ -562,6 +631,11 @@ async def _maybe_rebuild(owner_user_id: str, contact_id: int, bot: Bot | None = 
             return
     elif total - last < REBUILD_THRESHOLD:
         return
+
+    # Порог достигнут — гарантируем свежие message_samples на момент пересборки
+    # (перекрывает троттлинг на горячем пути) и сбрасываем счётчик.
+    _refresh_pending.pop(contact_id, None)
+    _refresh_samples(owner_user_id, contact_id)
 
     _rebuilding.add(contact_id)
     try:
@@ -936,13 +1010,68 @@ async def handle_business_connection(event: BusinessConnection) -> None:
     logging.info("business_connection %s: owner=%s %s", event.id, event.user.id, status)
 
 
+def _persist_business_message(
+    *, conn_id: str, owner_id: str, chat_ref: str, direction: str,
+    text: str | None, is_voice: bool, date: str, tg_message_id: int,
+    contact_tg_id: str, chat_first_name: str | None, chat_last_name: str | None,
+    chat_username: str | None, sender_username: str | None,
+) -> int | None:
+    """Синхронная DB-часть обработки business-сообщения: сохранение + резолв контакта
+    + троттлинг refresh. Возвращает contact_id для пересборки (или None).
+    Выполняется в asyncio.to_thread, чтобы не блокировать event loop на живом потоке."""
+    inserted = save_business_message(
+        connection_id=conn_id, owner_user_id=owner_id, chat_ref=chat_ref,
+        direction=direction, text=text, date=date, tg_message_id=tg_message_id,
+        raw_meta=_msg_meta(text, is_voice),
+    )
+    if not inserted:
+        # Повторная доставка того же сообщения — не триггерим пересборку.
+        logging.info(
+            "business_message дубль пропущен: conn=%s chat_ref=%s msg_id=%s",
+            conn_id, chat_ref, tg_message_id,
+        )
+        return None
+    logging.info(
+        "business_message saved: conn=%s chat_ref=%s direction=%s",
+        conn_id, chat_ref, direction,
+    )
+    upsert_user(owner_id, f"user{owner_id}")
+
+    # Для приватного чата contact_tg_id всегда равен ID собеседника
+    if contact_tg_id == owner_id:
+        return None  # edge-case: не создаём контакт «сам с собой»
+    original_id = f"user{contact_tg_id}"
+
+    contact_row = find_contact_by_original_id(owner_id, original_id)
+    if not contact_row:
+        # Контакт ещё не создан — создаём автоматически из данных чата
+        display_name = " ".join(
+            p for p in (chat_first_name or "", chat_last_name or "") if p
+        ).strip()
+        cid = get_or_create_contact(owner_id, original_id, display_name)
+        if chat_username:
+            update_contact_username(cid, chat_username)
+        upsert_chat_ref_mapping(owner_id, chat_ref, cid)
+        logging.info("auto-created contact: id=%s name=%s", cid, display_name)
+    else:
+        cid = contact_row["id"]
+        upsert_chat_ref_mapping(owner_id, chat_ref, cid)
+        if direction == "in" and sender_username:
+            update_contact_username(cid, sender_username)
+
+    # Освежаем message_samples (без LLM, дёшево), но не чаще раза в N сообщений
+    if _should_refresh_samples(cid):
+        _refresh_samples(owner_id, cid)
+    return cid
+
+
 @dp.business_message()
 async def handle_business_message(event: Message, bot: Bot) -> None:
     conn_id = event.business_connection_id
     if not conn_id:
         return
 
-    conn_row = get_business_connection(conn_id)
+    conn_row = await asyncio.to_thread(get_business_connection, conn_id)
     if not conn_row:
         logging.warning("business_message: unknown connection %s", conn_id)
         return
@@ -957,50 +1086,18 @@ async def handle_business_message(event: Message, bot: Bot) -> None:
     text, is_voice = await _message_text(bot, event)  # голосовое → текст через Whisper
     date      = event.date.isoformat()
 
-    save_business_message(
-        connection_id=conn_id,
-        owner_user_id=owner_id,
-        chat_ref=chat_ref,
-        direction=direction,
-        text=text,
-        date=date,
-        tg_message_id=event.message_id,
-        raw_meta=_msg_meta(text, is_voice),
+    # Синхронную DB-часть уводим в поток, чтобы не блокировать event loop.
+    contact_id_for_rebuild = await asyncio.to_thread(
+        _persist_business_message,
+        conn_id=conn_id, owner_id=owner_id, chat_ref=chat_ref, direction=direction,
+        text=text, is_voice=is_voice, date=date, tg_message_id=event.message_id,
+        contact_tg_id=str(event.chat.id),
+        chat_first_name=event.chat.first_name, chat_last_name=event.chat.last_name,
+        chat_username=getattr(event.chat, "username", None),
+        sender_username=event.from_user.username if event.from_user else None,
     )
-    logging.info(
-        "business_message saved: conn=%s chat_ref=%s direction=%s",
-        conn_id, chat_ref, direction,
-    )
-
-    upsert_user(owner_id, f"user{owner_id}")
-
-    # Для приватного чата event.chat.id всегда равен ID собеседника
-    contact_tg_id = str(event.chat.id)
-    if contact_tg_id == owner_id:
-        # edge-case: избегаем создания контакта «сам с собой»
-        return
-    original_id = f"user{contact_tg_id}"
-
-    contact_row = find_contact_by_original_id(owner_id, original_id)
-    if not contact_row:
-        # Контакт ещё не создан — создаём автоматически из данных чата
-        parts = [event.chat.first_name or "", event.chat.last_name or ""]
-        display_name = " ".join(p for p in parts if p).strip()
-        new_cid = get_or_create_contact(owner_id, original_id, display_name)
-        if getattr(event.chat, "username", None):
-            update_contact_username(new_cid, event.chat.username)
-        upsert_chat_ref_mapping(owner_id, chat_ref, new_cid)
-        contact_id_for_rebuild = new_cid
-        logging.info("auto-created contact: id=%s name=%s", new_cid, display_name)
-    else:
-        upsert_chat_ref_mapping(owner_id, chat_ref, contact_row["id"])
-        contact_id_for_rebuild = contact_row["id"]
-        if direction == "in" and event.from_user and event.from_user.username:
-            update_contact_username(contact_row["id"], event.from_user.username)
 
     if contact_id_for_rebuild:
-        # Освежаем message_samples при каждом сообщении (без LLM, дёшево)
-        _refresh_samples(owner_id, contact_id_for_rebuild)
         asyncio.create_task(_maybe_rebuild(owner_id, contact_id_for_rebuild, bot))
 
 
@@ -1351,11 +1448,22 @@ async def cmd_provider(message: Message) -> None:
     parts = (message.text or "").split(maxsplit=1)
     variants = " · ".join(p.lower() for p in PROVIDER_NAMES) + " · auto"
     if len(parts) < 2:
+        stats = get_provider_stats()
+        stats_lines = ""
+        if stats:
+            rows = [
+                f"• {n}: ok {s['ok']}, лимит {s['rate_limit']}, ошибок {s['error']}, ~{s['avg_ms']:.0f}мс"
+                for n in PROVIDER_NAMES if (s := stats.get(n))
+            ]
+            if rows:
+                stats_lines = "\n\n📊 Вызовы (с рестарта):\n" + "\n".join(rows)
         await message.answer(
-            f"Сейчас активен: {get_forced_provider()}\n\n"
+            f"Сейчас активен: {get_forced_provider()}\n"
+            f"Каскад: {' → '.join(PROVIDER_NAMES)}\n\n"
             f"Переключить: /provider <{variants}>\n"
-            "После выбора просто что-нибудь перепиши — в логах будет «LLM: ответил ...».\n"
+            "После выбора что-нибудь перепиши — в логах будет «LLM [Провайдер]: ok ...».\n"
             "/provider auto — вернуть обычный каскад."
+            + stats_lines
         )
         return
     try:
@@ -1364,7 +1472,7 @@ async def cmd_provider(message: Message) -> None:
         await message.answer(str(e))
         return
     if result == "auto":
-        await message.answer("✅ Провайдер: авто-каскад (Groq → Gemini → OpenRouter).")
+        await message.answer(f"✅ Провайдер: авто-каскад ({' → '.join(PROVIDER_NAMES)}).")
     else:
         await message.answer(
             f"✅ Принудительно выбран: {result}.\n"
@@ -1631,7 +1739,7 @@ async def handle_draft(message: Message, state: FSMContext, bot: Bot) -> None:
     data = await state.get_data()
     await state.clear()
 
-    if not await _consume_trial_or_paywall(bot, message, str(message.from_user.id)):
+    if not await _quota_gate(bot, message, str(message.from_user.id)):
         return
 
     _last_action[message.from_user.id] = {
@@ -1759,7 +1867,7 @@ async def handle_incoming(message: Message, state: FSMContext, bot: Bot) -> None
     # авто-режим («Переписать») вместо продолжения «Ответить за меня».
     # Выйти из режима — любая кнопка меню (handle_menu_button сбрасывает state).
 
-    if not await _consume_trial_or_paywall(bot, message, str(message.from_user.id)):
+    if not await _quota_gate(bot, message, str(message.from_user.id)):
         return
 
     # Короткий разбор динамики (один вызов LLM на сообщение) — до выбора стиля,
@@ -1871,7 +1979,7 @@ async def _prompt_screenshot_style(
     # ВАЖНО: user_id передаётся отдельным параметром, а не берётся из
     # target.from_user — при edit=True target это call.message, чей
     # .from_user это БОТ, а не пользователь (стандартная ловушка aiogram).
-    if not await _consume_trial_or_paywall(bot, target, telegram_id):
+    if not await _quota_gate(bot, target, telegram_id):
         return
     style_card = await _style_for_rewrite(telegram_id, contact_id)
     if not style_card:
@@ -1897,7 +2005,7 @@ async def _prompt_screenshot_style_no_contact(
 ) -> None:
     """Для человека, которого ещё нет в базе — общий (агрегатный) стиль автора,
     без per-contact interaction_card (промпт сам подставит нейтральный фолбэк)."""
-    if not await _consume_trial_or_paywall(bot, target, telegram_id):
+    if not await _quota_gate(bot, target, telegram_id):
         return
     style_card = await _gen_style_card(telegram_id)
     if not style_card:
@@ -2230,14 +2338,58 @@ async def cb_delete_cancel(call: CallbackQuery) -> None:
 
 # ── Авто-переписка (catch-all, должен быть последним) ─────────────────────────
 
+@dp.message(Command("auto"))
+async def cmd_auto(message: Message) -> None:
+    """Переключатель авто-режима: когда включён — любой присланный текст предлагается
+    переписать без нажатия кнопки. По умолчанию управляется явно."""
+    telegram_id = str(message.from_user.id)
+    enabled, contact_id = get_auto_mode(telegram_id)
+
+    if enabled:
+        set_auto_mode(telegram_id, False, contact_id)
+        await message.answer(
+            "🔕 Авто-режим выключен. Произвольный текст больше не превращается в черновик — "
+            "жми «📝 Переписать», когда нужно. Включить снова: /auto"
+        )
+        return
+
+    # Включаем — нужен целевой контакт
+    if not contact_id:
+        contacts = list_contacts(telegram_id)
+        if not contacts:
+            await message.answer(
+                "Сначала загрузи чат или подключи Автоматизацию — тогда будет кого переписывать."
+            )
+            return
+        if len(contacts) == 1:
+            contact_id = contacts[0]["id"]
+        else:
+            await message.answer(
+                "У тебя несколько контактов. Выбери целевой через настройку контакта, "
+                "потом снова /auto."
+            )
+            return
+
+    set_auto_mode(telegram_id, True, contact_id)
+    c = get_contact_by_id(contact_id)
+    name = _contact_name(c) if c else "контакт"
+    await message.answer(
+        f"🔔 Авто-режим включён — {name}. Любое присланное сообщение предложу переписать "
+        "под этот стиль. Выключить: /auto"
+    )
+
+
 @dp.message(F.text & ~F.text.in_(_ALL_BTNS))
 async def auto_rewrite_handler(message: Message, state: FSMContext, bot: Bot) -> None:
     if await state.get_state() is not None:
         return
 
     telegram_id = str(message.from_user.id)
-    # Авто-режим всегда активен. Цель — выбранный контакт, иначе единственный.
-    _, contact_id = get_auto_mode(telegram_id)
+    # Explicit-гейт: реагируем на произвольный текст ТОЛЬКО если авто-режим явно включён
+    # (переключается командой /auto). Иначе случайное сообщение не превращается в черновик.
+    enabled, contact_id = get_auto_mode(telegram_id)
+    if not enabled:
+        return
     if not contact_id:
         contacts = list_contacts(telegram_id)
         if len(contacts) == 1:
@@ -2250,7 +2402,7 @@ async def auto_rewrite_handler(message: Message, state: FSMContext, bot: Bot) ->
     if not style_card or not interaction_card:
         return
 
-    if not await _consume_trial_or_paywall(bot, message, telegram_id):
+    if not await _quota_gate(bot, message, telegram_id):
         return
 
     draft = message.text.strip()
@@ -2263,7 +2415,34 @@ async def auto_rewrite_handler(message: Message, state: FSMContext, bot: Bot) ->
 
 # ── запуск ────────────────────────────────────────────────────────────────────
 
+def _validate_startup_config() -> None:
+    """Fail-fast проверка до запуска polling. Хотя бы один LLM-ключ обязателен —
+    иначе бот не сможет генерировать ответы. Отсутствие отдельных ключей — warning
+    (каскад их просто пропустит)."""
+    keys = {
+        "GEMINI_API_KEY":     GEMINI_API_KEY,
+        "GROQ_API_KEY":       GROQ_API_KEY,
+        "OPENROUTER_API_KEY": OPENROUTER_API_KEY,
+    }
+    present = [name for name, val in keys.items() if val]
+    for name, val in keys.items():
+        if not val:
+            logging.warning("%s не задан — провайдер будет пропускаться в каскаде.", name)
+    if not present:
+        raise RuntimeError(
+            "Не задан ни один LLM-ключ (GEMINI_API_KEY / GROQ_API_KEY / OPENROUTER_API_KEY). "
+            "Бот не сможет генерировать ответы — заполни .env."
+        )
+    if not GROQ_API_KEY:
+        logging.warning(
+            "GROQ_API_KEY не задан — распознавание голоса/скриншотов пойдёт только "
+            "через Gemini-fallback."
+        )
+    logging.info("Конфиг проверен. Доступные LLM-ключи: %s", ", ".join(present))
+
+
 async def main() -> None:
+    _validate_startup_config()
     init_db()
     bot = Bot(token=BOT_TOKEN)
     await bot.set_my_commands([
@@ -2277,6 +2456,7 @@ async def main() -> None:
         BotCommand(command="rewrite",     description="Переписать сообщение"),
         BotCommand(command="screenshot",  description="Ответить по скриншоту"),
         BotCommand(command="reply",       description="Помочь ответить собеседнику"),
+        BotCommand(command="auto",        description="Вкл/выкл авто-режим переписывания"),
         BotCommand(command="contacts",    description="Загруженные чаты"),
         BotCommand(command="deep_analysis", description="Глубокий анализ отношений"),
         BotCommand(command="deep_style_analysis", description="Глубокий анализ моего стиля"),
