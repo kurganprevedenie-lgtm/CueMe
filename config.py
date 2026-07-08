@@ -28,6 +28,9 @@ VISION_MODEL = os.getenv("VISION_MODEL", "qwen/qwen3.6-27b")
 
 REBUILD_THRESHOLD = int(os.getenv("REBUILD_THRESHOLD", "50"))
 SAMPLE_SIZE = int(os.getenv("SAMPLE_SIZE", "150"))
+# Порог ПЕРВОЙ сборки карточек контакта (когда их ещё нет вообще) — ниже
+# обычного REBUILD_THRESHOLD, чтобы новый юзер быстрее увидел первый результат.
+FIRST_BUILD_THRESHOLD = int(os.getenv("FIRST_BUILD_THRESHOLD", "15"))
 
 # ── Подписка (Tribute) ──────────────────────────────────────────────────────
 # Приватный канал-пропуск: Tribute сам добавляет/убирает участников по оплате,
