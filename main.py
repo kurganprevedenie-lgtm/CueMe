@@ -4,7 +4,6 @@ import logging
 import re
 import tempfile
 import time
-from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from aiogram import Bot, Dispatcher, F
@@ -55,7 +54,7 @@ from llm import (
     suggest_reply_from_screenshot,
     transcribe_audio,
 )
-from tg_parser import manual_paste_speakers, parse_chat, parse_manual_paste
+from tg_parser import parse_chat
 from storage import (
     count_biz_messages_for_contact,
     count_imported_messages,
@@ -439,10 +438,6 @@ async def _message_text(bot: Bot, event: Message) -> tuple[str | None, bool]:
 class Setup(StatesGroup):
     waiting_for_json    = State()
     waiting_for_contact = State()
-
-class ManualPaste(StatesGroup):
-    waiting_for_text = State()
-    waiting_for_name = State()
 
 class Rewrite(StatesGroup):
     waiting_for_draft = State()
@@ -1072,22 +1067,43 @@ async def _run_demo(telegram_id: str, target: Message) -> None:
 def onboarding_kb() -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     b.button(text="📱 Подключить через Настройки", callback_data="onb:business")
-    b.button(text="⚡ Ускорить текстом", callback_data="onb:paste")
     b.button(text="💻 У меня есть комп (JSON)", callback_data="onb:json")
     b.button(text="🎬 Попробовать на примере", callback_data="demo")
     b.adjust(1)
     return b.as_markup()
 
 
-async def _business_connect_text(bot: Bot) -> str:
+# Как открыть Настройки Telegram — единственный шаг, различающийся по платформам.
+_PLATFORM_OPEN_SETTINGS = {
+    "iphone":  "Открой Telegram → внизу экрана нажми на вкладку ⚙️ Settings",
+    "android": "Открой Telegram → нажми ☰ (три полоски) в левом верхнем углу → Настройки",
+    "desktop": "Открой Telegram → нажми ☰ в левом верхнем углу (или на свой аватар "
+               "в левой панели) → Настройки",
+}
+_PLATFORM_LABELS = {"iphone": "🍏 iPhone", "android": "🤖 Android", "desktop": "💻 Компьютер"}
+
+
+def platform_pick_kb() -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    for key, label in _PLATFORM_LABELS.items():
+        b.button(text=label, callback_data=f"onb:platform:{key}")
+    b.adjust(3)
+    return b.as_markup()
+
+
+async def _business_connect_text(bot: Bot, platform: str) -> str:
     me = await bot.get_me()
+    open_settings = _PLATFORM_OPEN_SETTINGS.get(platform, _PLATFORM_OPEN_SETTINGS["android"])
     return (
         "Подключи меня к своим чатам — я буду учиться твоему стилю прямо "
         "по живой переписке, ничего загружать не нужно:\n\n"
-        f"1️⃣ Открой Настройки Telegram → Автоматизация чатов\n"
-        f"2️⃣ Впиши @{me.username} → Добавить\n"
-        "3️⃣ Включи только Secretary Mode\n"
-        "4️⃣ Выбери чаты, к которым дать доступ (можно один)\n\n"
+        f"1️⃣ {open_settings}\n"
+        "2️⃣ Найди «Telegram для бизнеса» → «Чат-боты»\n"
+        f"3️⃣ В поле впиши @{me.username} и выбери меня\n"
+        "4️⃣ Включи переключатель «Ответы на сообщения»\n"
+        "5️⃣ Выбери чаты, к которым дать доступ (можно один)\n\n"
+        "Не нашёл пункт «Telegram для бизнеса»? В поиске по настройкам введи "
+        "«бизнес» или «business» — так быстрее всего.\n\n"
         "Всё — дальше просто переписывайся как обычно. Как только накопится "
         f"{FIRST_BUILD_THRESHOLD} сообщений по человеку, пришлю первый разбор твоего стиля.\n\n"
         "Имена и контакты собеседников не сохраняются — только анонимизированные паттерны."
@@ -1113,25 +1129,18 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
 
 
 @dp.callback_query(F.data == "onb:business")
-async def cb_onboarding_business(call: CallbackQuery, state: FSMContext, bot: Bot) -> None:
+async def cb_onboarding_business(call: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
     await call.answer()
     upsert_user(str(call.from_user.id), f"user{call.from_user.id}")
-    await call.message.answer(await _business_connect_text(bot))
+    await call.message.answer("Ты сейчас с какого устройства?", reply_markup=platform_pick_kb())
 
 
-@dp.callback_query(F.data == "onb:paste")
-async def cb_onboarding_paste(call: CallbackQuery, state: FSMContext) -> None:
+@dp.callback_query(F.data.startswith("onb:platform:"))
+async def cb_onboarding_platform(call: CallbackQuery, bot: Bot) -> None:
+    platform = call.data.split(":")[2]
     await call.answer()
-    await state.set_state(ManualPaste.waiting_for_text)
-    await call.message.answer(
-        "Открой переписку с человеком, выдели побольше сообщений (10-20 и больше — "
-        "чем больше, тем точнее), скопируй и вставь сюда одним сообщением.\n\n"
-        "Подойдёт любой формат — например:\n"
-        "Аня: привет, как дела?\n"
-        "Я: привет) нормально, ты как\n\n"
-        "Или просто скопированный из Telegram кусок с именами."
-    )
+    await call.message.answer(await _business_connect_text(bot, platform))
 
 
 @dp.callback_query(F.data == "onb:json")
@@ -1141,145 +1150,6 @@ async def cb_onboarding_json(call: CallbackQuery, state: FSMContext) -> None:
     await call.message.answer(
         "Загрузи переписку: Telegram Desktop → открой чат → ⋮ → "
         "Экспорт истории чата → формат JSON (без медиа) → пришли файл result.json сюда."
-    )
-
-
-# ── Онбординг: ручная вставка переписки (без JSON) ───────────────────────────
-
-@dp.message(ManualPaste.waiting_for_text, F.text & ~F.text.in_(_ALL_BTNS))
-async def handle_manual_paste(message: Message, state: FSMContext) -> None:
-    text = (message.text or "").strip()
-    if not text:
-        await message.answer("Вставь скопированный кусок переписки текстом.")
-        return
-
-    my_msgs, contact_msgs, status = parse_manual_paste(text)
-
-    if status == "empty":
-        await message.answer(
-            "Не смог разобрать, где чьи сообщения 😕\n\n"
-            "Попробуй пометить строки именами, например:\n"
-            "Аня: привет, как дела?\n"
-            "Я: привет) нормально\n\n"
-            "Свои сообщения помечай «Я:» — и пришли ещё раз."
-        )
-        return  # остаёмся в waiting_for_text
-
-    if status == "need_side":
-        speakers = manual_paste_speakers(text)[:2]
-        await state.update_data(paste_text=text)
-        b = InlineKeyboardBuilder()
-        for i, sp in enumerate(speakers):
-            b.button(text=sp, callback_data=f"pside:{i}")
-        b.adjust(1)
-        await state.update_data(paste_speakers=speakers)
-        await message.answer("Кто из них ты?", reply_markup=b.as_markup())
-        return
-
-    await _manual_paste_ask_name(message, state, my_msgs, contact_msgs)
-
-
-@dp.callback_query(F.data.startswith("pside:"))
-async def cb_manual_paste_side(call: CallbackQuery, state: FSMContext) -> None:
-    data = await state.get_data()
-    text     = data.get("paste_text")
-    speakers = data.get("paste_speakers") or []
-    idx = int(call.data.split(":")[1])
-    if not text or idx >= len(speakers):
-        await call.answer("Контекст устарел — вставь переписку заново.", show_alert=True)
-        return
-
-    await call.answer()
-    my_msgs, contact_msgs, status = parse_manual_paste(text, my_name=speakers[idx])
-    if status != "ok" or not my_msgs:
-        await call.message.answer(
-            "Что-то пошло не так при разборе — вставь переписку ещё раз."
-        )
-        await state.set_state(ManualPaste.waiting_for_text)
-        return
-
-    await call.message.edit_text(f"Понял, ты — {speakers[idx]}.")
-    await _manual_paste_ask_name(call.message, state, my_msgs, contact_msgs)
-
-
-async def _manual_paste_ask_name(
-    target: Message, state: FSMContext, my_msgs: list[str], contact_msgs: list[str]
-) -> None:
-    await state.update_data(paste_my=my_msgs, paste_contact=contact_msgs)
-    await state.set_state(ManualPaste.waiting_for_name)
-    total = len(my_msgs) + len(contact_msgs)
-    await target.answer(
-        f"Разобрал: твоих сообщений — {len(my_msgs)}, собеседника — {len(contact_msgs)} "
-        f"(всего {total}).\n\n"
-        "Как назвать этот диалог? Напиши имя (например «Аня с бумбла»):"
-    )
-
-
-@dp.message(ManualPaste.waiting_for_name, F.text & ~F.text.in_(_ALL_BTNS))
-async def handle_manual_paste_name(message: Message, state: FSMContext) -> None:
-    name = (message.text or "").strip()
-    if not name or len(name) > 64:
-        await message.answer("Напиши короткое имя для диалога (до 64 символов).")
-        return
-
-    data = await state.get_data()
-    my_msgs: list[str]      = data.get("paste_my") or []
-    contact_msgs: list[str] = data.get("paste_contact") or []
-    await state.clear()
-
-    telegram_id = str(message.from_user.id)
-    upsert_user(telegram_id, f"user{telegram_id}")
-    contact_id = get_or_create_contact(telegram_id, f"manual_{int(time.time())}", name)
-
-    # Синтетические даты (порядок сохраняем секундами) — реальных дат в
-    # copy-paste нет, а imported_messages сортируется по date.
-    base = datetime.now(timezone.utc)
-    seq = [("out", t) for t in my_msgs] + [("in", t) for t in contact_msgs]
-    save_imported_messages(contact_id, [
-        {"direction": d, "text": t, "date": (base + timedelta(seconds=i)).isoformat()}
-        for i, (d, t) in enumerate(seq)
-    ])
-    save_message_samples(
-        contact_id, my_msgs[:100], contact_msgs[:50],
-        _quick_stats(my_msgs, contact_msgs), contact_label=name,
-    )
-    delete_style_card(telegram_id)
-    delete_deep_style_analysis(telegram_id)
-
-    total = len(my_msgs) + len(contact_msgs)
-    if total < FIRST_BUILD_THRESHOLD:
-        await message.answer(
-            f"✓ Сохранил ({total} сообщ.). Для первого разбора стиля нужно хотя бы "
-            f"{FIRST_BUILD_THRESHOLD} — вставь ещё кусок переписки через «⚡ Ускорить "
-            "текстом» или подключи Автоматизацию чатов (/connect), и я доберу сам.",
-            reply_markup=main_kb(),
-        )
-        return
-
-    await message.answer("✓ Сохранил. Генерирую первый разбор — ~20 секунд...")
-    style_card       = await _gen_my_style_per_contact(contact_id, telegram_id)
-    interaction_card = await _gen_interaction_card(contact_id, telegram_id)
-
-    if not style_card:
-        await message.answer(
-            "Сохранил переписку, но разбор пока не получился — попробуй позже "
-            "через «🎯 Мой стиль с ним».",
-            reply_markup=main_kb(),
-        )
-        return
-
-    if interaction_card:
-        set_auto_mode(telegram_id, True, contact_id)
-
-    await _answer_long(
-        message,
-        f"Вот первый набросок твоего стиля с {name} — черновой, станет точнее "
-        f"по мере переписки через бота:\n\n{style_card}",
-    )
-    await message.answer(
-        "Готово к работе — жми «📝 Переписать» или просто пиши сообщения. "
-        "А чтобы я учился на живой переписке — подключи Автоматизацию чатов: /connect",
-        reply_markup=main_kb(),
     )
 
 
@@ -1441,8 +1311,8 @@ async def cb_setup_contact(call: CallbackQuery, state: FSMContext) -> None:
 # ── /connect ─────────────────────────────────────────────────────────────────
 
 @dp.message(Command("connect"))
-async def cmd_connect(message: Message, bot: Bot) -> None:
-    await message.answer(await _business_connect_text(bot))
+async def cmd_connect(message: Message) -> None:
+    await message.answer("Ты сейчас с какого устройства?", reply_markup=platform_pick_kb())
 
 
 # ── /provider — переключить LLM-провайдера (для теста) ───────────────────────
