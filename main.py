@@ -24,6 +24,7 @@ from aiogram.types import (
 from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
 
 from config import (
+    ADMIN_TELEGRAM_ID,
     APP_NAME,
     BOT_TOKEN,
     FIRST_BUILD_THRESHOLD,
@@ -119,17 +120,18 @@ dp = Dispatcher(storage=MemoryStorage())
 BTN_REWRITE       = "📝 Переписать"
 BTN_SCREENSHOT    = "📸 По скриншоту"
 BTN_REPLY         = "💬 Ответить за меня"
-BTN_CONTACT       = "🔍 Стиль собеседника"
-BTN_CONTACTS      = "📋 Контакты"
 BTN_DEEP          = "🔬 Глубокий анализ"
 BTN_DEEP_STYLE    = "🪞 Глубокий анализ стиля"
 BTN_HELP          = "❓ Помощь"
-# BTN_ME («👤 Мой стиль») и BTN_MY_STYLE_FOR («🎯 Мой стиль с ним») временно
-# убраны из меню — дублируют BTN_DEEP_STYLE/BTN_DEEP. Функции (_show_style,
-# _show_my_style_for, /me) не удалены — можно вернуть кнопки одной правкой.
+# BTN_ME («👤 Мой стиль») убрана вместе с командой /me — дублировала
+# BTN_DEEP_STYLE (и была бесплатной лазейкой мимо подписки на неё).
+# BTN_MY_STYLE_FOR («🎯 Мой стиль с ним») убрана из меню, но _show_my_style_for
+# не удалена — можно вернуть кнопку одной правкой.
+# BTN_CONTACT («🔍 Стиль собеседника») удалена совсем — её interaction_card
+# теперь блоком внутри «Глубокий анализ» (_format_deep_analysis). BTN_CONTACTS
+# («📋 Контакты») убрана из меню — доступна только как команда /contacts.
 _ALL_BTNS = {
-    BTN_REWRITE, BTN_SCREENSHOT, BTN_REPLY, BTN_CONTACT,
-    BTN_CONTACTS, BTN_DEEP, BTN_DEEP_STYLE, BTN_HELP,
+    BTN_REWRITE, BTN_SCREENSHOT, BTN_REPLY, BTN_DEEP, BTN_DEEP_STYLE, BTN_HELP,
 }
 
 # Защита от параллельных пересборок одного контакта
@@ -278,7 +280,6 @@ async def _require_premium(bot: Bot, target: Message, telegram_id: str) -> bool:
 def main_kb() -> ReplyKeyboardMarkup:
     b = ReplyKeyboardBuilder()
     b.row(KeyboardButton(text=BTN_REWRITE), KeyboardButton(text=BTN_SCREENSHOT), KeyboardButton(text=BTN_REPLY))
-    b.row(KeyboardButton(text=BTN_CONTACT), KeyboardButton(text=BTN_CONTACTS))
     b.row(KeyboardButton(text=BTN_DEEP), KeyboardButton(text=BTN_DEEP_STYLE))
     b.row(KeyboardButton(text=BTN_HELP))
     return b.as_markup(resize_keyboard=True)
@@ -799,17 +800,18 @@ async def _gen_deep_analysis(contact_id: int, owner_user_id: str) -> dict | None
     }
 
 
-def _format_deep_analysis(name: str, data: dict) -> tuple[str, str]:
+def _format_deep_analysis(name: str, data: dict, interaction_card: str | None) -> tuple[str, str, str]:
     msg1 = (
         f"🔬 Глубокий анализ — {name}\n\n"
         f"💞 Совместимость\n\n{data['compatibility_text']}\n\n"
         f"📖 История отношений\n\n{data['history_text']}"
     )
-    msg2 = (
+    msg2 = f"🗣️ Стиль и привычки {name}\n\n{interaction_card}" if interaction_card else ""
+    msg3 = (
         f"🧭 Сильные стороны, проблемы и точки роста\n\n{data['swot_text']}\n\n"
         f"🎁 Рекомендации подарков\n\n{data['gifts_text']}"
     )
-    return msg1, msg2
+    return msg1, msg2, msg3
 
 
 def deep_analysis_result_kb(contact_id: int) -> InlineKeyboardMarkup:
@@ -851,9 +853,17 @@ async def _run_deep_analysis(
         )
         return
 
-    msg1, msg2 = _format_deep_analysis(name, data)
+    try:
+        interaction_card = await _gen_interaction_card(contact_id, telegram_id)
+    except Exception:
+        logging.exception("deep_analysis: не удалось получить стиль собеседника")
+        interaction_card = None
+
+    msg1, msg2, msg3 = _format_deep_analysis(name, data, interaction_card)
     await _answer_long(target, msg1)
-    await _answer_long(target, msg2, reply_markup=deep_analysis_result_kb(contact_id))
+    if msg2:
+        await _answer_long(target, msg2)
+    await _answer_long(target, msg3, reply_markup=deep_analysis_result_kb(contact_id))
 
 
 async def _show_deep_analysis(message: Message, bot: Bot) -> None:
@@ -1110,10 +1120,10 @@ def _capabilities_text() -> str:
         "📸 По скриншоту — пришли скриншот переписки → выбери стиль ответа. "
         "Можно слать скриншоты один за другим без повторного нажатия кнопки\n"
         "💬 Ответить за меня — подскажу ответ на его сообщение, с выбором стиля\n"
-        "🔍 Стиль собеседника — как писать ему\n"
-        "🔬 Глубокий анализ — совместимость, история отношений, подарки\n"
+        "🔬 Глубокий анализ — совместимость, история отношений, как писать "
+        "этому человеку, подарки\n"
         "🪞 Глубокий анализ стиля — твой коммуникативный профиль и советы для дейтинга\n"
-        "📋 Контакты · /stats — портрет в цифрах · /compare — сравнить стили\n\n"
+        "/contacts — загруженные чаты · /stats — портрет в цифрах · /compare — сравнить стили\n\n"
         f"💎 {FREE_TRIAL_REQUESTS} бесплатных попыток на переписать/ответить/скриншот, "
         "дальше и остальные функции — по подписке. Статус — /premium.\n\n"
         "Полный список команд — /help"
@@ -1303,10 +1313,6 @@ async def handle_menu_button(message: Message, state: FSMContext, bot: Bot) -> N
         await _start_screenshot(message, state)
     elif message.text == BTN_REPLY:
         await _start_reply(message, state)
-    elif message.text == BTN_CONTACT:
-        await _show_contact_style(message, bot)
-    elif message.text == BTN_CONTACTS:
-        await _show_contacts(message)
     elif message.text == BTN_DEEP:
         await _show_deep_analysis(message, bot)
     elif message.text == BTN_DEEP_STYLE:
@@ -1396,7 +1402,7 @@ async def handle_document(message: Message, bot: Bot, state: FSMContext) -> None
     else:
         await message.answer(
             f"Загружено — {name} ({chat.meta.total_messages} сообщений).\n"
-            "Нажми «🔍 Стиль собеседника» для анализа.",
+            "Нажми «🔬 Глубокий анализ» для разбора.",
             reply_markup=main_kb(),
         )
 
@@ -1441,10 +1447,14 @@ async def cmd_connect(message: Message) -> None:
     await message.answer("Ты сейчас с какого устройства?", reply_markup=platform_pick_kb())
 
 
-# ── /provider — переключить LLM-провайдера (для теста) ───────────────────────
+# ── /provider — переключить LLM-провайдера (только для админа) ───────────────
+# Меняет каскад ГЛОБАЛЬНО для всего бота (module-level _forced в llm.py), а не
+# только для вызывающего — поэтому доступ только разработчику по ADMIN_TELEGRAM_ID.
 
 @dp.message(Command("provider"))
 async def cmd_provider(message: Message) -> None:
+    if not ADMIN_TELEGRAM_ID or str(message.from_user.id) != ADMIN_TELEGRAM_ID:
+        return
     parts = (message.text or "").split(maxsplit=1)
     variants = " · ".join(p.lower() for p in PROVIDER_NAMES) + " · auto"
     if len(parts) < 2:
@@ -1478,42 +1488,6 @@ async def cmd_provider(message: Message) -> None:
             f"✅ Принудительно выбран: {result}.\n"
             "Перепиши любое сообщение для проверки. /provider auto — вернуть каскад."
         )
-
-
-# ── /me ───────────────────────────────────────────────────────────────────────
-
-@dp.message(Command("me"))
-async def cmd_me(message: Message) -> None:
-    await _show_style(message)
-
-
-# ── Мой общий стиль (агрегат) ─────────────────────────────────────────────────
-
-async def _show_style(message: Message) -> None:
-    telegram_id = str(message.from_user.id)
-    contacts = list_contacts(telegram_id)
-    if not contacts:
-        await message.answer("Сначала загрузи JSON-файл чата.")
-        return
-
-    style_card = get_style_card(telegram_id)
-    if not style_card:
-        await message.answer("Генерирую общий портрет — займёт ~20 секунд...")
-        style_card = await _gen_style_card(telegram_id)
-
-    if not style_card:
-        await message.answer("Не удалось сгенерировать анализ.")
-        return
-
-    if len(contacts) == 1:
-        c = contacts[0]
-        name = _contact_name(c)
-        per_contact = get_my_style_per_contact(c["id"])
-        extra = f"\n\n── Мой стиль с {name} ──\n\n{per_contact}" if per_contact else ""
-        await _answer_long(message, f"Твой общий портрет:\n\n{style_card}{extra}")
-        return
-
-    await _answer_long(message, f"Твой общий портрет:\n\n{style_card}")
 
 
 # ── 🎯 Мой стиль с конкретным человеком ──────────────────────────────────────
@@ -1595,60 +1569,6 @@ async def cmd_contacts(message: Message) -> None:
     await _show_contacts(message)
 
 
-# ── 🔍 Стиль собеседника ──────────────────────────────────────────────────────
-
-async def _show_contact_style(message: Message, bot: Bot) -> None:
-    telegram_id = str(message.from_user.id)
-    contacts = list_contacts(telegram_id)
-    if not contacts:
-        await message.answer("Нет загруженных чатов. Отправь JSON-файл.")
-        return
-
-    if not await _require_premium(bot, message, telegram_id):
-        return
-
-    if len(contacts) == 1:
-        c = contacts[0]
-        name = _contact_name(c)
-        card = get_interaction_card(c["id"])
-        if not card:
-            await message.answer(f"Генерирую анализ {name} — займёт ~20 секунд...")
-            card = await _gen_interaction_card(c["id"], telegram_id)
-        if not card:
-            await message.answer("Не удалось сгенерировать анализ.")
-            return
-        await _answer_long(message, f"Как писать {name}:\n\n{card}")
-        return
-
-    await message.answer("Чей стиль показать?", reply_markup=contacts_kb(contacts, "cstyle"))
-
-
-@dp.callback_query(F.data.startswith("cstyle:"))
-async def cb_contact_style(call: CallbackQuery, bot: Bot) -> None:
-    contact_id = int(call.data.split(":")[1])
-    contact    = get_contact_by_id(contact_id)
-    if not contact:
-        await call.answer("Контакт не найден.")
-        return
-
-    telegram_id = str(call.from_user.id)
-    if not await _require_premium(bot, call.message, telegram_id):
-        await call.answer()
-        return
-
-    await call.answer()
-    name = _contact_name(contact)
-
-    card = get_interaction_card(contact_id)
-    if not card:
-        await call.message.edit_text(f"Генерирую анализ {name} — займёт ~20 секунд...")
-        card = await _gen_interaction_card(contact_id, str(call.from_user.id))
-
-    if not card:
-        await call.message.edit_text("Не удалось сгенерировать анализ.")
-        return
-
-    await _edit_or_answer_long(call.message, f"Как писать {name}:\n\n{card}")
 
 
 # ── Хелпер: стиль для перезаписи (per-contact → global fallback) ──────────────
@@ -2025,10 +1945,10 @@ async def _prompt_screenshot_style_no_contact(
         await target.answer(text, reply_markup=kb)
 
 
-# ── /rebuild_all — принудительная пересборка всего (для теста) ───────────────
+# ── /rebuild — принудительная пересборка всех карточек ───────────────────────
 
-@dp.message(Command("rebuild_all"))
-async def cmd_rebuild_all(message: Message, bot: Bot) -> None:
+@dp.message(Command("rebuild"))
+async def cmd_rebuild(message: Message, bot: Bot) -> None:
     telegram_id = str(message.from_user.id)
     if not await _require_premium(bot, message, telegram_id):
         return
@@ -2064,7 +1984,7 @@ async def cmd_rebuild_all(message: Message, bot: Bot) -> None:
             await status.edit_text(_progress(rebuilt) + f"\n\n⛔ Дальше упёрлись в лимит.\n{e}")
             return
         except Exception:
-            logging.exception("rebuild_all failed for contact_id=%s", c["id"])
+            logging.exception("rebuild failed for contact_id=%s", c["id"])
 
     await status.edit_text(_progress(rebuilt))
 
@@ -2091,42 +2011,33 @@ async def cmd_rebuild_all(message: Message, bot: Bot) -> None:
 
 async def _show_help(message: Message) -> None:
     await message.answer(
-        "Доступные команды:\n\n"
-        "/start — начало работы / онбординг\n"
-        "/help — список команд\n"
-        "/demo — попробовать на готовом примере\n"
-        "/connect — как подключить Автоматизацию чатов\n"
-        "/me — твой общий стиль общения\n"
-        "/stats — твой портрет в цифрах\n"
-        "/compare — как ты пишешь разным людям (сравнение)\n"
-        "/rewrite — переписать сообщение\n"
-        "/screenshot — ответить по скриншоту переписки\n"
-        "/reply — помочь ответить на сообщение собеседника\n"
+        "Вот что я умею (то же самое есть и кнопками в меню):\n\n"
+        "📝 Написать за тебя — выбор стиля у каждого: флирт/юмор/нежно/"
+        "уверенно/дружески/формально\n"
+        "/rewrite — переписать свой черновик под собеседника\n"
+        "/reply — ответить на его сообщение\n"
+        "/screenshot — ответить по скриншоту переписки (можно слать скриншоты "
+        "один за другим)\n\n"
+        "🔬 Разобраться\n"
+        "/deep_analysis — совместимость, история отношений, стиль и привычки "
+        "собеседника, идеи подарков\n"
+        "/deep_style_analysis — твой коммуникативный профиль и советы для дейтинга\n"
+        "/compare — сравнить, как ты пишешь разным людям\n"
+        "/stats — портрет в цифрах, бесплатно\n\n"
+        "⚙️ Аккаунт\n"
         "/contacts — список загруженных чатов\n"
-        "/deep_analysis — глубокий анализ: совместимость, история, подарки\n"
-        "/deep_style_analysis — глубокий анализ твоего стиля (агрегат по всем)\n"
-        "/premium — статус подписки и ссылка на оформление\n"
-        "/delete — удалить свои данные\n"
-        "/rebuild_all — принудительно пересобрать все карточки\n\n"
-        "Кнопки в меню:\n"
-        "📝 Переписать — черновик → выбор стиля (флирт/юмор/нежно/уверенно/"
-        "дружески/формально) → готовое сообщение\n"
-        "📸 По скриншоту — пришли скриншот переписки, выбери чей это диалог "
-        "(можно выбрать «🆕 Новый человек», если его ещё нет в базе) и стиль ответа. "
-        "После ответа можно сразу прислать следующий скриншот — без повторного "
-        "нажатия кнопки, пока не выйдешь через меню\n"
-        "💬 Ответить за меня — подскажу ответ на сообщение собеседника, с выбором стиля\n"
-        "🔍 Стиль собеседника — паттерны и советы по нему\n"
-        "🔬 Глубокий анализ — совместимость, история отношений по периодам, "
-        "сильные стороны/проблемы/точки роста, идеи подарков\n"
-        "🪞 Глубокий анализ стиля — твой коммуникативный профиль, как менялся стиль "
-        "по периодам, сильные/слабые стороны как собеседника, советы для дейтинга\n"
-        "📋 Контакты — загруженные переписки\n"
-        "❓ Помощь — это сообщение\n\n"
-        "Любое сообщение, которое ты просто напишешь боту, автоматически "
-        "переписывается под активного собеседника (🟢 в /contacts).\n\n"
-        f"💎 Переписать/Ответить/Скриншот — {FREE_TRIAL_REQUESTS} бесплатных попыток, "
-        "дальше и весь остальной функционал — по подписке CueMe Premium. Статус — /premium."
+        "/connect — как подключить Автоматизацию чатов (живой поток переписки)\n"
+        "/auto — вкл/выкл авто-режим: когда включён, любой присланный текст "
+        "сразу предлагается переписать, без команды и кнопки\n"
+        "/premium — статус подписки\n"
+        "/rebuild — принудительно пересобрать все карточки заново\n"
+        "/delete — удалить свои данные\n\n"
+        "🎬 Остальное\n"
+        "/start — начало работы\n"
+        "/demo — попробовать на примере\n"
+        "/help — это сообщение\n\n"
+        f"💎 {FREE_TRIAL_REQUESTS} бесплатных попыток на переписать/ответить/скриншот, "
+        "дальше и остальные функции — по подписке. Статус — /premium."
     )
 
 
@@ -2462,7 +2373,7 @@ async def main() -> None:
         BotCommand(command="deep_style_analysis", description="Глубокий анализ моего стиля"),
         BotCommand(command="premium",     description="Статус подписки"),
         BotCommand(command="delete",      description="Удалить свои данные"),
-        BotCommand(command="rebuild_all", description="Пересобрать все карточки"),
+        BotCommand(command="rebuild",     description="Пересобрать все карточки"),
     ])
     await dp.start_polling(
         bot,

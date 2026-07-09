@@ -19,6 +19,10 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 # OpenRouter — llama-3.1-8b-instruct:free.
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 
+# telegram_id разработчика — единственный, кому доступна /provider (меняет
+# LLM-каскад глобально для всего бота, поэтому не должна быть открыта всем).
+ADMIN_TELEGRAM_ID = os.getenv("ADMIN_TELEGRAM_ID", "")
+
 # Порядок каскада LLM (через запятую). Дефолт — Gemini основной. На сервере без
 # GEMINI_PROXY имеет смысл поставить groq первым: "groq,gemini,openrouter".
 LLM_PROVIDER_ORDER = os.getenv("LLM_PROVIDER_ORDER", "gemini,groq,openrouter")
