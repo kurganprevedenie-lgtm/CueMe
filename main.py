@@ -357,18 +357,19 @@ async def _run_style_generation(
         # Реальный вызов LLM — здесь и только здесь гейт + списание.
         if not await _quota_gate(bot, target, str(telegram_id)):
             return
+        prev = ctx.get("result") if force_fresh else None
         try:
             if kind == "rewrite":
                 result, expl, rating = await rewrite_message_explained(
-                    text, style_card, interaction_card, style_key
+                    text, style_card, interaction_card, style_key, previous_result=prev
                 )
             elif kind == "reply":
                 result, expl, rating = await suggest_reply(
-                    text, style_card, interaction_card, style_key
+                    text, style_card, interaction_card, style_key, previous_result=prev
                 )
             else:  # screenshot
                 result, expl, rating = await suggest_reply_from_screenshot(
-                    text, style_card, interaction_card, style_key
+                    text, style_card, interaction_card, style_key, previous_result=prev
                 )
         except RateLimitError:
             await target.answer("Лимит исчерпан, попробуй позже.")
