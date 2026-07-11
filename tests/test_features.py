@@ -224,3 +224,44 @@ def test_winning_dedup_and_recency_and_limit():
     wins = winning_messages(msgs, max_examples=2)
     assert len(wins) == 2
     assert wins[0] == "классный заход номер 4"   # самый свежий первым
+
+
+# ── interest_trend ──────────────────────────────────────────────────────────────
+
+from features import interest_trend
+
+
+def _dm(direction, text, iso):
+    return {"direction": direction, "text": text, "date": iso}
+
+
+def test_interest_trend_warming():
+    # ранние реплики короткие/без вопросов, свежие — длиннее и с вопросами → теплеет
+    msgs = []
+    for i in range(3):
+        msgs.append(_dm("out", "как ты?", f"2026-07-0{i+1}T10:00:00"))
+        msgs.append(_dm("in", "норм", f"2026-07-0{i+1}T12:00:00"))
+    for i in range(3, 6):
+        msgs.append(_dm("out", "как ты?", f"2026-07-0{i+1}T10:00:00"))
+        msgs.append(_dm("in", "оооо это так интересно, а ты как? расскажи подробнее пожалуйста!", f"2026-07-0{i+1}T10:05:00"))
+    t = interest_trend(msgs)
+    assert t["verdict"] == "теплеет"
+    assert any("длиннее" in e or "вопрос" in e or "быстрее" in e for e in t["evidence"])
+
+
+def test_interest_trend_cooling():
+    msgs = []
+    for i in range(3):
+        msgs.append(_dm("out", "как ты?", f"2026-07-0{i+1}T10:00:00"))
+        msgs.append(_dm("in", "ой привет, так рада тебя слышать, как твои дела?", f"2026-07-0{i+1}T10:03:00"))
+    for i in range(3, 6):
+        msgs.append(_dm("out", "как ты?", f"2026-07-0{i+1}T10:00:00"))
+        msgs.append(_dm("in", "угу", f"2026-07-0{i+1}T13:30:00"))
+    t = interest_trend(msgs)
+    assert t["verdict"] == "остывает"
+
+
+def test_interest_trend_none_when_little_data():
+    msgs = [_dm("in", "привет", "2026-07-01T10:00:00"),
+            _dm("in", "как ты", "2026-07-01T10:01:00")]
+    assert interest_trend(msgs) is None

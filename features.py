@@ -235,3 +235,70 @@ def winning_messages(dated_msgs: list[dict], max_examples: int = 3,
         if len(out) >= max_examples:
             break
     return out
+
+
+def _in_reply_latencies(msgs: list[dict]) -> list[float]:
+    """Секунды: как быстро собеседник ('in') отвечал на сообщение автора ('out'),
+    в пределах сессии. msgs — уже отсортированы по дате."""
+    lat: list[float] = []
+    for prev, cur in zip(msgs, msgs[1:]):
+        if cur["direction"] != "in" or prev["direction"] != "out":
+            continue
+        try:
+            gap = (datetime.fromisoformat(cur["date"]) - datetime.fromisoformat(prev["date"])).total_seconds()
+        except (ValueError, TypeError, KeyError):
+            continue
+        if 0 <= gap <= SESSION_GAP.total_seconds():
+            lat.append(gap)
+    return lat
+
+
+def interest_trend(dated_msgs: list[dict], min_in: int = 6) -> Optional[dict]:
+    """Динамика интереса собеседника во времени (без LLM): сравнивает раннюю и
+    свежую половины его сообщений по длине реплик, доле вопросов к автору и
+    скорости ответа. Возвращает {'verdict', 'evidence'} или None (данных мало).
+    verdict ∈ {'теплеет', 'ровно', 'остывает'} — с опорой на конкретные сдвиги."""
+    msgs = sorted((m for m in dated_msgs if m.get("text") and m.get("date")),
+                  key=lambda m: m["date"])
+    in_msgs = [m for m in msgs if m["direction"] == "in"]
+    if len(in_msgs) < min_in:
+        return None
+
+    mid = len(in_msgs) // 2
+    early, recent = in_msgs[:mid], in_msgs[mid:]
+
+    def _avg_len(xs: list[dict]) -> float:
+        return sum(len(m["text"]) for m in xs) / len(xs)
+
+    def _q_ratio(xs: list[dict]) -> float:
+        return sum(1 for m in xs if "?" in m["text"]) / len(xs)
+
+    score = 0
+    evidence: list[str] = []
+
+    el, rl = _avg_len(early), _avg_len(recent)
+    if rl >= el * 1.2:
+        score += 1; evidence.append(f"отвечает длиннее ({el:.0f}→{rl:.0f} симв.)")
+    elif rl <= el * 0.8:
+        score -= 1; evidence.append(f"отвечает короче ({el:.0f}→{rl:.0f} симв.)")
+
+    eq, rq = _q_ratio(early), _q_ratio(recent)
+    if rq >= eq + 0.15:
+        score += 1; evidence.append(f"чаще задаёт тебе вопросы ({eq:.0%}→{rq:.0%})")
+    elif rq <= eq - 0.15:
+        score -= 1; evidence.append(f"реже задаёт тебе вопросы ({eq:.0%}→{rq:.0%})")
+
+    lat = _in_reply_latencies(msgs)
+    if len(lat) >= 4:
+        m = len(lat) // 2
+        el_lat = sum(lat[:m]) / m
+        rl_lat = sum(lat[m:]) / (len(lat) - m)
+        if rl_lat <= el_lat * 0.7:
+            score += 1; evidence.append(f"отвечает быстрее ({el_lat/60:.0f}→{rl_lat/60:.0f} мин)")
+        elif rl_lat >= el_lat * 1.4:
+            score -= 1; evidence.append(f"отвечает медленнее ({el_lat/60:.0f}→{rl_lat/60:.0f} мин)")
+
+    verdict = "теплеет" if score > 0 else "остывает" if score < 0 else "ровно"
+    if not evidence:
+        evidence.append("заметных сдвигов нет — динамика ровная")
+    return {"verdict": verdict, "evidence": evidence}
