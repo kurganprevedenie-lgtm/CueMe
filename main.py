@@ -62,7 +62,9 @@ from llm import (
     live_coach_step,
     make_features_summary,
     rewrite_message_explained,
+    rewrite_message_variants,
     sample_texts,
+    screenshot_variants,
     set_forced_provider,
     suggest_reply,
     suggest_reply_from_screenshot,
@@ -1798,11 +1800,12 @@ async def handle_draft(message: Message, state: FSMContext, bot: Bot) -> None:
     if not await _quota_gate(bot, message, str(message.from_user.id)):
         return
 
-    action_id = _new_action(message.from_user.id, {
+    ctx = {
         "kind": "rewrite", "text": draft, "result": None, "style": None,
         "style_card": data["style_card"], "interaction_card": data["interaction_card"],
-    })
-    await message.answer("В каком стиле переписать?", reply_markup=style_pick_kb(action_id))
+    }
+    action_id = _new_action(message.from_user.id, ctx)
+    await _run_variants_generation(message, ctx, message.from_user.id, bot, action_id)
 
 
 # ── 💬 Ответить за меня ───────────────────────────────────────────────────────
@@ -1982,13 +1985,17 @@ def variants_result_kb(action_id: str) -> InlineKeyboardMarkup:
     return b.as_markup()
 
 
-async def _run_reply_variants(
-    target: Message, ctx: dict, telegram_id: int, bot: Bot, action_id: str, force_fresh: bool = False,
+async def _run_variants_generation(
+    target: Message, ctx: dict, telegram_id: int, bot: Bot, action_id: str,
+    state: FSMContext | None = None, force_fresh: bool = False,
 ) -> None:
-    """Генерирует несколько именованных вариантов ответа ОДНИМ вызовом LLM для
-    «Ответить за меня» (замена прежнего «сначала выбери стиль»). Гейт и списание
-    триала — один раз за вызов (не за каждый вариант), т.к. это один вызов LLM."""
-    text = ctx.get("text")
+    """Общий шаг генерации нескольких именованных вариантов ОДНИМ вызовом LLM —
+    для «Переписать» / «Ответить за меня» / «По скриншоту» (замена прежнего
+    «сначала выбери стиль»). Диспетчер по ctx["kind"] зовёт нужную из трёх
+    *_variants функций. Гейт и списание триала — один раз за вызов (не за
+    каждый вариант), т.к. это один вызов LLM."""
+    kind = ctx.get("kind")
+    text = ctx.get("text") if kind in ("rewrite", "reply") else ctx.get("chat_text")
     if text is None:
         await target.answer("Контекст устарел — начни заново.")
         return
@@ -1996,7 +2003,7 @@ async def _run_reply_variants(
     style_card, interaction_card = ctx["style_card"], ctx["interaction_card"]
     signals = ctx.get("data_signals")
     winning = ctx.get("winning")
-    cache_key = _style_cache_key("reply_variants", "", text, style_card, interaction_card)
+    cache_key = _style_cache_key(f"{kind}_variants", "", text, style_card, interaction_card)
 
     variants = None
     if not force_fresh:
@@ -2004,7 +2011,7 @@ async def _run_reply_variants(
         if cached:
             try:
                 variants = [tuple(v) for v in json.loads(cached)]
-                logging.info("reply-variants: cache hit")
+                logging.info("%s-variants: cache hit", kind)
             except (ValueError, TypeError):
                 variants = None
 
@@ -2014,15 +2021,26 @@ async def _run_reply_variants(
             return
         prev = ctx.get("variants") if force_fresh else None
         try:
-            variants = await suggest_reply_variants(
-                text, style_card, interaction_card,
-                data_signals=signals, previous_variants=prev, winning_examples=winning,
-            )
+            if kind == "rewrite":
+                variants = await rewrite_message_variants(
+                    text, style_card, interaction_card,
+                    previous_variants=prev, winning_examples=winning,
+                )
+            elif kind == "reply":
+                variants = await suggest_reply_variants(
+                    text, style_card, interaction_card,
+                    data_signals=signals, previous_variants=prev, winning_examples=winning,
+                )
+            else:  # screenshot
+                variants = await screenshot_variants(
+                    text, style_card, interaction_card,
+                    previous_variants=prev, data_signals=signals, winning_examples=winning,
+                )
         except RateLimitError:
             await target.answer("Лимит исчерпан, попробуй позже.")
             return
         except Exception:
-            logging.exception("reply-variants: ошибка генерации")
+            logging.exception("%s-variants: ошибка генерации", kind)
             await target.answer("Не получилось сгенерировать варианты — попробуй ещё раз.")
             return
 
@@ -2031,7 +2049,7 @@ async def _run_reply_variants(
         await _charge_trial_if_needed(bot, str(telegram_id))
         set_llm_cache(cache_key, json.dumps(variants, ensure_ascii=False))
         try:
-            record_event(str(telegram_id), "gen_reply_variants", str(len(variants)))
+            record_event(str(telegram_id), f"gen_{kind}_variants", str(len(variants)))
         except Exception:
             logging.exception("telemetry: не удалось записать событие генерации вариантов")
 
@@ -2041,32 +2059,40 @@ async def _run_reply_variants(
 
     ctx["variants"] = variants
     await _answer_long(target, _format_variants(variants), reply_markup=variants_result_kb(action_id))
-    await target.answer(
-        "Пришли следующее сообщение собеседника, чтобы ответить и на него. "
-        "Чтобы выйти из режима — нажми любую кнопку меню."
-    )
+
+    if kind == "reply":
+        await target.answer(
+            "Пришли следующее сообщение собеседника, чтобы ответить и на него. "
+            "Чтобы выйти из режима — нажми любую кнопку меню."
+        )
+    elif kind == "screenshot" and state is not None:
+        await state.set_state(Screenshot.waiting_for_image)
+        await target.answer(
+            "Пришли следующий скриншот (или текст переписки), чтобы продолжить. "
+            "Чтобы выйти из режима — нажми любую кнопку меню."
+        )
 
 
 @dp.callback_query(F.data.startswith("varother:"))
 async def cb_variants_other(call: CallbackQuery) -> None:
     action_id = call.data.split(":", 1)[1]
     ctx = _get_action(call.from_user.id, action_id)
-    if not ctx or ctx.get("kind") != "reply":
+    if not ctx or ctx.get("kind") not in _STYLE_KINDS:
         await call.answer("Контекст устарел — начни заново.", show_alert=True)
         return
     await call.answer()
-    await call.message.answer("В каком стиле ответить?", reply_markup=style_pick_kb(action_id))
+    await call.message.answer("В каком стиле?", reply_markup=style_pick_kb(action_id))
 
 
 @dp.callback_query(F.data.startswith("varregen:"))
-async def cb_variants_regen(call: CallbackQuery) -> None:
+async def cb_variants_regen(call: CallbackQuery, state: FSMContext) -> None:
     action_id = call.data.split(":", 1)[1]
     ctx = _get_action(call.from_user.id, action_id)
-    if not ctx or ctx.get("kind") != "reply":
+    if not ctx or ctx.get("kind") not in _STYLE_KINDS:
         await call.answer("Контекст устарел — начни заново.", show_alert=True)
         return
     await call.answer("Подбираю другие варианты...")
-    await _run_reply_variants(call.message, ctx, call.from_user.id, call.bot, action_id, force_fresh=True)
+    await _run_variants_generation(call.message, ctx, call.from_user.id, call.bot, action_id, state, force_fresh=True)
 
 
 @dp.message(ReplyHelp.waiting_for_incoming, _not_command)
@@ -2097,7 +2123,7 @@ async def handle_incoming(message: Message, state: FSMContext, bot: Bot) -> None
         "winning": _winning_for_contact(str(message.from_user.id), contact_id),
     }
     action_id = _new_action(message.from_user.id, ctx)
-    await _run_reply_variants(message, ctx, message.from_user.id, bot, action_id)
+    await _run_variants_generation(message, ctx, message.from_user.id, bot, action_id, state)
 
 
 @dp.message(Command("reply"))
@@ -2372,7 +2398,7 @@ async def _proceed_screenshot_style_pick(message: Message, state: FSMContext, ch
 
 
 @dp.callback_query(F.data.startswith("shotcontact:"))
-async def cb_screenshot_contact(call: CallbackQuery, bot: Bot) -> None:
+async def cb_screenshot_contact(call: CallbackQuery, bot: Bot, state: FSMContext) -> None:
     parts = call.data.split(":")
     if len(parts) != 3:
         await call.answer("Контекст устарел — начни заново через «📸 По скриншоту».", show_alert=True)
@@ -2387,7 +2413,7 @@ async def cb_screenshot_contact(call: CallbackQuery, bot: Bot) -> None:
 
     if raw_id == "new":
         await call.answer()
-        await _prompt_screenshot_style_no_contact(bot, call.message, call.from_user.id, telegram_id, ctx["chat_text"], edit=True)
+        await _prompt_screenshot_style_no_contact(bot, call.message, call.from_user.id, telegram_id, ctx["chat_text"], state, edit=True)
         return
 
     contact_id = int(raw_id)
@@ -2397,11 +2423,12 @@ async def cb_screenshot_contact(call: CallbackQuery, bot: Bot) -> None:
         return
 
     await call.answer()
-    await _prompt_screenshot_style(bot, call.message, call.from_user.id, telegram_id, contact_id, ctx["chat_text"], edit=True)
+    await _prompt_screenshot_style(bot, call.message, call.from_user.id, telegram_id, contact_id, ctx["chat_text"], state, edit=True)
 
 
 async def _prompt_screenshot_style(
-    bot: Bot, target: Message, user_id: int, telegram_id: str, contact_id: int, chat_text: str, edit: bool = False
+    bot: Bot, target: Message, user_id: int, telegram_id: str, contact_id: int, chat_text: str,
+    state: FSMContext, edit: bool = False,
 ) -> None:
     # ВАЖНО: user_id передаётся отдельным параметром, а не берётся из
     # target.from_user — при edit=True target это call.message, чей
@@ -2426,22 +2453,23 @@ async def _prompt_screenshot_style(
         return
 
     samples = get_message_samples(contact_id)
-    action_id = _new_action(user_id, {
+    ctx = {
         "kind": "screenshot", "chat_text": chat_text, "result": None, "style": None,
         "style_card": style_card, "interaction_card": interaction_card,
         "data_signals": _reply_data_signals(samples, _last_incoming_line(chat_text)),
         "winning": _winning_for_contact(telegram_id, contact_id),
-    })
-    text = "В каком стиле ответить?"
-    kb = style_pick_kb(action_id)
+    }
+    action_id = _new_action(user_id, ctx)
     if edit:
-        await target.edit_text(text, reply_markup=kb)
+        await target.edit_text("Генерирую варианты...")
     else:
-        await target.answer(text, reply_markup=kb)
+        await target.answer("Генерирую варианты...")
+    await _run_variants_generation(target, ctx, user_id, bot, action_id, state)
 
 
 async def _prompt_screenshot_style_no_contact(
-    bot: Bot, target: Message, user_id: int, telegram_id: str, chat_text: str, edit: bool = False
+    bot: Bot, target: Message, user_id: int, telegram_id: str, chat_text: str,
+    state: FSMContext, edit: bool = False,
 ) -> None:
     """Для человека, которого ещё нет в базе — общий (агрегатный) стиль автора,
     без per-contact interaction_card (промпт сам подставит нейтральный фолбэк)."""
@@ -2461,17 +2489,17 @@ async def _prompt_screenshot_style_no_contact(
         await (target.edit_text(text) if edit else target.answer(text))
         return
 
-    action_id = _new_action(user_id, {
+    ctx = {
         "kind": "screenshot", "chat_text": chat_text, "result": None, "style": None,
         "style_card": style_card, "interaction_card": "",
         "data_signals": _reply_data_signals(None, _last_incoming_line(chat_text)),
-    })
-    text = "В каком стиле ответить?"
-    kb = style_pick_kb(action_id)
+    }
+    action_id = _new_action(user_id, ctx)
     if edit:
-        await target.edit_text(text, reply_markup=kb)
+        await target.edit_text("Генерирую варианты...")
     else:
-        await target.answer(text, reply_markup=kb)
+        await target.answer("Генерирую варианты...")
+    await _run_variants_generation(target, ctx, user_id, bot, action_id, state)
 
 
 # ── /rebuild — принудительная пересборка всех карточек ───────────────────────
