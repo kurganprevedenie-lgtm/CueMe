@@ -61,13 +61,9 @@ from llm import (
     get_provider_stats,
     live_coach_step,
     make_features_summary,
-    rewrite_message_explained,
-    rewrite_message_variants,
     sample_texts,
     screenshot_variants,
     set_forced_provider,
-    suggest_reply,
-    suggest_reply_from_screenshot,
     suggest_reply_variants,
     transcribe_audio,
 )
@@ -84,7 +80,6 @@ from storage import (
     get_all_dated_my_messages,
     get_all_per_contact_style_cards,
     get_any_user_samples,
-    get_auto_mode,
     get_biz_messages_for_contact,
     get_business_connection,
     get_contact_by_id,
@@ -114,7 +109,6 @@ from storage import (
     save_running_notes,
     save_style_card,
     record_event,
-    set_auto_mode,
     set_llm_cache,
     update_contact_username,
     upsert_business_connection,
@@ -153,7 +147,6 @@ async def on_unhandled_error(event: ErrorEvent) -> bool:
     return True
 
 
-BTN_REWRITE       = "📝 Переписать"
 BTN_SCREENSHOT    = "📸 По скриншоту"
 BTN_REPLY         = "💬 Ответить за меня"
 BTN_LIVE          = "💫 Новый диалог"
@@ -167,8 +160,10 @@ BTN_HELP          = "❓ Помощь"
 # BTN_CONTACT («🔍 Стиль собеседника») удалена совсем — её interaction_card
 # теперь блоком внутри «Глубокий анализ» (_format_deep_analysis). BTN_CONTACTS
 # («📋 Контакты») убрана из меню — доступна только как команда /contacts.
+# BTN_REWRITE («📝 Переписать») и /auto удалены совсем — их сценарий (черновик
+# без привязки к входящему) теперь полностью закрывает «💫 Новый диалог».
 _ALL_BTNS = {
-    BTN_REWRITE, BTN_SCREENSHOT, BTN_REPLY, BTN_LIVE, BTN_DEEP, BTN_DEEP_STYLE, BTN_HELP,
+    BTN_SCREENSHOT, BTN_REPLY, BTN_LIVE, BTN_DEEP, BTN_DEEP_STYLE, BTN_HELP,
 }
 
 # Защита от параллельных пересборок одного контакта
@@ -343,70 +338,16 @@ async def _require_premium(bot: Bot, target: Message, telegram_id: str) -> bool:
 
 def main_kb() -> ReplyKeyboardMarkup:
     b = ReplyKeyboardBuilder()
-    b.row(KeyboardButton(text=BTN_REWRITE), KeyboardButton(text=BTN_SCREENSHOT), KeyboardButton(text=BTN_REPLY))
+    b.row(KeyboardButton(text=BTN_SCREENSHOT), KeyboardButton(text=BTN_REPLY))
     b.row(KeyboardButton(text=BTN_LIVE))
     b.row(KeyboardButton(text=BTN_DEEP), KeyboardButton(text=BTN_DEEP_STYLE))
     b.row(KeyboardButton(text=BTN_HELP))
     return b.as_markup(resize_keyboard=True)
 
 
-def style_pick_kb(action_id: str) -> InlineKeyboardMarkup:
-    """Единая клавиатура выбора стиля — общая для «Переписать», «Ответить за
-    меня» и «По скриншоту». action_id зашит в callback_data и указывает на
-    конкретный слот в _last_action[user_id] — так несколько параллельных
-    черновиков/входящих у одного юзера не путаются друг с другом."""
-    b = InlineKeyboardBuilder()
-    b.button(text="🎯 Подбери сам", callback_data=f"stylepick:auto:{action_id}")
-    for key, (label, _desc) in REPLY_STYLES.items():
-        b.button(text=label, callback_data=f"stylepick:{key}:{action_id}")
-    b.adjust(1, 2)
-    return b.as_markup()
-
-
-def _auto_style_for_ctx(ctx: dict) -> str:
-    """Консервативный выбор стиля по текущей ситуации. Пользователь всё ещё может
-    нажать «Другой стиль», это только быстрый дефолт для частых кейсов."""
-    kind = ctx.get("kind")
-    text = (ctx.get("text") if kind in ("rewrite", "reply") else ctx.get("chat_text")) or ""
-    last = _last_incoming_line(text) if kind == "screenshot" else text
-    low = last.lower()
-    signals = (ctx.get("data_signals") or "").lower()
-
-    if "отказ/холод/негатив" in signals or any(
-        p in low for p in ("не до знакомств", "всё равно", "все равно", "бесит", "не хочу", "не интересно", "неинтересно")
-    ):
-        return "confident"
-    if any(p in low for p in ("страшно", "боюсь", "тревожно", "устала", "устал", "вымоталась", "плохо", "тяжело")):
-        return "tender"
-    if any(p in low for p in ("здравствуйте", "добрый день", "вы ", "вам ", "вас ")):
-        return "formal"
-    if any(p in low for p in ("ахах", "хаха", "смешно", "пицц", "шут", "угар")):
-        return "humor"
-    if any(p in low for p in ("снился", "снилась", "мечтаю", "скуч", "цел", "краси", "симпат")):
-        return "flirt"
-    if any(p in low for p in ("во сколько", "когда", "где", "встреч", "завтра", "сегодня", "кофе", "прогул")):
-        return "friendly"
-    if kind == "rewrite" and any(p in low for p in ("может", "сходим", "увидимся", "встретимся")):
-        return "flirt"
-    return "friendly"
-
-
-# Telegram ограничивает CopyTextButton.text 256 символами.
-_COPY_TEXT_LIMIT = 256
-
-
-def style_result_kb(action_id: str, copy_text: str | None = None) -> InlineKeyboardMarkup:
-    b = InlineKeyboardBuilder()
-    b.button(text="✏️ Другой стиль", callback_data=f"styleother:{action_id}")
-    b.button(text="🔄 Перегенерировать", callback_data=f"styleregen:{action_id}")
-    # Нативная кнопка Telegram копирует текст в буфер прямо на клиенте.
-    # Если текст длиннее лимита — fallback на callback (шлём копируемым блоком).
-    if copy_text and len(copy_text) <= _COPY_TEXT_LIMIT:
-        b.button(text="📋 Скопировать", copy_text=CopyTextButton(text=copy_text))
-    else:
-        b.button(text="📋 Скопировать", callback_data=f"stylecopy:{action_id}")
-    b.adjust(1, 2)
-    return b.as_markup()
+# style_pick_kb/_auto_style_for_ctx/style_result_kb (точечный выбор одного стиля
+# после показа вариантов, кнопка «Другой тон») убраны вместе с ней — см. main.py
+# variants_result_kb ниже. Точечный выбор стиля больше нигде не используется.
 
 
 def _style_cache_key(kind: str, style: str, text: str, style_card: str, interaction_card: str) -> str:
@@ -414,167 +355,6 @@ def _style_cache_key(kind: str, style: str, text: str, style_card: str, interact
     ключ меняется сам (авто-инвалидация без TTL-гонок)."""
     raw = "\x00".join([kind or "", style or "", text or "", style_card or "", interaction_card or ""])
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
-
-
-async def _run_style_generation(
-    target: Message, ctx: dict, telegram_id: int, bot: Bot, action_id: str,
-    state: FSMContext | None = None, force_fresh: bool = False,
-) -> None:
-    """Общий шаг генерации для всех трёх фич переписывания (rewrite/reply/screenshot)
-    после того как стиль выбран. Шлёт результат + пояснение/оценку отдельным
-    сообщением; для «Ответить за меня» и «По скриншоту» — ещё и напоминание
-    как продолжить (авто-режим: следующее сообщение/скриншот без повторного
-    нажатия кнопки меню).
-
-    Гейт монетизации: проверка ДО вызова LLM, списание — только ПОСЛЕ успешного
-    ответа. Кэш: попадание = НЕ вызов LLM → попытку не тратим. force_fresh=True
-    (регенерация) обходит кэш, чтобы дать новый вариант, и обновляет запись."""
-    kind      = ctx.get("kind")
-    style_key = ctx.get("style")
-    text      = ctx.get("text") if kind in ("rewrite", "reply") else ctx.get("chat_text")
-    if not style_key or text is None:
-        await target.answer("Контекст устарел — начни заново.")
-        return
-
-    style_card, interaction_card = ctx["style_card"], ctx["interaction_card"]
-    cache_key = _style_cache_key(kind, style_key, text, style_card, interaction_card)
-
-    result = expl = rating = None
-    if not force_fresh:
-        cached = get_llm_cache(cache_key, LLM_CACHE_TTL_SEC)
-        if cached:
-            try:
-                result, expl, rating = json.loads(cached)
-                logging.info("style-gen: cache hit (%s/%s)", kind, style_key)
-            except (ValueError, TypeError):
-                result = None
-
-    if result is None:
-        # Реальный вызов LLM — здесь и только здесь гейт + списание.
-        if not await _quota_gate(bot, target, str(telegram_id)):
-            return
-        prev = ctx.get("result") if force_fresh else None
-        signals = ctx.get("data_signals")
-        winning = ctx.get("winning")
-        try:
-            if kind == "rewrite":
-                result, expl, rating = await rewrite_message_explained(
-                    text, style_card, interaction_card, style_key, previous_result=prev
-                )
-            elif kind == "reply":
-                result, expl, rating = await suggest_reply(
-                    text, style_card, interaction_card, style_key,
-                    previous_result=prev, data_signals=signals, winning_examples=winning,
-                )
-            else:  # screenshot
-                result, expl, rating = await suggest_reply_from_screenshot(
-                    text, style_card, interaction_card, style_key,
-                    previous_result=prev, data_signals=signals, winning_examples=winning,
-                )
-        except RateLimitError:
-            await target.answer("Лимит исчерпан, попробуй позже.")
-            return
-        except Exception:
-            logging.exception("%s: ошибка генерации (стиль %s)", kind, style_key)
-            await target.answer("Не получилось сгенерировать — попробуй ещё раз.")
-            return
-
-        # Успех — списываем попытку (premium не тратит) и кэшируем.
-        await _charge_trial_if_needed(bot, str(telegram_id))
-        set_llm_cache(cache_key, json.dumps([result, expl, rating], ensure_ascii=False))
-        # Телеметрия исходов (best-effort — сбой не должен ломать выдачу ответа).
-        try:
-            record_event(str(telegram_id), f"gen_{kind}", style_key or "")
-        except Exception:
-            logging.exception("telemetry: не удалось записать событие генерации")
-
-    ctx["result"] = result
-    await _answer_long(target, result, reply_markup=style_result_kb(action_id, result))
-    tail = ""
-    if expl:
-        tail += f"💡 {expl}"
-    if rating:
-        tail += ("\n\n" if tail else "") + rating
-    if tail:
-        await target.answer(tail)
-
-    if kind == "reply":
-        await target.answer(
-            "Пришли следующее сообщение собеседника, чтобы ответить и на него. "
-            "Чтобы выйти из режима — нажми любую кнопку меню."
-        )
-    elif kind == "screenshot" and state is not None:
-        await state.set_state(Screenshot.waiting_for_image)
-        await target.answer(
-            "Пришли следующий скриншот (или текст переписки), чтобы продолжить. "
-            "Чтобы выйти из режима — нажми любую кнопку меню."
-        )
-
-
-_STYLE_KINDS = ("rewrite", "reply", "screenshot")
-
-
-@dp.callback_query(F.data.startswith("stylepick:"))
-async def cb_style_pick(call: CallbackQuery, state: FSMContext) -> None:
-    parts = call.data.split(":")
-    if len(parts) != 3:
-        await call.answer("Контекст устарел — начни заново.", show_alert=True)
-        return
-    _, style_key, action_id = parts
-    ctx = _get_action(call.from_user.id, action_id)
-    if not ctx or ctx.get("kind") not in _STYLE_KINDS:
-        await call.answer("Контекст устарел — начни заново.", show_alert=True)
-        return
-    if style_key == "auto":
-        style_key = _auto_style_for_ctx(ctx)
-    elif style_key not in REPLY_STYLES:
-        await call.answer("Контекст устарел — начни заново.", show_alert=True)
-        return
-    await call.answer()
-    ctx["style"] = style_key
-    label = REPLY_STYLES[style_key][0]
-    await call.message.edit_text(f"Генерирую в стиле «{label}»...", reply_markup=None)
-    await _run_style_generation(call.message, ctx, call.from_user.id, call.bot, action_id, state)
-
-
-@dp.callback_query(F.data.startswith("styleother:"))
-async def cb_style_other(call: CallbackQuery) -> None:
-    action_id = call.data.split(":", 1)[1]
-    ctx = _get_action(call.from_user.id, action_id)
-    if not ctx or ctx.get("kind") not in _STYLE_KINDS:
-        await call.answer("Контекст устарел — начни заново.", show_alert=True)
-        return
-    await call.answer()
-    await call.message.answer("В каком стиле?", reply_markup=style_pick_kb(action_id))
-
-
-@dp.callback_query(F.data.startswith("styleregen:"))
-async def cb_style_regen(call: CallbackQuery, state: FSMContext) -> None:
-    action_id = call.data.split(":", 1)[1]
-    ctx = _get_action(call.from_user.id, action_id)
-    if not ctx or ctx.get("kind") not in _STYLE_KINDS or not ctx.get("style"):
-        await call.answer("Контекст устарел — начни заново.", show_alert=True)
-        return
-    await call.answer("Перегенерирую...")
-    # force_fresh: реген должен дать НОВЫЙ вариант, а не вернуть тот же из кэша.
-    await _run_style_generation(call.message, ctx, call.from_user.id, call.bot, action_id, state, force_fresh=True)
-
-
-@dp.callback_query(F.data.startswith("stylecopy:"))
-async def cb_style_copy(call: CallbackQuery) -> None:
-    """Fallback для текста длиннее лимита CopyTextButton (256): шлём его
-    моноширинным блоком — по тапу Telegram копирует содержимое в буфер."""
-    action_id = call.data.split(":", 1)[1]
-    ctx = _get_action(call.from_user.id, action_id)
-    if not ctx or not ctx.get("result"):
-        await call.answer("Текст не найден — начни заново.", show_alert=True)
-        return
-    await call.answer("Нажми на текст, чтобы скопировать")
-    wrapped = f"<code>{html.escape(ctx['result'])}</code>"
-    if len(wrapped) <= 4096:
-        await call.message.answer(wrapped, parse_mode="HTML")
-    else:
-        await _answer_long(call.message, ctx["result"])
 
 
 def contacts_kb(contacts: list, prefix: str) -> InlineKeyboardMarkup:
@@ -636,9 +416,6 @@ def _not_command(message: Message) -> bool:
 class Setup(StatesGroup):
     waiting_for_json    = State()
     waiting_for_contact = State()
-
-class Rewrite(StatesGroup):
-    waiting_for_draft = State()
 
 class ReplyHelp(StatesGroup):
     waiting_for_incoming = State()
@@ -1252,15 +1029,16 @@ async def handle_business_message(event: Message, bot: Bot) -> None:
 def _capabilities_text() -> str:
     return (
         "Вот что я умею:\n\n"
-        "📝 Переписать — твой черновик → выбери стиль → готовое под собеседника\n"
-        "📸 По скриншоту — пришли скриншот переписки → выбери стиль ответа. "
+        "💬 Ответить за меня — сразу несколько вариантов ответа на его сообщение\n"
+        "📸 По скриншоту — пришли скриншот переписки → несколько вариантов ответа. "
         "Можно слать скриншоты один за другим без повторного нажатия кнопки\n"
-        "💬 Ответить за меня — подскажу ответ на его сообщение, с выбором стиля\n"
+        "💫 Новый диалог — помогу с первого сообщения новому человеку, даже без "
+        "накопленной истории\n"
         "🔬 Глубокий анализ — совместимость, история отношений, как писать "
         "этому человеку, подарки\n"
         "🪞 Глубокий анализ стиля — твой коммуникативный профиль и советы для дейтинга\n"
         "/contacts — загруженные чаты · /stats — портрет в цифрах · /compare — сравнить стили\n\n"
-        f"💎 {FREE_TRIAL_REQUESTS} бесплатных попыток на переписать/ответить/скриншот, "
+        f"💎 {FREE_TRIAL_REQUESTS} бесплатных попыток на ответ/скриншот, "
         "дальше и остальные функции — по подписке. Статус — /premium.\n\n"
         "Полный список команд — /help"
     )
@@ -1316,9 +1094,9 @@ async def _run_demo(telegram_id: str, target: Message) -> None:
         "Готово! Создал двух примеров-собеседников:\n"
         "• Босс (демо) — формальный, на «Вы»\n"
         "• Друг (демо) — неформальный, на «ты»\n\n"
-        "Нажми «📝 Переписать», выбери одного и напиши любой черновик "
-        "(например: «напомнить про встречу в пятницу») — увидишь, как одно и то же "
-        "сообщение меняется под каждого.\n\n"
+        "Нажми «💬 Ответить за меня», выбери одного и пришли любое сообщение "
+        "(например: «как дела, увидимся на этой неделе?») — увидишь, как ответ "
+        "меняется под каждого.\n\n"
         "ℹ️ В демо голос условный. На твоих данных бот будет писать твоим голосом — "
         "загрузи экспорт чата, когда захочешь.",
         reply_markup=main_kb(),
@@ -1443,9 +1221,7 @@ async def cmd_demo(message: Message, state: FSMContext) -> None:
 @dp.message(F.text.in_(_ALL_BTNS))
 async def handle_menu_button(message: Message, state: FSMContext, bot: Bot) -> None:
     await state.clear()
-    if message.text == BTN_REWRITE:
-        await _start_rewrite(message, state)
-    elif message.text == BTN_SCREENSHOT:
+    if message.text == BTN_SCREENSHOT:
         await _start_screenshot(message, state)
     elif message.text == BTN_REPLY:
         await _start_reply(message, state)
@@ -1520,10 +1296,10 @@ async def handle_document(message: Message, bot: Bot, state: FSMContext) -> None
             style_card       = await _gen_style_card(telegram_id)
             interaction_card = await _gen_interaction_card(contact_id, telegram_id)
             if style_card and interaction_card:
-                set_auto_mode(telegram_id, True, contact_id)
                 await message.answer(
-                    f"Готово! Авто-режим включён — {name}.\n"
-                    "Просто пиши сообщения — буду переписывать под него.",
+                    f"Готово! Данные по {name} загружены.\n"
+                    "Жми «💬 Ответить за меня» (подскажу что ответить) или "
+                    "«📸 По скриншоту».",
                     reply_markup=main_kb(),
                 )
             else:
@@ -1565,11 +1341,10 @@ async def cb_setup_contact(call: CallbackQuery, state: FSMContext) -> None:
     interaction_card = await _gen_interaction_card(contact_id, telegram_id)
 
     if style_card and interaction_card:
-        set_auto_mode(telegram_id, True, contact_id)
         await state.clear()
         await call.message.edit_text(
-            f"Готово! Авто-режим включён — {name}.\n"
-            "Просто пиши сообщения — буду переписывать под него."
+            f"Готово! Данные по {name} загружены.\n"
+            "Жми «💬 Ответить за меня» (подскажу что ответить) или «📸 По скриншоту»."
         )
         await call.message.answer("Готово к работе 👇", reply_markup=main_kb())
     else:
@@ -1692,14 +1467,8 @@ async def _show_contacts(message: Message) -> None:
     if not contacts:
         await message.answer("Нет загруженных чатов. Отправь JSON-файл.")
         return
-    _, auto_cid = get_auto_mode(telegram_id)
-    lines = []
-    for c in contacts:
-        mark = " 🟢" if c["id"] == auto_cid else ""
-        lines.append(f"• {_contact_name(c)}{mark}")
-    await message.answer(
-        "Загруженные чаты (🟢 — активный для авто-переписки):\n" + "\n".join(lines)
-    )
+    lines = [f"• {_contact_name(c)}" for c in contacts]
+    await message.answer("Загруженные чаты:\n" + "\n".join(lines))
 
 
 @dp.message(Command("contacts"))
@@ -1719,93 +1488,9 @@ async def _style_for_rewrite(telegram_id: str, contact_id: int) -> str | None:
     return await _gen_style_card(telegram_id)
 
 
-# ── Переписать ────────────────────────────────────────────────────────────────
-
-async def _start_rewrite(message: Message, state: FSMContext) -> None:
-    telegram_id = str(message.from_user.id)
-    contacts = list_contacts(telegram_id)
-    if not contacts:
-        await message.answer("Сначала загрузи JSON-файл чата.")
-        return
-
-    if len(contacts) == 1:
-        c = contacts[0]
-        style_card       = await _style_for_rewrite(telegram_id, c["id"])
-        interaction_card = get_interaction_card(c["id"])
-        if not style_card or not interaction_card:
-            await message.answer("Генерирую анализ — займёт ~20 секунд...")
-            if not interaction_card:
-                interaction_card = await _gen_interaction_card(c["id"], telegram_id)
-            if not style_card:
-                style_card = await _gen_style_card(telegram_id)
-        if not style_card or not interaction_card:
-            await message.answer("Не удалось сгенерировать анализ.")
-            return
-        await state.update_data(style_card=style_card, interaction_card=interaction_card)
-        await state.set_state(Rewrite.waiting_for_draft)
-        name = _contact_name(c)
-        await message.answer(f"Напиши черновик для {name}:")
-        return
-
-    await message.answer("Для кого пишешь?", reply_markup=contacts_kb(contacts, "rw"))
-
-
-@dp.message(Command("rewrite"))
-async def cmd_rewrite(message: Message, state: FSMContext) -> None:
-    await _start_rewrite(message, state)
-
-
-@dp.callback_query(F.data.startswith("rw:"))
-async def cb_rewrite_contact(call: CallbackQuery, state: FSMContext) -> None:
-    contact_id  = int(call.data.split(":")[1])
-    telegram_id = str(call.from_user.id)
-
-    contact = get_contact_by_id(contact_id)
-    if not contact:
-        await call.answer("Контакт не найден.")
-        return
-
-    await call.answer()
-
-    style_card       = await _style_for_rewrite(telegram_id, contact_id)
-    interaction_card = get_interaction_card(contact_id)
-    if not style_card or not interaction_card:
-        await call.message.edit_text("Генерирую анализ — займёт ~20 секунд...")
-        if not interaction_card:
-            interaction_card = await _gen_interaction_card(contact_id, telegram_id)
-        if not style_card:
-            style_card = await _gen_style_card(telegram_id)
-
-    if not style_card or not interaction_card:
-        await call.message.edit_text("Не удалось сгенерировать анализ.")
-        return
-
-    await state.update_data(style_card=style_card, interaction_card=interaction_card)
-    await state.set_state(Rewrite.waiting_for_draft)
-    name = _contact_name(contact)
-    await call.message.edit_text(f"Напиши черновик для {name}:")
-
-
-@dp.message(Rewrite.waiting_for_draft)
-async def handle_draft(message: Message, state: FSMContext, bot: Bot) -> None:
-    txt, _ = await _message_text(bot, message)
-    draft = (txt or "").strip()
-    if not draft:
-        await message.answer("Пришли черновик текстом или голосовым.")
-        return
-
-    data = await state.get_data()
-    await state.clear()
-
-    if not await _quota_gate(bot, message, str(message.from_user.id)):
-        return
-
-    ctx = {
-        "kind": "rewrite", "text": draft, "result": None, "style": None,
-        "style_card": data["style_card"], "interaction_card": data["interaction_card"],
-    }
-    action_id = _new_action(message.from_user.id, ctx)
-    await _run_variants_generation(message, ctx, message.from_user.id, bot, action_id)
+# Кнопка «📝 Переписать» и /rewrite убраны совсем — сценарий (черновик без
+# привязки к входящему) теперь закрывает «💫 Новый диалог». _style_for_rewrite
+# выше не удалена — общий хелпер, используется reply/screenshot тоже.
 
 
 # ── 💬 Ответить за меня ───────────────────────────────────────────────────────
@@ -1974,14 +1659,18 @@ def _format_variants(variants: list[tuple[str, str]]) -> str:
     for i, (name, text) in enumerate(variants):
         letter = _VARIANT_LETTERS[i] if i < len(_VARIANT_LETTERS) else str(i + 1)
         blocks.append(f"Вариант {letter}: {name}\n- {text}")
-    return "Вот несколько вариантов — выбирай стиль или комбинируй.\n\n" + "\n\n".join(blocks)
+    return "Вот несколько вариантов — выбирай или комбинируй.\n\n" + "\n\n".join(blocks)
+
+
+# _VARIANT_KINDS — какие ctx["kind"] поддерживают вариантную генерацию.
+# «🎯 Другой тон» (точечный выбор одного стиля) убран — оставлена только
+# перегенерация; вместе с ней ушла и старая style_pick_kb-инфраструктура.
+_VARIANT_KINDS = ("reply", "screenshot")
 
 
 def variants_result_kb(action_id: str) -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
-    b.button(text="🎯 Другой тон", callback_data=f"varother:{action_id}")
     b.button(text="🔄 Другие варианты", callback_data=f"varregen:{action_id}")
-    b.adjust(2)
     return b.as_markup()
 
 
@@ -1990,12 +1679,11 @@ async def _run_variants_generation(
     state: FSMContext | None = None, force_fresh: bool = False,
 ) -> None:
     """Общий шаг генерации нескольких именованных вариантов ОДНИМ вызовом LLM —
-    для «Переписать» / «Ответить за меня» / «По скриншоту» (замена прежнего
-    «сначала выбери стиль»). Диспетчер по ctx["kind"] зовёт нужную из трёх
-    *_variants функций. Гейт и списание триала — один раз за вызов (не за
-    каждый вариант), т.к. это один вызов LLM."""
+    для «Ответить за меня» / «По скриншоту». Диспетчер по ctx["kind"] зовёт
+    нужную из *_variants функций. Гейт и списание триала — один раз за вызов
+    (не за каждый вариант), т.к. это один вызов LLM."""
     kind = ctx.get("kind")
-    text = ctx.get("text") if kind in ("rewrite", "reply") else ctx.get("chat_text")
+    text = ctx.get("text") if kind == "reply" else ctx.get("chat_text")
     if text is None:
         await target.answer("Контекст устарел — начни заново.")
         return
@@ -2021,12 +1709,7 @@ async def _run_variants_generation(
             return
         prev = ctx.get("variants") if force_fresh else None
         try:
-            if kind == "rewrite":
-                variants = await rewrite_message_variants(
-                    text, style_card, interaction_card,
-                    previous_variants=prev, winning_examples=winning,
-                )
-            elif kind == "reply":
+            if kind == "reply":
                 variants = await suggest_reply_variants(
                     text, style_card, interaction_card,
                     data_signals=signals, previous_variants=prev, winning_examples=winning,
@@ -2073,22 +1756,11 @@ async def _run_variants_generation(
         )
 
 
-@dp.callback_query(F.data.startswith("varother:"))
-async def cb_variants_other(call: CallbackQuery) -> None:
-    action_id = call.data.split(":", 1)[1]
-    ctx = _get_action(call.from_user.id, action_id)
-    if not ctx or ctx.get("kind") not in _STYLE_KINDS:
-        await call.answer("Контекст устарел — начни заново.", show_alert=True)
-        return
-    await call.answer()
-    await call.message.answer("В каком стиле?", reply_markup=style_pick_kb(action_id))
-
-
 @dp.callback_query(F.data.startswith("varregen:"))
 async def cb_variants_regen(call: CallbackQuery, state: FSMContext) -> None:
     action_id = call.data.split(":", 1)[1]
     ctx = _get_action(call.from_user.id, action_id)
-    if not ctx or ctx.get("kind") not in _STYLE_KINDS:
+    if not ctx or ctx.get("kind") not in _VARIANT_KINDS:
         await call.answer("Контекст устарел — начни заново.", show_alert=True)
         return
     await call.answer("Подбираю другие варианты...")
@@ -2569,12 +2241,13 @@ async def cmd_rebuild(message: Message, bot: Bot) -> None:
 async def _show_help(message: Message) -> None:
     await message.answer(
         "Вот что я умею (то же самое есть и кнопками в меню):\n\n"
-        "📝 Написать за тебя — выбор стиля у каждого: флирт/юмор/нежно/"
-        "уверенно/дружески/формально\n"
-        "/rewrite — переписать свой черновик под собеседника\n"
+        "💬 Ответить за меня — несколько вариантов ответа: Флирт/Дружески/"
+        "Уверенно (или другое, если сообщение тяжёлое/деликатное)\n"
         "/reply — ответить на его сообщение\n"
         "/screenshot — ответить по скриншоту переписки (можно слать скриншоты "
-        "один за другим)\n\n"
+        "один за другим)\n"
+        "💫 Новый диалог — помогу с первого сообщения новому человеку, без "
+        "накопленной истории\n\n"
         "🔬 Разобраться\n"
         "/deep_analysis — совместимость, история отношений, стиль и привычки "
         "собеседника, идеи подарков\n"
@@ -2584,8 +2257,6 @@ async def _show_help(message: Message) -> None:
         "⚙️ Аккаунт\n"
         "/contacts — список загруженных чатов\n"
         "/connect — как подключить Автоматизацию чатов (живой поток переписки)\n"
-        "/auto — вкл/выкл авто-режим: когда включён, любой присланный текст "
-        "сразу предлагается переписать, без команды и кнопки\n"
         "/premium — статус подписки\n"
         "/rebuild — принудительно пересобрать все карточки заново\n"
         "/delete — удалить свои данные\n\n"
@@ -2593,7 +2264,7 @@ async def _show_help(message: Message) -> None:
         "/start — начало работы\n"
         "/demo — попробовать на примере\n"
         "/help — это сообщение\n\n"
-        f"💎 {FREE_TRIAL_REQUESTS} бесплатных попыток на переписать/ответить/скриншот, "
+        f"💎 {FREE_TRIAL_REQUESTS} бесплатных попыток на ответ/скриншот, "
         "дальше и остальные функции — по подписке. Статус — /premium."
     )
 
@@ -2616,7 +2287,7 @@ async def cmd_premium(message: Message, bot: Bot) -> None:
     left = max(0, FREE_TRIAL_REQUESTS - used)
     await message.answer(
         f"Бесплатных попыток осталось: {left} из {FREE_TRIAL_REQUESTS} "
-        "(Переписать / Ответить за меня / По скриншоту).\n"
+        "(Ответить за меня / По скриншоту).\n"
         "Глубокий анализ, стиль собеседника и сравнение стилей — только по подписке.",
         reply_markup=paywall_kb(),
     )
@@ -2804,81 +2475,11 @@ async def cb_delete_cancel(call: CallbackQuery) -> None:
     await call.message.edit_text("Удаление отменено.")
 
 
-# ── Авто-переписка (catch-all, должен быть последним) ─────────────────────────
-
-@dp.message(Command("auto"))
-async def cmd_auto(message: Message) -> None:
-    """Переключатель авто-режима: когда включён — любой присланный текст предлагается
-    переписать без нажатия кнопки. По умолчанию управляется явно."""
-    telegram_id = str(message.from_user.id)
-    enabled, contact_id = get_auto_mode(telegram_id)
-
-    if enabled:
-        set_auto_mode(telegram_id, False, contact_id)
-        await message.answer(
-            "🔕 Авто-режим выключен. Произвольный текст больше не превращается в черновик — "
-            "жми «📝 Переписать», когда нужно. Включить снова: /auto"
-        )
-        return
-
-    # Включаем — нужен целевой контакт
-    if not contact_id:
-        contacts = list_contacts(telegram_id)
-        if not contacts:
-            await message.answer(
-                "Сначала загрузи чат или подключи Автоматизацию — тогда будет кого переписывать."
-            )
-            return
-        if len(contacts) == 1:
-            contact_id = contacts[0]["id"]
-        else:
-            await message.answer(
-                "У тебя несколько контактов. Выбери целевой через настройку контакта, "
-                "потом снова /auto."
-            )
-            return
-
-    set_auto_mode(telegram_id, True, contact_id)
-    c = get_contact_by_id(contact_id)
-    name = _contact_name(c) if c else "контакт"
-    await message.answer(
-        f"🔔 Авто-режим включён — {name}. Любое присланное сообщение предложу переписать "
-        "под этот стиль. Выключить: /auto"
-    )
-
-
-@dp.message(F.text & ~F.text.in_(_ALL_BTNS))
-async def auto_rewrite_handler(message: Message, state: FSMContext, bot: Bot) -> None:
-    if await state.get_state() is not None:
-        return
-
-    telegram_id = str(message.from_user.id)
-    # Explicit-гейт: реагируем на произвольный текст ТОЛЬКО если авто-режим явно включён
-    # (переключается командой /auto). Иначе случайное сообщение не превращается в черновик.
-    enabled, contact_id = get_auto_mode(telegram_id)
-    if not enabled:
-        return
-    if not contact_id:
-        contacts = list_contacts(telegram_id)
-        if len(contacts) == 1:
-            contact_id = contacts[0]["id"]
-        else:
-            return  # несколько контактов и не выбран целевой — не угадываем
-
-    style_card       = await _style_for_rewrite(telegram_id, contact_id)
-    interaction_card = get_interaction_card(contact_id)
-    if not style_card or not interaction_card:
-        return
-
-    if not await _quota_gate(bot, message, telegram_id):
-        return
-
-    draft = message.text.strip()
-    action_id = _new_action(message.from_user.id, {
-        "kind": "rewrite", "text": draft, "result": None, "style": None,
-        "style_card": style_card, "interaction_card": interaction_card,
-    })
-    await message.answer("В каком стиле переписать?", reply_markup=style_pick_kb(action_id))
+# /auto и auto_rewrite_handler (catch-all авто-переписка) убраны вместе с
+# «Переписать» — тот же сценарий (черновик без привязки к входящему) теперь
+# закрывает «💫 Новый диалог». get_auto_mode/set_auto_mode/auto_contact_id в
+# storage.py не тронуты (неиспользуемые, но безвредные) — не было смысла
+# трогать схему БД ради этого.
 
 
 # ── запуск ────────────────────────────────────────────────────────────────────
@@ -2921,10 +2522,8 @@ async def main() -> None:
         BotCommand(command="me",          description="Мой стиль общения"),
         BotCommand(command="stats",       description="Портрет в цифрах"),
         BotCommand(command="compare",     description="Сравнить стиль с разными людьми"),
-        BotCommand(command="rewrite",     description="Переписать сообщение"),
         BotCommand(command="screenshot",  description="Ответить по скриншоту"),
         BotCommand(command="reply",       description="Помочь ответить собеседнику"),
-        BotCommand(command="auto",        description="Вкл/выкл авто-режим переписывания"),
         BotCommand(command="contacts",    description="Загруженные чаты"),
         BotCommand(command="deep_analysis", description="Глубокий анализ отношений"),
         BotCommand(command="deep_style_analysis", description="Глубокий анализ моего стиля"),

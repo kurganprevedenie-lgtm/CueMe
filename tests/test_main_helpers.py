@@ -55,29 +55,8 @@ def test_last_incoming_line():
     assert main._last_incoming_line("") == ""
 
 
-# ── _auto_style_for_ctx ──────────────────────────────────────────────────────
-
-def test_auto_style_for_ctx_hard_and_tender_cases():
-    assert main._auto_style_for_ctx({
-        "kind": "reply",
-        "text": "слушай, мне сейчас не до знакомств",
-        "data_signals": "• последняя реплика читается как отказ/холод/негатив",
-    }) == "confident"
-    assert main._auto_style_for_ctx({
-        "kind": "reply",
-        "text": "мечтаю попробовать но мне страшно если честно",
-    }) == "tender"
-
-
-def test_auto_style_for_ctx_logistics_and_screenshot():
-    assert main._auto_style_for_ctx({
-        "kind": "reply",
-        "text": "ну что, во сколько завтра встречаемся?",
-    }) == "friendly"
-    assert main._auto_style_for_ctx({
-        "kind": "screenshot",
-        "chat_text": "Собеседник: ты мне сегодня снился\nЯ: ничего себе",
-    }) == "flirt"
+# _auto_style_for_ctx удалена вместе со старой style_pick_kb-инфраструктурой
+# (точечный выбор стиля/«Другой тон» убраны — см. main.py).
 
 
 # ── _reply_data_signals ───────────────────────────────────────────────────────
