@@ -9,6 +9,7 @@ from features import (
     extract_features,
     detect_reply_situation,
     stage_hint,
+    totals_from_summary,
 )
 
 BASE = datetime(2026, 7, 1, 12, 0, 0)
@@ -161,3 +162,24 @@ def test_stage_hint_buckets():
 
 def test_stage_hint_handles_none_like_zeros():
     assert "свежее знакомство" in stage_hint(0, 0)
+
+
+# ── totals_from_summary ─────────────────────────────────────────────────────────
+
+def test_totals_from_summary_parses_real_format():
+    from llm import make_features_summary
+    from features import ChatFeatures, SideFeatures
+
+    def side(n):
+        return SideFeatures(total_messages=n, avg_message_length=42.0,
+                            avg_response_latency_sec=None, question_ratio=0.2,
+                            emoji_per_message=0.3, initiative_ratio=0.5,
+                            photo_ratio=0.0, formality="informal")
+
+    summary = make_features_summary(ChatFeatures(my=side(137), contact=side(89)))
+    assert totals_from_summary(summary) == (137, 89)
+
+
+def test_totals_from_summary_none_on_garbage():
+    assert totals_from_summary("") is None
+    assert totals_from_summary("нет чисел про сообщения") is None

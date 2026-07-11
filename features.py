@@ -166,6 +166,20 @@ def detect_reply_situation(last_incoming: str) -> Optional[str]:
     return None
 
 
+_TOTAL_MSGS_RE = re.compile(r"(\d+)\s*сообщ")
+
+
+def totals_from_summary(features_summary: str) -> Optional[tuple[int, int]]:
+    """Достаёт (мои, собеседника) тоталы сообщений из строки make_features_summary
+    («Пользователь: N сообщ. ... Собеседник: M сообщ. ...»). Нужно, чтобы стадия
+    считалась по РЕАЛЬНОМУ объёму переписки, а не по усечённой длине семплов.
+    None, если распарсить не удалось (формат сводки поменялся)."""
+    nums = _TOTAL_MSGS_RE.findall(features_summary or "")
+    if len(nums) >= 2:
+        return int(nums[0]), int(nums[1])
+    return None
+
+
 def stage_hint(my_total: int, contact_total: int) -> str:
     """Стадия общения по суммарному числу сообщений (грубые корзины).
     Значения приблизительные (семплы могут быть усечены), но направление верное:

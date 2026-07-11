@@ -41,7 +41,7 @@ from config import (
     REPLY_STYLES,
     SAMPLE_SIZE,
 )
-from features import detect_reply_situation, extract_features, stage_hint
+from features import detect_reply_situation, extract_features, stage_hint, totals_from_summary
 from llm import (
     ILLEGIBLE_MARKER,
     PROVIDER_NAMES,
@@ -1765,8 +1765,14 @@ def _reply_data_signals(samples: dict | None, last_incoming: str) -> str | None:
     пометка о тяжёлой/сухой последней реплике. Готовый блок-список или None."""
     parts: list[str] = []
     if samples:
-        my_n = len(samples.get("my_sample") or [])
-        c_n = len(samples.get("contact_sample") or [])
+        # Стадия — по РЕАЛЬНОМУ объёму из features_summary; семплы усечены и годятся
+        # лишь как фолбэк, если сводку не удалось распарсить.
+        totals = totals_from_summary(samples.get("features_summary") or "")
+        if totals:
+            my_n, c_n = totals
+        else:
+            my_n = len(samples.get("my_sample") or [])
+            c_n = len(samples.get("contact_sample") or [])
         if my_n + c_n >= 4:  # тот же порог, что и для разбора динамики
             parts.append(stage_hint(my_n, c_n))
     situ = detect_reply_situation(last_incoming)
