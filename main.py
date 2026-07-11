@@ -41,7 +41,7 @@ from config import (
     REPLY_STYLES,
     SAMPLE_SIZE,
 )
-from features import extract_features
+from features import detect_reply_situation, extract_features, stage_hint
 from llm import (
     ILLEGIBLE_MARKER,
     PROVIDER_NAMES,
@@ -359,6 +359,7 @@ async def _run_style_generation(
         if not await _quota_gate(bot, target, str(telegram_id)):
             return
         prev = ctx.get("result") if force_fresh else None
+        signals = ctx.get("data_signals")
         try:
             if kind == "rewrite":
                 result, expl, rating = await rewrite_message_explained(
@@ -366,11 +367,13 @@ async def _run_style_generation(
                 )
             elif kind == "reply":
                 result, expl, rating = await suggest_reply(
-                    text, style_card, interaction_card, style_key, previous_result=prev
+                    text, style_card, interaction_card, style_key,
+                    previous_result=prev, data_signals=signals,
                 )
             else:  # screenshot
                 result, expl, rating = await suggest_reply_from_screenshot(
-                    text, style_card, interaction_card, style_key, previous_result=prev
+                    text, style_card, interaction_card, style_key,
+                    previous_result=prev, data_signals=signals,
                 )
         except RateLimitError:
             await target.answer("Лимит исчерпан, попробуй позже.")
@@ -1747,6 +1750,31 @@ def _format_blocks(blocks: list[dict]) -> str:
     )
 
 
+def _last_incoming_line(chat_text: str) -> str:
+    """Последняя непустая строка распознанной переписки — приближение последней
+    реплики собеседника для ситуативной эвристики (скриншот/OCR)."""
+    for line in reversed((chat_text or "").splitlines()):
+        s = line.strip()
+        if s:
+            return s
+    return ""
+
+
+def _reply_data_signals(samples: dict | None, last_incoming: str) -> str | None:
+    """Факты для промпта ответа (без LLM): стадия общения по объёму переписки +
+    пометка о тяжёлой/сухой последней реплике. Готовый блок-список или None."""
+    parts: list[str] = []
+    if samples:
+        my_n = len(samples.get("my_sample") or [])
+        c_n = len(samples.get("contact_sample") or [])
+        if my_n + c_n >= 4:  # тот же порог, что и для разбора динамики
+            parts.append(stage_hint(my_n, c_n))
+    situ = detect_reply_situation(last_incoming)
+    if situ:
+        parts.append(situ)
+    return "\n".join(f"• {p}" for p in parts) if parts else None
+
+
 async def _send_reply_analysis(message: Message, contact_id, incoming: str) -> None:
     """Короткий разбор динамики переписки перед выбором стиля.
     Дополняет готовый ответ, не заменяет его. При любой проблеме — молча пропускаем,
@@ -1791,13 +1819,16 @@ async def handle_incoming(message: Message, state: FSMContext, bot: Bot) -> None
     if not await _quota_gate(bot, message, str(message.from_user.id)):
         return
 
+    contact_id = data.get("contact_id")
     # Короткий разбор динамики (один вызов LLM на сообщение) — до выбора стиля,
     # чтобы не пересчитывать его на каждой смене стиля/регенерации.
-    await _send_reply_analysis(message, data.get("contact_id"), incoming)
+    await _send_reply_analysis(message, contact_id, incoming)
 
+    samples = get_message_samples(contact_id) if contact_id else None
     _last_action[message.from_user.id] = {
         "kind": "reply", "text": incoming, "result": None, "style": None,
         "style_card": data["style_card"], "interaction_card": data["interaction_card"],
+        "data_signals": _reply_data_signals(samples, incoming),
     }
     await message.answer("В каком стиле ответить?", reply_markup=style_pick_kb())
 
@@ -1909,9 +1940,11 @@ async def _prompt_screenshot_style(
         return
     interaction_card = await _gen_interaction_card(contact_id, telegram_id) or ""
 
+    samples = get_message_samples(contact_id)
     _last_action[user_id] = {
         "kind": "screenshot", "chat_text": chat_text, "result": None, "style": None,
         "style_card": style_card, "interaction_card": interaction_card,
+        "data_signals": _reply_data_signals(samples, _last_incoming_line(chat_text)),
     }
     text = "В каком стиле ответить?"
     kb = style_pick_kb()
@@ -1937,6 +1970,7 @@ async def _prompt_screenshot_style_no_contact(
     _last_action[user_id] = {
         "kind": "screenshot", "chat_text": chat_text, "result": None, "style": None,
         "style_card": style_card, "interaction_card": "",
+        "data_signals": _reply_data_signals(None, _last_incoming_line(chat_text)),
     }
     text = "В каком стиле ответить?"
     kb = style_pick_kb()

@@ -7,6 +7,8 @@ from features import (
     _formality,
     _response_latencies,
     extract_features,
+    detect_reply_situation,
+    stage_hint,
 )
 
 BASE = datetime(2026, 7, 1, 12, 0, 0)
@@ -121,3 +123,41 @@ def test_question_ratio_denominator_is_text_messages_only():
     assert f.contact.question_ratio == 1.0
     assert f.contact.total_messages == 2
     assert f.contact.photo_ratio == 0.5
+
+
+# ── detect_reply_situation ──────────────────────────────────────────────────────
+
+def test_situation_none_for_normal_message():
+    assert detect_reply_situation("расскажи, как прошёл твой день?") is None
+    assert detect_reply_situation("") is None
+    assert detect_reply_situation("   ") is None
+
+
+def test_situation_negative_rejection():
+    for t in ["не хочу с тобой общаться", "отстань", "давай не будем", "мне всё равно"]:
+        assert detect_reply_situation(t) is not None
+        assert "достоинством" in detect_reply_situation(t)
+
+
+def test_situation_dry_one_word_ack():
+    for t in ["ок", "Угу", "ясно", "нз"]:
+        hint = detect_reply_situation(t)
+        assert hint is not None and "сух" in hint
+
+
+def test_situation_short_but_warm_not_flagged():
+    # короткое, но не из сухого списка и не негатив — не помечаем как тяжёлое
+    assert detect_reply_situation("привет!") is None
+    assert detect_reply_situation("спасибо ❤️") is None
+
+
+# ── stage_hint ──────────────────────────────────────────────────────────────────
+
+def test_stage_hint_buckets():
+    assert "свежее знакомство" in stage_hint(3, 2)
+    assert "общение уже идёт" in stage_hint(30, 30)
+    assert "давняя переписка" in stage_hint(200, 200)
+
+
+def test_stage_hint_handles_none_like_zeros():
+    assert "свежее знакомство" in stage_hint(0, 0)
