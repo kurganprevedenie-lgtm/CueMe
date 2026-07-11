@@ -767,6 +767,20 @@ _BEGGING_PHRASES = (
 _CLICHE_OPENERS = {"давай", "слушай", "кстати", "честно"}
 
 
+def _winning_block(examples: list[str] | None) -> str:
+    """Блок few-shot из реальных «удачных заходов» автора (features.winning_messages).
+    Пусто, если примеров нет."""
+    if not examples:
+        return ""
+    lines = "\n".join(f"- «{e}»" for e in examples)
+    return (
+        "=== ТАК У ТЕБЯ РЕАЛЬНО ЗАХОДИТ (твои прошлые сообщения, на которые "
+        "собеседники отвечали живо — перенимай заход и энергию, но НЕ копируй "
+        "дословно и не тащи их тему):\n"
+        f"{lines}\n\n"
+    )
+
+
 def _strip_wrapping_quotes(text: str) -> str:
     """Снимает кавычки, в которые модель иногда оборачивает весь ответ вопреки
     инструкции «без кавычек». Внутренние кавычки не трогает."""
@@ -1042,9 +1056,11 @@ async def suggest_reply(
     style: str | None = None,
     previous_result: str | None = None,
     data_signals: str | None = None,
+    winning_examples: list[str] | None = None,
 ) -> tuple[str, str, str]:
     """Предлагает как ответить на сообщение собеседника — в голосе автора.
     Возвращает (ответ, пояснение, оценка)."""
+    winning_block = _winning_block(winning_examples)
     regen_block = ""
     if previous_result:
         regen_block = (
@@ -1066,6 +1082,7 @@ async def suggest_reply(
         "учётом привычек собеседника. Цель — чтобы собеседник почувствовал интерес "
         "и захотел продолжить общение.\n\n"
         f"ГОЛОС АВТОРА:\n{style_card}\n\n"
+        f"{winning_block}"
         f"ПРИВЫЧКИ СОБЕСЕДНИКА (как он обычно пишет):\n{interaction_card}\n\n"
         f"{_style_block(style)}"
         f"{regen_block}"
@@ -1164,10 +1181,12 @@ async def suggest_reply_from_screenshot(
     style: str | None = None,
     previous_result: str | None = None,
     data_signals: str | None = None,
+    winning_examples: list[str] | None = None,
 ) -> tuple[str, str, str]:
     """Ответ на распознанную переписку в голосе автора, в заданном стиле.
     Возвращает (ответ, пояснение, оценка)."""
     interaction_block = interaction_card or "нет данных о собеседнике — ориентируйся только на текст переписки"
+    winning_block = _winning_block(winning_examples)
     regen_block = ""
     if previous_result:
         regen_block = (
@@ -1189,6 +1208,7 @@ async def suggest_reply_from_screenshot(
         "чтобы звучать живо и уверенно. Цель — чтобы собеседник почувствовал "
         "интерес и захотел продолжить общение.\n\n"
         f"ГОЛОС АВТОРА:\n{style_card}\n\n"
+        f"{winning_block}"
         f"ПРИВЫЧКИ СОБЕСЕДНИКА:\n{interaction_block}\n\n"
         f"{_style_block(style)}"
         f"{regen_block}"

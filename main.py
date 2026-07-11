@@ -41,7 +41,7 @@ from config import (
     REPLY_STYLES,
     SAMPLE_SIZE,
 )
-from features import detect_reply_situation, extract_features, stage_hint, totals_from_summary
+from features import detect_reply_situation, extract_features, stage_hint, totals_from_summary, winning_messages
 from llm import (
     ILLEGIBLE_MARKER,
     PROVIDER_NAMES,
@@ -390,6 +390,7 @@ async def _run_style_generation(
             return
         prev = ctx.get("result") if force_fresh else None
         signals = ctx.get("data_signals")
+        winning = ctx.get("winning")
         try:
             if kind == "rewrite":
                 result, expl, rating = await rewrite_message_explained(
@@ -398,12 +399,12 @@ async def _run_style_generation(
             elif kind == "reply":
                 result, expl, rating = await suggest_reply(
                     text, style_card, interaction_card, style_key,
-                    previous_result=prev, data_signals=signals,
+                    previous_result=prev, data_signals=signals, winning_examples=winning,
                 )
             else:  # screenshot
                 result, expl, rating = await suggest_reply_from_screenshot(
                     text, style_card, interaction_card, style_key,
-                    previous_result=prev, data_signals=signals,
+                    previous_result=prev, data_signals=signals, winning_examples=winning,
                 )
         except RateLimitError:
             await target.answer("Лимит исчерпан, попробуй позже.")
@@ -1830,6 +1831,19 @@ def _reply_data_signals(samples: dict | None, last_incoming: str) -> str | None:
     return "\n".join(f"• {p}" for p in parts) if parts else None
 
 
+def _winning_for_contact(owner: str, contact_id) -> list[str] | None:
+    """Few-shot «удачных заходов» автора с этим контактом (features.winning_messages
+    по накопленной переписке). None, если контакта/данных нет — best-effort."""
+    if not contact_id:
+        return None
+    try:
+        wins = winning_messages(get_all_dated_messages(owner, contact_id))
+    except Exception:
+        logging.exception("winning: не удалось посчитать удачные заходы")
+        return None
+    return wins or None
+
+
 async def _send_reply_analysis(message: Message, contact_id, incoming: str) -> None:
     """Короткий разбор динамики переписки перед выбором стиля.
     Дополняет готовый ответ, не заменяет его. При любой проблеме — молча пропускаем,
@@ -1883,6 +1897,7 @@ async def handle_incoming(message: Message, state: FSMContext, bot: Bot) -> None
         "kind": "reply", "text": incoming, "result": None, "style": None,
         "style_card": data["style_card"], "interaction_card": data["interaction_card"],
         "data_signals": _reply_data_signals(samples, incoming),
+        "winning": _winning_for_contact(str(message.from_user.id), contact_id),
     }
     await message.answer("В каком стиле ответить?", reply_markup=style_pick_kb())
 
@@ -1999,6 +2014,7 @@ async def _prompt_screenshot_style(
         "kind": "screenshot", "chat_text": chat_text, "result": None, "style": None,
         "style_card": style_card, "interaction_card": interaction_card,
         "data_signals": _reply_data_signals(samples, _last_incoming_line(chat_text)),
+        "winning": _winning_for_contact(telegram_id, contact_id),
     }
     text = "В каком стиле ответить?"
     kb = style_pick_kb()

@@ -33,3 +33,17 @@ def test_quality_issues_catches_prod_failures():
 
 def test_quality_issues_accepts_clean_message():
     assert _quality_issues("грузия звучит как хороший план, что там первое в списке?") == []
+
+
+from llm import _winning_block
+
+
+def test_winning_block_empty_when_no_examples():
+    assert _winning_block(None) == ""
+    assert _winning_block([]) == ""
+
+
+def test_winning_block_formats_examples():
+    b = _winning_block(["рванём в горы?", "покажу лучшие места"])
+    assert "ТАК У ТЕБЯ РЕАЛЬНО ЗАХОДИТ" in b
+    assert "- «рванём в горы?»" in b and "- «покажу лучшие места»" in b
