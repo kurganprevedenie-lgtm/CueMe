@@ -1875,10 +1875,9 @@ async def handle_incoming(message: Message, state: FSMContext, bot: Bot) -> None
         return
 
     contact_id = data.get("contact_id")
-    # Короткий разбор динамики (один вызов LLM на сообщение) — до выбора стиля,
-    # чтобы не пересчитывать его на каждой смене стиля/регенерации.
-    await _send_reply_analysis(message, contact_id, incoming)
-
+    # «Разбор переписки» (_send_reply_analysis) здесь отключён намеренно:
+    # пользователь ждёт просто ответ, а не аналитику перед каждым ответом.
+    # Вернуть — один вызов: await _send_reply_analysis(message, contact_id, incoming)
     samples = get_message_samples(contact_id) if contact_id else None
     _last_action[message.from_user.id] = {
         "kind": "reply", "text": incoming, "result": None, "style": None,
