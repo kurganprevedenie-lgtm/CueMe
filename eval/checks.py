@@ -31,10 +31,20 @@ def opener_word(text: str) -> str:
     return m.group(0) if m else ""
 
 
+def has_exotic_script(text: str) -> bool:
+    """Иероглифы/кана/тай/хангыль — почти всегда глитч модели, жёсткий фейл."""
+    return bool(_FOREIGN_SCRIPT.search(text or ""))
+
+
+def has_latin(text: str) -> bool:
+    """Латиница — мягкий флаг: бывает легитимной (бренды, ссылки), но и англ.
+    слова-протечки («dry»). Считаем отдельно, не роняем оценку автоматически."""
+    return bool(_LATIN.search(text or ""))
+
+
 def has_foreign_script(text: str) -> bool:
-    """Латиница или иероглифы/кана/тай/хангыль — то, чего в русском ответе быть не должно."""
-    t = text or ""
-    return bool(_LATIN.search(t) or _FOREIGN_SCRIPT.search(t))
+    """Латиница ИЛИ экзотический скрипт (обратная совместимость)."""
+    return has_latin(text) or has_exotic_script(text)
 
 
 def has_ai_stock(text: str) -> bool:

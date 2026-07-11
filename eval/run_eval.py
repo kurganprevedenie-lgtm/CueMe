@@ -27,10 +27,11 @@ def _gen(sc):
 
 
 def evaluate(text: str, expects: dict) -> list[str]:
-    """Список нарушений (пусто = всё ок)."""
+    """Список ЖЁСТКИХ нарушений (пусто = всё ок). Латиница сюда не входит —
+    она мягкий флаг (см. latin_flag)."""
     fails = []
-    if expects.get("no_foreign") and checks.has_foreign_script(text):
-        fails.append("foreign_script")
+    if expects.get("no_foreign") and checks.has_exotic_script(text):
+        fails.append("exotic_script")
     if expects.get("no_ai_stock") and checks.has_ai_stock(text):
         fails.append("ai_stock")
     if expects.get("no_begging") and checks.has_begging(text):
@@ -41,6 +42,12 @@ def evaluate(text: str, expects: dict) -> list[str]:
     if mw and checks.word_count(text) > mw:
         fails.append(f"too_long:{checks.word_count(text)}>{mw}")
     return fails
+
+
+def effective_score(judge_score: int, has_hard_fail: bool) -> int:
+    """Гибрид: детерминированное нарушение принудительно роняет балл судьи (≤3) —
+    объективный факт важнее мнения LLM. Иначе — балл судьи как есть."""
+    return min(judge_score, 3) if has_hard_fail else judge_score
 
 
 async def _gen_with_retry(sc, retries=5):
@@ -77,10 +84,11 @@ async def main():
         out.write(line + "\n")
         out.flush()
 
-    total = passed = 0
+    total = passed = latin_count = 0
     fail_counter: dict[str, int] = {}
     opener_counter: dict[str, int] = {}
     judge_scores = []
+    eff_scores = []
 
     scs = SCENARIOS[: args.limit]
     for i, sc in enumerate(scs):
@@ -101,16 +109,25 @@ async def main():
             key = f.split(":")[0]
             fail_counter[key] = fail_counter.get(key, 0) + 1
 
+        latin = checks.has_latin(msg)
+        if latin:
+            latin_count += 1
+
         mark = "✓" if not fails else "✗"
         w(f"{mark} {sc['id']} [{sc['style']}]")
         w(f"    ОТВЕТ: {msg.replace(chr(10), ' / ')}")
         if fails:
             w(f"    НАРУШЕНИЯ: {', '.join(fails)}")
+        if latin:
+            w("    ⚠ латиница (мягкий флаг — проверь глазами: бренд/ссылка или протечка)")
         if judge:
             try:
                 score, verdict = await judge.score(sc, msg)
+                eff = effective_score(score, bool(fails))
                 judge_scores.append(score)
-                w(f"    СУДЬЯ: {score}/10 — {verdict}")
+                eff_scores.append(eff)
+                extra = f" → эффективный {eff}/10 (нарушения)" if eff != score else ""
+                w(f"    СУДЬЯ: {score}/10{extra} — {verdict}")
             except Exception as e:
                 w(f"    СУДЬЯ: ошибка {e}")
         w()
@@ -120,10 +137,13 @@ async def main():
     w(f"ИТОГ: {passed}/{total} без детерминированных нарушений")
     if fail_counter:
         w("Нарушения по типам: " + ", ".join(f"{k}={v}" for k, v in sorted(fail_counter.items())))
+    w(f"Мягкий флаг латиницы: {latin_count}/{total}")
     dom = sorted(opener_counter.items(), key=lambda kv: -kv[1])[:5]
     w("Топ зачинов: " + ", ".join(f"«{k}»×{v}" for k, v in dom))
     if judge_scores:
-        w(f"Средний балл судьи: {sum(judge_scores)/len(judge_scores):.1f}/10")
+        avg_raw = sum(judge_scores) / len(judge_scores)
+        avg_eff = sum(eff_scores) / len(eff_scores)
+        w(f"Средний балл судьи: raw {avg_raw:.1f} / эффективный {avg_eff:.1f} из 10")
     out.close()
 
 

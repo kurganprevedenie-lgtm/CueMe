@@ -6,11 +6,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "eval"))
 from checks import (
     opener_word,
     has_foreign_script,
+    has_exotic_script,
+    has_latin,
     has_ai_stock,
     has_begging,
     word_count,
     opens_with_cliche,
 )
+from run_eval import effective_score
 
 
 def test_opener_word():
@@ -25,6 +28,20 @@ def test_has_foreign_script():
     assert has_foreign_script("с dry юмором") is True      # англ. слово
     assert has_foreign_script("привет, как дела? 😄") is False
     assert has_foreign_script("норм, увидимся в 7") is False
+
+
+def test_exotic_vs_latin_split():
+    # экзотика — жёсткий фейл (глитч), латиница — мягкий флаг (бренды легитимны)
+    assert has_exotic_script("✅正常но") is True
+    assert has_exotic_script("го в McDonalds") is False
+    assert has_latin("го в McDonalds") is True
+    assert has_latin("норм, увидимся 😄") is False
+
+
+def test_effective_score_hybrid():
+    assert effective_score(9, has_hard_fail=False) == 9   # чисто → как есть
+    assert effective_score(8, has_hard_fail=True) == 3    # нарушение роняет до ≤3
+    assert effective_score(2, has_hard_fail=True) == 2    # уже ниже — не поднимаем
 
 
 def test_has_ai_stock():
