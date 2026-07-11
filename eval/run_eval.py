@@ -17,12 +17,15 @@ from scenarios import SCENARIOS, STYLE_CARD, INTERACTION_CARD  # noqa: E402
 
 
 def _gen(sc):
-    """Возвращает корутину генерации для сценария."""
+    """Возвращает корутину генерации для сценария. Карточки берём из сценария
+    (реальный экспорт), иначе — дефолтные из scenarios.py."""
+    style_card = sc.get("style_card", STYLE_CARD)
+    inter_card = sc.get("interaction_card", INTERACTION_CARD)
     if sc["kind"] == "rewrite":
         return llm.rewrite_message_explained(
-            sc["draft"], STYLE_CARD, INTERACTION_CARD, sc["style"])
+            sc["draft"], style_card, inter_card, sc["style"])
     return llm.suggest_reply(
-        sc["incoming"], STYLE_CARD, INTERACTION_CARD, sc["style"],
+        sc["incoming"], style_card, inter_card, sc["style"],
         data_signals=sc.get("data_signals"))
 
 
@@ -67,7 +70,15 @@ async def main():
     ap.add_argument("--out", default=os.path.join(os.path.dirname(__file__), "eval_report.txt"))
     ap.add_argument("--pace", type=float, default=20.0, help="пауза между вызовами, сек")
     ap.add_argument("--judge", action="store_true", help="подключить LLM-судью (eval/judge.py)")
+    ap.add_argument("--export", help="путь к Telegram result.json — гнать на РЕАЛЬНЫХ данных")
+    ap.add_argument("--my-id", help="мой id в экспорте (обязателен с --export)")
     args = ap.parse_args()
+
+    if args.export:
+        import from_export
+        source = from_export.scenarios_from_export(args.export, args.my_id, args.limit)
+    else:
+        source = SCENARIOS
 
     judge = None
     if args.judge:
@@ -90,7 +101,7 @@ async def main():
     judge_scores = []
     eff_scores = []
 
-    scs = SCENARIOS[: args.limit]
+    scs = source[: args.limit]
     for i, sc in enumerate(scs):
         try:
             msg, expl, rating = await _gen_with_retry(sc)
