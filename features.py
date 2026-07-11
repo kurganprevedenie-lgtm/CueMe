@@ -1,6 +1,6 @@
 import re
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import Optional
 
 from tg_parser import Message, ParsedChat
@@ -192,3 +192,46 @@ def stage_hint(my_total: int, contact_total: int) -> str:
         return "стадия: общение уже идёт — можно теплее и чуть глубже"
     return ("стадия: давняя переписка — уместны глубина и тепло; при тёплой "
             "динамике можно мягко предложить встречу")
+
+
+def winning_messages(dated_msgs: list[dict], max_examples: int = 3,
+                     min_reply_words: int = 3) -> list[str]:
+    """«Обучение на своих удачных заходах» без ML: исходящие сообщения автора, на
+    которые собеседник ответил ЖИВО — быстро (в пределах сессии), не сухо и не
+    негативом, содержательной репликой. Эмпирические примеры «что реально
+    заходит» для few-shot в промпте генерации.
+
+    dated_msgs: [{"date": iso-str, "direction": "out"/"in", "text": str}].
+    Возвращает до max_examples текстов, свежие первыми, без повторов."""
+    msgs = sorted((m for m in dated_msgs if m.get("text")),
+                  key=lambda m: m.get("date") or "")
+    wins: list[str] = []
+    for cur, nxt in zip(msgs, msgs[1:]):
+        if cur["direction"] != "out" or nxt["direction"] != "in":
+            continue
+        reply = (nxt["text"] or "").strip()
+        # реплика «зашла»: не сухая/негатив (detect_reply_situation молчит) и содержательная
+        if detect_reply_situation(reply) is not None:
+            continue
+        if len(re.findall(r"\w+", reply)) < min_reply_words:
+            continue
+        text = (cur["text"] or "").strip()
+        if not (1 <= len(re.findall(r"\w+", text)) <= 40):
+            continue
+        # быстрый ответ — в пределах сессии (если даты парсятся)
+        try:
+            if datetime.fromisoformat(nxt["date"]) - datetime.fromisoformat(cur["date"]) > SESSION_GAP:
+                continue
+        except (ValueError, TypeError, KeyError):
+            pass
+        wins.append(text)
+
+    seen: set[str] = set()
+    out: list[str] = []
+    for t in reversed(wins):            # свежие важнее
+        if t.lower() not in seen:
+            seen.add(t.lower())
+            out.append(t)
+        if len(out) >= max_examples:
+            break
+    return out

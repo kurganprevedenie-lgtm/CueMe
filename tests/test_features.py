@@ -183,3 +183,44 @@ def test_totals_from_summary_parses_real_format():
 def test_totals_from_summary_none_on_garbage():
     assert totals_from_summary("") is None
     assert totals_from_summary("нет чисел про сообщения") is None
+
+
+# ── winning_messages ────────────────────────────────────────────────────────────
+
+from features import winning_messages
+
+
+def _m(direction, text, iso):
+    return {"direction": direction, "text": text, "date": iso}
+
+
+def test_winning_picks_out_msgs_with_lively_reply():
+    msgs = [
+        _m("out", "как настроение? рванём в горы на выходных?", "2026-07-01T10:00:00"),
+        _m("in",  "ооо да, давно хотела, куда именно?",        "2026-07-01T10:05:00"),  # живой ответ → win
+        _m("out", "ну ок",                                     "2026-07-01T11:00:00"),
+        _m("in",  "угу",                                       "2026-07-01T11:02:00"),  # сухо → не win
+    ]
+    wins = winning_messages(msgs)
+    assert wins == ["как настроение? рванём в горы на выходных?"]
+
+
+def test_winning_excludes_slow_and_negative_replies():
+    msgs = [
+        _m("out", "давай на кофе сходим",   "2026-07-01T10:00:00"),
+        _m("in",  "не хочу, отстань",       "2026-07-01T10:03:00"),  # негатив → не win
+        _m("out", "ну как знаешь, интересный был вечер вчера", "2026-07-02T10:00:00"),
+        _m("in",  "да, согласна полностью", "2026-07-03T20:00:00"),  # ответ через сутки → слишком долго
+    ]
+    assert winning_messages(msgs) == []
+
+
+def test_winning_dedup_and_recency_and_limit():
+    msgs = []
+    for i in range(5):
+        base = f"2026-07-0{i+1}T10:0"
+        msgs.append(_m("out", f"классный заход номер {i}", base + "0:00"))
+        msgs.append(_m("in", "ого расскажи подробнее пожалуйста", base + "3:00"))
+    wins = winning_messages(msgs, max_examples=2)
+    assert len(wins) == 2
+    assert wins[0] == "классный заход номер 4"   # самый свежий первым
