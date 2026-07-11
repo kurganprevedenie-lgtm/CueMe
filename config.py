@@ -14,6 +14,14 @@ if not BOT_TOKEN:
 
 # Groq — llama-3.3-70b. LLM_API_KEY поддерживается как алиас.
 GROQ_API_KEY = os.getenv("GROQ_API_KEY") or os.getenv("LLM_API_KEY")
+# Мультиаккаунтинг: несколько ключей Groq через запятую — код перебирает их по
+# кругу (та же логика, что у GEMINI_API_KEYS выше). Помогает только если ключи
+# из РАЗНЫХ аккаунтов Groq. Если GROQ_API_KEYS не задан — используется один
+# GROQ_API_KEY (обратная совместимость).
+_groq_keys_raw = os.getenv("GROQ_API_KEYS", "")
+GROQ_API_KEYS = [k.strip() for k in _groq_keys_raw.split(",") if k.strip()]
+if not GROQ_API_KEYS and GROQ_API_KEY:
+    GROQ_API_KEYS = [GROQ_API_KEY]
 # Gemini — основной (gemini-2.5-flash).
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 # Мультиаккаунтинг: несколько ключей Gemini через запятую — код перебирает их

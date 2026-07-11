@@ -21,7 +21,7 @@ import httpx
 from config import (
     GEMINI_API_KEYS,
     GEMINI_PROXY,
-    GROQ_API_KEY,
+    GROQ_API_KEYS,
     LLM_PROVIDER_ORDER,
     OPENROUTER_API_KEY,
     REPLY_STYLES,
@@ -134,23 +134,49 @@ async def _gemini_generate_with_media(
     return ""
 
 
+# ── Мультиаккаунтинг Groq: round-robin по нескольким ключам (та же логика,
+# что у Gemini выше) ───────────────────────────────────────────────────────
+
+_groq_key_cursor = 0
+
+
+def _groq_keys_rotated() -> list[str]:
+    global _groq_key_cursor
+    keys = GROQ_API_KEYS
+    if not keys:
+        return []
+    start = _groq_key_cursor % len(keys)
+    _groq_key_cursor = (start + 1) % len(keys)
+    return keys[start:] + keys[:start]
+
+
 async def _groq_transcribe(data: bytes, filename: str) -> str:
-    """Groq Whisper. Пусто при ошибке/без ключа."""
-    if not GROQ_API_KEY:
+    """Groq Whisper. Пусто при ошибке/без ключа. Перебирает ключи по кругу —
+    на любой 4xx (проблема конкретного ключа) пробует следующий, на прочих
+    ошибках сдаётся сразу (не ключ-специфично)."""
+    keys = _groq_keys_rotated()
+    if not keys:
         return ""
-    try:
-        async with httpx.AsyncClient(timeout=120.0, trust_env=False) as client:
-            resp = await client.post(
-                _WHISPER_URL,
-                headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
-                files={"file": (filename, data, "application/octet-stream")},
-                data={"model": _WHISPER_MODEL},
-            )
-        if resp.is_success:
-            return resp.json().get("text", "").strip()
-        log.warning("Whisper %s: %s", resp.status_code, resp.text[:200])
-    except Exception as e:
-        log.warning("Whisper: ошибка запроса — %s", e)
+    for key in keys:
+        try:
+            async with httpx.AsyncClient(timeout=120.0, trust_env=False) as client:
+                resp = await client.post(
+                    _WHISPER_URL,
+                    headers={"Authorization": f"Bearer {key}"},
+                    files={"file": (filename, data, "application/octet-stream")},
+                    data={"model": _WHISPER_MODEL},
+                )
+            if resp.is_success:
+                return resp.json().get("text", "").strip()
+            if 400 <= resp.status_code < 500:
+                log.warning("Whisper: ключ %s — HTTP %d, пробую следующий",
+                            _mask_key(key), resp.status_code)
+                continue
+            log.warning("Whisper %s: %s", resp.status_code, resp.text[:200])
+            return ""
+        except Exception as e:
+            log.warning("Whisper: ошибка запроса — %s", e)
+            return ""
     return ""
 
 
@@ -188,8 +214,11 @@ _VISION_PROMPT = (
 
 
 async def _groq_vision(b64: str) -> str:
-    """Распознавание через Groq Vision. Пусто при ошибке/без ключа."""
-    if not GROQ_API_KEY:
+    """Распознавание через Groq Vision. Пусто при ошибке/без ключа. Перебирает
+    ключи по кругу — на любой 4xx пробует следующий, на прочих ошибках
+    сдаётся сразу (не ключ-специфично)."""
+    keys = _groq_keys_rotated()
+    if not keys:
         return ""
     messages = [{
         "role": "user",
@@ -198,24 +227,31 @@ async def _groq_vision(b64: str) -> str:
             {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
         ],
     }]
-    try:
-        async with httpx.AsyncClient(timeout=120.0, trust_env=False) as client:
-            resp = await client.post(
-                _VISION_URL,
-                headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
-                json={
-                    "model": VISION_MODEL, "messages": messages, "max_tokens": 2000,
-                    # qwen3.6 — thinking-модель, иначе добавляет <think>...</think> перед
-                    # ответом и ломает точное сравнение с ILLEGIBLE_MARKER.
-                    "reasoning_effort": "none",
-                },
-            )
-        if resp.is_success:
-            text = resp.json()["choices"][0]["message"]["content"].strip()
-            return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
-        log.warning("Vision(Groq) %s: %s", resp.status_code, resp.text[:200])
-    except Exception as e:
-        log.warning("Vision(Groq): ошибка запроса — %s", e)
+    for key in keys:
+        try:
+            async with httpx.AsyncClient(timeout=120.0, trust_env=False) as client:
+                resp = await client.post(
+                    _VISION_URL,
+                    headers={"Authorization": f"Bearer {key}"},
+                    json={
+                        "model": VISION_MODEL, "messages": messages, "max_tokens": 2000,
+                        # qwen3.6 — thinking-модель, иначе добавляет <think>...</think> перед
+                        # ответом и ломает точное сравнение с ILLEGIBLE_MARKER.
+                        "reasoning_effort": "none",
+                    },
+                )
+            if resp.is_success:
+                text = resp.json()["choices"][0]["message"]["content"].strip()
+                return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+            if 400 <= resp.status_code < 500:
+                log.warning("Vision(Groq): ключ %s — HTTP %d, пробую следующий",
+                            _mask_key(key), resp.status_code)
+                continue
+            log.warning("Vision(Groq) %s: %s", resp.status_code, resp.text[:200])
+            return ""
+        except Exception as e:
+            log.warning("Vision(Groq): ошибка запроса — %s", e)
+            return ""
     return ""
 
 
@@ -253,14 +289,11 @@ class GroqProvider(LLMProvider):
     _URL   = "https://api.groq.com/openai/v1/chat/completions"
     _MODEL = "llama-3.3-70b-versatile"
 
-    async def ask(self, prompt: str, max_tokens: int) -> str:
-        if not GROQ_API_KEY:
-            raise ProviderError("GROQ_API_KEY не задан")
-
+    async def _ask_with_key(self, prompt: str, max_tokens: int, key: str) -> str:
         async with httpx.AsyncClient(timeout=90.0, trust_env=False) as client:
             resp = await client.post(
                 self._URL,
-                headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+                headers={"Authorization": f"Bearer {key}"},
                 json={
                     "model": self._MODEL,
                     "messages": [{"role": "user", "content": prompt}],
@@ -268,10 +301,15 @@ class GroqProvider(LLMProvider):
                 },
             )
 
-        # На ЛЮБОЙ 429 не ждём — сразу уходим на следующего провайдера (Gemini).
-        # Раньше на минутный лимит спали 65 с; с появлением fallback это не нужно.
-        if resp.status_code == 429:
-            raise RateLimitError("Groq: лимит исчерпан (429) — переключаюсь на следующего.")
+        # Любой 4xx — проблема КОНКРЕТНОГО ключа (невалиден, нет доступа, лимит
+        # именно на нём), не сервиса в целом — есть смысл пробовать следующий
+        # ключ (та же логика, что у Gemini). Раньше на 429 ещё и спали 65с —
+        # с появлением fallback/ротации это не нужно.
+        if 400 <= resp.status_code < 500:
+            raise RateLimitError(
+                f"Groq ключ {_mask_key(key)}: HTTP {resp.status_code} — "
+                "невалиден, нет доступа или лимит."
+            )
 
         if resp.status_code in (500, 502, 503):
             raise ProviderError(f"Groq {resp.status_code}: {resp.text[:200]}")
@@ -280,6 +318,24 @@ class GroqProvider(LLMProvider):
             raise ProviderError(f"Groq {resp.status_code}: {resp.text[:200]}")
 
         return resp.json()["choices"][0]["message"]["content"].strip()
+
+    async def ask(self, prompt: str, max_tokens: int) -> str:
+        """Перебирает ключи Groq по кругу (мультиаккаунтинг), как GeminiProvider."""
+        keys = _groq_keys_rotated()
+        if not keys:
+            raise ProviderError("GROQ_API_KEY(S) не задан")
+
+        last_exc: Exception = RateLimitError("Ни один ключ Groq не сработал.")
+        for i, key in enumerate(keys):
+            try:
+                return await self._ask_with_key(prompt, max_tokens, key)
+            except RateLimitError as e:
+                last_exc = e
+                if i + 1 < len(keys):
+                    log.warning("Groq: %s — пробую следующий ключ (%d/%d)",
+                                e, i + 2, len(keys))
+                continue
+        raise last_exc
 
 
 # ── Google Gemini ─────────────────────────────────────────────────────────────
