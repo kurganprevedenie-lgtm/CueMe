@@ -593,6 +593,15 @@ async def _message_text(bot: Bot, event: Message) -> tuple[str | None, bool]:
     return None, False
 
 
+def _not_command(message: Message) -> bool:
+    """True если сообщение НЕ похоже на слэш-команду. Команды (/premium, /help
+    и т.п.) должны срабатывать даже посреди пересылки сообщений в «Ответить за
+    меня»/«Живом диалоге» — иначе они проглатываются этими режимами (состояние
+    там нарочно не сбрасывается между сообщениями) и юзер не может проверить
+    статус или выйти иначе как кнопкой меню."""
+    return not (message.text or "").startswith("/")
+
+
 # ── FSM ───────────────────────────────────────────────────────────────────────
 
 class Setup(StatesGroup):
@@ -2033,7 +2042,7 @@ async def cb_variants_regen(call: CallbackQuery) -> None:
     await _run_reply_variants(call.message, ctx, call.from_user.id, call.bot, action_id, force_fresh=True)
 
 
-@dp.message(ReplyHelp.waiting_for_incoming)
+@dp.message(ReplyHelp.waiting_for_incoming, _not_command)
 async def handle_incoming(message: Message, state: FSMContext, bot: Bot) -> None:
     txt, _ = await _message_text(bot, message)
     incoming = (txt or "").strip()
@@ -2119,7 +2128,7 @@ async def handle_live_name(message: Message, state: FSMContext) -> None:
     )
 
 
-@dp.message(LiveDialogue.waiting_for_incoming)
+@dp.message(LiveDialogue.waiting_for_incoming, _not_command)
 async def handle_live_incoming(message: Message, state: FSMContext, bot: Bot) -> None:
     txt, _ = await _message_text(bot, message)
     incoming = (txt or "").strip()
