@@ -12,6 +12,13 @@ venv/
 *.sqlite3
 *.db
 
+# Артефакты eval-прогонов (выхлоп, не исходник) + локальные выгрузки переписок
+eval/eval_report.txt
+eval/run.log
+eval/*.report.txt
+chat.json
+chat.txt
+
 # IDE / система
 .vscode/
 .idea/
