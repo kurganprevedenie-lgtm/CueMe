@@ -729,6 +729,41 @@ def _split_rated(raw: str) -> tuple[str, str, str]:
     return msg, expl, rating
 
 
+# Экзотические скрипты (иероглифы/кана/тай/хангыль) — почти всегда глитч llama,
+# а не осмысленный текст. Латиницу НЕ трогаем: бренды/ссылки бывают легитимны.
+_EXOTIC_SCRIPT_RE = re.compile(r"[一-鿿぀-ヿ฀-๿가-힯]")
+_QUOTE_PAIRS = (("«", "»"), ('"', '"'), ("“", "”"), ("'", "'"), ("`", "`"))
+
+
+def _strip_wrapping_quotes(text: str) -> str:
+    """Снимает кавычки, в которые модель иногда оборачивает весь ответ вопреки
+    инструкции «без кавычек». Внутренние кавычки не трогает."""
+    t = (text or "").strip()
+    changed = True
+    while changed and len(t) >= 2:
+        changed = False
+        for left, right in _QUOTE_PAIRS:
+            if t.startswith(left) and t.endswith(right) and len(t) >= 2:
+                t = t[1:-1].strip()
+                changed = True
+                break
+    return t
+
+
+async def _finalize_rated(prompt: str) -> tuple[str, str, str]:
+    """Общий финал функций генерации: парсинг + детерминированные гвардрейлы.
+    Снимает обрамляющие кавычки; при экзотическом скрипте в тексте ответа (глитч
+    модели) один раз перегенерирует и берёт чистый вариант, если он вышел."""
+    msg, expl, rating = _split_rated(await _ask(prompt))
+    msg = _strip_wrapping_quotes(msg)
+    if _EXOTIC_SCRIPT_RE.search(msg):
+        msg2, expl2, rating2 = _split_rated(await _ask(prompt))
+        msg2 = _strip_wrapping_quotes(msg2)
+        if not _EXOTIC_SCRIPT_RE.search(msg2):
+            return msg2, expl2, rating2
+    return msg, expl, rating
+
+
 _BLOCK_RE = re.compile(
     r"<observation>(.*?)</observation>\s*"
     r"<mechanism>(.*?)</mechanism>\s*"
@@ -923,7 +958,7 @@ async def rewrite_message_explained(
         "Примеры: «✅ В его тоне, коротко — должно зайти» / «⚠️ Длинновато — "
         "обрежь до одной мысли»."
     )
-    return _split_rated(await _ask(prompt))
+    return await _finalize_rated(prompt)
 
 
 async def suggest_reply(
@@ -1035,7 +1070,7 @@ async def suggest_reply(
         "зайдёт. БЕЗ процентов. Начни со значка ✅ или ⚠️; если ⚠️ — в тех же "
         "словах дай микро-фикс (что подправить)."
     )
-    return _split_rated(await _ask(prompt))
+    return await _finalize_rated(prompt)
 
 
 async def suggest_reply_from_screenshot(
@@ -1146,7 +1181,7 @@ async def suggest_reply_from_screenshot(
         "зайдёт. БЕЗ процентов. Начни со значка ✅ или ⚠️; если ⚠️ — в тех же "
         "словах дай микро-фикс (что подправить)."
     )
-    return _split_rated(await _ask(prompt))
+    return await _finalize_rated(prompt)
 
 
 def _split_by_markers(raw: str, markers: list[str]) -> list[str]:
