@@ -143,6 +143,13 @@ def init_db() -> None:
                 event_type       TEXT NOT NULL,       -- что: gen_reply, gen_rewrite, ...
                 meta             TEXT                  -- произвольный контекст (стиль, kind)
             );
+
+            CREATE TABLE IF NOT EXISTS running_notes (
+                contact_id    INTEGER PRIMARY KEY,
+                notes_text    TEXT NOT NULL,
+                message_count INTEGER NOT NULL DEFAULT 0,
+                updated_at    TEXT NOT NULL
+            );
         """)
         _add_column_if_missing(conn, "users", "auto_mode", "INTEGER DEFAULT 0")
         _add_column_if_missing(conn, "users", "auto_contact_id", "INTEGER")
@@ -324,6 +331,32 @@ def get_interaction_card(contact_id: int) -> str | None:
             (contact_id,),
         ).fetchone()
         return row["card_text"] if row else None
+
+
+# ── running notes («Живой диалог» — накопительные заметки без порога) ─────────
+
+def get_running_notes(contact_id: int) -> dict | None:
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT notes_text, message_count, updated_at FROM running_notes WHERE contact_id = ?",
+            (contact_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def save_running_notes(contact_id: int, notes_text: str, message_count: int) -> None:
+    with _conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO running_notes (contact_id, notes_text, message_count, updated_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(contact_id) DO UPDATE SET
+                notes_text    = excluded.notes_text,
+                message_count = excluded.message_count,
+                updated_at    = excluded.updated_at
+            """,
+            (contact_id, notes_text, message_count, _now()),
+        )
 
 
 # ── message samples (для ленивой генерации карточек) ──────────────────────────
@@ -922,6 +955,7 @@ def delete_contact_data(telegram_id: str, contact_id: int) -> None:
         conn.execute("DELETE FROM deep_analysis        WHERE contact_id = ?", (contact_id,))
         conn.execute("DELETE FROM message_samples      WHERE contact_id = ?", (contact_id,))
         conn.execute("DELETE FROM imported_messages    WHERE contact_id = ?", (contact_id,))
+        conn.execute("DELETE FROM running_notes        WHERE contact_id = ?", (contact_id,))
         conn.execute("DELETE FROM contacts             WHERE id = ?",         (contact_id,))
         # сбрасываем агрегатные портреты — пересоберутся без удалённого контакта
         conn.execute("DELETE FROM style_cards         WHERE user_telegram_id = ?", (telegram_id,))
@@ -948,6 +982,7 @@ def delete_all_user_data(telegram_id: str) -> None:
             conn.execute(f"DELETE FROM deep_analysis        WHERE contact_id IN ({inlist})", cids)
             conn.execute(f"DELETE FROM message_samples      WHERE contact_id IN ({inlist})", cids)
             conn.execute(f"DELETE FROM imported_messages    WHERE contact_id IN ({inlist})", cids)
+            conn.execute(f"DELETE FROM running_notes        WHERE contact_id IN ({inlist})", cids)
         conn.execute("DELETE FROM contacts             WHERE user_telegram_id = ?", (telegram_id,))
         conn.execute("DELETE FROM style_cards          WHERE user_telegram_id = ?", (telegram_id,))
         conn.execute("DELETE FROM deep_style_analysis  WHERE user_telegram_id = ?", (telegram_id,))

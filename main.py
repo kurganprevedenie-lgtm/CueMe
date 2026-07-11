@@ -7,6 +7,7 @@ import logging
 import re
 import tempfile
 import time
+import uuid
 from pathlib import Path
 
 from aiogram import Bot, Dispatcher, F
@@ -58,6 +59,7 @@ from llm import (
     analyze_reply_dynamics,
     get_forced_provider,
     get_provider_stats,
+    live_coach_step,
     make_features_summary,
     rewrite_message_explained,
     sample_texts,
@@ -96,6 +98,7 @@ from storage import (
     get_my_style_last_rebuild_count,
     get_my_style_per_contact,
     get_or_create_contact,
+    get_running_notes,
     get_style_card,
     delete_deep_style_analysis,
     init_db,
@@ -106,6 +109,7 @@ from storage import (
     save_interaction_card,
     save_message_samples,
     save_my_style_per_contact,
+    save_running_notes,
     save_style_card,
     record_event,
     set_auto_mode,
@@ -123,6 +127,7 @@ dp = Dispatcher(storage=MemoryStorage())
 BTN_REWRITE       = "📝 Переписать"
 BTN_SCREENSHOT    = "📸 По скриншоту"
 BTN_REPLY         = "💬 Ответить за меня"
+BTN_LIVE          = "💫 Новый диалог"
 BTN_DEEP          = "🔬 Глубокий анализ"
 BTN_DEEP_STYLE    = "🪞 Глубокий анализ стиля"
 BTN_HELP          = "❓ Помощь"
@@ -134,7 +139,7 @@ BTN_HELP          = "❓ Помощь"
 # теперь блоком внутри «Глубокий анализ» (_format_deep_analysis). BTN_CONTACTS
 # («📋 Контакты») убрана из меню — доступна только как команда /contacts.
 _ALL_BTNS = {
-    BTN_REWRITE, BTN_SCREENSHOT, BTN_REPLY, BTN_DEEP, BTN_DEEP_STYLE, BTN_HELP,
+    BTN_REWRITE, BTN_SCREENSHOT, BTN_REPLY, BTN_LIVE, BTN_DEEP, BTN_DEEP_STYLE, BTN_HELP,
 }
 
 # Защита от параллельных пересборок одного контакта
@@ -310,6 +315,7 @@ async def _require_premium(bot: Bot, target: Message, telegram_id: str) -> bool:
 def main_kb() -> ReplyKeyboardMarkup:
     b = ReplyKeyboardBuilder()
     b.row(KeyboardButton(text=BTN_REWRITE), KeyboardButton(text=BTN_SCREENSHOT), KeyboardButton(text=BTN_REPLY))
+    b.row(KeyboardButton(text=BTN_LIVE))
     b.row(KeyboardButton(text=BTN_DEEP), KeyboardButton(text=BTN_DEEP_STYLE))
     b.row(KeyboardButton(text=BTN_HELP))
     return b.as_markup(resize_keyboard=True)
@@ -602,6 +608,10 @@ class ReplyHelp(StatesGroup):
 class Screenshot(StatesGroup):
     waiting_for_image = State()
 
+class LiveDialogue(StatesGroup):
+    waiting_for_name     = State()
+    waiting_for_incoming = State()
+
 
 # ── Выборка: biz-сообщения + fallback из JSON-семплов ─────────────────────────
 
@@ -783,6 +793,12 @@ async def _gen_interaction_card(contact_id: int, owner_user_id: str = "") -> str
     card = get_interaction_card(contact_id)
     if card:
         return card
+
+    # «Живой диалог» уже накопил заметки о собеседнике — используем их напрямую,
+    # пока не появится формально пересобранная карточка (без ожидания порога).
+    notes = get_running_notes(contact_id)
+    if notes and notes["notes_text"]:
+        return notes["notes_text"]
 
     samples = get_message_samples(contact_id)
     if samples:
@@ -1395,6 +1411,8 @@ async def handle_menu_button(message: Message, state: FSMContext, bot: Bot) -> N
         await _start_screenshot(message, state)
     elif message.text == BTN_REPLY:
         await _start_reply(message, state)
+    elif message.text == BTN_LIVE:
+        await _start_live_dialogue(message, state)
     elif message.text == BTN_DEEP:
         await _show_deep_analysis(message, bot)
     elif message.text == BTN_DEEP_STYLE:
@@ -2049,6 +2067,210 @@ async def handle_incoming(message: Message, state: FSMContext, bot: Bot) -> None
 @dp.message(Command("reply"))
 async def cmd_reply(message: Message, state: FSMContext) -> None:
     await _start_reply(message, state)
+
+
+# ── 💫 Живой диалог с нуля (холодный старт, без порога накопления) ───────────
+
+_LIVE_NEUTRAL_STYLE_PLACEHOLDER = (
+    "Данных о твоём стиле письма пока нет — пиши нейтрально: разговорной "
+    "длиной, без выраженного регистра/тона, без домыслов о привычках автора. "
+    "Как только появятся другие данные (JSON-экспорт, другие переписки), "
+    "стиль подключится сам."
+)
+
+LIVE_NOTES_SUMMARY_EVERY = 4  # раз в сколько сообщений показывать «что я уже понял»
+
+
+def _running_notes_preview(notes_text: str, n: int = 2) -> str:
+    """Последние n непустых строк заметок — для короткого «что я уже понял»."""
+    lines = [ln.strip() for ln in (notes_text or "").splitlines() if ln.strip()]
+    return "\n".join(lines[-n:])
+
+
+def live_variants_kb(action_id: str) -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    b.button(text="🔄 Другие варианты", callback_data=f"liveregen:{action_id}")
+    return b.as_markup()
+
+
+async def _start_live_dialogue(message: Message, state: FSMContext) -> None:
+    await state.set_state(LiveDialogue.waiting_for_name)
+    await message.answer(
+        "Как назвать этот диалог? Просто имя или метка, чтобы потом узнать среди контактов."
+    )
+
+
+@dp.message(LiveDialogue.waiting_for_name)
+async def handle_live_name(message: Message, state: FSMContext) -> None:
+    name = (message.text or "").strip()
+    if not name:
+        await message.answer("Пришли имя текстом.")
+        return
+
+    telegram_id = str(message.from_user.id)
+    upsert_user(telegram_id, f"user{telegram_id}")
+    contact_id = get_or_create_contact(telegram_id, f"live_{uuid.uuid4().hex}", name)
+
+    await state.set_state(LiveDialogue.waiting_for_incoming)
+    await state.update_data(contact_id=contact_id, dialogue_history=[])
+    await message.answer(
+        f"Готово — «{name}». Присылай её сообщения по одному, на каждое сразу дам "
+        "несколько вариантов ответа. Чтобы выйти из режима — нажми любую кнопку меню."
+    )
+
+
+@dp.message(LiveDialogue.waiting_for_incoming)
+async def handle_live_incoming(message: Message, state: FSMContext, bot: Bot) -> None:
+    txt, _ = await _message_text(bot, message)
+    incoming = (txt or "").strip()
+    if not incoming:
+        await message.answer("Пришли сообщение собеседницы текстом или голосовым.")
+        return
+
+    data = await state.get_data()
+    # Состояние НЕ сбрасываем — можно форвардить сообщения одно за другим без
+    # повторного нажатия кнопки. Выйти из режима — любая кнопка меню.
+
+    if not await _quota_gate(bot, message, str(message.from_user.id)):
+        return
+
+    contact_id = data.get("contact_id")
+    if not contact_id:
+        await message.answer("Контекст диалога потерян — начни заново через «💫 Новый диалог».")
+        return
+
+    telegram_id = str(message.from_user.id)
+    style_card = await _gen_style_card(telegram_id) or _LIVE_NEUTRAL_STYLE_PLACEHOLDER
+    notes_row = get_running_notes(contact_id)
+    running_notes = notes_row["notes_text"] if notes_row else None
+    message_count = notes_row["message_count"] if notes_row else 0
+    dialogue_history = data.get("dialogue_history") or []
+
+    ctx = {
+        "kind": "live", "text": incoming, "contact_id": contact_id,
+        "style_card": style_card, "running_notes": running_notes,
+        "dialogue_history": dialogue_history, "message_count": message_count,
+        "variants": None,
+    }
+    action_id = _new_action(message.from_user.id, ctx)
+
+    # Короткая история диалога — эфемерно, в FSM; долгая память — running_notes в БД.
+    new_history = (dialogue_history + [incoming])[-8:]
+    await state.update_data(dialogue_history=new_history)
+
+    await _run_live_coach_step(message, ctx, message.from_user.id, bot, action_id)
+
+
+async def _run_live_coach_step(
+    target: Message, ctx: dict, telegram_id: int, bot: Bot, action_id: str, force_fresh: bool = False,
+) -> None:
+    """«Живой диалог»: первый проход — live_coach_step (советы + допись заметок,
+    одна попытка триала на пересланное сообщение). «Другие варианты» — просто
+    suggest_reply_variants поверх уже сохранённых заметок, БЕЗ повторной записи
+    в running_notes (иначе один и тот же инсайт задвоился бы в заметках)."""
+    text = ctx.get("text")
+    contact_id = ctx.get("contact_id")
+    if text is None or not contact_id:
+        await target.answer("Контекст устарел — начни заново.")
+        return
+
+    style_card = ctx["style_card"]
+    running_notes = ctx.get("running_notes") or ""
+
+    if force_fresh:
+        if not await _quota_gate(bot, target, str(telegram_id)):
+            return
+        try:
+            variants = await suggest_reply_variants(
+                text, style_card, running_notes, previous_variants=ctx.get("variants"),
+            )
+        except RateLimitError:
+            await target.answer("Лимит исчерпан, попробуй позже.")
+            return
+        except Exception:
+            logging.exception("live-coach: ошибка регена вариантов")
+            await target.answer("Не получилось сгенерировать варианты — попробуй ещё раз.")
+            return
+        await _charge_trial_if_needed(bot, str(telegram_id))
+        try:
+            record_event(str(telegram_id), "gen_live_regen", str(len(variants)))
+        except Exception:
+            logging.exception("telemetry: не удалось записать событие live-регена")
+        if not variants:
+            await target.answer("Не получилось сгенерировать варианты — попробуй ещё раз.")
+            return
+        ctx["variants"] = variants
+        await _answer_long(target, _format_variants(variants), reply_markup=live_variants_kb(action_id))
+        return
+
+    cache_key = _style_cache_key("live", "", text, style_card, running_notes)
+    cached = get_llm_cache(cache_key, LLM_CACHE_TTL_SEC)
+    variants = updated_notes = None
+    if cached:
+        try:
+            payload = json.loads(cached)
+            variants = [tuple(v) for v in payload["variants"]]
+            updated_notes = payload["notes"]
+            logging.info("live-coach: cache hit")
+        except (ValueError, TypeError, KeyError):
+            variants = updated_notes = None
+
+    if variants is None:
+        if not await _quota_gate(bot, target, str(telegram_id)):
+            return
+        try:
+            variants, updated_notes = await live_coach_step(
+                text, style_card, running_notes or None, ctx.get("dialogue_history"),
+            )
+        except RateLimitError:
+            await target.answer("Лимит исчерпан, попробуй позже.")
+            return
+        except Exception:
+            logging.exception("live-coach: ошибка генерации")
+            await target.answer("Не получилось сгенерировать совет — попробуй ещё раз.")
+            return
+
+        # Успех — списываем ОДНУ попытку (один вызов LLM даёт и советы, и заметки).
+        await _charge_trial_if_needed(bot, str(telegram_id))
+        set_llm_cache(cache_key, json.dumps({"variants": variants, "notes": updated_notes}, ensure_ascii=False))
+        try:
+            record_event(str(telegram_id), "gen_live", str(len(variants)))
+        except Exception:
+            logging.exception("telemetry: не удалось записать событие live-генерации")
+
+        new_count = ctx.get("message_count", 0) + 1
+        save_running_notes(contact_id, updated_notes, new_count)
+        ctx["message_count"] = new_count
+
+    if not variants:
+        await target.answer("Не получилось сгенерировать совет — попробуй ещё раз.")
+        return
+
+    ctx["variants"] = variants
+    ctx["running_notes"] = updated_notes
+    await _answer_long(target, _format_variants(variants), reply_markup=live_variants_kb(action_id))
+
+    message_count = ctx.get("message_count", 0)
+    if updated_notes and (message_count == 1 or message_count % LIVE_NOTES_SUMMARY_EVERY == 0):
+        preview = _running_notes_preview(updated_notes)
+        if preview:
+            await target.answer(f"Что я уже понял:\n{preview}")
+
+    await target.answer(
+        "Пришли следующее сообщение собеседницы — отвечу и на него. "
+        "Чтобы выйти из режима — нажми любую кнопку меню."
+    )
+
+
+@dp.callback_query(F.data.startswith("liveregen:"))
+async def cb_live_regen(call: CallbackQuery) -> None:
+    action_id = call.data.split(":", 1)[1]
+    ctx = _get_action(call.from_user.id, action_id)
+    if not ctx or ctx.get("kind") != "live":
+        await call.answer("Контекст устарел — начни заново через «💫 Новый диалог».", show_alert=True)
+        return
+    await call.answer("Подбираю другие варианты...")
+    await _run_live_coach_step(call.message, ctx, call.from_user.id, call.bot, action_id, force_fresh=True)
 
 
 # ── 📸 Ответить по скриншоту ──────────────────────────────────────────────────
