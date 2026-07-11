@@ -40,6 +40,15 @@ PYTHONPATH=. python eval/run_eval.py --export result.json --my-id user123456 --l
 кейсах. Экспорт (Telegram Desktop → result.json) в репозиторий не коммитим — это
 приватные данные.
 
+Переписку из **уже накопленной** бота-базы можно выгрузить одной командой
+(`tools/export.py`):
+
+```bash
+python -m tools.export --list                      # какие контакты есть (id + счётчик)
+python -m tools.export --contact 3 --out chat.json # выгрузить в формат экспорта
+PYTHONPATH=. python eval/run_eval.py --export chat.json --my-id <my_id>
+```
+
 ## Про лимиты провайдера
 
 Промпты крупные (~1800 токенов). Groq free-tier ограничивает токены в минуту И в
