@@ -98,8 +98,9 @@ async def _gemini_generate_with_media(
     text_prompt: str, mime_type: str, media_b64: str, max_tokens: int
 ) -> str:
     """Один запрос к Gemini generateContent с inline-медиа (image/audio). Пусто при ошибке.
-    Перебирает ключи по кругу — на 429 пробует следующий, на прочих ошибках сдаётся сразу
-    (не ключ-специфично, смысла перебирать нет)."""
+    Перебирает ключи по кругу — на любой 4xx (проблема конкретного ключа: невалиден,
+    нет доступа, лимит) пробует следующий, на прочих ошибках сдаётся сразу (не
+    ключ-специфично, смысла перебирать нет)."""
     keys = _gemini_keys_rotated()
     if not keys:
         return ""
@@ -121,8 +122,9 @@ async def _gemini_generate_with_media(
             if resp.is_success:
                 parts = resp.json()["candidates"][0].get("content", {}).get("parts") or []
                 return "".join(p.get("text", "") for p in parts).strip()
-            if resp.status_code == 429:
-                log.warning("Gemini media: ключ %s исчерпан, пробую следующий", _mask_key(key))
+            if 400 <= resp.status_code < 500:
+                log.warning("Gemini media: ключ %s — HTTP %d, пробую следующий",
+                            _mask_key(key), resp.status_code)
                 continue
             log.warning("Gemini media %s: %s", resp.status_code, resp.text[:200])
             return ""
@@ -312,8 +314,17 @@ class GeminiProvider(LLMProvider):
         async with httpx.AsyncClient(**client_kwargs) as client:
             resp = await client.post(self._url(key), json=payload)
 
-        if resp.status_code == 429:
-            raise RateLimitError(f"Лимит Gemini исчерпан (ключ {_mask_key(key)}).")
+        # Любой 4xx (400-499) — проблема КОНКРЕТНОГО ключа: невалиден, нет доступа
+        # к модели/API, исчерпан лимит именно на нём. Тело запроса у нас статичное
+        # и заведомо корректное, так что 4xx может означать только «что-то не так
+        # с ключом», а не с запросом — есть смысл пробовать следующий ключ. На
+        # практике встречаются и 429 (лимит), и 404 (API не подключён), и 400
+        # («API key not valid» для битого ключа) — коды разные, причина одна.
+        if 400 <= resp.status_code < 500:
+            raise RateLimitError(
+                f"Gemini ключ {_mask_key(key)}: HTTP {resp.status_code} — "
+                "невалиден, нет доступа или лимит."
+            )
 
         if resp.status_code in (500, 502, 503):
             raise ProviderError(f"Gemini {resp.status_code}: {resp.text[:200]}")
@@ -335,23 +346,24 @@ class GeminiProvider(LLMProvider):
             raise ProviderError(f"Gemini: неожиданный формат ответа — {e}") from e
 
     async def ask(self, prompt: str, max_tokens: int) -> str:
-        """Перебирает ключи Gemini по кругу (мультиаккаунтинг). На 429 пробует
-        следующий ключ — это может быть лимит именно этого ключа/аккаунта.
-        На прочих ошибках (5xx, сеть) сдаётся сразу: они не ключ-специфичны,
-        все ключи упрутся в то же самое — быстрее отдать каскаду шанс на Groq."""
+        """Перебирает ключи Gemini по кругу (мультиаккаунтинг). На 401/403/404/429
+        пробует следующий ключ — это проблема конкретного ключа/аккаунта (невалиден,
+        нет доступа, исчерпан лимит), а не сервиса в целом. На прочих ошибках (5xx,
+        сеть) сдаётся сразу: они не ключ-специфичны, все ключи упрутся в то же самое
+        — быстрее отдать каскаду шанс на Groq."""
         keys = _gemini_keys_rotated()
         if not keys:
             raise ProviderError("GEMINI_API_KEY(S) не задан")
 
-        last_exc: Exception = RateLimitError("Лимит Gemini исчерпан на всех ключах.")
+        last_exc: Exception = RateLimitError("Ни один ключ Gemini не сработал.")
         for i, key in enumerate(keys):
             try:
                 return await self._ask_with_key(prompt, max_tokens, key)
             except RateLimitError as e:
                 last_exc = e
                 if i + 1 < len(keys):
-                    log.warning("Gemini: ключ %s исчерпан, пробую следующий (%d/%d)",
-                                _mask_key(key), i + 2, len(keys))
+                    log.warning("Gemini: %s — пробую следующий ключ (%d/%d)",
+                                e, i + 2, len(keys))
                 continue
         raise last_exc
 
