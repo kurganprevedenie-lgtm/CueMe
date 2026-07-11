@@ -136,6 +136,13 @@ def init_db() -> None:
                 result     TEXT NOT NULL,   -- JSON-сериализованный результат
                 created_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS events (
+                id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts               TEXT NOT NULL,        -- когда (UTC ISO)
+                user_telegram_id TEXT,                -- кто (может быть NULL для системных)
+                event_type       TEXT NOT NULL,       -- что: gen_reply, gen_rewrite, ...
+                meta             TEXT                  -- произвольный контекст (стиль, kind)
+            );
         """)
         _add_column_if_missing(conn, "users", "auto_mode", "INTEGER DEFAULT 0")
         _add_column_if_missing(conn, "users", "auto_contact_id", "INTEGER")
@@ -637,6 +644,44 @@ def set_llm_cache(cache_key: str, result: str) -> None:
             "INSERT OR REPLACE INTO llm_cache (cache_key, result, created_at) VALUES (?, ?, ?)",
             (cache_key, result, _now()),
         )
+
+
+# ── события / метрики исходов ─────────────────────────────────────────────────
+# Фундамент продуктовой аналитики: воронка триал→оплата, что генерят, доходят ли
+# до встречи. Провайдер событий провязывается в main.py по мере надобности.
+
+def record_event(user_telegram_id: str | None, event_type: str, meta: str = "") -> None:
+    """Пишет одно событие. Телеметрия best-effort — вызывать из-под try, чтобы
+    сбой записи не ломал пользовательский флоу."""
+    with _conn() as conn:
+        conn.execute(
+            "INSERT INTO events (ts, user_telegram_id, event_type, meta) VALUES (?, ?, ?, ?)",
+            (_now(), user_telegram_id, event_type, meta),
+        )
+
+
+def count_events(event_type: str, user_telegram_id: str | None = None) -> int:
+    """Сколько раз произошло событие (опционально по конкретному юзеру)."""
+    with _conn() as conn:
+        if user_telegram_id is None:
+            row = conn.execute(
+                "SELECT COUNT(*) n FROM events WHERE event_type = ?", (event_type,)
+            ).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT COUNT(*) n FROM events WHERE event_type = ? AND user_telegram_id = ?",
+                (event_type, user_telegram_id),
+            ).fetchone()
+    return row["n"]
+
+
+def event_funnel() -> dict[str, int]:
+    """Сводка по типам событий {event_type: count} — простой обзор воронки."""
+    with _conn() as conn:
+        rows = conn.execute(
+            "SELECT event_type, COUNT(*) n FROM events GROUP BY event_type"
+        ).fetchall()
+    return {r["event_type"]: r["n"] for r in rows}
 
 
 def get_all_dated_my_messages(owner_user_id: str) -> list[dict]:

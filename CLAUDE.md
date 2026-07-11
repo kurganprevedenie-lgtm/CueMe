@@ -105,6 +105,8 @@ deep_analysis(contact_id PK, compatibility_text, history_text,
               swot_text, gifts_text, updated_at)
 deep_style_analysis(user_telegram_id PK, profile_text, history_text,
                     swot_text, tips_text, updated_at)
+events(id PK AUTO, ts, user_telegram_id, event_type, meta)  -- продуктовая
+       -- аналитика: record_event / count_events / event_funnel (storage.py)
 ```
 
 ## Файлы проекта

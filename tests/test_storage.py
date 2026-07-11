@@ -105,3 +105,28 @@ def test_llm_cache_overwrite(db):
     storage.set_llm_cache("k", "v1")
     storage.set_llm_cache("k", "v2")  # INSERT OR REPLACE
     assert storage.get_llm_cache("k", 100) == "v2"
+
+
+# ── события / метрики ────────────────────────────────────────────────────────
+
+def test_record_and_count_events(db):
+    assert storage.count_events("gen_reply") == 0
+    storage.record_event("u1", "gen_reply", "flirt")
+    storage.record_event("u1", "gen_reply", "humor")
+    storage.record_event("u2", "gen_reply", "flirt")
+    storage.record_event("u1", "gen_rewrite", "confident")
+    assert storage.count_events("gen_reply") == 3
+    assert storage.count_events("gen_reply", "u1") == 2   # фильтр по юзеру
+    assert storage.count_events("gen_rewrite") == 1
+
+
+def test_event_funnel(db):
+    storage.record_event("u1", "gen_reply", "")
+    storage.record_event("u1", "gen_reply", "")
+    storage.record_event("u1", "gen_screenshot", "")
+    assert storage.event_funnel() == {"gen_reply": 2, "gen_screenshot": 1}
+
+
+def test_record_event_allows_null_user(db):
+    storage.record_event(None, "system_startup")
+    assert storage.count_events("system_startup") == 1

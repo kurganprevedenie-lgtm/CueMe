@@ -105,6 +105,7 @@ from storage import (
     save_message_samples,
     save_my_style_per_contact,
     save_style_card,
+    record_event,
     set_auto_mode,
     set_llm_cache,
     update_contact_username,
@@ -386,6 +387,11 @@ async def _run_style_generation(
         # Успех — списываем попытку (premium не тратит) и кэшируем.
         await _charge_trial_if_needed(bot, str(telegram_id))
         set_llm_cache(cache_key, json.dumps([result, expl, rating], ensure_ascii=False))
+        # Телеметрия исходов (best-effort — сбой не должен ломать выдачу ответа).
+        try:
+            record_event(str(telegram_id), f"gen_{kind}", style_key or "")
+        except Exception:
+            logging.exception("telemetry: не удалось записать событие генерации")
 
     ctx["result"] = result
     await _answer_long(target, result, reply_markup=style_result_kb(result))
