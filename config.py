@@ -16,6 +16,16 @@ if not BOT_TOKEN:
 GROQ_API_KEY = os.getenv("GROQ_API_KEY") or os.getenv("LLM_API_KEY")
 # Gemini — основной (gemini-2.5-flash).
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+# Мультиаккаунтинг: несколько ключей Gemini через запятую — код перебирает их
+# по кругу, чтобы размазать нагрузку и меньше упираться в RPM-лимит одного
+# ключа (см. GeminiProvider в llm.py). ВАЖНО: помогает только если ключи из
+# РАЗНЫХ гугл-аккаунтов — если лимит у Google висит на уровне аккаунта/проекта,
+# несколько ключей ОДНОГО аккаунта его не обойдут. Если GEMINI_API_KEYS не
+# задан — используется один GEMINI_API_KEY (обратная совместимость).
+_gemini_keys_raw = os.getenv("GEMINI_API_KEYS", "")
+GEMINI_API_KEYS = [k.strip() for k in _gemini_keys_raw.split(",") if k.strip()]
+if not GEMINI_API_KEYS and GEMINI_API_KEY:
+    GEMINI_API_KEYS = [GEMINI_API_KEY]
 # OpenRouter — llama-3.1-8b-instruct:free.
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 

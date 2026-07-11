@@ -19,7 +19,7 @@ from abc import ABC, abstractmethod
 import httpx
 
 from config import (
-    GEMINI_API_KEY,
+    GEMINI_API_KEYS,
     GEMINI_PROXY,
     GROQ_API_KEY,
     LLM_PROVIDER_ORDER,
@@ -72,16 +72,37 @@ def _gemini_mm_kwargs() -> dict:
     return kwargs
 
 
+# ── Мультиаккаунтинг Gemini: round-robin по нескольким ключам ────────────────
+# Каждый вызов забирает список ключей начиная со СЛЕДУЮЩЕГО за прошлым разом —
+# так нагрузка размазывается по ключам равномерно, а не долбит первый до упора.
+# Помогает только если ключи из разных гугл-аккаунтов (см. комментарий в config.py).
+
+_gemini_key_cursor = 0
+
+
+def _gemini_keys_rotated() -> list[str]:
+    global _gemini_key_cursor
+    keys = GEMINI_API_KEYS
+    if not keys:
+        return []
+    start = _gemini_key_cursor % len(keys)
+    _gemini_key_cursor = (start + 1) % len(keys)
+    return keys[start:] + keys[:start]
+
+
+def _mask_key(key: str) -> str:
+    return f"...{key[-4:]}" if len(key) > 4 else "...?"
+
+
 async def _gemini_generate_with_media(
     text_prompt: str, mime_type: str, media_b64: str, max_tokens: int
 ) -> str:
-    """Один запрос к Gemini generateContent с inline-медиа (image/audio). Пусто при ошибке."""
-    if not GEMINI_API_KEY:
+    """Один запрос к Gemini generateContent с inline-медиа (image/audio). Пусто при ошибке.
+    Перебирает ключи по кругу — на 429 пробует следующий, на прочих ошибках сдаётся сразу
+    (не ключ-специфично, смысла перебирать нет)."""
+    keys = _gemini_keys_rotated()
+    if not keys:
         return ""
-    url = (
-        f"https://generativelanguage.googleapis.com/v1beta/models/"
-        f"{_GEMINI_MM_MODEL}:generateContent?key={GEMINI_API_KEY}"
-    )
     payload = {
         "contents": [{"role": "user", "parts": [
             {"text": text_prompt},
@@ -89,15 +110,25 @@ async def _gemini_generate_with_media(
         ]}],
         "generationConfig": {"maxOutputTokens": max_tokens, "thinkingConfig": {"thinkingBudget": 0}},
     }
-    try:
-        async with httpx.AsyncClient(**_gemini_mm_kwargs()) as client:
-            resp = await client.post(url, json=payload)
-        if resp.is_success:
-            parts = resp.json()["candidates"][0].get("content", {}).get("parts") or []
-            return "".join(p.get("text", "") for p in parts).strip()
-        log.warning("Gemini media %s: %s", resp.status_code, resp.text[:200])
-    except Exception as e:
-        log.warning("Gemini media: ошибка запроса — %s", e)
+    for key in keys:
+        url = (
+            f"https://generativelanguage.googleapis.com/v1beta/models/"
+            f"{_GEMINI_MM_MODEL}:generateContent?key={key}"
+        )
+        try:
+            async with httpx.AsyncClient(**_gemini_mm_kwargs()) as client:
+                resp = await client.post(url, json=payload)
+            if resp.is_success:
+                parts = resp.json()["candidates"][0].get("content", {}).get("parts") or []
+                return "".join(p.get("text", "") for p in parts).strip()
+            if resp.status_code == 429:
+                log.warning("Gemini media: ключ %s исчерпан, пробую следующий", _mask_key(key))
+                continue
+            log.warning("Gemini media %s: %s", resp.status_code, resp.text[:200])
+            return ""
+        except Exception as e:
+            log.warning("Gemini media: ошибка запроса — %s", e)
+            return ""
     return ""
 
 
@@ -255,17 +286,14 @@ class GeminiProvider(LLMProvider):
     name = "Gemini"
     _MODEL = "gemini-2.5-flash"
 
-    @property
-    def _url(self) -> str:
+    @staticmethod
+    def _url(key: str) -> str:
         return (
             f"https://generativelanguage.googleapis.com/v1beta/models/"
-            f"{self._MODEL}:generateContent?key={GEMINI_API_KEY}"
+            f"{GeminiProvider._MODEL}:generateContent?key={key}"
         )
 
-    async def ask(self, prompt: str, max_tokens: int) -> str:
-        if not GEMINI_API_KEY:
-            raise ProviderError("GEMINI_API_KEY не задан")
-
+    async def _ask_with_key(self, prompt: str, max_tokens: int, key: str) -> str:
         payload = {
             "contents": [{"role": "user", "parts": [{"text": prompt}]}],
             "generationConfig": {
@@ -282,10 +310,10 @@ class GeminiProvider(LLMProvider):
         if GEMINI_PROXY:
             client_kwargs["proxy"] = GEMINI_PROXY
         async with httpx.AsyncClient(**client_kwargs) as client:
-            resp = await client.post(self._url, json=payload)
+            resp = await client.post(self._url(key), json=payload)
 
         if resp.status_code == 429:
-            raise RateLimitError("Лимит Gemini исчерпан.")
+            raise RateLimitError(f"Лимит Gemini исчерпан (ключ {_mask_key(key)}).")
 
         if resp.status_code in (500, 502, 503):
             raise ProviderError(f"Gemini {resp.status_code}: {resp.text[:200]}")
@@ -305,6 +333,27 @@ class GeminiProvider(LLMProvider):
             raise ProviderError(f"Gemini: пустой ответ (finishReason={reason})")
         except (KeyError, IndexError) as e:
             raise ProviderError(f"Gemini: неожиданный формат ответа — {e}") from e
+
+    async def ask(self, prompt: str, max_tokens: int) -> str:
+        """Перебирает ключи Gemini по кругу (мультиаккаунтинг). На 429 пробует
+        следующий ключ — это может быть лимит именно этого ключа/аккаунта.
+        На прочих ошибках (5xx, сеть) сдаётся сразу: они не ключ-специфичны,
+        все ключи упрутся в то же самое — быстрее отдать каскаду шанс на Groq."""
+        keys = _gemini_keys_rotated()
+        if not keys:
+            raise ProviderError("GEMINI_API_KEY(S) не задан")
+
+        last_exc: Exception = RateLimitError("Лимит Gemini исчерпан на всех ключах.")
+        for i, key in enumerate(keys):
+            try:
+                return await self._ask_with_key(prompt, max_tokens, key)
+            except RateLimitError as e:
+                last_exc = e
+                if i + 1 < len(keys):
+                    log.warning("Gemini: ключ %s исчерпан, пробую следующий (%d/%d)",
+                                _mask_key(key), i + 2, len(keys))
+                continue
+        raise last_exc
 
 
 # ── OpenRouter ────────────────────────────────────────────────────────────────
