@@ -1,4 +1,4 @@
-from llm import _strip_wrapping_quotes, _EXOTIC_SCRIPT_RE
+from llm import _strip_wrapping_quotes, _EXOTIC_SCRIPT_RE, _quality_issues
 
 
 def test_strip_wrapping_quotes_removes_outer():
@@ -22,3 +22,14 @@ def test_exotic_script_detects_glitches():
     # латиница и обычный русский — НЕ экзотика (не трогаем)
     assert not _EXOTIC_SCRIPT_RE.search("го в McDonalds")
     assert not _EXOTIC_SCRIPT_RE.search("норм, увидимся в 7 😄")
+
+
+def test_quality_issues_catches_prod_failures():
+    issues = _quality_issues("кстати, звучит здорово, norm")
+    assert any("шаблонный зачин" in i for i in issues)
+    assert any("ассистентский штамп" in i for i in issues)
+    assert any("латиница" in i for i in issues)
+
+
+def test_quality_issues_accepts_clean_message():
+    assert _quality_issues("грузия звучит как хороший план, что там первое в списке?") == []

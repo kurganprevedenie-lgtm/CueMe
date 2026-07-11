@@ -48,9 +48,36 @@ def test_style_cache_key_deterministic_and_sensitive():
 
 def test_last_incoming_line():
     assert main._last_incoming_line("Она: привет\nЯ: норм\nОна: а ты куда?") == "Она: а ты куда?"
+    assert main._last_incoming_line("Собеседник: привет\nЯ: норм\nЯ: ага") == "Собеседник: привет"
+    assert main._last_incoming_line("Я: норм\nСобеседник: а ты куда?\nЯ: потом скажу") == "Собеседник: а ты куда?"
     assert main._last_incoming_line("одна строка") == "одна строка"
     assert main._last_incoming_line("текст\n\n   \n") == "текст"
     assert main._last_incoming_line("") == ""
+
+
+# ── _auto_style_for_ctx ──────────────────────────────────────────────────────
+
+def test_auto_style_for_ctx_hard_and_tender_cases():
+    assert main._auto_style_for_ctx({
+        "kind": "reply",
+        "text": "слушай, мне сейчас не до знакомств",
+        "data_signals": "• последняя реплика читается как отказ/холод/негатив",
+    }) == "confident"
+    assert main._auto_style_for_ctx({
+        "kind": "reply",
+        "text": "мечтаю попробовать но мне страшно если честно",
+    }) == "tender"
+
+
+def test_auto_style_for_ctx_logistics_and_screenshot():
+    assert main._auto_style_for_ctx({
+        "kind": "reply",
+        "text": "ну что, во сколько завтра встречаемся?",
+    }) == "friendly"
+    assert main._auto_style_for_ctx({
+        "kind": "screenshot",
+        "chat_text": "Собеседник: ты мне сегодня снился\nЯ: ничего себе",
+    }) == "flirt"
 
 
 # ── _reply_data_signals ───────────────────────────────────────────────────────

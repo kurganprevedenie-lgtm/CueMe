@@ -291,10 +291,39 @@ def style_pick_kb() -> InlineKeyboardMarkup:
     меня» и «По скриншоту». Какая фича сейчас активна — определяется по
     _last_action[user_id]["kind"], а не по callback_data (слот один на юзера)."""
     b = InlineKeyboardBuilder()
+    b.button(text="🎯 Подбери сам", callback_data="stylepick:auto")
     for key, (label, _desc) in REPLY_STYLES.items():
         b.button(text=label, callback_data=f"stylepick:{key}")
-    b.adjust(2)
+    b.adjust(1, 2)
     return b.as_markup()
+
+
+def _auto_style_for_ctx(ctx: dict) -> str:
+    """Консервативный выбор стиля по текущей ситуации. Пользователь всё ещё может
+    нажать «Другой стиль», это только быстрый дефолт для частых кейсов."""
+    kind = ctx.get("kind")
+    text = (ctx.get("text") if kind in ("rewrite", "reply") else ctx.get("chat_text")) or ""
+    last = _last_incoming_line(text) if kind == "screenshot" else text
+    low = last.lower()
+    signals = (ctx.get("data_signals") or "").lower()
+
+    if "отказ/холод/негатив" in signals or any(
+        p in low for p in ("не до знакомств", "всё равно", "все равно", "бесит", "не хочу", "не интересно", "неинтересно")
+    ):
+        return "confident"
+    if any(p in low for p in ("страшно", "боюсь", "тревожно", "устала", "устал", "вымоталась", "плохо", "тяжело")):
+        return "tender"
+    if any(p in low for p in ("здравствуйте", "добрый день", "вы ", "вам ", "вас ")):
+        return "formal"
+    if any(p in low for p in ("ахах", "хаха", "смешно", "пицц", "шут", "угар")):
+        return "humor"
+    if any(p in low for p in ("снился", "снилась", "мечтаю", "скуч", "цел", "краси", "симпат")):
+        return "flirt"
+    if any(p in low for p in ("во сколько", "когда", "где", "встреч", "завтра", "сегодня", "кофе", "прогул")):
+        return "friendly"
+    if kind == "rewrite" and any(p in low for p in ("может", "сходим", "увидимся", "встретимся")):
+        return "flirt"
+    return "friendly"
 
 
 # Telegram ограничивает CopyTextButton.text 256 символами.
@@ -423,7 +452,12 @@ _STYLE_KINDS = ("rewrite", "reply", "screenshot")
 async def cb_style_pick(call: CallbackQuery, state: FSMContext) -> None:
     style_key = call.data.split(":", 1)[1]
     ctx = _last_action.get(call.from_user.id)
-    if not ctx or ctx.get("kind") not in _STYLE_KINDS or style_key not in REPLY_STYLES:
+    if not ctx or ctx.get("kind") not in _STYLE_KINDS:
+        await call.answer("Контекст устарел — начни заново.", show_alert=True)
+        return
+    if style_key == "auto":
+        style_key = _auto_style_for_ctx(ctx)
+    elif style_key not in REPLY_STYLES:
         await call.answer("Контекст устарел — начни заново.", show_alert=True)
         return
     await call.answer()
@@ -1758,12 +1792,21 @@ def _format_blocks(blocks: list[dict]) -> str:
 
 def _last_incoming_line(chat_text: str) -> str:
     """Последняя непустая строка распознанной переписки — приближение последней
-    реплики собеседника для ситуативной эвристики (скриншот/OCR)."""
-    for line in reversed((chat_text or "").splitlines()):
-        s = line.strip()
-        if s:
+    реплики собеседника для ситуативной эвристики (скриншот/OCR). Если OCR
+    сохранил роли, пропускаем строки автора («Я: ...») и берём последнюю чужую."""
+    lines = [line.strip() for line in (chat_text or "").splitlines() if line.strip()]
+    if not lines:
+        return ""
+    self_re = re.compile(r"^(я|me|you)\s*[:：-]", re.IGNORECASE)
+    other_re = re.compile(r"^(собеседник|он|она|они|контакт|не я)\s*[:：-]", re.IGNORECASE)
+
+    for s in reversed(lines):
+        if other_re.match(s):
             return s
-    return ""
+    for s in reversed(lines):
+        if not self_re.match(s):
+            return s
+    return lines[-1]
 
 
 def _reply_data_signals(samples: dict | None, last_incoming: str) -> str | None:

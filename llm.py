@@ -733,10 +733,23 @@ def _split_rated(raw: str) -> tuple[str, str, str]:
     return msg, expl, rating
 
 
-# Экзотические скрипты (иероглифы/кана/тай/хангыль) — почти всегда глитч llama,
-# а не осмысленный текст. Латиницу НЕ трогаем: бренды/ссылки бывают легитимны.
+# Экзотические скрипты (иероглифы/кана/тай/хангыль) — почти всегда глитч llama.
+# Латиницу в готовом сообщении тоже отправляем на repair: промпты генерации требуют
+# чистую кириллицу, а eval уже ловил протечки вроде "norm".
 _EXOTIC_SCRIPT_RE = re.compile(r"[一-鿿぀-ヿ฀-๿가-힯]")
+_LATIN_RE = re.compile(r"[A-Za-z]")
+_WORD_RE = re.compile(r"\w+", re.UNICODE)
 _QUOTE_PAIRS = (("«", "»"), ('"', '"'), ("“", "”"), ("'", "'"), ("`", "`"))
+_AI_STOCK_PHRASES = (
+    "звучит здорово", "я понимаю, что", "отличный вопрос", "надеюсь, у тебя всё",
+    "надеюсь, у тебя все", "рад был помочь", "как я могу помочь", "чем могу помочь",
+)
+_BEGGING_PHRASES = (
+    "давай не будем расставаться", "давай пообщаемся", "не отписывайся",
+    "не пропадай", "не уходи", "давай не отписываться", "прошу", "умоляю",
+    "дай мне шанс", "не бросай",
+)
+_CLICHE_OPENERS = {"давай", "слушай", "кстати", "честно"}
 
 
 def _strip_wrapping_quotes(text: str) -> str:
@@ -754,16 +767,57 @@ def _strip_wrapping_quotes(text: str) -> str:
     return t
 
 
+def _opener_word(text: str) -> str:
+    m = _WORD_RE.search((text or "").lower())
+    return m.group(0) if m else ""
+
+
+def _quality_issues(msg: str) -> list[str]:
+    """Жёсткие дефекты готового сообщения. Это prod-версия eval-гвардрейлов:
+    если модель дала явную протечку или клише, пробуем один ремонтный проход."""
+    low = (msg or "").lower()
+    issues: list[str] = []
+    if _EXOTIC_SCRIPT_RE.search(msg or ""):
+        issues.append("есть иероглифы/экзотический алфавит")
+    if _LATIN_RE.search(msg or ""):
+        issues.append("есть латиница, хотя нужен только русский текст")
+    if any(p in low for p in _AI_STOCK_PHRASES):
+        issues.append("есть ассистентский штамп")
+    if any(p in low for p in _BEGGING_PHRASES):
+        issues.append("есть дожим или выпрашивание")
+    opener = _opener_word(msg)
+    if opener in _CLICHE_OPENERS:
+        issues.append(f"шаблонный зачин «{opener}»")
+    return issues
+
+
+async def _repair_rated(prompt: str, bad_msg: str, issues: list[str]) -> tuple[str, str, str]:
+    repair_prompt = (
+        f"{prompt}\n\n"
+        "=== ПРЕДЫДУЩИЙ ВАРИАНТ НЕ ПРОШЁЛ ПРОВЕРКУ КАЧЕСТВА ===\n"
+        f"Плохой вариант:\n«{bad_msg}»\n\n"
+        "Проблемы:\n"
+        + "\n".join(f"• {issue}" for issue in issues)
+        + "\n\n"
+        "Перепиши результат заново. Сохрани исходный смысл и формат вывода "
+        "(сообщение, затем пояснение, затем оценка), но устрани ВСЕ проблемы выше. "
+        "Не делай косметическую правку — выбери другой заход и чистый русский текст."
+    )
+    msg, expl, rating = _split_rated(await _ask(repair_prompt))
+    return _strip_wrapping_quotes(msg), expl, rating
+
+
 async def _finalize_rated(prompt: str) -> tuple[str, str, str]:
     """Общий финал функций генерации: парсинг + детерминированные гвардрейлы.
     Снимает обрамляющие кавычки; при экзотическом скрипте в тексте ответа (глитч
-    модели) один раз перегенерирует и берёт чистый вариант, если он вышел."""
+    модели), латинице, клишированном зачине или дожиме один раз просит модель
+    отремонтировать ответ и берёт чистый вариант, если он вышел."""
     msg, expl, rating = _split_rated(await _ask(prompt))
     msg = _strip_wrapping_quotes(msg)
-    if _EXOTIC_SCRIPT_RE.search(msg):
-        msg2, expl2, rating2 = _split_rated(await _ask(prompt))
-        msg2 = _strip_wrapping_quotes(msg2)
-        if not _EXOTIC_SCRIPT_RE.search(msg2):
+    issues = _quality_issues(msg)
+    if issues:
+        msg2, expl2, rating2 = await _repair_rated(prompt, msg, issues)
+        if not _quality_issues(msg2):
             return msg2, expl2, rating2
     return msg, expl, rating
 
