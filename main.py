@@ -18,7 +18,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
     BotCommand,
     BusinessConnection,
-    CallbackQuery, Document, Message,
+    CallbackQuery, Document, ErrorEvent, Message,
     CopyTextButton,
     InlineKeyboardMarkup,
     ReplyKeyboardMarkup, KeyboardButton,
@@ -123,6 +123,33 @@ from storage import (
 logging.basicConfig(level=logging.INFO)
 
 dp = Dispatcher(storage=MemoryStorage())
+
+
+@dp.errors()
+async def on_unhandled_error(event: ErrorEvent) -> bool:
+    """Глобальная сетка на необработанные исключения в хендлерах. Без неё сбой
+    (например, недоступный LLM при генерации карточек) тихо убивал кнопку:
+    спиннер гас, а пользователь не понимал, что произошло. Теперь — понятное
+    сообщение вместо молчания."""
+    logging.exception("unhandled update error: %s", event.exception)
+    text = ("Лимит запросов исчерпан — попробуй через пару минут."
+            if isinstance(event.exception, RateLimitError)
+            else "Что-то пошло не так — попробуй ещё раз.")
+    upd = event.update
+    try:
+        cq = getattr(upd, "callback_query", None)
+        if cq is not None:
+            try:
+                await cq.answer(text, show_alert=True)
+            except Exception:
+                if cq.message is not None:
+                    await cq.message.answer(text)
+        elif getattr(upd, "message", None) is not None:
+            await upd.message.answer(text)
+    except Exception:
+        logging.exception("error handler: не удалось уведомить пользователя")
+    return True
+
 
 BTN_REWRITE       = "📝 Переписать"
 BTN_SCREENSHOT    = "📸 По скриншоту"
@@ -2381,12 +2408,22 @@ async def _prompt_screenshot_style(
     # .from_user это БОТ, а не пользователь (стандартная ловушка aiogram).
     if not await _quota_gate(bot, target, telegram_id):
         return
-    style_card = await _style_for_rewrite(telegram_id, contact_id)
+    # Генерация карточек ходит в LLM — без обработки ошибок сбой (лимит/провайдер
+    # недоступен) тихо убивал кнопку: спиннер гас, а сообщение не менялось.
+    try:
+        style_card = await _style_for_rewrite(telegram_id, contact_id)
+        interaction_card = (await _gen_interaction_card(contact_id, telegram_id) or "") if style_card else ""
+    except RateLimitError:
+        await (target.edit_text if edit else target.answer)("Лимит запросов исчерпан — попробуй через пару минут.")
+        return
+    except Exception:
+        logging.exception("screenshot: не удалось сгенерировать карточки")
+        await (target.edit_text if edit else target.answer)("Сервис сейчас перегружен — попробуй чуть позже.")
+        return
     if not style_card:
         text = "Не удалось получить твой стиль — сначала загрузи JSON чата или дай накопить сообщений."
         await (target.edit_text(text) if edit else target.answer(text))
         return
-    interaction_card = await _gen_interaction_card(contact_id, telegram_id) or ""
 
     samples = get_message_samples(contact_id)
     action_id = _new_action(user_id, {
@@ -2410,7 +2447,15 @@ async def _prompt_screenshot_style_no_contact(
     без per-contact interaction_card (промпт сам подставит нейтральный фолбэк)."""
     if not await _quota_gate(bot, target, telegram_id):
         return
-    style_card = await _gen_style_card(telegram_id)
+    try:
+        style_card = await _gen_style_card(telegram_id)
+    except RateLimitError:
+        await (target.edit_text if edit else target.answer)("Лимит запросов исчерпан — попробуй через пару минут.")
+        return
+    except Exception:
+        logging.exception("screenshot(new): не удалось сгенерировать стиль")
+        await (target.edit_text if edit else target.answer)("Сервис сейчас перегружен — попробуй чуть позже.")
+        return
     if not style_card:
         text = "Не удалось получить твой стиль — сначала загрузи JSON чата или дай накопить сообщений."
         await (target.edit_text(text) if edit else target.answer(text))
