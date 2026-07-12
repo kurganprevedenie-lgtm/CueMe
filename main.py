@@ -19,7 +19,6 @@ from aiogram.types import (
     BotCommand,
     BusinessConnection,
     CallbackQuery, Document, ErrorEvent, Message,
-    CopyTextButton,
     InlineKeyboardMarkup,
     ReplyKeyboardMarkup, KeyboardButton,
 )
@@ -40,7 +39,6 @@ from config import (
     LLM_CACHE_TTL_SEC,
     REBUILD_THRESHOLD,
     REFRESH_SAMPLES_EVERY_N,
-    REPLY_STYLES,
     SAMPLE_SIZE,
 )
 from features import detect_reply_situation, extract_features, stage_hint, totals_from_summary, winning_messages
@@ -238,14 +236,17 @@ def _split_long_text(text: str, limit: int = TELEGRAM_MAX_LEN) -> list[str]:
 
 
 async def _answer_long(
-    message: Message, text: str, reply_markup: InlineKeyboardMarkup | None = None
+    message: Message, text: str, reply_markup: InlineKeyboardMarkup | None = None,
+    parse_mode: str | None = None,
 ) -> None:
     """Как message.answer(), но безопасно для текста длиннее лимита Telegram —
-    клавиатура (если есть) уходит с последним куском."""
+    клавиатура (если есть) уходит с последним куском. _split_long_text режет по
+    границам абзацев, поэтому HTML-теги внутри одного абзаца (см. _format_variants)
+    не рвутся посередине, пока сам абзац короче лимита."""
     chunks = _split_long_text(text)
     for i, chunk in enumerate(chunks):
         last = i == len(chunks) - 1
-        await message.answer(chunk, reply_markup=reply_markup if last else None)
+        await message.answer(chunk, reply_markup=reply_markup if last else None, parse_mode=parse_mode)
 
 
 async def _edit_or_answer_long(message: Message, text: str) -> None:
@@ -1655,10 +1656,15 @@ _VARIANT_LETTERS = "АБВГДЕЁЖЗИ"
 
 
 def _format_variants(variants: list[tuple[str, str]]) -> str:
+    """HTML: текст каждого варианта в <code> — в Telegram такой блок копируется
+    по одному тапу, без отдельной кнопки «Скопировать» на каждый вариант."""
     blocks = []
     for i, (name, text) in enumerate(variants):
         letter = _VARIANT_LETTERS[i] if i < len(_VARIANT_LETTERS) else str(i + 1)
-        blocks.append(f"Вариант {letter}: {name}\n- {text}")
+        blocks.append(
+            f"<b>Вариант {letter}: {html.escape(name)}</b>\n"
+            f"<code>{html.escape(text)}</code>"
+        )
     return "Вот несколько вариантов — выбирай или комбинируй.\n\n" + "\n\n".join(blocks)
 
 
@@ -1741,7 +1747,9 @@ async def _run_variants_generation(
         return
 
     ctx["variants"] = variants
-    await _answer_long(target, _format_variants(variants), reply_markup=variants_result_kb(action_id))
+    await _answer_long(
+        target, _format_variants(variants), reply_markup=variants_result_kb(action_id), parse_mode="HTML",
+    )
 
     if kind == "reply":
         await target.answer(
@@ -1934,7 +1942,9 @@ async def _run_live_coach_step(
             await target.answer("Не получилось сгенерировать варианты — попробуй ещё раз.")
             return
         ctx["variants"] = variants
-        await _answer_long(target, _format_variants(variants), reply_markup=live_variants_kb(action_id))
+        await _answer_long(
+            target, _format_variants(variants), reply_markup=live_variants_kb(action_id), parse_mode="HTML",
+        )
         return
 
     cache_key = _style_cache_key("live", "", text, style_card, running_notes)
@@ -1982,7 +1992,9 @@ async def _run_live_coach_step(
 
     ctx["variants"] = variants
     ctx["running_notes"] = updated_notes
-    await _answer_long(target, _format_variants(variants), reply_markup=live_variants_kb(action_id))
+    await _answer_long(
+        target, _format_variants(variants), reply_markup=live_variants_kb(action_id), parse_mode="HTML",
+    )
 
     message_count = ctx.get("message_count", 0)
     if updated_notes and (message_count == 1 or message_count % LIVE_NOTES_SUMMARY_EVERY == 0):
