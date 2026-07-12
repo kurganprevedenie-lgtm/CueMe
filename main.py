@@ -358,6 +358,16 @@ _GENDER_LABELS = {"male": "парень", "female": "девушка"}
 _GENDER_PROMPT_TEXT = "Для начала — как к тебе обращаться?"
 
 
+def _contact_words(user_gender: str | None) -> tuple[str, str]:
+    """(родительный падеж «собеседник/собеседница», притяжательное «его/её») —
+    кто на другом конце «Нового диалога». Гетеро дефолт для дейтинга:
+    пользователь-девушка пишет парню, пользователь-парень (или пол
+    неизвестен) — девушке."""
+    if user_gender == "female":
+        return "собеседника", "его"
+    return "собеседницы", "её"
+
+
 def gender_kb() -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     b.button(text="🙋‍♂️ Я парень", callback_data="gender:male")
@@ -1889,10 +1899,12 @@ async def cmd_reply(message: Message, state: FSMContext) -> None:
 # ── 💫 Живой диалог с нуля (холодный старт, без порога накопления) ───────────
 
 _LIVE_NEUTRAL_STYLE_PLACEHOLDER = (
-    "Данных о твоём стиле письма пока нет — пиши нейтрально: разговорной "
-    "длиной, без выраженного регистра/тона, без домыслов о привычках автора. "
-    "Как только появятся другие данные (JSON-экспорт, другие переписки), "
-    "стиль подключится сам."
+    "Данных о твоём стиле письма пока нет — пиши так, как типично пишут в "
+    "дейтинг-переписке в этом возрасте (18-30): на «ты», без канцелярита и "
+    "лишней вежливости, чаще со строчной буквы в начале сообщения и без "
+    "строгой пунктуации, разговорной длиной. Без домыслов о привычках автора "
+    "сверх этого. Как только появятся другие данные (JSON-экспорт, другие "
+    "переписки), стиль подключится сам и станет точнее."
 )
 
 LIVE_NOTES_SUMMARY_EVERY = 4  # раз в сколько сообщений показывать «что я уже понял»
@@ -1930,8 +1942,9 @@ async def handle_live_name(message: Message, state: FSMContext) -> None:
 
     await state.set_state(LiveDialogue.waiting_for_incoming)
     await state.update_data(contact_id=contact_id, dialogue_history=[])
+    _, pron = _contact_words(get_gender(telegram_id))
     await message.answer(
-        f"Готово — «{name}». Присылай её сообщения по одному, на каждое сразу дам "
+        f"Готово — «{name}». Присылай {pron} сообщения по одному, на каждое сразу дам "
         "несколько вариантов ответа. Чтобы выйти из режима — нажми любую кнопку меню."
     )
 
@@ -1941,7 +1954,8 @@ async def handle_live_incoming(message: Message, state: FSMContext, bot: Bot) ->
     txt, _ = await _message_text(bot, message)
     incoming = (txt or "").strip()
     if not incoming:
-        await message.answer("Пришли сообщение собеседницы текстом или голосовым.")
+        contact_gen, _ = _contact_words(get_gender(str(message.from_user.id)))
+        await message.answer(f"Пришли сообщение {contact_gen} текстом или голосовым.")
         return
 
     data = await state.get_data()
@@ -2080,8 +2094,9 @@ async def _run_live_coach_step(
         if preview:
             await target.answer(f"Что я уже понял:\n{preview}")
 
+    contact_gen, _ = _contact_words(gender)
     await target.answer(
-        "Пришли следующее сообщение собеседницы — отвечу и на него. "
+        f"Пришли следующее сообщение {contact_gen} — отвечу и на него. "
         "Чтобы выйти из режима — нажми любую кнопку меню."
     )
 
