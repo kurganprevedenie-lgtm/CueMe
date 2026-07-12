@@ -72,8 +72,8 @@ FIRST_BUILD_THRESHOLD = int(os.getenv("FIRST_BUILD_THRESHOLD", "15"))
 PREMIUM_CHANNEL_ID = os.getenv("PREMIUM_CHANNEL_ID")
 # Ссылка на оформление подписки (со страницы канала в Tribute) — показываем в пейволле.
 PREMIUM_SUBSCRIBE_URL = os.getenv("PREMIUM_SUBSCRIBE_URL", "")
-# Сколько бесплатных генераций (Переписать/Ответить за меня/По скриншоту) даём
-# до пейволла. Остальные функции (глубокий анализ и т.п.) только по подписке.
+# Сколько бесплатных генераций (Ответить за меня/По скриншоту) даём
+# до пейволла. Остальные функции (анализ собеседника и т.п.) только по подписке.
 FREE_TRIAL_REQUESTS = int(os.getenv("FREE_TRIAL_REQUESTS", "5"))
 # Кэш проверки членства в канале (сек) — не дёргать Telegram API на каждое сообщение.
 PREMIUM_CACHE_TTL = int(os.getenv("PREMIUM_CACHE_TTL", "300"))

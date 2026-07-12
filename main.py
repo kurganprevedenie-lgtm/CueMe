@@ -148,15 +148,15 @@ async def on_unhandled_error(event: ErrorEvent) -> bool:
 BTN_SCREENSHOT    = "📸 По скриншоту"
 BTN_REPLY         = "💬 Ответить за меня"
 BTN_LIVE          = "💫 Новый диалог"
-BTN_DEEP          = "🔬 Глубокий анализ"
-BTN_DEEP_STYLE    = "🪞 Глубокий анализ стиля"
+BTN_DEEP          = "🔬 Анализ собеседника"
+BTN_DEEP_STYLE    = "🪞 Анализ своего стиля"
 BTN_HELP          = "❓ Помощь"
 # BTN_ME («👤 Мой стиль») убрана вместе с командой /me — дублировала
 # BTN_DEEP_STYLE (и была бесплатной лазейкой мимо подписки на неё).
 # BTN_MY_STYLE_FOR («🎯 Мой стиль с ним») убрана из меню, но _show_my_style_for
 # не удалена — можно вернуть кнопку одной правкой.
 # BTN_CONTACT («🔍 Стиль собеседника») удалена совсем — её interaction_card
-# теперь блоком внутри «Глубокий анализ» (_format_deep_analysis). BTN_CONTACTS
+# теперь блоком внутри «Анализ собеседника» (_format_deep_analysis). BTN_CONTACTS
 # («📋 Контакты») убрана из меню — доступна только как команда /contacts.
 # BTN_REWRITE («📝 Переписать») и /auto удалены совсем — их сценарий (черновик
 # без привязки к входящему) теперь полностью закрывает «💫 Новый диалог».
@@ -328,7 +328,7 @@ async def _charge_trial_if_needed(bot: Bot, telegram_id: str) -> None:
 
 
 async def _require_premium(bot: Bot, target: Message, telegram_id: str) -> bool:
-    """Гейт для функций без бесплатного триала (глубокий анализ, стиль
+    """Гейт для функций без бесплатного триала (анализ собеседника, стиль
     собеседника, /compare и т.п.) — доступ только по активной подписке."""
     if await _is_premium(bot, telegram_id):
         return True
@@ -652,7 +652,7 @@ async def _gen_my_style_per_contact(contact_id: int, owner_user_id: str) -> str 
     return card
 
 
-# ── 🔬 Глубокий анализ ────────────────────────────────────────────────────────
+# ── 🔬 Анализ собеседника ─────────────────────────────────────────────────────
 
 DEEP_ANALYSIS_MIN_MSGS = 10  # минимум сообщений с каждой стороны, иначе анализ бессмысленен
 
@@ -716,7 +716,7 @@ async def _gen_deep_analysis(contact_id: int, owner_user_id: str) -> dict | None
 
 def _format_deep_analysis(name: str, data: dict, interaction_card: str | None) -> tuple[str, str, str]:
     msg1 = (
-        f"🔬 Глубокий анализ — {name}\n\n"
+        f"🔬 Анализ собеседника — {name}\n\n"
         f"💞 Совместимость\n\n{data['compatibility_text']}\n\n"
         f"📖 История отношений\n\n{data['history_text']}"
     )
@@ -746,7 +746,7 @@ async def _run_deep_analysis(
         return
     name = _contact_name(contact)
 
-    wait_text = f"Готовлю глубокий анализ — {name}. Это займёт ~30 секунд..."
+    wait_text = f"Готовлю анализ собеседника — {name}. Это займёт ~30 секунд..."
     await (target.edit_text(wait_text) if edit else target.answer(wait_text))
 
     try:
@@ -761,7 +761,7 @@ async def _run_deep_analysis(
 
     if not data:
         await target.answer(
-            f"Пока маловато данных по {name} для глубокого анализа — нужно минимум "
+            f"Пока маловато данных по {name} для анализа собеседника — нужно минимум "
             f"{DEEP_ANALYSIS_MIN_MSGS} сообщений с обеих сторон (JSON-экспорт или "
             "накопление через Автоматизацию чатов)."
         )
@@ -791,7 +791,7 @@ async def _show_deep_analysis(message: Message, bot: Bot) -> None:
         await _run_deep_analysis(bot, message, telegram_id, contacts[0]["id"])
         return
 
-    await message.answer("Для кого сделать глубокий анализ?", reply_markup=contacts_kb(contacts, "deepan"))
+    await message.answer("Для кого сделать анализ собеседника?", reply_markup=contacts_kb(contacts, "deepan"))
 
 
 @dp.message(Command("deep_analysis"))
@@ -816,7 +816,7 @@ async def cb_deep_analysis_contact(call: CallbackQuery, bot: Bot) -> None:
     await _run_deep_analysis(bot, call.message, telegram_id, contact_id, edit=True)
 
 
-# ── 🪞 Глубокий анализ моего стиля (агрегат по всем контактам) ────────────────
+# ── 🪞 Анализ своего стиля (агрегат по всем контактам) ────────────────────────
 
 DEEP_STYLE_MIN_MSGS = 20  # минимум своих сообщений суммарно, иначе анализ бессмысленен
 
@@ -854,7 +854,7 @@ async def _gen_deep_style_analysis(telegram_id: str) -> dict | None:
 
 def _format_deep_style_analysis(data: dict) -> tuple[str, str]:
     msg1 = (
-        "🪞 Глубокий анализ твоего стиля\n\n"
+        "🪞 Анализ своего стиля\n\n"
         f"🎙️ Коммуникативный профиль\n\n{data['profile_text']}\n\n"
         f"📖 Как менялся твой стиль\n\n{data['history_text']}"
     )
@@ -874,7 +874,7 @@ def deep_style_result_kb() -> InlineKeyboardMarkup:
 async def _run_deep_style_analysis(bot: Bot, target: Message, telegram_id: str) -> None:
     if not await _require_premium(bot, target, telegram_id):
         return
-    await target.answer("Готовлю глубокий анализ твоего стиля. Это займёт ~30 секунд...")
+    await target.answer("Готовлю анализ своего стиля. Это займёт ~30 секунд...")
 
     try:
         data = await _gen_deep_style_analysis(telegram_id)
@@ -888,7 +888,7 @@ async def _run_deep_style_analysis(bot: Bot, target: Message, telegram_id: str) 
 
     if not data:
         await target.answer(
-            f"Пока маловато данных для глубокого анализа стиля — нужно минимум "
+            f"Пока маловато данных для анализа своего стиля — нужно минимум "
             f"{DEEP_STYLE_MIN_MSGS} твоих сообщений суммарно (JSON-экспорт или "
             "накопление через Автоматизацию чатов)."
         )
@@ -1035,9 +1035,9 @@ def _capabilities_text() -> str:
         "Можно слать скриншоты один за другим без повторного нажатия кнопки\n"
         "💫 Новый диалог — помогу с первого сообщения новому человеку, даже без "
         "накопленной истории\n"
-        "🔬 Глубокий анализ — совместимость, история отношений, как писать "
+        "🔬 Анализ собеседника — совместимость, история отношений, как писать "
         "этому человеку, подарки\n"
-        "🪞 Глубокий анализ стиля — твой коммуникативный профиль и советы для дейтинга\n"
+        "🪞 Анализ своего стиля — твой коммуникативный профиль и советы для дейтинга\n"
         "/contacts — загруженные чаты · /stats — портрет в цифрах · /compare — сравнить стили\n\n"
         f"💎 {FREE_TRIAL_REQUESTS} бесплатных попыток на ответ/скриншот, "
         "дальше и остальные функции — по подписке. Статус — /premium.\n\n"
@@ -1317,7 +1317,7 @@ async def handle_document(message: Message, bot: Bot, state: FSMContext) -> None
     else:
         await message.answer(
             f"Загружено — {name} ({chat.meta.total_messages} сообщений).\n"
-            "Нажми «🔬 Глубокий анализ» для разбора.",
+            "Нажми «🔬 Анализ собеседника» для разбора.",
             reply_markup=main_kb(),
         )
 
@@ -2300,7 +2300,7 @@ async def cmd_premium(message: Message, bot: Bot) -> None:
     await message.answer(
         f"Бесплатных попыток осталось: {left} из {FREE_TRIAL_REQUESTS} "
         "(Ответить за меня / По скриншоту).\n"
-        "Глубокий анализ, стиль собеседника и сравнение стилей — только по подписке.",
+        "Анализ собеседника, стиль собеседника и сравнение стилей — только по подписке.",
         reply_markup=paywall_kb(),
     )
 
@@ -2537,8 +2537,8 @@ async def main() -> None:
         BotCommand(command="screenshot",  description="Ответить по скриншоту"),
         BotCommand(command="reply",       description="Помочь ответить собеседнику"),
         BotCommand(command="contacts",    description="Загруженные чаты"),
-        BotCommand(command="deep_analysis", description="Глубокий анализ отношений"),
-        BotCommand(command="deep_style_analysis", description="Глубокий анализ моего стиля"),
+        BotCommand(command="deep_analysis", description="Анализ собеседника"),
+        BotCommand(command="deep_style_analysis", description="Анализ своего стиля"),
         BotCommand(command="premium",     description="Статус подписки"),
         BotCommand(command="delete",      description="Удалить свои данные"),
         BotCommand(command="rebuild",     description="Пересобрать все карточки"),

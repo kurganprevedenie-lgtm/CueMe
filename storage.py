@@ -557,7 +557,7 @@ def get_all_per_contact_style_cards(owner_user_id: str) -> list[dict]:
     ]
 
 
-# ── deep analysis (кэш глубокого анализа пары) ────────────────────────────────
+# ── deep analysis (кэш анализа собеседника, пара) ─────────────────────────────
 
 def save_deep_analysis(
     contact_id: int,
@@ -603,7 +603,7 @@ def delete_deep_analysis(contact_id: int) -> None:
         conn.execute("DELETE FROM deep_analysis WHERE contact_id = ?", (contact_id,))
 
 
-# ── deep style analysis (кэш глубокого анализа своего стиля, агрегат) ─────────
+# ── deep style analysis (кэш анализа своего стиля, агрегат) ───────────────────
 
 def save_deep_style_analysis(
     user_telegram_id: str,
@@ -719,7 +719,7 @@ def event_funnel() -> dict[str, int]:
 
 def get_all_dated_my_messages(owner_user_id: str) -> list[dict]:
     """Все исходящие сообщения пользователя (business + imported) по ВСЕМ его
-    контактам, с датами — для агрегатного глубокого анализа собственного стиля."""
+    контактам, с датами — для агрегатного анализа собственного стиля."""
     with _conn() as conn:
         biz_rows = conn.execute(
             """
@@ -780,8 +780,8 @@ def get_biz_messages_for_contact(
 
 
 def get_all_dated_messages(owner_user_id: str, contact_id: int) -> list[dict]:
-    """Все сообщения контакта (business + imported) с датами — для глубокого
-    анализа (совместимость, история по периодам). Без сортировки — сортировка
+    """Все сообщения контакта (business + imported) с датами — для анализа
+    собеседника (совместимость, история по периодам). Без сортировки — сортировка
     и семплирование на стороне вызывающего."""
     with _conn() as conn:
         biz_rows = conn.execute(
