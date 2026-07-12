@@ -831,7 +831,7 @@ def _format_deep_analysis(name: str, data: dict, interaction_card: str | None) -
     )
     msg2 = f"🗣️ Стиль и привычки {name}\n\n{interaction_card}" if interaction_card else ""
     msg3 = (
-        f"🧭 Сильные стороны, проблемы и точки роста\n\n{data['swot_text']}\n\n"
+        f"🚩💚 Флаги\n\n{data['swot_text']}\n\n"
         f"🎁 Рекомендации подарков\n\n{data['gifts_text']}"
     )
     return msg1, msg2, msg3
