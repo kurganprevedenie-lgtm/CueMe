@@ -980,6 +980,93 @@ def _deep_style_stats_summary(rows: list[dict]) -> str:
     )
 
 
+# v1 (профиль/история по периодам/swot/советы, 2 сообщения) — оставлено для
+# отката. Заменено компактной 3-блочной карточкой (архетип/факты/совет) одним
+# сообщением + вычисляемым блоком совместимости без LLM (см. ниже).
+# async def _gen_deep_style_analysis(telegram_id: str) -> dict | None:
+#     """Ленивая генерация с кэшем в deep_style_analysis. None — данных мало."""
+#     cached = get_deep_style_analysis(telegram_id)
+#     if cached:
+#         return cached
+#
+#     rows = get_all_dated_my_messages(telegram_id)
+#     if len(rows) < DEEP_STYLE_MIN_MSGS:
+#         return None
+#
+#     dated_lines = _periodized_dated_lines(rows)
+#     stats       = _deep_style_stats_summary(rows)
+#     profile, history, swot, tips = await build_deep_style_analysis(
+#         dated_lines, stats, user_gender=get_gender(telegram_id),
+#     )
+#     save_deep_style_analysis(telegram_id, profile, history, swot, tips)
+#     return {
+#         "profile_text": profile, "history_text": history,
+#         "swot_text": swot, "tips_text": tips,
+#     }
+#
+#
+# def _format_deep_style_analysis(data: dict) -> tuple[str, str]:
+#     msg1 = (
+#         "🪞 Анализ своего стиля\n\n"
+#         f"🎙️ Коммуникативный профиль\n\n{data['profile_text']}\n\n"
+#         f"📖 Как менялся твой стиль\n\n{data['history_text']}"
+#     )
+#     msg2 = (
+#         f"🧭 Сильные стороны, проблемы и точки роста\n\n{data['swot_text']}\n\n"
+#         f"🎯 Рекомендации для дейтинга\n\n{data['tips_text']}"
+#     )
+#     return msg1, msg2
+
+
+_COMPAT_NUM_RE = re.compile(r"Совместимость:\s*(\d+)\s*/\s*100")
+
+
+def _best_winning_example(telegram_id: str) -> str | None:
+    """Реальный проверенный пример удачного захода (features.winning_messages,
+    без LLM) — первый найденный среди НЕ-демо контактов пользователя. None,
+    если ни для одного контакта явных случаев не набралось."""
+    for c in list_contacts(telegram_id):
+        if _is_demo_contact(c["id"]):
+            continue
+        wins = _winning_for_contact(telegram_id, c["id"])
+        if wins:
+            return wins[0]
+    return None
+
+
+def _first_compat_reason(compatibility_text: str) -> str:
+    """Первый буллет-пункт compatibility_text (после строки «Совместимость:
+    XX/100») как есть, без LLM — короткий пересказ, не весь текст целиком."""
+    for line in compatibility_text.splitlines()[1:]:
+        line = line.strip()
+        if line.startswith("•"):
+            return line.lstrip("•").strip()
+    return ""
+
+
+def _best_compatibility_contact(telegram_id: str) -> tuple[str, str] | None:
+    """Контакт с максимальной совместимостью среди тех, для кого «Анализ
+    собеседника» УЖЕ проводился (get_deep_analysis — без форсирования
+    генерации, без LLM-вызовов, быстро). None, если ни для одного контакта
+    анализа ещё нет. Возвращает (имя_контакта, compatibility_text)."""
+    best: tuple[int, str, str] | None = None
+    for c in list_contacts(telegram_id):
+        if _is_demo_contact(c["id"]):
+            continue
+        data = get_deep_analysis(c["id"])
+        if not data:
+            continue
+        m = _COMPAT_NUM_RE.search(data["compatibility_text"])
+        if not m:
+            continue
+        score = int(m.group(1))
+        if best is None or score > best[0]:
+            best = (score, _contact_name(c), data["compatibility_text"])
+    if best is None:
+        return None
+    return best[1], best[2]
+
+
 async def _gen_deep_style_analysis(telegram_id: str) -> dict | None:
     """Ленивая генерация с кэшем в deep_style_analysis. None — данных мало."""
     cached = get_deep_style_analysis(telegram_id)
@@ -992,27 +1079,42 @@ async def _gen_deep_style_analysis(telegram_id: str) -> dict | None:
 
     dated_lines = _periodized_dated_lines(rows)
     stats       = _deep_style_stats_summary(rows)
-    profile, history, swot, tips = await build_deep_style_analysis(
-        dated_lines, stats, user_gender=get_gender(telegram_id),
+    winning     = _best_winning_example(telegram_id)
+    profile, facts, tip = await build_deep_style_analysis(
+        dated_lines, stats, user_gender=get_gender(telegram_id), winning_example=winning,
     )
-    save_deep_style_analysis(telegram_id, profile, history, swot, tips)
-    return {
-        "profile_text": profile, "history_text": history,
-        "swot_text": swot, "tips_text": tips,
-    }
+    save_deep_style_analysis(telegram_id, profile, facts, tip)
+    return {"profile_text": profile, "facts_text": facts, "tip_text": tip}
 
 
-def _format_deep_style_analysis(data: dict) -> tuple[str, str]:
-    msg1 = (
-        "🪞 Анализ своего стиля\n\n"
-        f"🎙️ Коммуникативный профиль\n\n{data['profile_text']}\n\n"
-        f"📖 Как менялся твой стиль\n\n{data['history_text']}"
-    )
-    msg2 = (
-        f"🧭 Сильные стороны, проблемы и точки роста\n\n{data['swot_text']}\n\n"
-        f"🎯 Рекомендации для дейтинга\n\n{data['tips_text']}"
-    )
-    return msg1, msg2
+def _format_deep_style_analysis(telegram_id: str, data: dict) -> str:
+    """Все 4 блока — одно компактное сообщение. Блок 4 (совместимость) считается
+    заново при каждом показе (не кэшируется вместе с остальными тремя), т.к.
+    deep_analysis других контактов может обновиться позже."""
+    parts = [
+        "🪞 Анализ своего стиля",
+        data["profile_text"].strip(),
+        data["facts_text"].strip(),
+        data["tip_text"].strip(),
+    ]
+
+    best = _best_compatibility_contact(telegram_id)
+    if best:
+        name, compat_text = best
+        m = _COMPAT_NUM_RE.search(compat_text)
+        score = m.group(1) if m else "?"
+        reason = _first_compat_reason(compat_text)
+        compat_block = f"💕 Лучше всего складывается с {name} ({score}/100)"
+        if reason:
+            compat_block += f"\n{reason}"
+        parts.append(compat_block)
+    else:
+        parts.append(
+            "Запусти «Анализ собеседника» хотя бы для одного контакта, чтобы "
+            "увидеть тут сравнение."
+        )
+
+    return "\n\n".join(parts)
 
 
 def deep_style_result_kb() -> InlineKeyboardMarkup:
@@ -1044,9 +1146,8 @@ async def _run_deep_style_analysis(bot: Bot, target: Message, telegram_id: str) 
         )
         return
 
-    msg1, msg2 = _format_deep_style_analysis(data)
-    await _answer_long(target, msg1)
-    await _answer_long(target, msg2, reply_markup=deep_style_result_kb())
+    card = _format_deep_style_analysis(telegram_id, data)
+    await _answer_long(target, card, reply_markup=deep_style_result_kb())
 
 
 async def _show_deep_style_analysis(message: Message, bot: Bot) -> None:

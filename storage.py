@@ -176,6 +176,19 @@ def init_db() -> None:
         _add_column_if_missing(conn, "deep_analysis", "howto_text", "TEXT NOT NULL DEFAULT ''")
         _add_column_if_missing(conn, "deep_analysis", "style_text", "TEXT NOT NULL DEFAULT ''")
         _add_column_if_missing(conn, "deep_analysis", "flags_text", "TEXT NOT NULL DEFAULT ''")
+        # deep_style_analysis: переход на компактную 3-блочную карточку (архетип/
+        # факты/совет) — «история по периодам» и SWOT убраны, совместимость с
+        # лучшим контактом теперь отдельный вычисляемый блок без LLM (не хранится
+        # тут). profile_text переиспользован (был «голос и манера», стал «архетип»
+        # — тот же по смыслу первый блок). Старый кэш несовместим — чистим.
+        dsa_cols = [r[1] for r in conn.execute("PRAGMA table_info(deep_style_analysis)").fetchall()]
+        if "history_text" in dsa_cols:
+            conn.execute("DELETE FROM deep_style_analysis")
+            conn.execute("ALTER TABLE deep_style_analysis DROP COLUMN history_text")
+            conn.execute("ALTER TABLE deep_style_analysis DROP COLUMN swot_text")
+            conn.execute("ALTER TABLE deep_style_analysis DROP COLUMN tips_text")
+        _add_column_if_missing(conn, "deep_style_analysis", "facts_text", "TEXT NOT NULL DEFAULT ''")
+        _add_column_if_missing(conn, "deep_style_analysis", "tip_text", "TEXT NOT NULL DEFAULT ''")
 
         # Индексы под горячие выборки (пересборка карточек, чтение истории)
         _create_index_if_missing(
@@ -702,27 +715,68 @@ def delete_deep_analysis(contact_id: int) -> None:
 
 # ── deep style analysis (кэш анализа своего стиля, агрегат) ───────────────────
 
+# v1 (профиль/история по периодам/swot/советы) — оставлено для отката. Заменено
+# компактной 3-блочной карточкой (архетип/факты/совет) — см. миграцию в init_db,
+# дропающую history_text/swot_text/tips_text.
+# def save_deep_style_analysis(
+#     user_telegram_id: str,
+#     profile_text: str,
+#     history_text: str,
+#     swot_text: str,
+#     tips_text: str,
+# ) -> None:
+#     with _conn() as conn:
+#         conn.execute(
+#             """
+#             INSERT INTO deep_style_analysis
+#                 (user_telegram_id, profile_text, history_text, swot_text, tips_text, updated_at)
+#             VALUES (?, ?, ?, ?, ?, ?)
+#             ON CONFLICT(user_telegram_id) DO UPDATE SET
+#                 profile_text = excluded.profile_text,
+#                 history_text = excluded.history_text,
+#                 swot_text    = excluded.swot_text,
+#                 tips_text    = excluded.tips_text,
+#                 updated_at   = excluded.updated_at
+#             """,
+#             (user_telegram_id, profile_text, history_text, swot_text, tips_text, _now()),
+#         )
+#
+#
+# def get_deep_style_analysis(user_telegram_id: str) -> dict | None:
+#     with _conn() as conn:
+#         row = conn.execute(
+#             "SELECT * FROM deep_style_analysis WHERE user_telegram_id = ?",
+#             (user_telegram_id,),
+#         ).fetchone()
+#     if not row:
+#         return None
+#     return {
+#         "profile_text": row["profile_text"],
+#         "history_text": row["history_text"],
+#         "swot_text":    row["swot_text"],
+#         "tips_text":    row["tips_text"],
+#     }
+
+
 def save_deep_style_analysis(
     user_telegram_id: str,
     profile_text: str,
-    history_text: str,
-    swot_text: str,
-    tips_text: str,
+    facts_text: str,
+    tip_text: str,
 ) -> None:
     with _conn() as conn:
         conn.execute(
             """
             INSERT INTO deep_style_analysis
-                (user_telegram_id, profile_text, history_text, swot_text, tips_text, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?)
+                (user_telegram_id, profile_text, facts_text, tip_text, updated_at)
+            VALUES (?, ?, ?, ?, ?)
             ON CONFLICT(user_telegram_id) DO UPDATE SET
                 profile_text = excluded.profile_text,
-                history_text = excluded.history_text,
-                swot_text    = excluded.swot_text,
-                tips_text    = excluded.tips_text,
+                facts_text   = excluded.facts_text,
+                tip_text     = excluded.tip_text,
                 updated_at   = excluded.updated_at
             """,
-            (user_telegram_id, profile_text, history_text, swot_text, tips_text, _now()),
+            (user_telegram_id, profile_text, facts_text, tip_text, _now()),
         )
 
 
@@ -736,9 +790,8 @@ def get_deep_style_analysis(user_telegram_id: str) -> dict | None:
         return None
     return {
         "profile_text": row["profile_text"],
-        "history_text": row["history_text"],
-        "swot_text":    row["swot_text"],
-        "tips_text":    row["tips_text"],
+        "facts_text":   row["facts_text"],
+        "tip_text":     row["tip_text"],
     }
 
 

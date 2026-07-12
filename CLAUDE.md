@@ -105,10 +105,10 @@ business_messages(id PK AUTO, connection_id, owner_user_id,
                   text, date, tg_message_id, raw_meta JSON)
 business_chat_refs(owner_user_id, chat_ref, contact_id,
                    PRIMARY KEY (owner_user_id, chat_ref))
-deep_analysis(contact_id PK, compatibility_text, history_text,
-              swot_text, gifts_text, updated_at)
-deep_style_analysis(user_telegram_id PK, profile_text, history_text,
-                    swot_text, tips_text, updated_at)
+deep_analysis(contact_id PK, compatibility_text, howto_text,
+              style_text, flags_text, updated_at)
+deep_style_analysis(user_telegram_id PK, profile_text, facts_text,
+                    tip_text, updated_at)
 events(id PK AUTO, ts, user_telegram_id, event_type, meta)  -- продуктовая
        -- аналитика: record_event / count_events / event_funnel (storage.py)
 ```
