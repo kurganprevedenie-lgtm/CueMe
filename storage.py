@@ -155,6 +155,7 @@ def init_db() -> None:
         _add_column_if_missing(conn, "users", "auto_contact_id", "INTEGER")
         _add_column_if_missing(conn, "users", "trial_used", "INTEGER NOT NULL DEFAULT 0")
         _add_column_if_missing(conn, "users", "gender", "TEXT")
+        _add_column_if_missing(conn, "users", "demo_trial_used", "INTEGER NOT NULL DEFAULT 0")
         _add_column_if_missing(conn, "contacts", "username", "TEXT")
         _add_column_if_missing(conn, "message_samples", "contact_label", "TEXT")
         # user_features_summary — подмножество features_summary, убираем дубль
@@ -227,6 +228,22 @@ def increment_trial_used(telegram_id: str) -> None:
     with _conn() as conn:
         conn.execute(
             "UPDATE users SET trial_used = trial_used + 1 WHERE telegram_id = ?",
+            (telegram_id,),
+        )
+
+
+def get_demo_trial_used(telegram_id: str) -> int:
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT demo_trial_used FROM users WHERE telegram_id = ?", (telegram_id,)
+        ).fetchone()
+    return row["demo_trial_used"] if row else 0
+
+
+def increment_demo_trial_used(telegram_id: str) -> None:
+    with _conn() as conn:
+        conn.execute(
+            "UPDATE users SET demo_trial_used = demo_trial_used + 1 WHERE telegram_id = ?",
             (telegram_id,),
         )
 

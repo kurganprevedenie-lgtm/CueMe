@@ -75,6 +75,10 @@ PREMIUM_SUBSCRIBE_URL = os.getenv("PREMIUM_SUBSCRIBE_URL", "")
 # Сколько бесплатных генераций (Ответить за меня/По скриншоту) даём
 # до пейволла. Остальные функции (анализ собеседника и т.п.) только по подписке.
 FREE_TRIAL_REQUESTS = int(os.getenv("FREE_TRIAL_REQUESTS", "5"))
+# Отдельная (щедрая) тихая квота для демо-контактов (demo_boss/demo_friend) —
+# не должна делить лимит с реальным использованием. Пользователю не сообщаем
+# про этот лимит, пока он не исчерпан.
+DEMO_TRIAL_LIMIT = int(os.getenv("DEMO_TRIAL_LIMIT", "25"))
 # Кэш проверки членства в канале (сек) — не дёргать Telegram API на каждое сообщение.
 PREMIUM_CACHE_TTL = int(os.getenv("PREMIUM_CACHE_TTL", "300"))
 
