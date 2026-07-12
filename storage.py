@@ -162,6 +162,20 @@ def init_db() -> None:
         ms_cols = [r[1] for r in conn.execute("PRAGMA table_info(message_samples)").fetchall()]
         if "user_features_summary" in ms_cols:
             conn.execute("ALTER TABLE message_samples DROP COLUMN user_features_summary")
+        # deep_analysis: переход на 4-блочную структуру (совместимость/как писать/
+        # длина-ритм-регистр/флаги) — «история по периодам» и «подарки» убраны из
+        # фичи. Старый кэш по прежним колонкам структурно несовместим с новым
+        # форматом (он же ЛЕНИВЫЙ кэш, не пользовательские данные) — чистим и
+        # перегенерируем при следующем открытии «Анализ собеседника».
+        da_cols = [r[1] for r in conn.execute("PRAGMA table_info(deep_analysis)").fetchall()]
+        if "history_text" in da_cols:
+            conn.execute("DELETE FROM deep_analysis")
+            conn.execute("ALTER TABLE deep_analysis DROP COLUMN history_text")
+            conn.execute("ALTER TABLE deep_analysis DROP COLUMN swot_text")
+            conn.execute("ALTER TABLE deep_analysis DROP COLUMN gifts_text")
+        _add_column_if_missing(conn, "deep_analysis", "howto_text", "TEXT NOT NULL DEFAULT ''")
+        _add_column_if_missing(conn, "deep_analysis", "style_text", "TEXT NOT NULL DEFAULT ''")
+        _add_column_if_missing(conn, "deep_analysis", "flags_text", "TEXT NOT NULL DEFAULT ''")
 
         # Индексы под горячие выборки (пересборка карточек, чтение истории)
         _create_index_if_missing(
@@ -599,27 +613,70 @@ def get_all_per_contact_style_cards(owner_user_id: str) -> list[dict]:
 
 # ── deep analysis (кэш анализа собеседника, пара) ─────────────────────────────
 
+# v1 (совместимость/история по периодам/swot-или-флаги/подарки) — оставлено для
+# отката. Заменено 4-блочной структурой (совместимость/как писать/длина-ритм-
+# регистр/флаги) — см. миграцию в init_db, дропающую history_text/swot_text/
+# gifts_text.
+# def save_deep_analysis(
+#     contact_id: int,
+#     compatibility_text: str,
+#     history_text: str,
+#     swot_text: str,
+#     gifts_text: str,
+# ) -> None:
+#     with _conn() as conn:
+#         conn.execute(
+#             """
+#             INSERT INTO deep_analysis
+#                 (contact_id, compatibility_text, history_text, swot_text, gifts_text, updated_at)
+#             VALUES (?, ?, ?, ?, ?, ?)
+#             ON CONFLICT(contact_id) DO UPDATE SET
+#                 compatibility_text = excluded.compatibility_text,
+#                 history_text       = excluded.history_text,
+#                 swot_text          = excluded.swot_text,
+#                 gifts_text         = excluded.gifts_text,
+#                 updated_at         = excluded.updated_at
+#             """,
+#             (contact_id, compatibility_text, history_text, swot_text, gifts_text, _now()),
+#         )
+#
+#
+# def get_deep_analysis(contact_id: int) -> dict | None:
+#     with _conn() as conn:
+#         row = conn.execute(
+#             "SELECT * FROM deep_analysis WHERE contact_id = ?", (contact_id,)
+#         ).fetchone()
+#     if not row:
+#         return None
+#     return {
+#         "compatibility_text": row["compatibility_text"],
+#         "history_text":       row["history_text"],
+#         "swot_text":          row["swot_text"],
+#         "gifts_text":         row["gifts_text"],
+#     }
+
+
 def save_deep_analysis(
     contact_id: int,
     compatibility_text: str,
-    history_text: str,
-    swot_text: str,
-    gifts_text: str,
+    howto_text: str,
+    style_text: str,
+    flags_text: str,
 ) -> None:
     with _conn() as conn:
         conn.execute(
             """
             INSERT INTO deep_analysis
-                (contact_id, compatibility_text, history_text, swot_text, gifts_text, updated_at)
+                (contact_id, compatibility_text, howto_text, style_text, flags_text, updated_at)
             VALUES (?, ?, ?, ?, ?, ?)
             ON CONFLICT(contact_id) DO UPDATE SET
                 compatibility_text = excluded.compatibility_text,
-                history_text       = excluded.history_text,
-                swot_text          = excluded.swot_text,
-                gifts_text         = excluded.gifts_text,
+                howto_text         = excluded.howto_text,
+                style_text         = excluded.style_text,
+                flags_text         = excluded.flags_text,
                 updated_at         = excluded.updated_at
             """,
-            (contact_id, compatibility_text, history_text, swot_text, gifts_text, _now()),
+            (contact_id, compatibility_text, howto_text, style_text, flags_text, _now()),
         )
 
 
@@ -632,9 +689,9 @@ def get_deep_analysis(contact_id: int) -> dict | None:
         return None
     return {
         "compatibility_text": row["compatibility_text"],
-        "history_text":       row["history_text"],
-        "swot_text":          row["swot_text"],
-        "gifts_text":         row["gifts_text"],
+        "howto_text":         row["howto_text"],
+        "style_text":         row["style_text"],
+        "flags_text":         row["flags_text"],
     }
 
 

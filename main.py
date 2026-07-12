@@ -799,6 +799,48 @@ def _deep_stats_summary(rows: list[dict]) -> str:
     )
 
 
+# v1 (совместимость/история по периодам/флаги/подарки, 3 сообщения msg1/msg2/msg3
+# с отдельным interaction_card) — оставлено для отката. Заменено 4-блочной
+# структурой (совместимость/как писать/длина-ритм-регистр/флаги), которая сама
+# закрывает то, что раньше показывал отдельный interaction_card-вызов в msg2.
+# async def _gen_deep_analysis(contact_id: int, owner_user_id: str) -> dict | None:
+#     """Ленивая генерация с кэшем в deep_analysis. None — данных мало."""
+#     cached = get_deep_analysis(contact_id)
+#     if cached:
+#         return cached
+#
+#     rows = get_all_dated_messages(owner_user_id, contact_id)
+#     my_count = sum(1 for r in rows if r["direction"] == "out" and r["text"])
+#     ct_count = sum(1 for r in rows if r["direction"] == "in" and r["text"])
+#     if my_count < DEEP_ANALYSIS_MIN_MSGS or ct_count < DEEP_ANALYSIS_MIN_MSGS:
+#         return None
+#
+#     dated_lines = _periodized_dated_lines(rows)
+#     stats       = _deep_stats_summary(rows)
+#     compat, history, swot, gifts = await build_deep_analysis(
+#         dated_lines, stats, user_gender=get_gender(owner_user_id),
+#     )
+#     save_deep_analysis(contact_id, compat, history, swot, gifts)
+#     return {
+#         "compatibility_text": compat, "history_text": history,
+#         "swot_text": swot, "gifts_text": gifts,
+#     }
+#
+#
+# def _format_deep_analysis(name: str, data: dict, interaction_card: str | None) -> tuple[str, str, str]:
+#     msg1 = (
+#         f"🔬 Анализ собеседника — {name}\n\n"
+#         f"💞 Совместимость\n\n{data['compatibility_text']}\n\n"
+#         f"📖 История отношений\n\n{data['history_text']}"
+#     )
+#     msg2 = f"🗣️ Стиль и привычки {name}\n\n{interaction_card}" if interaction_card else ""
+#     msg3 = (
+#         f"🚩💚 Флаги\n\n{data['swot_text']}\n\n"
+#         f"🎁 Рекомендации подарков\n\n{data['gifts_text']}"
+#     )
+#     return msg1, msg2, msg3
+
+
 async def _gen_deep_analysis(contact_id: int, owner_user_id: str) -> dict | None:
     """Ленивая генерация с кэшем в deep_analysis. None — данных мало."""
     cached = get_deep_analysis(contact_id)
@@ -813,28 +855,32 @@ async def _gen_deep_analysis(contact_id: int, owner_user_id: str) -> dict | None
 
     dated_lines = _periodized_dated_lines(rows)
     stats       = _deep_stats_summary(rows)
-    compat, history, swot, gifts = await build_deep_analysis(
+    compat, howto, style, flags = await build_deep_analysis(
         dated_lines, stats, user_gender=get_gender(owner_user_id),
     )
-    save_deep_analysis(contact_id, compat, history, swot, gifts)
+    save_deep_analysis(contact_id, compat, howto, style, flags)
     return {
-        "compatibility_text": compat, "history_text": history,
-        "swot_text": swot, "gifts_text": gifts,
+        "compatibility_text": compat, "howto_text": howto,
+        "style_text": style, "flags_text": flags,
     }
 
 
-def _format_deep_analysis(name: str, data: dict, interaction_card: str | None) -> tuple[str, str, str]:
-    msg1 = (
-        f"🔬 Анализ собеседника — {name}\n\n"
-        f"💞 Совместимость\n\n{data['compatibility_text']}\n\n"
-        f"📖 История отношений\n\n{data['history_text']}"
-    )
-    msg2 = f"🗣️ Стиль и привычки {name}\n\n{interaction_card}" if interaction_card else ""
-    msg3 = (
-        f"🚩💚 Флаги\n\n{data['swot_text']}\n\n"
-        f"🎁 Рекомендации подарков\n\n{data['gifts_text']}"
-    )
-    return msg1, msg2, msg3
+def _format_deep_analysis(name: str, data: dict) -> list[str]:
+    """Собирает все 4 блока в один текст; если не влезает в лимит Telegram —
+    делит на 2 логичных сообщения (1+2 и 3+4), а не режет механически."""
+    header = f"🔬 Анализ собеседника — {name}\n\n"
+    block1 = f"💞 Совместимость\n\n{data['compatibility_text']}"
+    block2 = f"✍️ Как писать {name}\n\n{data['howto_text']}"
+    block3 = f"📏 Длина, ритм и язык\n\n{data['style_text']}"
+    block4 = f"🚩💚 Флаги\n\n{data['flags_text']}"
+
+    full = header + f"{block1}\n\n{block2}\n\n{block3}\n\n{block4}"
+    if len(full) <= TELEGRAM_MAX_LEN:
+        return [full]
+
+    part1 = header + f"{block1}\n\n{block2}"
+    part2 = f"{block3}\n\n{block4}"
+    return [part1, part2]
 
 
 def deep_analysis_result_kb(contact_id: int) -> InlineKeyboardMarkup:
@@ -876,17 +922,10 @@ async def _run_deep_analysis(
         )
         return
 
-    try:
-        interaction_card = await _gen_interaction_card(contact_id, telegram_id)
-    except Exception:
-        logging.exception("deep_analysis: не удалось получить стиль собеседника")
-        interaction_card = None
-
-    msg1, msg2, msg3 = _format_deep_analysis(name, data, interaction_card)
-    await _answer_long(target, msg1)
-    if msg2:
-        await _answer_long(target, msg2)
-    await _answer_long(target, msg3, reply_markup=deep_analysis_result_kb(contact_id))
+    messages = _format_deep_analysis(name, data)
+    for i, msg in enumerate(messages):
+        last = i == len(messages) - 1
+        await _answer_long(target, msg, reply_markup=deep_analysis_result_kb(contact_id) if last else None)
 
 
 async def _show_deep_analysis(message: Message, bot: Bot) -> None:
