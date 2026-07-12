@@ -154,6 +154,7 @@ def init_db() -> None:
         _add_column_if_missing(conn, "users", "auto_mode", "INTEGER DEFAULT 0")
         _add_column_if_missing(conn, "users", "auto_contact_id", "INTEGER")
         _add_column_if_missing(conn, "users", "trial_used", "INTEGER NOT NULL DEFAULT 0")
+        _add_column_if_missing(conn, "users", "gender", "TEXT")
         _add_column_if_missing(conn, "contacts", "username", "TEXT")
         _add_column_if_missing(conn, "message_samples", "contact_label", "TEXT")
         # user_features_summary — подмножество features_summary, убираем дубль
@@ -227,6 +228,28 @@ def increment_trial_used(telegram_id: str) -> None:
         conn.execute(
             "UPDATE users SET trial_used = trial_used + 1 WHERE telegram_id = ?",
             (telegram_id,),
+        )
+
+
+def get_gender(telegram_id: str) -> str | None:
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT gender FROM users WHERE telegram_id = ?", (telegram_id,)
+        ).fetchone()
+    return row["gender"] if row else None
+
+
+def set_gender(telegram_id: str, gender: str) -> None:
+    """Ставит пол; создаёт строку users, если её ещё нет (пол спрашивается в
+    самом начале, до upsert_user из остального онбординга)."""
+    with _conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO users (telegram_id, my_id, created_at, gender)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(telegram_id) DO UPDATE SET gender = excluded.gender
+            """,
+            (telegram_id, f"user{telegram_id}", _now(), gender),
         )
 
 

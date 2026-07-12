@@ -42,6 +42,12 @@ def test_style_cache_key_deterministic_and_sensitive():
     # смена карточки стиля меняет ключ (авто-инвалидация)
     assert main._style_cache_key("reply", "flirt", "привет", "card-B", "inter-A") != k1
     assert main._style_cache_key("rewrite", "flirt", "привет", "card-A", "inter-A") != k1
+    # смена пола (extra) — тоже меняет ключ (иначе после /gender вернётся кэш старого рода)
+    assert main._style_cache_key("reply", "flirt", "привет", "card-A", "inter-A", extra="male") != k1
+    assert (
+        main._style_cache_key("reply", "flirt", "привет", "card-A", "inter-A", extra="male")
+        != main._style_cache_key("reply", "flirt", "привет", "card-A", "inter-A", extra="female")
+    )
 
 
 # ── _last_incoming_line ───────────────────────────────────────────────────────

@@ -10,7 +10,7 @@ import time
 import uuid
 from pathlib import Path
 
-from aiogram import Bot, Dispatcher, F
+from aiogram import BaseMiddleware, Bot, Dispatcher, F
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -83,6 +83,7 @@ from storage import (
     get_contact_by_id,
     get_deep_analysis,
     get_deep_style_analysis,
+    get_gender,
     get_llm_cache,
     get_interaction_card,
     get_imported_messages,
@@ -107,6 +108,7 @@ from storage import (
     save_running_notes,
     save_style_card,
     record_event,
+    set_gender,
     set_llm_cache,
     update_contact_username,
     upsert_business_connection,
@@ -346,15 +348,64 @@ def main_kb() -> ReplyKeyboardMarkup:
     return b.as_markup(resize_keyboard=True)
 
 
+# ── Пол пользователя ─────────────────────────────────────────────────────────
+# Спрашивается в самом начале, до любого другого взаимодействия (см.
+# GenderGateMiddleware ниже) — нужен для согласования рода в русском: и когда
+# бот обращается к пользователю напрямую, и в промптах генерации (варианты
+# ответа пишутся от первого лица автора — «я устал»/«я устала»).
+
+_GENDER_LABELS = {"male": "парень", "female": "девушка"}
+_GENDER_PROMPT_TEXT = "Для начала — как к тебе обращаться?"
+
+
+def gender_kb() -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    b.button(text="🙋‍♂️ Я парень", callback_data="gender:male")
+    b.button(text="🙋‍♀️ Я девушка", callback_data="gender:female")
+    b.adjust(2)
+    return b.as_markup()
+
+
+class GenderGateMiddleware(BaseMiddleware):
+    """Пока пол не выбран — перехватывает любое сообщение/callback (кроме самого
+    выбора пола) и показывает клавиатуру выбора вместо обычной обработки."""
+
+    async def __call__(self, handler, event, data):
+        user = data.get("event_from_user")
+        if user is None:
+            return await handler(event, data)
+
+        if isinstance(event, CallbackQuery) and event.data in ("gender:male", "gender:female"):
+            return await handler(event, data)
+
+        telegram_id = str(user.id)
+        if get_gender(telegram_id) is not None:
+            return await handler(event, data)
+
+        target = event.message if isinstance(event, CallbackQuery) else event
+        if target is not None:
+            await target.answer(_GENDER_PROMPT_TEXT, reply_markup=gender_kb())
+        if isinstance(event, CallbackQuery):
+            await event.answer()
+        return None
+
+
+dp.message.outer_middleware(GenderGateMiddleware())
+dp.callback_query.outer_middleware(GenderGateMiddleware())
+
+
 # style_pick_kb/_auto_style_for_ctx/style_result_kb (точечный выбор одного стиля
 # после показа вариантов, кнопка «Другой тон») убраны вместе с ней — см. main.py
 # variants_result_kb ниже. Точечный выбор стиля больше нигде не используется.
 
 
-def _style_cache_key(kind: str, style: str, text: str, style_card: str, interaction_card: str) -> str:
+def _style_cache_key(
+    kind: str, style: str, text: str, style_card: str, interaction_card: str, extra: str = "",
+) -> str:
     """Контент-адресный ключ кэша: включает карточки стиля, поэтому при их пересборке
-    ключ меняется сам (авто-инвалидация без TTL-гонок)."""
-    raw = "\x00".join([kind or "", style or "", text or "", style_card or "", interaction_card or ""])
+    ключ меняется сам (авто-инвалидация без TTL-гонок). extra — доп. фактор,
+    меняющий генерацию (например пол автора), не завязанный на карточки."""
+    raw = "\x00".join([kind or "", style or "", text or "", style_card or "", interaction_card or "", extra or ""])
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
@@ -706,7 +757,9 @@ async def _gen_deep_analysis(contact_id: int, owner_user_id: str) -> dict | None
 
     dated_lines = _periodized_dated_lines(rows)
     stats       = _deep_stats_summary(rows)
-    compat, history, swot, gifts = await build_deep_analysis(dated_lines, stats)
+    compat, history, swot, gifts = await build_deep_analysis(
+        dated_lines, stats, user_gender=get_gender(owner_user_id),
+    )
     save_deep_analysis(contact_id, compat, history, swot, gifts)
     return {
         "compatibility_text": compat, "history_text": history,
@@ -844,7 +897,9 @@ async def _gen_deep_style_analysis(telegram_id: str) -> dict | None:
 
     dated_lines = _periodized_dated_lines(rows)
     stats       = _deep_style_stats_summary(rows)
-    profile, history, swot, tips = await build_deep_style_analysis(dated_lines, stats)
+    profile, history, swot, tips = await build_deep_style_analysis(
+        dated_lines, stats, user_gender=get_gender(telegram_id),
+    )
     save_deep_style_analysis(telegram_id, profile, history, swot, tips)
     return {
         "profile_text": profile, "history_text": history,
@@ -1159,10 +1214,7 @@ async def _business_connect_text(bot: Bot, platform: str) -> str:
     )
 
 
-@dp.message(CommandStart())
-async def cmd_start(message: Message, state: FSMContext) -> None:
-    await state.clear()
-    telegram_id = str(message.from_user.id)
+async def _send_start_menu(message: Message, telegram_id: str) -> None:
     caps = _capabilities_text()
 
     if list_contacts(telegram_id):
@@ -1175,6 +1227,28 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
         "С чего начнём? 👇",
         reply_markup=onboarding_kb(),
     )
+
+
+@dp.message(CommandStart())
+async def cmd_start(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    await _send_start_menu(message, str(message.from_user.id))
+
+
+@dp.callback_query(F.data.in_({"gender:male", "gender:female"}))
+async def cb_gender_select(call: CallbackQuery, state: FSMContext) -> None:
+    gender = call.data.split(":", 1)[1]
+    telegram_id = str(call.from_user.id)
+    set_gender(telegram_id, gender)
+    await call.answer()
+    await call.message.edit_text(f"Принято — обращаюсь как к «{_GENDER_LABELS[gender]}».")
+    await state.clear()
+    await _send_start_menu(call.message, telegram_id)
+
+
+@dp.message(Command("gender"))
+async def cmd_gender(message: Message) -> None:
+    await message.answer("Как теперь к тебе обращаться?", reply_markup=gender_kb())
 
 
 @dp.callback_query(F.data == "onb:business")
@@ -1695,7 +1769,8 @@ async def _run_variants_generation(
     style_card, interaction_card = ctx["style_card"], ctx["interaction_card"]
     signals = ctx.get("data_signals")
     winning = ctx.get("winning")
-    cache_key = _style_cache_key(f"{kind}_variants", "", text, style_card, interaction_card)
+    gender = get_gender(str(telegram_id))
+    cache_key = _style_cache_key(f"{kind}_variants", "", text, style_card, interaction_card, extra=gender or "")
 
     variants = None
     if not force_fresh:
@@ -1717,11 +1792,13 @@ async def _run_variants_generation(
                 variants = await suggest_reply_variants(
                     text, style_card, interaction_card,
                     data_signals=signals, previous_variants=prev, winning_examples=winning,
+                    user_gender=gender,
                 )
             else:  # screenshot
                 variants = await screenshot_variants(
                     text, style_card, interaction_card,
                     previous_variants=prev, data_signals=signals, winning_examples=winning,
+                    user_gender=gender,
                 )
         except RateLimitError:
             await target.answer("Лимит исчерпан, попробуй позже.")
@@ -1916,6 +1993,7 @@ async def _run_live_coach_step(
 
     style_card = ctx["style_card"]
     running_notes = ctx.get("running_notes") or ""
+    gender = get_gender(str(telegram_id))
 
     if force_fresh:
         if not await _quota_gate(bot, target, str(telegram_id)):
@@ -1923,6 +2001,7 @@ async def _run_live_coach_step(
         try:
             variants = await suggest_reply_variants(
                 text, style_card, running_notes, previous_variants=ctx.get("variants"),
+                user_gender=gender,
             )
         except RateLimitError:
             await target.answer("Лимит исчерпан, попробуй позже.")
@@ -1945,7 +2024,7 @@ async def _run_live_coach_step(
         )
         return
 
-    cache_key = _style_cache_key("live", "", text, style_card, running_notes)
+    cache_key = _style_cache_key("live", "", text, style_card, running_notes, extra=gender or "")
     cached = get_llm_cache(cache_key, LLM_CACHE_TTL_SEC)
     variants = updated_notes = None
     if cached:
@@ -1963,6 +2042,7 @@ async def _run_live_coach_step(
         try:
             variants, updated_notes = await live_coach_step(
                 text, style_card, running_notes or None, ctx.get("dialogue_history"),
+                user_gender=gender,
             )
         except RateLimitError:
             await target.answer("Лимит исчерпан, попробуй позже.")
@@ -2526,6 +2606,7 @@ async def main() -> None:
     bot = Bot(token=BOT_TOKEN)
     await bot.set_my_commands([
         BotCommand(command="start",       description="Начало работы"),
+        BotCommand(command="gender",      description="Сменить пол"),
         BotCommand(command="help",        description="Список команд"),
         BotCommand(command="demo",        description="Попробовать на примере"),
         BotCommand(command="connect",     description="Подключить Автоматизацию чатов"),
