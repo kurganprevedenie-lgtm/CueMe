@@ -1021,19 +1021,6 @@ def _deep_style_stats_summary(rows: list[dict]) -> str:
 _COMPAT_NUM_RE = re.compile(r"Совместимость:\s*(\d+)\s*/\s*100")
 
 
-def _best_winning_example(telegram_id: str) -> str | None:
-    """Реальный проверенный пример удачного захода (features.winning_messages,
-    без LLM) — первый найденный среди НЕ-демо контактов пользователя. None,
-    если ни для одного контакта явных случаев не набралось."""
-    for c in list_contacts(telegram_id):
-        if _is_demo_contact(c["id"]):
-            continue
-        wins = _winning_for_contact(telegram_id, c["id"])
-        if wins:
-            return wins[0]
-    return None
-
-
 def _first_compat_reason(compatibility_text: str) -> str:
     """Первый буллет-пункт compatibility_text (после строки «Совместимость:
     XX/100») как есть, без LLM — короткий пересказ, не весь текст целиком."""
@@ -1079,9 +1066,8 @@ async def _gen_deep_style_analysis(telegram_id: str) -> dict | None:
 
     dated_lines = _periodized_dated_lines(rows)
     stats       = _deep_style_stats_summary(rows)
-    winning     = _best_winning_example(telegram_id)
     profile, facts, tip = await build_deep_style_analysis(
-        dated_lines, stats, user_gender=get_gender(telegram_id), winning_example=winning,
+        dated_lines, stats, user_gender=get_gender(telegram_id),
     )
     save_deep_style_analysis(telegram_id, profile, facts, tip)
     return {"profile_text": profile, "facts_text": facts, "tip_text": tip}
@@ -2651,7 +2637,8 @@ async def cmd_premium(message: Message, bot: Bot) -> None:
         text = (
             f"Бесплатных попыток осталось: {left} из {FREE_TRIAL_REQUESTS} "
             "(Ответить за меня / По скриншоту).\n"
-            "Анализ собеседника, стиль собеседника и сравнение стилей — только по подписке."
+            "Анализ собеседника, стиль собеседника и сравнение стилей — только по подписке.\n\n"
+            "Если вы оплатили подписку, но бот показывает, что какие-то функции недоступны, подождите пару минут и еще раз проверьте свою подписку через /premium"
         )
     await message.answer(text, reply_markup=paywall_kb())
 
