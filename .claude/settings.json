@@ -1,0 +1,11 @@
+{
+  "autoApprove": true,
+  "permissions": {
+    "allow": [
+      "Bash(py -3.13 -m py_compile llm.py main.py)",
+      "Bash(py -3.13 -m pytest tests/ -q)",
+      "Bash(git push *)",
+      "Bash(py -3.13 -m py_compile storage.py)"
+    ]
+  }
+}

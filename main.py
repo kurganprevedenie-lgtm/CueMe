@@ -39,8 +39,11 @@ from config import (
     PREMIUM_CHANNEL_ID,
     PREMIUM_SUBSCRIBE_URL,
     LLM_CACHE_TTL_SEC,
+    OPENERS_FOR_HER,
+    OPENERS_FOR_HIM,
     REBUILD_THRESHOLD,
     REFRESH_SAMPLES_EVERY_N,
+    REVIVE_QUESTIONS,
     SAMPLE_SIZE,
 )
 from features import detect_reply_situation, extract_features, stage_hint, totals_from_summary, winning_messages
@@ -161,6 +164,7 @@ BTN_LIVE          = "💫 Новый диалог"
 BTN_DEEP          = "🔬 Анализ собеседника"
 BTN_DEEP_STYLE    = "🪞 Анализ своего стиля"
 BTN_DATE          = "💐 Идеальное свидание"
+BTN_REVIVE        = "🔥 Оживить диалог"
 BTN_HELP          = "❓ Помощь"
 # BTN_ME («👤 Мой стиль») убрана вместе с командой /me — дублировала
 # BTN_DEEP_STYLE (и была бесплатной лазейкой мимо подписки на неё).
@@ -172,7 +176,7 @@ BTN_HELP          = "❓ Помощь"
 # BTN_REWRITE («📝 Переписать») и /auto удалены совсем — их сценарий (черновик
 # без привязки к входящему) теперь полностью закрывает «💫 Новый диалог».
 _ALL_BTNS = {
-    BTN_SCREENSHOT, BTN_REPLY, BTN_LIVE, BTN_DEEP, BTN_DEEP_STYLE, BTN_DATE, BTN_HELP,
+    BTN_SCREENSHOT, BTN_REPLY, BTN_LIVE, BTN_DEEP, BTN_DEEP_STYLE, BTN_DATE, BTN_REVIVE, BTN_HELP,
 }
 
 # Защита от параллельных пересборок одного контакта
@@ -396,7 +400,7 @@ def main_kb() -> ReplyKeyboardMarkup:
     b.row(KeyboardButton(text=BTN_SCREENSHOT), KeyboardButton(text=BTN_REPLY))
     b.row(KeyboardButton(text=BTN_LIVE))
     b.row(KeyboardButton(text=BTN_DEEP), KeyboardButton(text=BTN_DEEP_STYLE))
-    b.row(KeyboardButton(text=BTN_DATE))
+    b.row(KeyboardButton(text=BTN_DATE), KeyboardButton(text=BTN_REVIVE))
     b.row(KeyboardButton(text=BTN_HELP))
     return b.as_markup(resize_keyboard=True)
 
@@ -1644,13 +1648,15 @@ async def handle_menu_button(message: Message, state: FSMContext, bot: Bot) -> N
     elif message.text == BTN_REPLY:
         await _start_reply(message, state)
     elif message.text == BTN_LIVE:
-        await _start_live_dialogue(message, state)
+        await _show_live_start(message)
     elif message.text == BTN_DEEP:
         await _show_deep_analysis(message, bot)
     elif message.text == BTN_DEEP_STYLE:
         await _show_deep_style_analysis(message, bot)
     elif message.text == BTN_DATE:
         await _show_ideal_date(message, bot)
+    elif message.text == BTN_REVIVE:
+        await _show_revive(message, state)
     elif message.text == BTN_HELP:
         await _show_help(message)
 
@@ -2274,77 +2280,118 @@ def live_variants_kb(action_id: str) -> InlineKeyboardMarkup:
     return b.as_markup()
 
 
-# Готовые заходы для «первого сообщения» в «Новом диалоге» — когда первым пишешь
-# ты, а истории ещё нет. Пол собеседника берём по гетеро-дефолту приложения
-# (пользователь-девушка → пишет парню, пользователь-парень/неизвестно → девушке,
-# как в _contact_words). Статичные скрипты — без LLM и без списания квоты.
-_LIVE_OPENERS_TO_FEMALE = [
-    "привет, как дела?",
-    "привет) как настроение",
-    "чем занимаешься обычно по вечерам",
-    "что делаешь на выходных",
-    "как оценишь свой день по шкале от 1 до 10",
-    "у нас тут высокий процент совпадения, что скажешь",
-    "что смотрела последнее и не пожалела",
-    "что последнее тебя реально рассмешило",
-    "ты больше домашний человек или всё время где-то тусуешься",
-    "привет, как погода у тебя там",
-    "что последнее тебя удивило",
-    "привет, как прошёл день",
-    "ты сова или жаворонок",
-    "чем сейчас увлекаешься",
-    "привет, что нового",
-]
-_LIVE_OPENERS_TO_MALE = [
-    "привет, как дела?",
-    "как настроение",
-    "чем занимаешься обычно по вечерам",
-    "что делаешь на выходных",
-    "у нас тут высокий процент совпадения, что скажешь",
-    "что смотрел последнее интересное",
-    "что последнее тебя рассмешило",
-    "привет, как день прошёл",
-    "ты сова или жаворонок",
-    "чем сейчас увлекаешься",
-    "привет, что нового",
-    "как оценишь свой день по шкале от 1 до 10",
-    "привет) как ты вообще",
-    "что последнее тебя удивило",
-    "привет, чем занят",
-]
+# ── Готовые фразы (статичные скрипты, без LLM и без квоты) ────────────────────
+# «Новый диалог» — развилка: 🎯 живой коучинг (существующий флоу) или 🎲 готовые
+# открывашки (OPENERS_FOR_HER/HIM). «🔥 Оживить диалог» — отдельная кнопка меню
+# с универсальными вопросами (REVIVE_QUESTIONS), работает для любого разговора.
+# Показанные варианты в рамках сессии не повторяются (трекинг через FSM data,
+# сбрасывается при исчерпании списка).
 
-_LIVE_OPENERS_SHOWN = 5  # сколько заходов показываем за раз
+async def _pick_no_repeat(state: FSMContext, key: str, items: list[str]) -> str:
+    """Случайный элемент items, не повторяющий уже показанные в этой сессии
+    (индексы в FSM data[key]). Когда весь список исчерпан — начинает заново."""
+    data = await state.get_data()
+    shown = data.get(key) or []
+    remaining = [i for i in range(len(items)) if i not in shown]
+    if not remaining:
+        remaining = list(range(len(items)))
+        shown = []
+    idx = random.choice(remaining)
+    await state.update_data(**{key: shown + [idx]})
+    return items[idx]
 
 
-def _openers_for_user(user_gender: str | None) -> list[str]:
-    """Список заходов под пол СОБЕСЕДНИКА (гетеро-дефолт: юзер-девушка пишет
-    парню, юзер-парень/неизвестно — девушке)."""
-    return _LIVE_OPENERS_TO_MALE if user_gender == "female" else _LIVE_OPENERS_TO_FEMALE
+def _copy_block(intro: str, phrase: str, kb: InlineKeyboardMarkup) -> tuple[str, dict]:
+    """Одна фраза tap-to-copy (HTML <code>) + интро + кнопка «Другой вариант»."""
+    text = f"{intro}\n\n<code>{html.escape(phrase)}</code>"
+    return text, {"reply_markup": kb, "parse_mode": "HTML"}
 
 
-def _format_openers(user_gender: str | None) -> str:
-    """5 случайных заходов, tap-to-copy (HTML <code>) — как первое сообщение."""
-    picks = random.sample(_openers_for_user(user_gender), _LIVE_OPENERS_SHOWN)
-    blocks = "\n\n".join(f"<code>{html.escape(t)}</code>" for t in picks)
-    return (
-        "✍️ Если пишешь первым — вот готовые заходы (тапни, чтобы скопировать):\n\n"
-        f"{blocks}"
-    )
+# --- Новый диалог: развилка коучинг / готовые фразы ---
 
-
-def live_openers_kb() -> InlineKeyboardMarkup:
+def live_start_kb() -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
-    b.button(text="🔄 Другие заходы", callback_data="liveopeners")
+    b.button(text="🎯 Живой коучинг", callback_data="live:coach")
+    b.button(text="🎲 Готовые фразы для начала", callback_data="live:phrases")
+    b.adjust(1)
     return b.as_markup()
 
 
-@dp.callback_query(F.data == "liveopeners")
-async def cb_live_openers(call: CallbackQuery) -> None:
-    await call.answer("Другие заходы")
-    await call.message.answer(
-        _format_openers(get_gender(str(call.from_user.id))),
-        reply_markup=live_openers_kb(), parse_mode="HTML",
+async def _show_live_start(message: Message) -> None:
+    await message.answer("Как начнём?", reply_markup=live_start_kb())
+
+
+@dp.callback_query(F.data == "live:coach")
+async def cb_live_coach(call: CallbackQuery, state: FSMContext) -> None:
+    await call.answer()
+    await _start_live_dialogue(call.message, state)
+
+
+def phrases_gender_kb() -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    b.button(text="👩 Ей", callback_data="phrases:her")
+    b.button(text="👨 Ему", callback_data="phrases:him")
+    b.adjust(2)
+    return b.as_markup()
+
+
+def phrase_next_kb(target: str) -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    b.button(text="🔄 Другой вариант", callback_data=f"phrase_next:{target}")
+    return b.as_markup()
+
+
+async def _send_opener(msg: Message, state: FSMContext, target: str) -> None:
+    items = OPENERS_FOR_HER if target == "her" else OPENERS_FOR_HIM
+    phrase = await _pick_no_repeat(state, f"opener_shown_{target}", items)
+    text, kw = _copy_block(
+        "Держи заход (тапни, чтобы скопировать):", phrase, phrase_next_kb(target)
     )
+    await msg.answer(text, **kw)
+
+
+@dp.callback_query(F.data == "live:phrases")
+async def cb_live_phrases(call: CallbackQuery) -> None:
+    await call.answer()
+    await call.message.answer("Кому пишешь?", reply_markup=phrases_gender_kb())
+
+
+@dp.callback_query(F.data.startswith("phrases:"))
+async def cb_phrases_gender(call: CallbackQuery, state: FSMContext) -> None:
+    target = call.data.split(":", 1)[1]  # her | him
+    await call.answer()
+    await _send_opener(call.message, state, target)
+
+
+@dp.callback_query(F.data.startswith("phrase_next:"))
+async def cb_phrase_next(call: CallbackQuery, state: FSMContext) -> None:
+    target = call.data.split(":", 1)[1]
+    await call.answer("Другой вариант")
+    await _send_opener(call.message, state, target)
+
+
+# --- 🔥 Оживить диалог (универсальные вопросы, отдельная кнопка) ---
+
+def revive_next_kb() -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    b.button(text="🔄 Другой вариант", callback_data="revive_next")
+    return b.as_markup()
+
+
+async def _send_revive(msg: Message, state: FSMContext) -> None:
+    q = await _pick_no_repeat(state, "revive_shown", REVIVE_QUESTIONS)
+    text, kw = _copy_block("Вот что может оживить разговор:", q, revive_next_kb())
+    await msg.answer(text, **kw)
+
+
+async def _show_revive(message: Message, state: FSMContext) -> None:
+    await _send_revive(message, state)
+
+
+@dp.callback_query(F.data == "revive_next")
+async def cb_revive_next(call: CallbackQuery, state: FSMContext) -> None:
+    await call.answer("Другой вариант")
+    await _send_revive(call.message, state)
 
 
 async def _start_live_dialogue(message: Message, state: FSMContext) -> None:
@@ -2372,9 +2419,6 @@ async def handle_live_name(message: Message, state: FSMContext) -> None:
     await message.answer(
         f"Готово — «{name}». Присылай {pron} сообщения по одному, на каждое сразу дам "
         "несколько вариантов ответа. Чтобы выйти из режима — нажми любую кнопку меню."
-    )
-    await message.answer(
-        _format_openers(gender), reply_markup=live_openers_kb(), parse_mode="HTML",
     )
 
 
@@ -2822,8 +2866,10 @@ async def _show_help(message: Message) -> None:
         "/reply — ответить на его сообщение\n"
         "/screenshot — ответить по скриншоту переписки (можно слать скриншоты "
         "один за другим)\n"
-        "💫 Новый диалог — помогу с первого сообщения новому человеку, без "
-        "накопленной истории\n\n"
+        "💫 Новый диалог — помогу с первого сообщения новому человеку (живой "
+        "коучинг или готовые открывашки), без накопленной истории\n"
+        "🔥 Оживить диалог (кнопка в меню) — вопрос, чтобы расшевелить затихший "
+        "разговор\n\n"
         "🔬 Разобраться\n"
         "/deep_analysis — совместимость, история отношений, стиль и привычки "
         "собеседника, идеи подарков\n"
