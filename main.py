@@ -975,21 +975,34 @@ async def cb_deep_analysis_contact(call: CallbackQuery, bot: Bot) -> None:
 IDEAL_DATE_MIN_MSGS = 5  # минимум сообщений собеседника, иначе не за что зацепиться
 
 
+def _spread_sample(rows: list[dict], direction: str, target: int) -> list[str]:
+    """Равномерная выборка target сообщений заданного направления по ВСЕЙ истории
+    (не только последние N) — как периодизация в _periodized_dated_lines, но
+    плоским списком текстов. Так упоминания интересов из любого периода переписки
+    попадают в промпт, а не только из свежих сообщений."""
+    msgs = [
+        r["text"] for r in sorted(
+            (r for r in rows if r["direction"] == direction and r["text"] and r["text"].strip()),
+            key=lambda r: r["date"],
+        )
+    ]
+    if len(msgs) <= target:
+        return msgs
+    step = len(msgs) / target
+    return [msgs[int(i * step)] for i in range(target)]
+
+
 def _ideal_date_samples(contact_id: int, owner_user_id: str) -> dict | None:
-    """Семплы для build_ideal_date: message_samples (JSON) с фолбэком на
-    business-семплы (как в _gen_interaction_card). None — сообщений собеседника
-    слишком мало для осмысленной идеи."""
-    samples = get_message_samples(contact_id)
-    if samples:
-        contact_msgs = samples["contact_sample"]
-        my_msgs      = samples["my_sample"]
-        stats        = samples["features_summary"]
-    else:
-        contact_msgs = _get_rebuild_sample(owner_user_id, contact_id, "in", SAMPLE_SIZE)
-        my_msgs      = _get_rebuild_sample(owner_user_id, contact_id, "out", SAMPLE_SIZE)
-        stats        = _quick_stats(my_msgs, contact_msgs)
+    """Семплы для build_ideal_date по ВСЕЙ истории переписки (business + JSON,
+    через get_all_dated_messages) с равномерным охватом всех периодов — как в
+    «Анализе собеседника», а не только последние сообщения. None — сообщений
+    собеседника слишком мало для осмысленной идеи."""
+    rows = get_all_dated_messages(owner_user_id, contact_id)
+    contact_msgs = _spread_sample(rows, "in", 100)
+    my_msgs      = _spread_sample(rows, "out", 40)
     if len(contact_msgs) < IDEAL_DATE_MIN_MSGS:
         return None
+    stats = _deep_stats_summary(rows)
     return {"contact_sample": contact_msgs, "my_sample": my_msgs, "features_summary": stats}
 
 
