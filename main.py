@@ -4,6 +4,7 @@ import html
 import itertools
 import json
 import logging
+import random
 import re
 import tempfile
 import time
@@ -975,11 +976,14 @@ async def cb_deep_analysis_contact(call: CallbackQuery, bot: Bot) -> None:
 IDEAL_DATE_MIN_MSGS = 5  # минимум сообщений собеседника, иначе не за что зацепиться
 
 
-def _spread_sample(rows: list[dict], direction: str, target: int) -> list[str]:
+def _spread_sample(rows: list[dict], direction: str, target: int, offset: float = 0.0) -> list[str]:
     """Равномерная выборка target сообщений заданного направления по ВСЕЙ истории
     (не только последние N) — как периодизация в _periodized_dated_lines, но
     плоским списком текстов. Так упоминания интересов из любого периода переписки
-    попадают в промпт, а не только из свежих сообщений."""
+    попадают в промпт, а не только из свежих сообщений.
+    offset ∈ [0,1) сдвигает точку внутри каждого временного окна — при offset=0
+    выборка детерминированная, со случайным offset «Другая идея» видит ДРУГИЕ
+    сообщения (тот же равномерный охват, другие представители)."""
     msgs = [
         r["text"] for r in sorted(
             (r for r in rows if r["direction"] == direction and r["text"] and r["text"].strip()),
@@ -989,30 +993,36 @@ def _spread_sample(rows: list[dict], direction: str, target: int) -> list[str]:
     if len(msgs) <= target:
         return msgs
     step = len(msgs) / target
-    return [msgs[int(i * step)] for i in range(target)]
+    last = len(msgs) - 1
+    return [msgs[min(last, int(i * step + offset * step))] for i in range(target)]
 
 
-def _ideal_date_samples(contact_id: int, owner_user_id: str) -> dict | None:
+def _ideal_date_samples(contact_id: int, owner_user_id: str, offset: float = 0.0) -> dict | None:
     """Семплы для build_ideal_date по ВСЕЙ истории переписки (business + JSON,
     через get_all_dated_messages) с равномерным охватом всех периодов — как в
-    «Анализе собеседника», а не только последние сообщения. None — сообщений
-    собеседника слишком мало для осмысленной идеи."""
+    «Анализе собеседника», а не только последние сообщения. offset сдвигает
+    выборку («Другая идея» → другие сообщения). None — сообщений собеседника
+    слишком мало для осмысленной идеи."""
     rows = get_all_dated_messages(owner_user_id, contact_id)
-    contact_msgs = _spread_sample(rows, "in", 100)
-    my_msgs      = _spread_sample(rows, "out", 40)
+    contact_msgs = _spread_sample(rows, "in", 100, offset)
+    my_msgs      = _spread_sample(rows, "out", 40, offset)
     if len(contact_msgs) < IDEAL_DATE_MIN_MSGS:
         return None
     stats = _deep_stats_summary(rows)
     return {"contact_sample": contact_msgs, "my_sample": my_msgs, "features_summary": stats}
 
 
-async def _gen_ideal_date(contact_id: int, owner_user_id: str) -> dict | None:
-    """Ленивая генерация с кэшем в ideal_date. None — данных мало."""
-    cached = get_ideal_date(contact_id)
-    if cached:
-        return cached
+async def _gen_ideal_date(contact_id: int, owner_user_id: str, fresh: bool = False) -> dict | None:
+    """Ленивая генерация с кэшем в ideal_date. None — данных мало.
+    fresh=True («Другая идея») — не читает кэш и берёт СЛУЧАЙНО сдвинутую
+    выборку, чтобы модель увидела другие сообщения и дала заметно другую идею."""
+    if not fresh:
+        cached = get_ideal_date(contact_id)
+        if cached:
+            return cached
 
-    samples = _ideal_date_samples(contact_id, owner_user_id)
+    offset = random.random() if fresh else 0.0
+    samples = _ideal_date_samples(contact_id, owner_user_id, offset)
     if not samples:
         return None
 
@@ -1041,7 +1051,8 @@ def ideal_date_result_kb(contact_id: int) -> InlineKeyboardMarkup:
 
 
 async def _run_ideal_date(
-    bot: Bot, target: Message, telegram_id: str, contact_id: int, edit: bool = False
+    bot: Bot, target: Message, telegram_id: str, contact_id: int,
+    edit: bool = False, fresh: bool = False,
 ) -> None:
     if not await _require_premium(bot, target, telegram_id):
         return
@@ -1056,7 +1067,7 @@ async def _run_ideal_date(
     await (target.edit_text(wait_text) if edit else target.answer(wait_text))
 
     try:
-        data = await _gen_ideal_date(contact_id, telegram_id)
+        data = await _gen_ideal_date(contact_id, telegram_id, fresh=fresh)
     except RateLimitError:
         await target.answer("Лимит LLM исчерпан, попробуй позже.")
         return
@@ -1096,7 +1107,7 @@ async def cb_ideal_date_refresh(call: CallbackQuery, bot: Bot) -> None:
     telegram_id = str(call.from_user.id)
     await call.answer("Придумываю другую идею...")
     delete_ideal_date(contact_id)
-    await _run_ideal_date(bot, call.message, telegram_id, contact_id)
+    await _run_ideal_date(bot, call.message, telegram_id, contact_id, fresh=True)
 
 
 @dp.callback_query(F.data.startswith("idealdate:"))
