@@ -2274,6 +2274,79 @@ def live_variants_kb(action_id: str) -> InlineKeyboardMarkup:
     return b.as_markup()
 
 
+# Готовые заходы для «первого сообщения» в «Новом диалоге» — когда первым пишешь
+# ты, а истории ещё нет. Пол собеседника берём по гетеро-дефолту приложения
+# (пользователь-девушка → пишет парню, пользователь-парень/неизвестно → девушке,
+# как в _contact_words). Статичные скрипты — без LLM и без списания квоты.
+_LIVE_OPENERS_TO_FEMALE = [
+    "привет, как дела?",
+    "привет) как настроение",
+    "чем занимаешься обычно по вечерам",
+    "что делаешь на выходных",
+    "как оценишь свой день по шкале от 1 до 10",
+    "у нас тут высокий процент совпадения, что скажешь",
+    "что смотрела последнее и не пожалела",
+    "что последнее тебя реально рассмешило",
+    "ты больше домашний человек или всё время где-то тусуешься",
+    "привет, как погода у тебя там",
+    "что последнее тебя удивило",
+    "привет, как прошёл день",
+    "ты сова или жаворонок",
+    "чем сейчас увлекаешься",
+    "привет, что нового",
+]
+_LIVE_OPENERS_TO_MALE = [
+    "привет, как дела?",
+    "как настроение",
+    "чем занимаешься обычно по вечерам",
+    "что делаешь на выходных",
+    "у нас тут высокий процент совпадения, что скажешь",
+    "что смотрел последнее интересное",
+    "что последнее тебя рассмешило",
+    "привет, как день прошёл",
+    "ты сова или жаворонок",
+    "чем сейчас увлекаешься",
+    "привет, что нового",
+    "как оценишь свой день по шкале от 1 до 10",
+    "привет) как ты вообще",
+    "что последнее тебя удивило",
+    "привет, чем занят",
+]
+
+_LIVE_OPENERS_SHOWN = 5  # сколько заходов показываем за раз
+
+
+def _openers_for_user(user_gender: str | None) -> list[str]:
+    """Список заходов под пол СОБЕСЕДНИКА (гетеро-дефолт: юзер-девушка пишет
+    парню, юзер-парень/неизвестно — девушке)."""
+    return _LIVE_OPENERS_TO_MALE if user_gender == "female" else _LIVE_OPENERS_TO_FEMALE
+
+
+def _format_openers(user_gender: str | None) -> str:
+    """5 случайных заходов, tap-to-copy (HTML <code>) — как первое сообщение."""
+    picks = random.sample(_openers_for_user(user_gender), _LIVE_OPENERS_SHOWN)
+    blocks = "\n\n".join(f"<code>{html.escape(t)}</code>" for t in picks)
+    return (
+        "✍️ Если пишешь первым — вот готовые заходы (тапни, чтобы скопировать):\n\n"
+        f"{blocks}"
+    )
+
+
+def live_openers_kb() -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    b.button(text="🔄 Другие заходы", callback_data="liveopeners")
+    return b.as_markup()
+
+
+@dp.callback_query(F.data == "liveopeners")
+async def cb_live_openers(call: CallbackQuery) -> None:
+    await call.answer("Другие заходы")
+    await call.message.answer(
+        _format_openers(get_gender(str(call.from_user.id))),
+        reply_markup=live_openers_kb(), parse_mode="HTML",
+    )
+
+
 async def _start_live_dialogue(message: Message, state: FSMContext) -> None:
     await state.set_state(LiveDialogue.waiting_for_name)
     await message.answer(
@@ -2294,10 +2367,14 @@ async def handle_live_name(message: Message, state: FSMContext) -> None:
 
     await state.set_state(LiveDialogue.waiting_for_incoming)
     await state.update_data(contact_id=contact_id, dialogue_history=[])
-    _, pron = _contact_words(get_gender(telegram_id))
+    gender = get_gender(telegram_id)
+    _, pron = _contact_words(gender)
     await message.answer(
         f"Готово — «{name}». Присылай {pron} сообщения по одному, на каждое сразу дам "
         "несколько вариантов ответа. Чтобы выйти из режима — нажми любую кнопку меню."
+    )
+    await message.answer(
+        _format_openers(gender), reply_markup=live_openers_kb(), parse_mode="HTML",
     )
 
 
