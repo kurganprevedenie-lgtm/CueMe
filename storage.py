@@ -131,6 +131,13 @@ def init_db() -> None:
                 updated_at       TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS ideal_date (
+                contact_id INTEGER PRIMARY KEY,
+                date_idea  TEXT NOT NULL,
+                gift_ideas TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS llm_cache (
                 cache_key  TEXT PRIMARY KEY,
                 result     TEXT NOT NULL,   -- JSON-сериализованный результат
@@ -713,6 +720,38 @@ def delete_deep_analysis(contact_id: int) -> None:
         conn.execute("DELETE FROM deep_analysis WHERE contact_id = ?", (contact_id,))
 
 
+# ── ideal date (кэш «Идеальное свидание», пара) ──────────────────────────────
+
+def save_ideal_date(contact_id: int, date_idea: str, gift_ideas: str) -> None:
+    with _conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO ideal_date (contact_id, date_idea, gift_ideas, updated_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(contact_id) DO UPDATE SET
+                date_idea  = excluded.date_idea,
+                gift_ideas = excluded.gift_ideas,
+                updated_at = excluded.updated_at
+            """,
+            (contact_id, date_idea, gift_ideas, _now()),
+        )
+
+
+def get_ideal_date(contact_id: int) -> dict | None:
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM ideal_date WHERE contact_id = ?", (contact_id,)
+        ).fetchone()
+    if not row:
+        return None
+    return {"date_idea": row["date_idea"], "gift_ideas": row["gift_ideas"]}
+
+
+def delete_ideal_date(contact_id: int) -> None:
+    with _conn() as conn:
+        conn.execute("DELETE FROM ideal_date WHERE contact_id = ?", (contact_id,))
+
+
 # ── deep style analysis (кэш анализа своего стиля, агрегат) ───────────────────
 
 # v1 (профиль/история по периодам/swot/советы) — оставлено для отката. Заменено
@@ -1103,6 +1142,7 @@ def delete_contact_data(telegram_id: str, contact_id: int) -> None:
         conn.execute("DELETE FROM interaction_cards    WHERE contact_id = ?", (contact_id,))
         conn.execute("DELETE FROM my_style_per_contact WHERE contact_id = ?", (contact_id,))
         conn.execute("DELETE FROM deep_analysis        WHERE contact_id = ?", (contact_id,))
+        conn.execute("DELETE FROM ideal_date           WHERE contact_id = ?", (contact_id,))
         conn.execute("DELETE FROM message_samples      WHERE contact_id = ?", (contact_id,))
         conn.execute("DELETE FROM imported_messages    WHERE contact_id = ?", (contact_id,))
         conn.execute("DELETE FROM running_notes        WHERE contact_id = ?", (contact_id,))
@@ -1130,6 +1170,7 @@ def delete_all_user_data(telegram_id: str) -> None:
             conn.execute(f"DELETE FROM interaction_cards    WHERE contact_id IN ({inlist})", cids)
             conn.execute(f"DELETE FROM my_style_per_contact WHERE contact_id IN ({inlist})", cids)
             conn.execute(f"DELETE FROM deep_analysis        WHERE contact_id IN ({inlist})", cids)
+            conn.execute(f"DELETE FROM ideal_date           WHERE contact_id IN ({inlist})", cids)
             conn.execute(f"DELETE FROM message_samples      WHERE contact_id IN ({inlist})", cids)
             conn.execute(f"DELETE FROM imported_messages    WHERE contact_id IN ({inlist})", cids)
             conn.execute(f"DELETE FROM running_notes        WHERE contact_id IN ({inlist})", cids)

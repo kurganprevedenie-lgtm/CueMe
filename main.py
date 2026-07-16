@@ -49,6 +49,7 @@ from llm import (
     RateLimitError,
     build_deep_analysis,
     build_deep_style_analysis,
+    build_ideal_date,
     build_interaction_card,
     build_my_style_for_contact,
     build_overall_style,
@@ -73,6 +74,7 @@ from storage import (
     delete_all_user_data,
     delete_contact_data,
     delete_deep_analysis,
+    delete_ideal_date,
     delete_style_card,
     find_contact_by_original_id,
     get_all_dated_messages,
@@ -86,6 +88,7 @@ from storage import (
     get_deep_style_analysis,
     get_demo_trial_used,
     get_gender,
+    get_ideal_date,
     get_llm_cache,
     get_interaction_card,
     get_imported_messages,
@@ -105,6 +108,7 @@ from storage import (
     save_business_message,
     save_deep_analysis,
     save_deep_style_analysis,
+    save_ideal_date,
     save_interaction_card,
     save_message_samples,
     save_my_style_per_contact,
@@ -155,6 +159,7 @@ BTN_REPLY         = "💬 Ответить за меня"
 BTN_LIVE          = "💫 Новый диалог"
 BTN_DEEP          = "🔬 Анализ собеседника"
 BTN_DEEP_STYLE    = "🪞 Анализ своего стиля"
+BTN_DATE          = "💐 Идеальное свидание"
 BTN_HELP          = "❓ Помощь"
 # BTN_ME («👤 Мой стиль») убрана вместе с командой /me — дублировала
 # BTN_DEEP_STYLE (и была бесплатной лазейкой мимо подписки на неё).
@@ -166,7 +171,7 @@ BTN_HELP          = "❓ Помощь"
 # BTN_REWRITE («📝 Переписать») и /auto удалены совсем — их сценарий (черновик
 # без привязки к входящему) теперь полностью закрывает «💫 Новый диалог».
 _ALL_BTNS = {
-    BTN_SCREENSHOT, BTN_REPLY, BTN_LIVE, BTN_DEEP, BTN_DEEP_STYLE, BTN_HELP,
+    BTN_SCREENSHOT, BTN_REPLY, BTN_LIVE, BTN_DEEP, BTN_DEEP_STYLE, BTN_DATE, BTN_HELP,
 }
 
 # Защита от параллельных пересборок одного контакта
@@ -390,6 +395,7 @@ def main_kb() -> ReplyKeyboardMarkup:
     b.row(KeyboardButton(text=BTN_SCREENSHOT), KeyboardButton(text=BTN_REPLY))
     b.row(KeyboardButton(text=BTN_LIVE))
     b.row(KeyboardButton(text=BTN_DEEP), KeyboardButton(text=BTN_DEEP_STYLE))
+    b.row(KeyboardButton(text=BTN_DATE))
     b.row(KeyboardButton(text=BTN_HELP))
     return b.as_markup(resize_keyboard=True)
 
@@ -964,6 +970,130 @@ async def cb_deep_analysis_contact(call: CallbackQuery, bot: Bot) -> None:
     await _run_deep_analysis(bot, call.message, telegram_id, contact_id, edit=True)
 
 
+# ── 💐 Идеальное свидание ─────────────────────────────────────────────────────
+
+IDEAL_DATE_MIN_MSGS = 5  # минимум сообщений собеседника, иначе не за что зацепиться
+
+
+def _ideal_date_samples(contact_id: int, owner_user_id: str) -> dict | None:
+    """Семплы для build_ideal_date: message_samples (JSON) с фолбэком на
+    business-семплы (как в _gen_interaction_card). None — сообщений собеседника
+    слишком мало для осмысленной идеи."""
+    samples = get_message_samples(contact_id)
+    if samples:
+        contact_msgs = samples["contact_sample"]
+        my_msgs      = samples["my_sample"]
+        stats        = samples["features_summary"]
+    else:
+        contact_msgs = _get_rebuild_sample(owner_user_id, contact_id, "in", SAMPLE_SIZE)
+        my_msgs      = _get_rebuild_sample(owner_user_id, contact_id, "out", SAMPLE_SIZE)
+        stats        = _quick_stats(my_msgs, contact_msgs)
+    if len(contact_msgs) < IDEAL_DATE_MIN_MSGS:
+        return None
+    return {"contact_sample": contact_msgs, "my_sample": my_msgs, "features_summary": stats}
+
+
+async def _gen_ideal_date(contact_id: int, owner_user_id: str) -> dict | None:
+    """Ленивая генерация с кэшем в ideal_date. None — данных мало."""
+    cached = get_ideal_date(contact_id)
+    if cached:
+        return cached
+
+    samples = _ideal_date_samples(contact_id, owner_user_id)
+    if not samples:
+        return None
+
+    interaction_card = await _gen_interaction_card(contact_id, owner_user_id) or ""
+    date_idea, gift_ideas = await build_ideal_date(
+        samples["contact_sample"], samples["my_sample"],
+        interaction_card, samples["features_summary"],
+    )
+    save_ideal_date(contact_id, date_idea, gift_ideas)
+    return {"date_idea": date_idea, "gift_ideas": gift_ideas}
+
+
+def _format_ideal_date(name: str, data: dict) -> str:
+    """Оба блока (идея свидания + подарки) — одним сообщением."""
+    return (
+        f"💐 Идеальное свидание — {name}\n\n"
+        f"{data['date_idea'].strip()}\n\n"
+        f"{data['gift_ideas'].strip()}"
+    )
+
+
+def ideal_date_result_kb(contact_id: int) -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    b.button(text="🔄 Другая идея", callback_data=f"idealdate_refresh:{contact_id}")
+    return b.as_markup()
+
+
+async def _run_ideal_date(
+    bot: Bot, target: Message, telegram_id: str, contact_id: int, edit: bool = False
+) -> None:
+    if not await _require_premium(bot, target, telegram_id):
+        return
+    contact = get_contact_by_id(contact_id)
+    if not contact:
+        text = "Контакт не найден."
+        await (target.edit_text(text) if edit else target.answer(text))
+        return
+    name = _contact_name(contact)
+
+    wait_text = f"Придумываю идеальное свидание с {name}. Это займёт ~20 секунд..."
+    await (target.edit_text(wait_text) if edit else target.answer(wait_text))
+
+    try:
+        data = await _gen_ideal_date(contact_id, telegram_id)
+    except RateLimitError:
+        await target.answer("Лимит LLM исчерпан, попробуй позже.")
+        return
+    except Exception:
+        logging.exception("ideal_date: ошибка генерации")
+        await target.answer("Не удалось придумать идею — попробуй ещё раз.")
+        return
+
+    if not data:
+        await target.answer(
+            f"Пока маловато сообщений от {name}, чтобы зацепиться за что-то "
+            f"конкретное — нужно хотя бы {IDEAL_DATE_MIN_MSGS} его сообщений "
+            "(JSON-экспорт или накопление через Автоматизацию чатов)."
+        )
+        return
+
+    await _answer_long(target, _format_ideal_date(name, data), reply_markup=ideal_date_result_kb(contact_id))
+
+
+async def _show_ideal_date(message: Message, bot: Bot) -> None:
+    telegram_id = str(message.from_user.id)
+    contacts = list_contacts(telegram_id)
+    if not contacts:
+        await message.answer("Сначала загрузи JSON-файл чата.")
+        return
+
+    if len(contacts) == 1:
+        await _run_ideal_date(bot, message, telegram_id, contacts[0]["id"])
+        return
+
+    await message.answer("С кем свидание?", reply_markup=contacts_kb(contacts, "idealdate"))
+
+
+@dp.callback_query(F.data.startswith("idealdate_refresh:"))
+async def cb_ideal_date_refresh(call: CallbackQuery, bot: Bot) -> None:
+    contact_id  = int(call.data.split(":")[1])
+    telegram_id = str(call.from_user.id)
+    await call.answer("Придумываю другую идею...")
+    delete_ideal_date(contact_id)
+    await _run_ideal_date(bot, call.message, telegram_id, contact_id)
+
+
+@dp.callback_query(F.data.startswith("idealdate:"))
+async def cb_ideal_date_contact(call: CallbackQuery, bot: Bot) -> None:
+    contact_id  = int(call.data.split(":")[1])
+    telegram_id = str(call.from_user.id)
+    await call.answer()
+    await _run_ideal_date(bot, call.message, telegram_id, contact_id, edit=True)
+
+
 # ── 🪞 Анализ своего стиля (агрегат по всем контактам) ────────────────────────
 
 DEEP_STYLE_MIN_MSGS = 20  # минимум своих сообщений суммарно, иначе анализ бессмысленен
@@ -1273,7 +1403,8 @@ def _capabilities_text() -> str:
         "накопленной истории\n"
         "🔬 Анализ собеседника — совместимость, история отношений, как писать "
         "этому человеку, подарки\n"
-        "🪞 Анализ своего стиля — твой коммуникативный профиль и советы для дейтинга\n\n"
+        "🪞 Анализ своего стиля — твой коммуникативный профиль и советы для дейтинга\n"
+        "💐 Идеальное свидание — идея свидания и подарков под конкретного человека\n\n"
         f"💎 {FREE_TRIAL_REQUESTS} бесплатных попыток даны на пробный период. Дальше и остальные функции — по подписке.\n"
         "Статус — /premium.\n"
         "Полный список команд — /help"
@@ -1494,6 +1625,8 @@ async def handle_menu_button(message: Message, state: FSMContext, bot: Bot) -> N
         await _show_deep_analysis(message, bot)
     elif message.text == BTN_DEEP_STYLE:
         await _show_deep_style_analysis(message, bot)
+    elif message.text == BTN_DATE:
+        await _show_ideal_date(message, bot)
     elif message.text == BTN_HELP:
         await _show_help(message)
 
@@ -2594,6 +2727,7 @@ async def _show_help(message: Message) -> None:
         "/deep_analysis — совместимость, история отношений, стиль и привычки "
         "собеседника, идеи подарков\n"
         "/deep_style_analysis — твой коммуникативный профиль и советы для дейтинга\n"
+        "💐 Идеальное свидание (кнопка в меню) — идея свидания и подарков под человека\n"
         "/compare — сравнить, как ты пишешь разным людям\n"
         "/stats — портрет в цифрах, бесплатно\n\n"
         "⚙️ Аккаунт\n"
