@@ -676,20 +676,18 @@ async def _maybe_rebuild(owner_user_id: str, contact_id: int, bot: Bot | None = 
         logging.info("auto-rebuild done: contact_id=%s ok=%s", contact_id, ok)
 
         if ok and is_first and bot is not None:
-            # Первый разбор готов — проактивно показываем черновик владельцу.
-            card = get_my_style_per_contact(contact_id)
+            # Первый разбор готов — короткое уведомление. Сама карточка сохранена
+            # и доступна по кнопке «🔬 Анализ собеседника» (полотно не шлём).
             c = get_contact_by_id(contact_id)
-            label = _contact_name(c) if c else "собеседник"
-            if card:
-                try:
-                    for chunk in _split_long_text(
-                        f"🎉 Накопилось достаточно сообщений — вот первый набросок "
-                        f"твоего стиля с {label}. Он черновой, станет точнее по мере "
-                        f"переписки через бота:\n\n{card}"
-                    ):
-                        await bot.send_message(int(owner_user_id), chunk)
-                except Exception:
-                    logging.warning("first-build notify failed: owner=%s", owner_user_id)
+            label = _contact_name(c) if c else "собеседником"
+            try:
+                await bot.send_message(
+                    int(owner_user_id),
+                    f"✅ Собралось достаточно сообщений с {label} — готов «🔬 Анализ "
+                    "собеседника». Открой его в меню, чтобы посмотреть разбор.",
+                )
+            except Exception:
+                logging.warning("first-build notify failed: owner=%s", owner_user_id)
     except RateLimitError:
         # Дневной лимит исчерпан — молчим 30 мин, пересоберём позже. Без трейсбека.
         _rebuild_cooldown_until = time.monotonic() + 1800
