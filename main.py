@@ -9,6 +9,7 @@ import re
 import tempfile
 import time
 import uuid
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from aiogram import BaseMiddleware, Bot, Dispatcher, F
@@ -42,6 +43,7 @@ from config import (
     OPENERS_FOR_HER,
     OPENERS_FOR_HIM,
     REBUILD_THRESHOLD,
+    REFERRAL_REWARD_DAYS,
     REFRESH_SAMPLES_EVERY_N,
     REVIVE_QUESTIONS,
     SAMPLE_SIZE,
@@ -89,6 +91,7 @@ from storage import (
     get_business_connection,
     get_contact_by_id,
     get_deep_analysis,
+    get_deep_analysis_free_until,
     get_deep_style_analysis,
     get_demo_trial_used,
     get_gender,
@@ -97,9 +100,12 @@ from storage import (
     get_interaction_card,
     get_imported_messages,
     get_message_samples,
+    get_pending_referral,
     get_trial_used,
+    get_user,
     increment_demo_trial_used,
     increment_trial_used,
+    mark_referral_credited,
     save_imported_messages,
     get_my_style_last_rebuild_count,
     get_my_style_per_contact,
@@ -116,9 +122,11 @@ from storage import (
     save_interaction_card,
     save_message_samples,
     save_my_style_per_contact,
+    save_referral_pending,
     save_running_notes,
     save_style_card,
     record_event,
+    set_deep_analysis_free_until,
     set_gender,
     set_llm_cache,
     update_contact_username,
@@ -165,6 +173,7 @@ BTN_DEEP          = "🔬 Анализ собеседника"
 BTN_DEEP_STYLE    = "🪞 Анализ своего стиля"
 BTN_DATE          = "💐 Идеальное свидание"
 BTN_REVIVE        = "🔥 Скрипты общения"
+BTN_INVITE        = "🎁 Пригласить друга"
 BTN_HELP          = "❓ Помощь"
 # BTN_ME («👤 Мой стиль») убрана вместе с командой /me — дублировала
 # BTN_DEEP_STYLE (и была бесплатной лазейкой мимо подписки на неё).
@@ -176,7 +185,8 @@ BTN_HELP          = "❓ Помощь"
 # BTN_REWRITE («📝 Переписать») и /auto удалены совсем — их сценарий (черновик
 # без привязки к входящему) теперь полностью закрывает «💫 Новый диалог».
 _ALL_BTNS = {
-    BTN_SCREENSHOT, BTN_REPLY, BTN_LIVE, BTN_DEEP, BTN_DEEP_STYLE, BTN_DATE, BTN_REVIVE, BTN_HELP,
+    BTN_SCREENSHOT, BTN_REPLY, BTN_LIVE, BTN_DEEP, BTN_DEEP_STYLE, BTN_DATE, BTN_REVIVE,
+    BTN_INVITE, BTN_HELP,
 }
 
 # Защита от параллельных пересборок одного контакта
@@ -395,13 +405,83 @@ async def _require_premium(bot: Bot, target: Message, telegram_id: str) -> bool:
     return False
 
 
+# ── Реферальная программа ─────────────────────────────────────────────────────
+# Пригласивший получает REFERRAL_REWARD_DAYS дней безлимитного «Анализ
+# собеседника», когда друг реально начинает пользоваться ботом (создан первый
+# контакт). Payload реф-ссылки ловим в GenderGateMiddleware, т.к. для нового
+# юзера cmd_start блокируется гейтом выбора пола (см. _maybe_capture_referral).
+_REF_PREFIX = "ref_"
+
+
+def _maybe_capture_referral(telegram_id: str, text: str | None) -> None:
+    """Ловит payload из первого «/start ref_<id>». Анти-абуз:
+    • referrer != сам приглашённый (не самоприглашение);
+    • приглашённого ещё НЕТ в users — строка создаётся только в set_gender
+      (позже первого /start), поэтому get_user is None ⇔ реально новый юзер;
+      существующий юзер по чужой ссылке награду не запускает.
+    save_referral_pending = INSERT OR IGNORE (одна запись на друга)."""
+    if not text:
+        return
+    parts = text.split(maxsplit=1)
+    if len(parts) != 2 or not parts[0].startswith("/start"):
+        return
+    payload = parts[1].strip()
+    if not payload.startswith(_REF_PREFIX):
+        return
+    referrer_id = payload[len(_REF_PREFIX):].strip()
+    if not referrer_id.isdigit() or referrer_id == telegram_id:
+        return
+    if get_user(telegram_id) is not None:
+        return  # уже существующий пользователь — не «новый друг»
+    save_referral_pending(referrer_id, telegram_id)
+
+
+async def _credit_referral_if_pending(bot: Bot, referred_id: str) -> None:
+    """Друг реально начал пользоваться (создан первый контакт) → начисляем
+    рефереру бесплатное окно и уведомляем. Идемпотентно: credited-флаг +
+    PRIMARY KEY(referred_id) не дают начислить дважды."""
+    referrer_id = get_pending_referral(referred_id)
+    if not referrer_id:
+        return
+    until = datetime.now(timezone.utc) + timedelta(days=REFERRAL_REWARD_DAYS)
+    set_deep_analysis_free_until(referrer_id, until)
+    mark_referral_credited(referred_id)
+    try:
+        await bot.send_message(
+            int(referrer_id),
+            "🎉 Твой друг начал пользоваться CueMe! Держи подарок — "
+            f"{REFERRAL_REWARD_DAYS} дня безлимитного «🔬 Анализ собеседника».",
+        )
+    except Exception:
+        logging.warning("referral notify failed: referrer=%s", referrer_id)
+
+
+def _has_referral_free_deep(telegram_id: str) -> bool:
+    """Активно ли реферальное окно безлимитного «Анализа собеседника»."""
+    until = get_deep_analysis_free_until(telegram_id)
+    return bool(until and until > datetime.now(timezone.utc))
+
+
+async def _show_invite(message: Message, bot: Bot) -> None:
+    me = await bot.get_me()
+    link = f"https://t.me/{me.username}?start={_REF_PREFIX}{message.from_user.id}"
+    await message.answer(
+        "🎁 Пригласи друга\n\n"
+        "Скинь ему свою ссылку — как только он начнёт пользоваться ботом, тебе "
+        f"дадутся {REFERRAL_REWARD_DAYS} дня безлимитного «🔬 Анализ собеседника»:\n\n"
+        f"<code>{html.escape(link)}</code>\n\n"
+        "(тапни по ссылке, чтобы скопировать)",
+        parse_mode="HTML",
+    )
+
+
 def main_kb() -> ReplyKeyboardMarkup:
     b = ReplyKeyboardBuilder()
     b.row(KeyboardButton(text=BTN_SCREENSHOT), KeyboardButton(text=BTN_REPLY))
     b.row(KeyboardButton(text=BTN_LIVE))
     b.row(KeyboardButton(text=BTN_DEEP), KeyboardButton(text=BTN_DEEP_STYLE))
     b.row(KeyboardButton(text=BTN_DATE), KeyboardButton(text=BTN_REVIVE))
-    b.row(KeyboardButton(text=BTN_HELP))
+    b.row(KeyboardButton(text=BTN_INVITE), KeyboardButton(text=BTN_HELP))
     return b.as_markup(resize_keyboard=True)
 
 
@@ -442,10 +522,15 @@ class GenderGateMiddleware(BaseMiddleware):
         if user is None:
             return await handler(event, data)
 
+        telegram_id = str(user.id)
+        # Реф-payload ловим здесь, до гейта: для нового юзера cmd_start иначе
+        # не запустится, пока не выбран пол, и payload «/start ref_…» потеряется.
+        if isinstance(event, Message):
+            _maybe_capture_referral(telegram_id, event.text)
+
         if isinstance(event, CallbackQuery) and event.data in ("gender:male", "gender:female"):
             return await handler(event, data)
 
-        telegram_id = str(user.id)
         if get_gender(telegram_id) is not None:
             return await handler(event, data)
 
@@ -901,8 +986,11 @@ def deep_analysis_result_kb(contact_id: int) -> InlineKeyboardMarkup:
 async def _run_deep_analysis(
     bot: Bot, target: Message, telegram_id: str, contact_id: int, edit: bool = False
 ) -> None:
-    if not await _require_premium(bot, target, telegram_id):
-        return
+    # Реферальная награда: активное бесплатное окно пропускает подписочный гейт
+    # ТОЛЬКО для «Анализа собеседника». Иначе — обычная проверка подписки.
+    if not _has_referral_free_deep(telegram_id):
+        if not await _require_premium(bot, target, telegram_id):
+            return
     contact = get_contact_by_id(contact_id)
     if not contact:
         text = "Контакт не найден."
@@ -1415,6 +1503,9 @@ async def handle_business_message(event: Message, bot: Bot) -> None:
     )
 
     if contact_id_for_rebuild:
+        # Друг подключил Business и пошёл живой поток — засчитываем реферала
+        # (идемпотентно: после первого зачёта get_pending_referral вернёт None).
+        await _credit_referral_if_pending(bot, owner_id)
         asyncio.create_task(_maybe_rebuild(owner_id, contact_id_for_rebuild, bot))
 
 
@@ -1483,6 +1574,7 @@ def _setup_demo(telegram_id: str) -> None:
 
 async def _run_demo(telegram_id: str, target: Message) -> None:
     _setup_demo(telegram_id)
+    await _credit_referral_if_pending(target.bot, telegram_id)
     await target.answer(
         "Готово! Создал двух примеров-собеседников:\n"
         "• Босс (демо) — формальный, на «Вы»\n"
@@ -1655,6 +1747,8 @@ async def handle_menu_button(message: Message, state: FSMContext, bot: Bot) -> N
         await _show_ideal_date(message, bot)
     elif message.text == BTN_REVIVE:
         await _show_revive(message, state)
+    elif message.text == BTN_INVITE:
+        await _show_invite(message, bot)
     elif message.text == BTN_HELP:
         await _show_help(message)
 
@@ -1703,6 +1797,8 @@ async def handle_document(message: Message, bot: Bot, state: FSMContext) -> None
         for m in chat.contact_messages if m.text
     ]
     save_imported_messages(contact_id, all_imported)
+
+    await _credit_referral_if_pending(bot, telegram_id)
 
     delete_style_card(telegram_id)
     delete_deep_style_analysis(telegram_id)
@@ -2873,6 +2969,8 @@ async def _show_help(message: Message) -> None:
         "собеседника, идеи подарков\n"
         "/deep_style_analysis — твой коммуникативный профиль и советы для дейтинга\n"
         "💐 Идеальное свидание (кнопка в меню) — идея свидания и подарков под человека\n"
+        f"🎁 Пригласить друга (кнопка в меню) — за друга дадим {REFERRAL_REWARD_DAYS} дня "
+        "безлимитного «Анализ собеседника»\n"
         "/compare — сравнить, как ты пишешь разным людям\n"
         "/stats — портрет в цифрах, бесплатно\n\n"
         "⚙️ Аккаунт\n"

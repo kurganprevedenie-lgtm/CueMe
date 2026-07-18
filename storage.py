@@ -157,12 +157,23 @@ def init_db() -> None:
                 message_count INTEGER NOT NULL DEFAULT 0,
                 updated_at    TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS referrals (
+                referrer_telegram_id TEXT NOT NULL,
+                referred_telegram_id TEXT NOT NULL,   -- один друг = одна запись
+                created_at           TEXT NOT NULL,
+                credited             INTEGER NOT NULL DEFAULT 0,  -- 0 = награда ещё не начислена
+                PRIMARY KEY (referred_telegram_id)
+            );
         """)
         _add_column_if_missing(conn, "users", "auto_mode", "INTEGER DEFAULT 0")
         _add_column_if_missing(conn, "users", "auto_contact_id", "INTEGER")
         _add_column_if_missing(conn, "users", "trial_used", "INTEGER NOT NULL DEFAULT 0")
         _add_column_if_missing(conn, "users", "gender", "TEXT")
         _add_column_if_missing(conn, "users", "demo_trial_used", "INTEGER NOT NULL DEFAULT 0")
+        # Реферальная награда: до какого момента (UTC ISO) у пригласившего
+        # безлимитный «Анализ собеседника». NULL = награды нет.
+        _add_column_if_missing(conn, "users", "deep_analysis_free_until", "TEXT")
         _add_column_if_missing(conn, "contacts", "username", "TEXT")
         _add_column_if_missing(conn, "message_samples", "contact_label", "TEXT")
         # user_features_summary — подмножество features_summary, убираем дубль
@@ -750,6 +761,73 @@ def get_ideal_date(contact_id: int) -> dict | None:
 def delete_ideal_date(contact_id: int) -> None:
     with _conn() as conn:
         conn.execute("DELETE FROM ideal_date WHERE contact_id = ?", (contact_id,))
+
+
+# ── рефералы (пригласи друга → 3 дня безлимитного «Анализ собеседника») ───────
+
+def save_referral_pending(referrer_telegram_id: str, referred_telegram_id: str) -> None:
+    """Фиксирует связь «кто кого пригласил», credited=0. INSERT OR IGNORE —
+    один друг = одна запись (PRIMARY KEY referred_telegram_id), повторный клик
+    по ссылке ничего не перезаписывает."""
+    with _conn() as conn:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO referrals
+                (referrer_telegram_id, referred_telegram_id, created_at, credited)
+            VALUES (?, ?, ?, 0)
+            """,
+            (referrer_telegram_id, referred_telegram_id, _now()),
+        )
+
+
+def get_pending_referral(referred_telegram_id: str) -> str | None:
+    """referrer_id, если по этому другу есть НЕзачтённая (credited=0) запись."""
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT referrer_telegram_id FROM referrals "
+            "WHERE referred_telegram_id = ? AND credited = 0",
+            (referred_telegram_id,),
+        ).fetchone()
+    return row["referrer_telegram_id"] if row else None
+
+
+def mark_referral_credited(referred_telegram_id: str) -> None:
+    with _conn() as conn:
+        conn.execute(
+            "UPDATE referrals SET credited = 1 WHERE referred_telegram_id = ?",
+            (referred_telegram_id,),
+        )
+
+
+def set_deep_analysis_free_until(telegram_id: str, until: datetime) -> None:
+    """Ставит окно безлимитного «Анализа собеседника» до until (UTC datetime).
+    Создаёт строку users, если её ещё нет (реферер — точно существующий юзер,
+    но на всякий случай безопасно)."""
+    with _conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO users (telegram_id, my_id, created_at, deep_analysis_free_until)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(telegram_id) DO UPDATE SET
+                deep_analysis_free_until = excluded.deep_analysis_free_until
+            """,
+            (telegram_id, f"user{telegram_id}", _now(), until.isoformat()),
+        )
+
+
+def get_deep_analysis_free_until(telegram_id: str) -> datetime | None:
+    """Момент окончания реферального безлимита (tz-aware UTC) или None."""
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT deep_analysis_free_until FROM users WHERE telegram_id = ?",
+            (telegram_id,),
+        ).fetchone()
+    if not row or not row["deep_analysis_free_until"]:
+        return None
+    try:
+        return datetime.fromisoformat(row["deep_analysis_free_until"])
+    except ValueError:
+        return None
 
 
 # ── deep style analysis (кэш анализа своего стиля, агрегат) ───────────────────

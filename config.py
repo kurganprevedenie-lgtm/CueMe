@@ -81,6 +81,9 @@ FREE_TRIAL_REQUESTS = int(os.getenv("FREE_TRIAL_REQUESTS", "5"))
 DEMO_TRIAL_LIMIT = int(os.getenv("DEMO_TRIAL_LIMIT", "25"))
 # Кэш проверки членства в канале (сек) — не дёргать Telegram API на каждое сообщение.
 PREMIUM_CACHE_TTL = int(os.getenv("PREMIUM_CACHE_TTL", "300"))
+# Реферальная награда: сколько дней безлимитного «Анализа собеседника» получает
+# пригласивший, когда его друг реально начинает пользоваться ботом.
+REFERRAL_REWARD_DAYS = int(os.getenv("REFERRAL_REWARD_DAYS", "3"))
 
 # Стили ответа для фичи «Ответить по скриншоту».
 # [0] — подпись на кнопке, [1] — инструкция стиля для промпта генерации.
