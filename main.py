@@ -77,6 +77,7 @@ from tg_parser import parse_chat
 from storage import (
     count_biz_messages_for_contact,
     count_imported_messages,
+    count_successful_referrals,
     delete_all_user_data,
     delete_contact_data,
     delete_deep_analysis,
@@ -100,9 +101,10 @@ from storage import (
     get_interaction_card,
     get_imported_messages,
     get_message_samples,
+    get_or_create_referral_code,
     get_pending_referral,
+    get_referrer_by_code,
     get_trial_used,
-    get_user,
     increment_demo_trial_used,
     increment_trial_used,
     mark_referral_credited,
@@ -408,32 +410,8 @@ async def _require_premium(bot: Bot, target: Message, telegram_id: str) -> bool:
 # ── Реферальная программа ─────────────────────────────────────────────────────
 # Пригласивший получает REFERRAL_REWARD_DAYS дней безлимитного «Анализ
 # собеседника», когда друг реально начинает пользоваться ботом (создан первый
-# контакт). Payload реф-ссылки ловим в GenderGateMiddleware, т.к. для нового
-# юзера cmd_start блокируется гейтом выбора пола (см. _maybe_capture_referral).
-_REF_PREFIX = "ref_"
-
-
-def _maybe_capture_referral(telegram_id: str, text: str | None) -> None:
-    """Ловит payload из первого «/start ref_<id>». Анти-абуз:
-    • referrer != сам приглашённый (не самоприглашение);
-    • приглашённого ещё НЕТ в users — строка создаётся только в set_gender
-      (позже первого /start), поэтому get_user is None ⇔ реально новый юзер;
-      существующий юзер по чужой ссылке награду не запускает.
-    save_referral_pending = INSERT OR IGNORE (одна запись на друга)."""
-    if not text:
-        return
-    parts = text.split(maxsplit=1)
-    if len(parts) != 2 or not parts[0].startswith("/start"):
-        return
-    payload = parts[1].strip()
-    if not payload.startswith(_REF_PREFIX):
-        return
-    referrer_id = payload[len(_REF_PREFIX):].strip()
-    if not referrer_id.isdigit() or referrer_id == telegram_id:
-        return
-    if get_user(telegram_id) is not None:
-        return  # уже существующий пользователь — не «новый друг»
-    save_referral_pending(referrer_id, telegram_id)
+# контакт). Друг вводит персональный код пригласившего командой /redeem —
+# см. cmd_redeem ниже для анти-абуз проверок.
 
 
 async def _credit_referral_if_pending(bot: Bot, referred_id: str) -> None:
@@ -463,16 +441,94 @@ def _has_referral_free_deep(telegram_id: str) -> bool:
 
 
 async def _show_invite(message: Message, bot: Bot) -> None:
-    me = await bot.get_me()
-    link = f"https://t.me/{me.username}?start={_REF_PREFIX}{message.from_user.id}"
+    telegram_id = str(message.from_user.id)
+    code = get_or_create_referral_code(telegram_id)
     await message.answer(
         "🎁 Пригласи друга\n\n"
-        "Скинь ему свою ссылку — как только он начнёт пользоваться ботом, тебе "
-        f"дадутся {REFERRAL_REWARD_DAYS} дня безлимитного «🔬 Анализ собеседника»:\n\n"
-        f"<code>{html.escape(link)}</code>\n\n"
-        "(тапни по ссылке, чтобы скопировать)",
+        "Скинь другу этот код — пусть введёт его командой /redeem в этом боте. "
+        "Как только он реально начнёт пользоваться CueMe — тебе дадутся "
+        f"{REFERRAL_REWARD_DAYS} дня безлимитного «🔬 Анализ собеседника»:\n\n"
+        f"<code>{html.escape(code)}</code>\n\n"
+        "(тапни по коду, чтобы скопировать)",
         parse_mode="HTML",
     )
+
+
+@dp.message(Command("invite"))
+async def cmd_invite(message: Message, bot: Bot) -> None:
+    await _show_invite(message, bot)
+
+
+class ReferralRedeem(StatesGroup):
+    waiting_for_code = State()
+
+
+@dp.message(Command("redeem"))
+async def cmd_redeem(message: Message, state: FSMContext) -> None:
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) == 2:
+        await _process_redeem(message, parts[1].strip())
+        return
+    await state.set_state(ReferralRedeem.waiting_for_code)
+    await message.answer("Введи код от друга:")
+
+
+@dp.message(ReferralRedeem.waiting_for_code)
+async def handle_redeem_code(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    await _process_redeem(message, (message.text or "").strip())
+
+
+async def _process_redeem(message: Message, code: str) -> None:
+    """Анти-абуз для /redeem:
+    • код должен существовать (принадлежать реальному пользователю);
+    • нельзя погасить свой же код (самоприглашение);
+    • нельзя погасить код, если у тебя УЖЕ есть хоть один контакт — значит ты
+      реально пользовался ботом раньше, «новым другом» задним числом стать
+      нельзя (в отличие от старой ссылочной схемы, здесь /redeem доступен
+      только ПОСЛЕ выбора пола, так что users-строка есть у всех — надёжный
+      признак «нового» теперь список контактов, а не факт существования в БД);
+    • один человек может погасить код только один раз — save_referral_pending
+      это PRIMARY KEY(referred_telegram_id), INSERT OR IGNORE."""
+    telegram_id = str(message.from_user.id)
+    code = code.upper().strip()
+
+    referrer_id = get_referrer_by_code(code) if code else None
+    if not referrer_id:
+        await message.answer("Код не найден — проверь, что ввёл его без опечаток.")
+        return
+    if referrer_id == telegram_id:
+        await message.answer("Это твой собственный код 🙂")
+        return
+    if list_contacts(telegram_id):
+        await message.answer("Похоже, ты уже пользуешься CueMe — этот код не для тебя.")
+        return
+    if get_pending_referral(telegram_id):
+        await message.answer("Ты уже вводил реферальный код раньше.")
+        return
+
+    save_referral_pending(referrer_id, telegram_id)
+    await message.answer(
+        "Принято! Как только ты начнёшь пользоваться ботом (например через "
+        "«🎬 Попробовать на примере») — твой друг получит награду.",
+        reply_markup=onboarding_kb(),
+    )
+
+
+@dp.message(Command("myref"))
+async def cmd_myref(message: Message) -> None:
+    telegram_id = str(message.from_user.id)
+    count = count_successful_referrals(telegram_id)
+    lines = [f"👥 Приведено друзей: {count}"]
+
+    if _has_referral_free_deep(telegram_id):
+        until = get_deep_analysis_free_until(telegram_id)
+        until_str = until.strftime("%d.%m.%Y %H:%M UTC")
+        lines.append(f"🎁 Безлимитный «Анализ собеседника» активен до {until_str}")
+    else:
+        lines.append("Сейчас активной награды нет — пригласи друга через /invite.")
+
+    await message.answer("\n".join(lines))
 
 
 def main_kb() -> ReplyKeyboardMarkup:
@@ -523,10 +579,6 @@ class GenderGateMiddleware(BaseMiddleware):
             return await handler(event, data)
 
         telegram_id = str(user.id)
-        # Реф-payload ловим здесь, до гейта: для нового юзера cmd_start иначе
-        # не запустится, пока не выбран пол, и payload «/start ref_…» потеряется.
-        if isinstance(event, Message):
-            _maybe_capture_referral(telegram_id, event.text)
 
         if isinstance(event, CallbackQuery) and event.data in ("gender:male", "gender:female"):
             return await handler(event, data)
@@ -2969,14 +3021,16 @@ async def _show_help(message: Message) -> None:
         "собеседника, идеи подарков\n"
         "/deep_style_analysis — твой коммуникативный профиль и советы для дейтинга\n"
         "💐 Идеальное свидание (кнопка в меню) — идея свидания и подарков под человека\n"
-        f"🎁 Пригласить друга (кнопка в меню) — за друга дадим {REFERRAL_REWARD_DAYS} дня "
-        "безлимитного «Анализ собеседника»\n"
         "/compare — сравнить, как ты пишешь разным людям\n"
         "/stats — портрет в цифрах, бесплатно\n\n"
         "⚙️ Аккаунт\n"
         "/contacts — список загруженных чатов\n"
         "/connect — как подключить Автоматизацию чатов (живой поток переписки)\n"
         "/progress — сколько накопилось до разбора/следующего обновления\n"
+        f"/invite — получить свой код, за друга по коду дадим {REFERRAL_REWARD_DAYS} дня "
+        "безлимитного «Анализ собеседника»\n"
+        "/redeem — ввести код друга\n"
+        "/myref — сколько друзей привёл и активна ли награда\n"
         "/premium — статус подписки\n"
         "/rebuild — принудительно пересобрать все карточки заново\n"
         "/delete — удалить свои данные\n\n"

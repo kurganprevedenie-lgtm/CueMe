@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import secrets
 import sqlite3
+import string
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -174,6 +176,9 @@ def init_db() -> None:
         # Реферальная награда: до какого момента (UTC ISO) у пригласившего
         # безлимитный «Анализ собеседника». NULL = награды нет.
         _add_column_if_missing(conn, "users", "deep_analysis_free_until", "TEXT")
+        # Личный реферальный код — друг вводит его вручную через /redeem.
+        _add_column_if_missing(conn, "users", "referral_code", "TEXT")
+        _create_index_if_missing(conn, "idx_users_referral_code", "users", "referral_code", unique=True)
         _add_column_if_missing(conn, "contacts", "username", "TEXT")
         _add_column_if_missing(conn, "message_samples", "contact_label", "TEXT")
         # user_features_summary — подмножество features_summary, убираем дубль
@@ -765,6 +770,46 @@ def delete_ideal_date(contact_id: int) -> None:
 
 # ── рефералы (пригласи друга → 3 дня безлимитного «Анализ собеседника») ───────
 
+_REFERRAL_CODE_ALPHABET = string.ascii_uppercase + string.digits
+_REFERRAL_CODE_LEN = 8
+
+
+def get_or_create_referral_code(telegram_id: str) -> str:
+    """Личный код для /redeem — генерируется один раз и закрепляется навсегда.
+    Ретраит при коллизии (уникальный индекс на users.referral_code)."""
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT referral_code FROM users WHERE telegram_id = ?", (telegram_id,)
+        ).fetchone()
+        if row and row["referral_code"]:
+            return row["referral_code"]
+
+        for _ in range(10):
+            code = "".join(secrets.choice(_REFERRAL_CODE_ALPHABET) for _ in range(_REFERRAL_CODE_LEN))
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO users (telegram_id, my_id, created_at, referral_code)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(telegram_id) DO UPDATE SET referral_code = excluded.referral_code
+                    """,
+                    (telegram_id, f"user{telegram_id}", _now(), code),
+                )
+                return code
+            except sqlite3.IntegrityError:
+                continue  # код уже занят — пробуем другой
+        raise RuntimeError("не удалось сгенерировать уникальный referral_code за 10 попыток")
+
+
+def get_referrer_by_code(code: str) -> str | None:
+    """telegram_id владельца кода, или None если код не найден."""
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT telegram_id FROM users WHERE referral_code = ?", (code,)
+        ).fetchone()
+    return row["telegram_id"] if row else None
+
+
 def save_referral_pending(referrer_telegram_id: str, referred_telegram_id: str) -> None:
     """Фиксирует связь «кто кого пригласил», credited=0. INSERT OR IGNORE —
     один друг = одна запись (PRIMARY KEY referred_telegram_id), повторный клик
@@ -828,6 +873,16 @@ def get_deep_analysis_free_until(telegram_id: str) -> datetime | None:
         return datetime.fromisoformat(row["deep_analysis_free_until"])
     except ValueError:
         return None
+
+
+def count_successful_referrals(telegram_id: str) -> int:
+    """Сколько друзей реально начали пользоваться ботом (credited=1) — для /myref."""
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) AS cnt FROM referrals WHERE referrer_telegram_id = ? AND credited = 1",
+            (telegram_id,),
+        ).fetchone()
+    return row["cnt"] if row else 0
 
 
 # ── deep style analysis (кэш анализа своего стиля, агрегат) ───────────────────
