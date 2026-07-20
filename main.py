@@ -176,6 +176,12 @@ BTN_DEEP_STYLE    = "🪞 Анализ своего стиля"
 BTN_DATE          = "💐 Идеальное свидание"
 BTN_REVIVE        = "🔥 Скрипты общения"
 BTN_INVITE        = "🎁 Пригласить друга"
+# BTN_ANALYZE/BTN_MORE — на главном экране, открывают инлайн-подменю с
+# BTN_DEEP/BTN_DEEP_STYLE и BTN_DATE/BTN_REVIVE/BTN_INVITE соответственно
+# (см. analyze_menu_kb/more_menu_kb) — чтобы не перегружать первый экран
+# 9 кнопками сразу.
+BTN_ANALYZE       = "🔬 Разобраться"
+BTN_MORE          = "⚙️ Ещё"
 BTN_HELP          = "❓ Помощь"
 # BTN_ME («👤 Мой стиль») убрана вместе с командой /me — дублировала
 # BTN_DEEP_STYLE (и была бесплатной лазейкой мимо подписки на неё).
@@ -187,8 +193,7 @@ BTN_HELP          = "❓ Помощь"
 # BTN_REWRITE («📝 Переписать») и /auto удалены совсем — их сценарий (черновик
 # без привязки к входящему) теперь полностью закрывает «💫 Новый диалог».
 _ALL_BTNS = {
-    BTN_SCREENSHOT, BTN_REPLY, BTN_LIVE, BTN_DEEP, BTN_DEEP_STYLE, BTN_DATE, BTN_REVIVE,
-    BTN_INVITE, BTN_HELP,
+    BTN_SCREENSHOT, BTN_REPLY, BTN_LIVE, BTN_ANALYZE, BTN_MORE, BTN_HELP,
 }
 
 # Защита от параллельных пересборок одного контакта
@@ -537,10 +542,26 @@ def main_kb() -> ReplyKeyboardMarkup:
     b = ReplyKeyboardBuilder()
     b.row(KeyboardButton(text=BTN_SCREENSHOT), KeyboardButton(text=BTN_REPLY))
     b.row(KeyboardButton(text=BTN_LIVE))
-    b.row(KeyboardButton(text=BTN_DEEP), KeyboardButton(text=BTN_DEEP_STYLE))
-    b.row(KeyboardButton(text=BTN_DATE), KeyboardButton(text=BTN_REVIVE))
-    b.row(KeyboardButton(text=BTN_INVITE), KeyboardButton(text=BTN_HELP))
+    b.row(KeyboardButton(text=BTN_ANALYZE), KeyboardButton(text=BTN_MORE))
+    b.row(KeyboardButton(text=BTN_HELP))
     return b.as_markup(resize_keyboard=True)
+
+
+def analyze_menu_kb() -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    b.button(text=BTN_DEEP, callback_data="menu:deep")
+    b.button(text=BTN_DEEP_STYLE, callback_data="menu:deepstyle")
+    b.adjust(1)
+    return b.as_markup()
+
+
+def more_menu_kb() -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    b.button(text=BTN_DATE, callback_data="menu:date")
+    b.button(text=BTN_REVIVE, callback_data="menu:revive")
+    b.button(text=BTN_INVITE, callback_data="menu:invite")
+    b.adjust(1)
+    return b.as_markup()
 
 
 # ── Пол пользователя ─────────────────────────────────────────────────────────
@@ -1785,7 +1806,7 @@ async def cmd_demo(message: Message, state: FSMContext) -> None:
 # ── Кнопки главного меню ──────────────────────────────────────────────────────
 
 @dp.message(F.text.in_(_ALL_BTNS))
-async def handle_menu_button(message: Message, state: FSMContext, bot: Bot) -> None:
+async def handle_menu_button(message: Message, state: FSMContext) -> None:
     await state.clear()
     if message.text == BTN_SCREENSHOT:
         await _start_screenshot(message, state)
@@ -1793,18 +1814,28 @@ async def handle_menu_button(message: Message, state: FSMContext, bot: Bot) -> N
         await _start_reply(message, state)
     elif message.text == BTN_LIVE:
         await _show_live_start(message)
-    elif message.text == BTN_DEEP:
-        await _show_deep_analysis(message, bot)
-    elif message.text == BTN_DEEP_STYLE:
-        await _show_deep_style_analysis(message, bot)
-    elif message.text == BTN_DATE:
-        await _show_ideal_date(message, bot)
-    elif message.text == BTN_REVIVE:
-        await _show_revive(message, state)
-    elif message.text == BTN_INVITE:
-        await _show_invite(message, bot)
+    elif message.text == BTN_ANALYZE:
+        await message.answer("Что разобрать?", reply_markup=analyze_menu_kb())
+    elif message.text == BTN_MORE:
+        await message.answer("Ещё:", reply_markup=more_menu_kb())
     elif message.text == BTN_HELP:
         await _show_help(message)
+
+
+@dp.callback_query(F.data.startswith("menu:"))
+async def cb_submenu(call: CallbackQuery, state: FSMContext, bot: Bot) -> None:
+    action = call.data.split(":", 1)[1]
+    await call.answer()
+    if action == "deep":
+        await _show_deep_analysis(call.message, bot)
+    elif action == "deepstyle":
+        await _show_deep_style_analysis(call.message, bot)
+    elif action == "date":
+        await _show_ideal_date(call.message, bot)
+    elif action == "revive":
+        await _show_revive(call.message, state)
+    elif action == "invite":
+        await _show_invite(call.message, bot)
 
 
 # ── Загрузка JSON-файла ───────────────────────────────────────────────────────
@@ -3008,29 +3039,30 @@ async def cmd_progress(message: Message) -> None:
 
 async def _show_help(message: Message) -> None:
     await message.answer(
-        "Вот что я умею (то же самое есть и кнопками в меню):\n\n"
+        "Вот что я умею. На главном экране — 3 кнопки для ответа плюс "
+        "«🔬 Разобраться» и «⚙️ Ещё» (открывают подменю с остальным):\n\n"
         "💬 Ответить за меня — несколько вариантов ответа: Флирт/Дружески/"
         "Уверенно (или другое, если сообщение тяжёлое/деликатное)\n"
         "/reply — ответить на его сообщение\n"
         "/screenshot — ответить по скриншоту переписки (можно слать скриншоты "
         "один за другим)\n"
         "💫 Новый диалог — помогу с первого сообщения новому человеку (живой "
-        "коучинг или готовые открывашки), без накопленной истории\n"
-        "🔥 Скрипты общения (кнопка в меню) — готовый вопрос, чтобы расшевелить "
-        "затихший разговор\n\n"
-        "🔬 Разобраться\n"
+        "коучинг или готовые открывашки), без накопленной истории\n\n"
+        "🔬 Разобраться (кнопка в меню)\n"
         "/deep_analysis — совместимость, история отношений, стиль и привычки "
         "собеседника, идеи подарков\n"
         "/deep_style_analysis — твой коммуникативный профиль и советы для дейтинга\n"
-        "💐 Идеальное свидание (кнопка в меню) — идея свидания и подарков под человека\n"
         "/compare — сравнить, как ты пишешь разным людям\n"
         "/stats — портрет в цифрах, бесплатно\n\n"
+        "⚙️ Ещё (кнопка в меню)\n"
+        "💐 Идеальное свидание — идея свидания и подарков под человека\n"
+        "🔥 Скрипты общения — готовый вопрос, чтобы расшевелить затихший разговор\n"
+        f"🎁 Пригласить друга (/invite) — получить свой код, за друга по коду дадим "
+        f"{REFERRAL_REWARD_DAYS} дня безлимитного «Анализ собеседника»\n\n"
         "⚙️ Аккаунт\n"
         "/contacts — список загруженных чатов\n"
         "/connect — как подключить Автоматизацию чатов (живой поток переписки)\n"
         "/progress — сколько накопилось до разбора/следующего обновления\n"
-        f"/invite — получить свой код, за друга по коду дадим {REFERRAL_REWARD_DAYS} дня "
-        "безлимитного «Анализ собеседника»\n"
         "/redeem — ввести код друга\n"
         "/myref — сколько друзей привёл и активна ли награда\n"
         "/premium — статус подписки\n"
