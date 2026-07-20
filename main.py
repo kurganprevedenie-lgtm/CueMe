@@ -13,6 +13,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from aiogram import BaseMiddleware, Bot, Dispatcher, F
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -3288,6 +3289,69 @@ async def cb_delete_all_confirm(call: CallbackQuery) -> None:
 async def cb_delete_cancel(call: CallbackQuery) -> None:
     await call.answer("Отменено")
     await call.message.edit_text("Удаление отменено.")
+
+
+# ── /wipe — стереть данные ПРОИЗВОЛЬНОГО пользователя (только для админа) ────
+# В отличие от /delete (только свои данные), берёт telegram_id аргументом —
+# для тестовых аккаунтов разработчика, чтобы проверять онбординг/рефералку
+# с чистого листа, «как будто пользователь никогда не пользовался ботом».
+
+@dp.message(Command("wipe"))
+async def cmd_wipe(message: Message, bot: Bot) -> None:
+    if not ADMIN_TELEGRAM_ID or str(message.from_user.id) != ADMIN_TELEGRAM_ID:
+        return
+    parts = (message.text or "").split(maxsplit=1)
+    arg = parts[1].strip() if len(parts) == 2 else ""
+    if not arg:
+        await message.answer("Использование: /wipe <telegram_id> или /wipe @username")
+        return
+
+    if arg.isdigit():
+        target_id = arg
+    elif arg.startswith("@"):
+        # Резолвим @username → numeric id через Telegram API. Работает только
+        # если бот уже когда-то получал апдейт от этого юзера (обычный случай
+        # для «стереть тестовый аккаунт») — иначе getChat падает.
+        try:
+            chat = await bot.get_chat(arg)
+        except TelegramBadRequest:
+            await message.answer(
+                f"Не удалось найти {arg} — бот должен был хотя бы раз получить "
+                "от него сообщение, иначе Telegram не отдаёт chat по username."
+            )
+            return
+        target_id = str(chat.id)
+        arg = f"{arg} ({target_id})"  # для текста подтверждения
+    else:
+        await message.answer("Использование: /wipe <telegram_id> или /wipe @username")
+        return
+
+    b = InlineKeyboardBuilder()
+    b.button(text=f"‼️ Да, стереть {target_id}", callback_data=f"wipeyes:{target_id}")
+    b.button(text="Отмена", callback_data="wipeno")
+    b.adjust(1)
+    await message.answer(
+        f"Стереть ВСЕ данные пользователя {arg} — как будто он никогда не "
+        "пользовался ботом? Необратимо.",
+        reply_markup=b.as_markup(),
+    )
+
+
+@dp.callback_query(F.data.startswith("wipeyes:"))
+async def cb_wipe_confirm(call: CallbackQuery) -> None:
+    if not ADMIN_TELEGRAM_ID or str(call.from_user.id) != ADMIN_TELEGRAM_ID:
+        await call.answer()
+        return
+    target_id = call.data.split(":", 1)[1]
+    delete_all_user_data(target_id)
+    await call.answer("Стёрто")
+    await call.message.edit_text(f"✓ Все данные пользователя {target_id} удалены.")
+
+
+@dp.callback_query(F.data == "wipeno")
+async def cb_wipe_cancel(call: CallbackQuery) -> None:
+    await call.answer("Отменено")
+    await call.message.edit_text("Отменено.")
 
 
 # /auto и auto_rewrite_handler (catch-all авто-переписка) убраны вместе с

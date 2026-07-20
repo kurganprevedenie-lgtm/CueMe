@@ -1291,7 +1291,9 @@ def delete_contact_data(telegram_id: str, contact_id: int) -> None:
 
 
 def delete_all_user_data(telegram_id: str) -> None:
-    """Полностью стирает все данные пользователя."""
+    """Полностью стирает все данные пользователя — как будто он никогда не
+    пользовался ботом (используется и в /delete для себя, и в /wipe админом
+    для произвольного telegram_id)."""
     with _conn() as conn:
         cids = [
             r["id"] for r in conn.execute(
@@ -1311,5 +1313,11 @@ def delete_all_user_data(telegram_id: str) -> None:
         conn.execute("DELETE FROM style_cards          WHERE user_telegram_id = ?", (telegram_id,))
         conn.execute("DELETE FROM deep_style_analysis  WHERE user_telegram_id = ?", (telegram_id,))
         conn.execute("DELETE FROM business_messages    WHERE owner_user_id = ?",    (telegram_id,))
-        conn.execute("DELETE FROM business_chat_refs WHERE owner_user_id = ?",    (telegram_id,))
-        conn.execute("DELETE FROM users              WHERE telegram_id = ?",      (telegram_id,))
+        conn.execute("DELETE FROM business_chat_refs   WHERE owner_user_id = ?",    (telegram_id,))
+        conn.execute("DELETE FROM business_connections WHERE owner_user_id = ?",    (telegram_id,))
+        conn.execute("DELETE FROM events               WHERE user_telegram_id = ?", (telegram_id,))
+        conn.execute(
+            "DELETE FROM referrals WHERE referrer_telegram_id = ? OR referred_telegram_id = ?",
+            (telegram_id, telegram_id),
+        )
+        conn.execute("DELETE FROM users                WHERE telegram_id = ?",      (telegram_id,))
