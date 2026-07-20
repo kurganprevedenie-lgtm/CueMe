@@ -22,7 +22,7 @@ from aiogram.types import (
     BotCommand,
     BusinessConnection,
     CallbackQuery, Document, ErrorEvent, Message,
-    InlineKeyboardMarkup,
+    InlineKeyboardButton, InlineKeyboardMarkup,
     ReplyKeyboardMarkup, KeyboardButton,
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
@@ -1705,8 +1705,15 @@ async def _business_connect_text(bot: Bot, platform: str) -> str:
     open_settings = _PLATFORM_OPEN_SETTINGS.get(platform, _PLATFORM_OPEN_SETTINGS["android"])
     edit_step     = _PLATFORM_EDIT_STEP.get(platform, _PLATFORM_EDIT_STEP["android"])
     return (
-        "Подключи меня к своим чатам — я буду учиться твоему стилю прямо "
-        "по живой переписке, ничего загружать не нужно:\n\n"
+        "👋 Добро пожаловать в CueMe!\n\n"
+        "Что умеет этот бот?\n\n"
+        "— Пишет ответы в твоём стиле, под конкретного собеседника\n"
+        "— Подсказывает что ответить прямо во время переписки\n"
+        "— Разбирает совместимость и подсказывает как лучше писать\n"
+        "— Предлагает идею свидания на основе того, что человек любит\n\n"
+        "Для работы бота нужно подключить его к своим чатам — он будет "
+        "учиться твоему стилю прямо по живой переписке, ничего загружать "
+        "не нужно:\n\n"
         f"1️⃣ {open_settings}\n"
         f"2️⃣ {edit_step}\n"
         "3️⃣ Выбери «Автоматизация чатов»\n"
@@ -1716,9 +1723,20 @@ async def _business_connect_text(bot: Bot, platform: str) -> str:
         "Не нашёл пункт «Автоматизация чатов»? В поиске по настройкам введи "
         "«автоматизация» или «automation» — так быстрее всего.\n\n"
         "Всё — дальше просто переписывайся как обычно. Как только накопится "
-        f"{FIRST_BUILD_THRESHOLD} сообщений, с момента подключения бота, по человеку, пришлю первый разбор твоего стиля.\n\n"
-        "Имена и контакты собеседников не сохраняются — только анонимизированные паттерны."
+        f"{FIRST_BUILD_THRESHOLD} сообщений, с момента подключения бота, по "
+        "человеку, пришлю первый разбор твоего стиля.\n\n"
+        "Имена и контакты собеседников не сохраняются — только "
+        "анонимизированные паттерны."
     )
+
+
+def business_connect_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⚙️ Настройки профиля", url="tg://settings/edit")],
+        [InlineKeyboardButton(text="👀 Видео-инструкция", url="https://t.me/CueMee")],
+        [InlineKeyboardButton(text="✨ Возможности бота", url="https://t.me/CueMee")],
+        [InlineKeyboardButton(text="🆘 Поддержка", url="https://t.me/furdokw")],
+    ])
 
 
 async def _send_start_menu(message: Message, telegram_id: str) -> None:
@@ -1778,7 +1796,10 @@ async def cb_onboarding_business(call: CallbackQuery, state: FSMContext) -> None
 async def cb_onboarding_platform(call: CallbackQuery, bot: Bot) -> None:
     platform = call.data.split(":")[2]
     await call.answer()
-    await call.message.answer(await _business_connect_text(bot, platform))
+    await call.message.answer(
+        await _business_connect_text(bot, platform),
+        reply_markup=business_connect_kb(),
+    )
 
 
 @dp.callback_query(F.data == "onb:json")
