@@ -566,13 +566,28 @@ def more_menu_kb() -> InlineKeyboardMarkup:
 
 
 # ── Пол пользователя ─────────────────────────────────────────────────────────
-# Спрашивается в самом начале, до любого другого взаимодействия (см.
-# GenderGateMiddleware ниже) — нужен для согласования рода в русском: и когда
-# бот обращается к пользователю напрямую, и в промптах генерации (варианты
-# ответа пишутся от первого лица автора — «я устал»/«я устала»).
+# Спрашивается НЕ сразу на /start (чтобы не мешать пройти онбординг — демо/
+# JSON/Business), а сразу после того как он реально завершён (см.
+# _maybe_prompt_gender, вызывается в тех же 3 точках, что и зачёт реферала).
+# GenderGateMiddleware ниже подключает жёсткий гейт уже ПОСЛЕ этого момента —
+# нужен для согласования рода в русском: и когда бот обращается к пользователю
+# напрямую, и в промптах генерации (варианты ответа пишутся от первого лица
+# автора — «я устал»/«я устала»).
 
 _GENDER_LABELS = {"male": "парень", "female": "девушка"}
-_GENDER_PROMPT_TEXT = "Для начала — как к тебе обращаться?"
+_GENDER_PROMPT_TEXT = "Кстати — как к тебе обращаться?"
+
+
+async def _maybe_prompt_gender(bot: Bot, telegram_id: str) -> None:
+    """Спрашивает пол один раз, сразу после реального завершения онбординга
+    (первый контакт создан — демо/JSON/Business). Идемпотентно — no-op, если
+    уже спрашивали/выбрали."""
+    if get_gender(telegram_id) is not None:
+        return
+    try:
+        await bot.send_message(int(telegram_id), _GENDER_PROMPT_TEXT, reply_markup=gender_kb())
+    except Exception:
+        logging.warning("gender prompt failed: telegram_id=%s", telegram_id)
 
 
 def _contact_words(user_gender: str | None) -> tuple[str, str]:
@@ -595,7 +610,10 @@ def gender_kb() -> InlineKeyboardMarkup:
 
 class GenderGateMiddleware(BaseMiddleware):
     """Пока пол не выбран — перехватывает любое сообщение/callback (кроме самого
-    выбора пола) и показывает клавиатуру выбора вместо обычной обработки."""
+    выбора пола) и показывает клавиатуру выбора вместо обычной обработки. НЕ
+    вмешивается, пока онбординг не завершён (нет ни одного контакта) — чтобы
+    свободно пройти демо/JSON/Business; после первого контакта _maybe_prompt_gender
+    уже проактивно спросил пол, и этот гейт просто ловит тех, кто проигнорировал."""
 
     async def __call__(self, handler, event, data):
         user = data.get("event_from_user")
@@ -609,6 +627,9 @@ class GenderGateMiddleware(BaseMiddleware):
 
         if get_gender(telegram_id) is not None:
             return await handler(event, data)
+
+        if not list_contacts(telegram_id):
+            return await handler(event, data)  # онбординг ещё не завершён — не мешаем
 
         target = event.message if isinstance(event, CallbackQuery) else event
         if target is not None:
@@ -1480,7 +1501,7 @@ async def cb_deep_style_analysis_refresh(call: CallbackQuery, bot: Bot) -> None:
 # ── Business API ──────────────────────────────────────────────────────────────
 
 @dp.business_connection()
-async def handle_business_connection(event: BusinessConnection) -> None:
+async def handle_business_connection(event: BusinessConnection, bot: Bot) -> None:
     upsert_business_connection(
         connection_id=event.id,
         owner_user_id=str(event.user.id),
@@ -1489,6 +1510,11 @@ async def handle_business_connection(event: BusinessConnection) -> None:
     )
     status = "подключён" if event.is_enabled else "отключён"
     logging.info("business_connection %s: owner=%s %s", event.id, event.user.id, status)
+    if event.is_enabled:
+        try:
+            await bot.send_message(event.user.id, "✅ Вы успешно подключили бота!")
+        except Exception:
+            logging.warning("business-connect notify failed: owner=%s", event.user.id)
 
 
 def _persist_business_message(
@@ -1580,8 +1606,10 @@ async def handle_business_message(event: Message, bot: Bot) -> None:
 
     if contact_id_for_rebuild:
         # Друг подключил Business и пошёл живой поток — засчитываем реферала
-        # (идемпотентно: после первого зачёта get_pending_referral вернёт None).
+        # (идемпотентно: после первого зачёта get_pending_referral вернёт None)
+        # и спрашиваем пол (тоже идемпотентно — no-op, если уже выбран).
         await _credit_referral_if_pending(bot, owner_id)
+        await _maybe_prompt_gender(bot, owner_id)
         asyncio.create_task(_maybe_rebuild(owner_id, contact_id_for_rebuild, bot))
 
 
@@ -1662,71 +1690,37 @@ async def _run_demo(telegram_id: str, target: Message) -> None:
         "загрузи экспорт чата, когда захочешь.",
         reply_markup=main_kb(),
     )
+    await _maybe_prompt_gender(target.bot, telegram_id)
 
 
 def onboarding_kb() -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
-    b.button(text="📱 Подключить через Настройки", callback_data="onb:business")
+    b.button(text="📖 Подробная инструкция", callback_data="onb:business")
     b.button(text="💻 У меня есть комп (JSON)", callback_data="onb:json")
     b.button(text="🎬 Попробовать на примере", callback_data="demo")
     b.adjust(1)
     return b.as_markup()
 
 
-# Как открыть Настройки и добраться до профиля — различается по платформам.
-# Путь для iPhone проверен вручную (Настройки → «Изменить» у профиля →
-# «Автоматизация чатов»). Android почти всегда зеркалит iOS-версию, поэтому
-# тот же путь; десктоп не проверялся — формулировка чуть более общая.
-_PLATFORM_OPEN_SETTINGS = {
-    "iphone":  "Открой Telegram → внизу экрана нажми на вкладку ⚙️ Settings",
-    "android": "Открой Telegram → нажми ☰ (три полоски) в левом верхнем углу → Настройки",
-    "desktop": "Открой Telegram → нажми ☰ в левом верхнем углу (или на свой аватар "
-               "в левой панели) → Настройки",
-}
-_PLATFORM_EDIT_STEP = {
-    "iphone":  "Нажми «Изменить» рядом со своим профилем/фото",
-    "android": "Нажми «Изменить» рядом со своим профилем/фото",
-    "desktop": "Найди кнопку редактирования профиля (иконка карандаша рядом с твоим "
-               "именем/фото) и открой её",
-}
-_PLATFORM_LABELS = {"iphone": "🍏 iPhone", "android": "🤖 Android", "desktop": "💻 Компьютер"}
+# Выбор устройства (iPhone/Android/десктоп) убран — шаги подключения теперь
+# одной универсальной формулировкой, без platform-specific веток.
 
 
-def platform_pick_kb() -> InlineKeyboardMarkup:
-    b = InlineKeyboardBuilder()
-    for key, label in _PLATFORM_LABELS.items():
-        b.button(text=label, callback_data=f"onb:platform:{key}")
-    b.adjust(3)
-    return b.as_markup()
-
-
-async def _business_connect_text(bot: Bot, platform: str) -> str:
+async def _business_connect_text(bot: Bot) -> str:
     me = await bot.get_me()
-    open_settings = _PLATFORM_OPEN_SETTINGS.get(platform, _PLATFORM_OPEN_SETTINGS["android"])
-    edit_step     = _PLATFORM_EDIT_STEP.get(platform, _PLATFORM_EDIT_STEP["android"])
     return (
-        "👋 Добро пожаловать в CueMe!\n\n"
-        "Что умеет этот бот?\n\n"
-        "— Пишет ответы в твоём стиле, под конкретного собеседника\n"
-        "— Подсказывает что ответить прямо во время переписки\n"
-        "— Разбирает совместимость и подсказывает как лучше писать\n"
-        "— Предлагает идею свидания на основе того, что человек любит\n\n"
-        "Для работы бота нужно подключить его к своим чатам — он будет "
-        "учиться твоему стилю прямо по живой переписке, ничего загружать "
-        "не нужно:\n\n"
-        f"1️⃣ {open_settings}\n"
-        f"2️⃣ {edit_step}\n"
+        "Подключи бота к своим чатам — он будет учиться твоему стилю прямо "
+        "по живой переписке, ничего загружать не нужно:\n\n"
+        "1️⃣ Открой Telegram → Настройки (в приложении — вкладка ⚙️ внизу "
+        "экрана или значок ☰/твой аватар в углу; на компьютере — значок ☰ "
+        "в левом верхнем углу или свой аватар в левой панели)\n"
+        "2️⃣ Нажми «Изменить» рядом со своим профилем/фото\n"
         "3️⃣ Выбери «Автоматизация чатов»\n"
         f"4️⃣ В поле впиши @{me.username} и выбери меня\n"
         "5️⃣ Включи переключатель «Ответы на сообщения»\n"
         "6️⃣ Выбери чаты, к которым дать доступ (можно один)\n\n"
         "Не нашёл пункт «Автоматизация чатов»? В поиске по настройкам введи "
-        "«автоматизация» или «automation» — так быстрее всего.\n\n"
-        "Всё — дальше просто переписывайся как обычно. Как только накопится "
-        f"{FIRST_BUILD_THRESHOLD} сообщений, с момента подключения бота, по "
-        "человеку, пришлю первый разбор твоего стиля.\n\n"
-        "Имена и контакты собеседников не сохраняются — только "
-        "анонимизированные паттерны."
+        "«автоматизация» или «automation» — так быстрее всего."
     )
 
 
@@ -1746,18 +1740,25 @@ async def _send_start_menu(message: Message, telegram_id: str) -> None:
         await message.answer(f"С возвращением!\n\n{caps}", reply_markup=main_kb())
         return
 
+    # TODO: как только будет готова картинка с инструкцией — отправить её сюда
+    # (message.answer_photo(photo, caption=...)) вместо текстового message.answer,
+    # и в первом абзаце после списка функций заменить формулировку на «Инструкция
+    # по подключению — на картинке выше», как в исходном ТЗ.
     await message.answer(
-        f"Привет! Я {APP_NAME} — твой дейтинг-коуч в переписках: пишу твоим голосом, "
-        "но так, чтобы собеседнику хотелось отвечать.\n\n"
-        "Как начнём?\n\n"
-        "🎬 Попробовать на примере — сразу увидишь, как это работает, на готовых "
-        "примерах, без каких-либо действий с твоей стороны. Результат — сразу. "
-        "Рекомендуем начать отсюда.\n\n"
-        "📱 Подключить через Настройки — бот сам учится на твоей живой переписке "
-        "прямо в Telegram, ничего скачивать не нужно. Займёт минуту, разбор придёт "
-        "по мере переписки.\n\n"
-        "💻 У меня есть комп (JSON) — если пользуешься Telegram Desktop, можно сразу "
-        "загрузить историю переписки и получить разбор без ожидания.",
+        "👋 Добро пожаловать в CueMe!\n\n"
+        "Что умеет этот бот?\n\n"
+        "— Пишет ответы в твоём стиле, под конкретного собеседника\n"
+        "— Подсказывает что ответить прямо во время переписки\n"
+        "— Разбирает совместимость и подсказывает как лучше писать\n"
+        "— Предлагает идею свидания на основе того, что человек любит\n\n"
+        "Чтобы подключить бота — жми «📖 Подробная инструкция» ниже, там всё "
+        "по шагам. Или сразу попробуй на примере, или загрузи экспорт "
+        "переписки, если он у тебя есть.\n\n"
+        "Всё — дальше просто переписывайся как обычно. Как только накопится "
+        f"{FIRST_BUILD_THRESHOLD} сообщений, с момента подключения бота, по "
+        "человеку, пришлю первый разбор твоего стиля.\n\n"
+        "Имена и контакты собеседников не сохраняются — только "
+        "анонимизированные паттерны.",
         reply_markup=onboarding_kb(),
     )
 
@@ -1785,19 +1786,12 @@ async def cmd_gender(message: Message) -> None:
 
 
 @dp.callback_query(F.data == "onb:business")
-async def cb_onboarding_business(call: CallbackQuery, state: FSMContext) -> None:
+async def cb_onboarding_business(call: CallbackQuery, state: FSMContext, bot: Bot) -> None:
     await state.clear()
     await call.answer()
     upsert_user(str(call.from_user.id), f"user{call.from_user.id}")
-    await call.message.answer("Ты сейчас с какого устройства?", reply_markup=platform_pick_kb())
-
-
-@dp.callback_query(F.data.startswith("onb:platform:"))
-async def cb_onboarding_platform(call: CallbackQuery, bot: Bot) -> None:
-    platform = call.data.split(":")[2]
-    await call.answer()
     await call.message.answer(
-        await _business_connect_text(bot, platform),
+        await _business_connect_text(bot),
         reply_markup=business_connect_kb(),
     )
 
@@ -1906,6 +1900,7 @@ async def handle_document(message: Message, bot: Bot, state: FSMContext) -> None
     save_imported_messages(contact_id, all_imported)
 
     await _credit_referral_if_pending(bot, telegram_id)
+    await _maybe_prompt_gender(bot, telegram_id)
 
     delete_style_card(telegram_id)
     delete_deep_style_analysis(telegram_id)
@@ -1983,8 +1978,11 @@ async def cb_setup_contact(call: CallbackQuery, state: FSMContext) -> None:
 # ── /connect ─────────────────────────────────────────────────────────────────
 
 @dp.message(Command("connect"))
-async def cmd_connect(message: Message) -> None:
-    await message.answer("Ты сейчас с какого устройства?", reply_markup=platform_pick_kb())
+async def cmd_connect(message: Message, bot: Bot) -> None:
+    await message.answer(
+        await _business_connect_text(bot),
+        reply_markup=business_connect_kb(),
+    )
 
 
 # ── /provider — переключить LLM-провайдера (только для админа) ───────────────
