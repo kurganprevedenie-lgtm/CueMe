@@ -527,15 +527,16 @@ async def _process_redeem(message: Message, code: str) -> None:
 async def cmd_myref(message: Message) -> None:
     telegram_id = str(message.from_user.id)
     count = count_successful_referrals(telegram_id)
-    lines = [f"👥 Приведено друзей: {count}"]
+    lines = ["🎁 Награда за рефералов:\n"]
 
     if _has_referral_free_deep(telegram_id):
         until = get_deep_analysis_free_until(telegram_id)
         until_str = until.strftime("%d.%m.%Y %H:%M UTC")
-        lines.append(f"🎁 Безлимитный «Анализ собеседника» активен до {until_str}")
+        lines.append(f"✅ Безлимитный «Анализ собеседника» — активен до {until_str}")
     else:
-        lines.append("Сейчас активной награды нет — пригласи друга через /invite.")
+        lines.append("⏳ Активной награды нет — пригласи друга через /invite")
 
+    lines.append(f"👥 Приведено друзей: {count}")
     await message.answer("\n".join(lines))
 
 
