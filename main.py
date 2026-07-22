@@ -3251,7 +3251,10 @@ async def _show_compare(message: Message, bot: Bot, telegram_id: str | None = No
     telegram_id = telegram_id or str(message.from_user.id)
     if not await _require_premium(bot, message, telegram_id):
         return
-    cards = get_all_per_contact_style_cards(telegram_id)
+    cards = [
+        c for c in get_all_per_contact_style_cards(telegram_id)
+        if c["original_from_id"] not in _DEMO_ORIGINAL_IDS
+    ]
     if len(cards) < 2:
         await message.answer(
             "Нужно минимум 2 разобранных собеседника. "

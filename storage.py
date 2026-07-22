@@ -631,7 +631,7 @@ def get_all_per_contact_style_cards(owner_user_id: str) -> list[dict]:
     with _conn() as conn:
         rows = conn.execute(
             """
-            SELECT ms.card_text, c.display_name, c.contact_alias
+            SELECT ms.card_text, c.display_name, c.contact_alias, c.original_from_id
             FROM my_style_per_contact ms
             JOIN contacts c ON ms.contact_id = c.id
             WHERE c.user_telegram_id = ?
@@ -640,8 +640,9 @@ def get_all_per_contact_style_cards(owner_user_id: str) -> list[dict]:
         ).fetchall()
     return [
         {
-            "card_text":    row["card_text"],
-            "display_name": row["display_name"] or row["contact_alias"],
+            "card_text":       row["card_text"],
+            "display_name":    row["display_name"] or row["contact_alias"],
+            "original_from_id": row["original_from_id"],
         }
         for row in rows
     ]
