@@ -446,8 +446,8 @@ def _has_referral_free_deep(telegram_id: str) -> bool:
     return bool(until and until > datetime.now(timezone.utc))
 
 
-async def _show_invite(message: Message, bot: Bot) -> None:
-    telegram_id = str(message.from_user.id)
+async def _show_invite(message: Message, bot: Bot, telegram_id: str | None = None) -> None:
+    telegram_id = telegram_id or str(message.from_user.id)
     code = get_or_create_referral_code(telegram_id)
     await message.answer(
         "🎁 Пригласи друга\n\n"
@@ -553,6 +553,8 @@ def analyze_menu_kb() -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     b.button(text=BTN_DEEP, callback_data="menu:deep")
     b.button(text=BTN_DEEP_STYLE, callback_data="menu:deepstyle")
+    b.button(text="📈 Сравнить стили", callback_data="menu:compare")
+    b.button(text="📊 Портрет в цифрах", callback_data="menu:stats")
     b.adjust(1)
     return b.as_markup()
 
@@ -1123,8 +1125,11 @@ async def _run_deep_analysis(
         await _answer_long(target, msg, reply_markup=deep_analysis_result_kb(contact_id) if last else None)
 
 
-async def _show_deep_analysis(message: Message, bot: Bot) -> None:
-    telegram_id = str(message.from_user.id)
+async def _show_deep_analysis(message: Message, bot: Bot, telegram_id: str | None = None) -> None:
+    # telegram_id передаётся явно из cb_submenu (call.from_user), т.к. message
+    # там — это сообщение БОТА с инлайн-клавиатурой, а не сообщение юзера, и
+    # message.from_user в этом случае был бы ботом, а не человеком.
+    telegram_id = telegram_id or str(message.from_user.id)
     contacts = list_contacts(telegram_id)
     if not contacts:
         await message.answer("Сначала загрузи JSON-файл чата.")
@@ -1275,8 +1280,8 @@ async def _run_ideal_date(
     await _answer_long(target, _format_ideal_date(name, data), reply_markup=ideal_date_result_kb(contact_id))
 
 
-async def _show_ideal_date(message: Message, bot: Bot) -> None:
-    telegram_id = str(message.from_user.id)
+async def _show_ideal_date(message: Message, bot: Bot, telegram_id: str | None = None) -> None:
+    telegram_id = telegram_id or str(message.from_user.id)
     contacts = list_contacts(telegram_id)
     if not contacts:
         await message.answer("Сначала загрузи JSON-файл чата.")
@@ -1478,8 +1483,8 @@ async def _run_deep_style_analysis(bot: Bot, target: Message, telegram_id: str) 
     await _answer_long(target, card, reply_markup=deep_style_result_kb())
 
 
-async def _show_deep_style_analysis(message: Message, bot: Bot) -> None:
-    telegram_id = str(message.from_user.id)
+async def _show_deep_style_analysis(message: Message, bot: Bot, telegram_id: str | None = None) -> None:
+    telegram_id = telegram_id or str(message.from_user.id)
     if not list_contacts(telegram_id):
         await message.answer("Сначала загрузи JSON-файл чата.")
         return
@@ -1862,17 +1867,22 @@ async def handle_menu_button(message: Message, state: FSMContext) -> None:
 @dp.callback_query(F.data.startswith("menu:"))
 async def cb_submenu(call: CallbackQuery, state: FSMContext, bot: Bot) -> None:
     action = call.data.split(":", 1)[1]
+    telegram_id = str(call.from_user.id)
     await call.answer()
     if action == "deep":
-        await _show_deep_analysis(call.message, bot)
+        await _show_deep_analysis(call.message, bot, telegram_id)
     elif action == "deepstyle":
-        await _show_deep_style_analysis(call.message, bot)
+        await _show_deep_style_analysis(call.message, bot, telegram_id)
     elif action == "date":
-        await _show_ideal_date(call.message, bot)
+        await _show_ideal_date(call.message, bot, telegram_id)
     elif action == "revive":
         await _show_revive(call.message, state)
     elif action == "invite":
-        await _show_invite(call.message, bot)
+        await _show_invite(call.message, bot, telegram_id)
+    elif action == "compare":
+        await _show_compare(call.message, bot, telegram_id)
+    elif action == "stats":
+        await _show_stats(call.message, telegram_id)
 
 
 # ── Загрузка JSON-файла ───────────────────────────────────────────────────────
@@ -3221,20 +3231,24 @@ def _compute_stats(telegram_id: str) -> str | None:
     return "\n".join(lines)
 
 
-@dp.message(Command("stats"))
-async def cmd_stats(message: Message) -> None:
-    stats = _compute_stats(str(message.from_user.id))
+async def _show_stats(message: Message, telegram_id: str | None = None) -> None:
+    telegram_id = telegram_id or str(message.from_user.id)
+    stats = _compute_stats(telegram_id)
     if not stats:
         await message.answer("Пока нет данных. Загрузи JSON-чат или накопи сообщения.")
         return
     await message.answer(stats)
 
 
+@dp.message(Command("stats"))
+async def cmd_stats(message: Message) -> None:
+    await _show_stats(message)
+
+
 # ── /compare — сравнение стиля с разными людьми ──────────────────────────────
 
-@dp.message(Command("compare"))
-async def cmd_compare(message: Message, bot: Bot) -> None:
-    telegram_id = str(message.from_user.id)
+async def _show_compare(message: Message, bot: Bot, telegram_id: str | None = None) -> None:
+    telegram_id = telegram_id or str(message.from_user.id)
     if not await _require_premium(bot, message, telegram_id):
         return
     cards = get_all_per_contact_style_cards(telegram_id)
@@ -3250,6 +3264,11 @@ async def cmd_compare(message: Message, bot: Bot) -> None:
         await _answer_long(message, result)
     except Exception as e:
         await message.answer(f"Ошибка: {e}")
+
+
+@dp.message(Command("compare"))
+async def cmd_compare(message: Message, bot: Bot) -> None:
+    await _show_compare(message, bot)
 
 
 # ── /delete — удалить данные (152-ФЗ) ────────────────────────────────────────
