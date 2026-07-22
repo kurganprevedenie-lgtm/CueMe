@@ -3132,7 +3132,7 @@ async def cmd_help(message: Message) -> None:
 async def cmd_premium(message: Message, bot: Bot) -> None:
     telegram_id = str(message.from_user.id)
     if await _is_premium(bot, telegram_id):
-        await message.answer("💎 Подписка CueMe Premium активна — весь функционал без ограничений.")
+        await message.answer("👑 Подписка:\n\n✅ Активна — весь функционал CueMe без ограничений.")
         return
 
     used = get_trial_used(telegram_id)
