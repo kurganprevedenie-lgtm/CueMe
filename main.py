@@ -3044,10 +3044,9 @@ async def cmd_rebuild(message: Message, bot: Bot) -> None:
 
 def _progress_line(name: str, done: int, threshold: int, is_first: bool) -> str:
     done = min(done, threshold)
-    if is_first:
-        suffix = "почти готово" if done >= threshold * 0.7 else "разбор ещё готовится"
-        return f"{name}: собрано {done} из {threshold} — {suffix}"
-    return f"{name}: собрано {done} из {threshold} до следующего обновления"
+    suffix = ("почти готово" if done >= threshold * 0.7 else "готовится") if is_first \
+        else "до обновления"
+    return f"▪️ <b>{html.escape(name)}</b> — {done}/{threshold} · {suffix}"
 
 
 @dp.message(Command("progress"))
@@ -3061,7 +3060,7 @@ async def cmd_progress(message: Message) -> None:
         )
         return
 
-    lines = ["📊 Прогресс по разбору стиля:\n"]
+    lines = ["📊 <b>Прогресс по разбору стиля:</b>\n"]
     for c in contacts:
         name = _contact_name(c)
         total = count_biz_messages_for_contact(telegram_id, c["id"])
@@ -3074,7 +3073,7 @@ async def cmd_progress(message: Message) -> None:
             done = max(total - last, 0)
             lines.append(_progress_line(name, done, REBUILD_THRESHOLD, is_first=False))
 
-    await message.answer("\n".join(lines))
+    await message.answer("\n".join(lines), parse_mode="HTML")
 
 
 # ── /help ────────────────────────────────────────────────────────────────────
@@ -3090,18 +3089,18 @@ async def _show_help(message: Message) -> None:
         "один за другим)\n"
         "💫 Новый диалог — помогу с первого сообщения новому человеку (живой "
         "коучинг или готовые открывашки), без накопленной истории\n\n"
-        "🔬 Разобраться (кнопка в меню)\n"
+        "<b>🔬 Разобраться</b> (кнопка в меню)\n"
         "/deep_analysis — совместимость, история отношений, стиль и привычки "
         "собеседника, идеи подарков\n"
         "/deep_style_analysis — твой коммуникативный профиль и советы для дейтинга\n"
         "/compare — сравнить, как ты пишешь разным людям\n"
         "/stats — портрет в цифрах, бесплатно\n\n"
-        "⚙️ Ещё (кнопка в меню)\n"
+        "<b>⚙️ Ещё</b> (кнопка в меню)\n"
         "💐 Идеальное свидание — идея свидания и подарков под человека\n"
         "🔥 Скрипты общения — готовый вопрос, чтобы расшевелить затихший разговор\n"
         f"🎁 Пригласить друга (/invite) — получить свой код, за друга по коду дадим "
         f"{REFERRAL_REWARD_DAYS} дня безлимитного «Анализ собеседника»\n\n"
-        "⚙️ Аккаунт\n"
+        "<b>⚙️ Аккаунт</b>\n"
         "/contacts — список загруженных чатов\n"
         "/connect — как подключить Автоматизацию чатов (живой поток переписки)\n"
         "/progress — сколько накопилось до разбора/следующего обновления\n"
@@ -3110,12 +3109,13 @@ async def _show_help(message: Message) -> None:
         "/premium — статус подписки\n"
         "/rebuild — принудительно пересобрать все карточки заново\n"
         "/delete — удалить свои данные\n\n"
-        "🎬 Остальное\n"
+        "<b>🎬 Остальное</b>\n"
         "/start — начало работы\n"
         "/demo — попробовать на примере\n"
         "/help — это сообщение\n\n"
         f"💎 {FREE_TRIAL_REQUESTS} бесплатных попыток на ответ/скриншот, "
-        "дальше и остальные функции — по подписке. Статус — /premium."
+        "дальше и остальные функции — по подписке. Статус — /premium.",
+        parse_mode="HTML",
     )
 
 
@@ -3137,15 +3137,17 @@ async def cmd_premium(message: Message, bot: Bot) -> None:
     left = max(0, FREE_TRIAL_REQUESTS - used)
     if left == 0:
         text = (
-            "Бесплатные попытки закончились — но, похоже, тебе заходит 😏 Дальше — "
-            "по подписке: весь функционал плюс полный разбор собеседника с подарками."
+            "👑 Подписка:\n\n"
+            "⏳ Бесплатные попытки закончились — но, похоже, тебе заходит 😏\n"
+            "Дальше по подписке — весь функционал плюс полный разбор собеседника с подарками."
         )
     else:
         text = (
-            f"Бесплатных попыток осталось: {left} из {FREE_TRIAL_REQUESTS} "
-            "(Ответить за меня / По скриншоту).\n"
-            "Анализ собеседника, стиль собеседника и сравнение стилей — только по подписке.\n\n"
-            "Если вы оплатили подписку, но бот показывает, что какие-то функции недоступны, подождите пару минут и еще раз проверьте свою подписку через /premium"
+            "👑 Подписка:\n\n"
+            f"⏳ Попыток осталось: {left} из {FREE_TRIAL_REQUESTS} "
+            "(Ответить за меня / По скриншоту / Новый диалог)\n\n"
+            "Анализ собеседника, анализ своего стиля и идеальное свидание — только по подписке.\n\n"
+            "Оплатили, но бот не видит подписку? Подождите пару минут и снова наберите /premium."
         )
     await message.answer(text, reply_markup=paywall_kb())
 
