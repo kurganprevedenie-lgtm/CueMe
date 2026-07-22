@@ -41,12 +41,6 @@ OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 # LLM-каскад глобально для всего бота, поэтому не должна быть открыта всем).
 ADMIN_TELEGRAM_ID = os.getenv("ADMIN_TELEGRAM_ID", "")
 
-# file_id видео-инструкции по подключению Автоматизации чатов (кнопка «👀
-# Видео-инструкция» на стартовом экране). Видео хранится на серверах Telegram,
-# не в репозитории — file_id получаем один раз через админ-хендлер в main.py
-# (отправить видео боту от ADMIN_TELEGRAM_ID) и прописываем сюда/в .env.
-ONBOARDING_VIDEO_FILE_ID = os.getenv("ONBOARDING_VIDEO_FILE_ID", "")
-
 # Порядок каскада LLM (через запятую). Дефолт — Gemini основной. На сервере без
 # GEMINI_PROXY имеет смысл поставить groq первым: "groq,gemini,openrouter".
 LLM_PROVIDER_ORDER = os.getenv("LLM_PROVIDER_ORDER", "gemini,groq,openrouter")

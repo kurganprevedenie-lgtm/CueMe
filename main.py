@@ -41,7 +41,6 @@ from config import (
     PREMIUM_CHANNEL_ID,
     PREMIUM_SUBSCRIBE_URL,
     LLM_CACHE_TTL_SEC,
-    ONBOARDING_VIDEO_FILE_ID,
     OPENERS_FOR_HER,
     OPENERS_FOR_HIM,
     REBUILD_THRESHOLD,
@@ -1728,42 +1727,10 @@ async def _business_connect_text(bot: Bot) -> str:
 def business_connect_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="⚙️ Настройки профиля", url="tg://settings/edit")],
-        [InlineKeyboardButton(text="👀 Видео-инструкция", callback_data="show_onboarding_video")],
+        [InlineKeyboardButton(text="👀 Видео-инструкция", url="https://t.me/CueMee")],
         [InlineKeyboardButton(text="✨ Возможности бота", url="https://t.me/CueMee")],
         [InlineKeyboardButton(text="🆘 Поддержка", url="https://t.me/furdokw")],
     ])
-
-
-@dp.callback_query(F.data == "show_onboarding_video")
-async def cb_show_onboarding_video(call: CallbackQuery) -> None:
-    await call.answer()
-    if not ONBOARDING_VIDEO_FILE_ID:
-        await call.message.answer(
-            "Видео-инструкция скоро появится — пока смотри шаги в тексте выше."
-        )
-        return
-    await call.message.answer_video(
-        video=ONBOARDING_VIDEO_FILE_ID,
-        caption="Как подключить Автоматизацию чатов — по шагам.",
-    )
-
-
-# ── Захват file_id видео-инструкции (только для админа) ──────────────────────
-# Разработчик присылает видео боту напрямую (просто как сообщение) — бот в
-# ответ шлёт его file_id, который нужно прописать в ONBOARDING_VIDEO_FILE_ID
-# (.env на сервере). Видео хранится на серверах Telegram, не в репозитории.
-
-@dp.message(F.video)
-async def handle_video(message: Message) -> None:
-    if not ADMIN_TELEGRAM_ID or str(message.from_user.id) != ADMIN_TELEGRAM_ID:
-        return
-    file_id = message.video.file_id
-    await message.answer(
-        "file_id этого видео:\n\n"
-        f"<code>{html.escape(file_id)}</code>\n\n"
-        "Пропиши его в .env на сервере как ONBOARDING_VIDEO_FILE_ID и перезапусти бота.",
-        parse_mode="HTML",
-    )
 
 
 async def _send_start_menu(message: Message, telegram_id: str) -> None:
