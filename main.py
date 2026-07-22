@@ -2566,9 +2566,10 @@ def phrase_next_kb(target: str) -> InlineKeyboardMarkup:
 async def _send_opener(msg: Message, state: FSMContext, target: str) -> None:
     items = OPENERS_FOR_HER if target == "her" else OPENERS_FOR_HIM
     phrase = await _pick_no_repeat(state, f"opener_shown_{target}", items)
-    text, kw = _copy_block(
-        "Держи заход (тапни, чтобы скопировать):", phrase, phrase_next_kb(target)
-    )
+    intro = "Держи заход (тапни, чтобы скопировать):"
+    if "[" in phrase:
+        intro += " замени [то, что в скобках] на реальную деталь из анкеты."
+    text, kw = _copy_block(intro, phrase, phrase_next_kb(target))
     await msg.answer(text, **kw)
 
 
