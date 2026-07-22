@@ -41,6 +41,7 @@ from config import (
     PREMIUM_CHANNEL_ID,
     PREMIUM_SUBSCRIBE_URL,
     LLM_CACHE_TTL_SEC,
+    ONBOARDING_VIDEO_FILE_ID,
     OPENERS_FOR_HER,
     OPENERS_FOR_HIM,
     REBUILD_THRESHOLD,
@@ -1727,10 +1728,42 @@ async def _business_connect_text(bot: Bot) -> str:
 def business_connect_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="⚙️ Настройки профиля", url="tg://settings/edit")],
-        [InlineKeyboardButton(text="👀 Видео-инструкция", url="https://t.me/CueMee")],
+        [InlineKeyboardButton(text="👀 Видео-инструкция", callback_data="show_onboarding_video")],
         [InlineKeyboardButton(text="✨ Возможности бота", url="https://t.me/CueMee")],
         [InlineKeyboardButton(text="🆘 Поддержка", url="https://t.me/furdokw")],
     ])
+
+
+@dp.callback_query(F.data == "show_onboarding_video")
+async def cb_show_onboarding_video(call: CallbackQuery) -> None:
+    await call.answer()
+    if not ONBOARDING_VIDEO_FILE_ID:
+        await call.message.answer(
+            "Видео-инструкция скоро появится — пока смотри шаги в тексте выше."
+        )
+        return
+    await call.message.answer_video(
+        video=ONBOARDING_VIDEO_FILE_ID,
+        caption="Как подключить Автоматизацию чатов — по шагам.",
+    )
+
+
+# ── Захват file_id видео-инструкции (только для админа) ──────────────────────
+# Разработчик присылает видео боту напрямую (просто как сообщение) — бот в
+# ответ шлёт его file_id, который нужно прописать в ONBOARDING_VIDEO_FILE_ID
+# (.env на сервере). Видео хранится на серверах Telegram, не в репозитории.
+
+@dp.message(F.video)
+async def handle_video(message: Message) -> None:
+    if not ADMIN_TELEGRAM_ID or str(message.from_user.id) != ADMIN_TELEGRAM_ID:
+        return
+    file_id = message.video.file_id
+    await message.answer(
+        "file_id этого видео:\n\n"
+        f"<code>{html.escape(file_id)}</code>\n\n"
+        "Пропиши его в .env на сервере как ONBOARDING_VIDEO_FILE_ID и перезапусти бота.",
+        parse_mode="HTML",
+    )
 
 
 async def _send_start_menu(message: Message, telegram_id: str) -> None:
@@ -1746,11 +1779,6 @@ async def _send_start_menu(message: Message, telegram_id: str) -> None:
     # по подключению — на картинке выше», как в исходном ТЗ.
     await message.answer(
         "👋 Добро пожаловать в CueMe!\n\n"
-        "Что умеет этот бот?\n\n"
-        "— Пишет ответы в твоём стиле, под конкретного собеседника\n"
-        "— Подсказывает что ответить прямо во время переписки\n"
-        "— Разбирает совместимость и подсказывает как лучше писать\n"
-        "— Предлагает идею свидания на основе того, что человек любит\n\n"
         "Подключи бота к своим чатам — он будет учиться твоему стилю прямо "
         "по живой переписке.\n\n"
         "Чтобы его подключить нажми на кнопку «⚙️ Настройки профиля» → "
@@ -1759,9 +1787,6 @@ async def _send_start_menu(message: Message, telegram_id: str) -> None:
         "один).\n\n"
         "Если появились сложности с настройкой автоматизации чатов, можешь "
         "перейти к видео-инструкции по кнопке ниже.\n\n"
-        "Всё — дальше просто переписывайся как обычно. Как только накопится "
-        f"{FIRST_BUILD_THRESHOLD} сообщений, с момента подключения бота, по "
-        "человеку, пришлю первый разбор твоего стиля.\n\n"
         "Имена и контакты собеседников не сохраняются — только "
         "анонимизированные паттерны.",
         reply_markup=business_connect_kb(),
