@@ -451,8 +451,18 @@ def _has_referral_free_deep(telegram_id: str) -> bool:
 async def _show_invite(message: Message, bot: Bot, telegram_id: str | None = None) -> None:
     telegram_id = telegram_id or str(message.from_user.id)
     code = get_or_create_referral_code(telegram_id)
+    count = count_successful_referrals(telegram_id)
+
+    if _has_referral_free_deep(telegram_id):
+        until = get_deep_analysis_free_until(telegram_id)
+        reward_line = f"✅ Безлимитный «Анализ собеседника» активен до {until.strftime('%d.%m.%Y %H:%M UTC')}\n"
+    else:
+        reward_line = ""
+
     await message.answer(
         "🎁 Пригласи друга\n\n"
+        f"👥 Приведено друзей: {count}\n"
+        f"{reward_line}\n"
         "Скинь другу этот код — пусть введёт его командой /redeem в этом боте. "
         "Как только он реально начнёт пользоваться CueMe — тебе дадутся "
         f"{REFERRAL_REWARD_DAYS} дня безлимитного «🔬 Анализ собеседника»:\n\n"
@@ -1755,10 +1765,13 @@ async def _business_connect_text(bot: Bot) -> str:
     )
 
 
-def business_connect_kb() -> InlineKeyboardMarkup:
+def business_connect_kb(telegram_id: str) -> InlineKeyboardMarkup:
+    friends = count_successful_referrals(telegram_id)
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="⚙️ Настройки профиля", url="tg://settings/edit")],
         [InlineKeyboardButton(text="👀 Видео-инструкция", url="https://t.me/CueMee")],
+        [InlineKeyboardButton(text="👑 Подписка", callback_data="show_premium")],
+        [InlineKeyboardButton(text=f"🎁 Друзья: {friends}", callback_data="show_invite")],
         [InlineKeyboardButton(text="✨ Возможности бота", url="https://t.me/CueMee")],
         [InlineKeyboardButton(text="🆘 Поддержка", url="https://t.me/furdokw")],
     ])
@@ -1826,16 +1839,16 @@ async def _send_start_menu(message: Message, telegram_id: str) -> None:
         await message.answer_video(
             video=FSInputFile(video_path),
             caption=welcome_text,
-            reply_markup=business_connect_kb(),
+            reply_markup=business_connect_kb(telegram_id),
         )
     elif ONBOARDING_VIDEO_FILE_ID:
         await message.answer_video(
             video=ONBOARDING_VIDEO_FILE_ID,
             caption=welcome_text,
-            reply_markup=business_connect_kb(),
+            reply_markup=business_connect_kb(telegram_id),
         )
     else:
-        await message.answer(welcome_text, reply_markup=business_connect_kb())
+        await message.answer(welcome_text, reply_markup=business_connect_kb(telegram_id))
 
 
 @dp.message(CommandStart())
@@ -1864,10 +1877,11 @@ async def cmd_gender(message: Message) -> None:
 async def cb_onboarding_business(call: CallbackQuery, state: FSMContext, bot: Bot) -> None:
     await state.clear()
     await call.answer()
-    upsert_user(str(call.from_user.id), f"user{call.from_user.id}")
+    telegram_id = str(call.from_user.id)
+    upsert_user(telegram_id, f"user{call.from_user.id}")
     await call.message.answer(
         await _business_connect_text(bot),
-        reply_markup=business_connect_kb(),
+        reply_markup=business_connect_kb(telegram_id),
     )
 
 
@@ -2061,7 +2075,7 @@ async def cb_setup_contact(call: CallbackQuery, state: FSMContext) -> None:
 async def cmd_connect(message: Message, bot: Bot) -> None:
     await message.answer(
         await _business_connect_text(bot),
-        reply_markup=business_connect_kb(),
+        reply_markup=business_connect_kb(str(message.from_user.id)),
     )
 
 
@@ -3185,30 +3199,44 @@ async def cmd_help(message: Message) -> None:
 
 # ── /premium — статус подписки ────────────────────────────────────────────────
 
-@dp.message(Command("premium"))
-async def cmd_premium(message: Message, bot: Bot) -> None:
-    telegram_id = str(message.from_user.id)
+async def _premium_status_text(bot: Bot, telegram_id: str) -> str:
     if await _is_premium(bot, telegram_id):
-        await message.answer("👑 Подписка:\n\n✅ Активна — весь функционал CueMe без ограничений.")
-        return
+        return "👑 Подписка:\n\n✅ Активна — весь функционал CueMe без ограничений."
 
     used = get_trial_used(telegram_id)
     left = max(0, FREE_TRIAL_REQUESTS - used)
     if left == 0:
-        text = (
+        return (
             "👑 Подписка:\n\n"
             "⏳ Бесплатные попытки закончились — но, похоже, тебе заходит 😏\n"
             "Дальше по подписке — весь функционал плюс полный разбор собеседника с подарками."
         )
-    else:
-        text = (
-            "👑 Подписка:\n\n"
-            f"⏳ Попыток осталось: {left} из {FREE_TRIAL_REQUESTS} "
-            "(Ответить за меня / По скриншоту / Новый диалог)\n\n"
-            "Анализ собеседника, анализ своего стиля и идеальное свидание — только по подписке.\n\n"
-            "Оплатили, но бот не видит подписку? Подождите пару минут и снова наберите /premium."
-        )
+    return (
+        "👑 Подписка:\n\n"
+        f"⏳ Попыток осталось: {left} из {FREE_TRIAL_REQUESTS} "
+        "(Ответить за меня / По скриншоту / Новый диалог)\n\n"
+        "Анализ собеседника, анализ своего стиля и идеальное свидание — только по подписке.\n\n"
+        "Оплатили, но бот не видит подписку? Подождите пару минут и снова наберите /premium."
+    )
+
+
+@dp.message(Command("premium"))
+async def cmd_premium(message: Message, bot: Bot) -> None:
+    text = await _premium_status_text(bot, str(message.from_user.id))
     await message.answer(text, reply_markup=paywall_kb())
+
+
+@dp.callback_query(F.data == "show_premium")
+async def cb_show_premium(call: CallbackQuery, bot: Bot) -> None:
+    await call.answer()
+    text = await _premium_status_text(bot, str(call.from_user.id))
+    await call.message.answer(text, reply_markup=paywall_kb())
+
+
+@dp.callback_query(F.data == "show_invite")
+async def cb_show_invite(call: CallbackQuery, bot: Bot) -> None:
+    await call.answer()
+    await _show_invite(call.message, bot, str(call.from_user.id))
 
 
 # ── /stats — портрет в цифрах (без LLM) ──────────────────────────────────────
