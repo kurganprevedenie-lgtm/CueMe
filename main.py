@@ -1540,6 +1540,7 @@ async def handle_business_connection(event: BusinessConnection, bot: Bot) -> Non
     status = "подключён" if event.is_enabled else "отключён"
     logging.info("business_connection %s: owner=%s %s", event.id, event.user.id, status)
     if event.is_enabled:
+        owner_id = str(event.user.id)
         try:
             await bot.send_message(
                 event.user.id,
@@ -1548,6 +1549,7 @@ async def handle_business_connection(event: BusinessConnection, bot: Bot) -> Non
             )
         except Exception:
             logging.warning("business-connect notify failed: owner=%s", event.user.id)
+        await _maybe_prompt_gender(bot, owner_id)
 
 
 def _persist_business_message(
