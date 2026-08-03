@@ -2261,13 +2261,23 @@ async def _start_reply(message: Message, state: FSMContext) -> None:
         interaction_card = get_interaction_card(c["id"])
         if not style_card or not interaction_card:
             await message.answer("Генерирую анализ — займёт ~20 секунд...")
-            if not interaction_card:
-                interaction_card = await _gen_interaction_card(c["id"], telegram_id)
-            if not style_card:
-                style_card = await _gen_style_card(telegram_id)
-        if not style_card or not interaction_card:
-            await message.answer("Не удалось сгенерировать анализ.")
-            return
+            try:
+                if not interaction_card:
+                    interaction_card = await _gen_interaction_card(c["id"], telegram_id)
+                if not style_card:
+                    style_card = await _gen_style_card(telegram_id)
+            except RateLimitError:
+                await message.answer("Лимит LLM исчерпан, попробуй позже.")
+                return
+            except Exception:
+                logging.exception("_start_reply: ошибка генерации карточек")
+                await message.answer("Не удалось сгенерировать анализ — попробуй ещё раз.")
+                return
+        # Данных ещё нет (например контакт только что автосоздался от одного
+        # исходящего сообщения, входящих ещё не было) — не тупик, отвечаем
+        # нейтрально по смыслу, как и в холодном старте «Живого диалога».
+        style_card = style_card or _LIVE_NEUTRAL_STYLE_PLACEHOLDER
+        interaction_card = interaction_card or _NEUTRAL_INTERACTION_PLACEHOLDER
         await state.update_data(
             style_card=style_card, interaction_card=interaction_card, contact_id=c["id"]
         )
@@ -2297,14 +2307,22 @@ async def cb_reply_contact(call: CallbackQuery, state: FSMContext) -> None:
     interaction_card = get_interaction_card(contact_id)
     if not style_card or not interaction_card:
         await call.message.edit_text("Генерирую анализ — займёт ~20 секунд...")
-        if not interaction_card:
-            interaction_card = await _gen_interaction_card(contact_id, telegram_id)
-        if not style_card:
-            style_card = await _gen_style_card(telegram_id)
+        try:
+            if not interaction_card:
+                interaction_card = await _gen_interaction_card(contact_id, telegram_id)
+            if not style_card:
+                style_card = await _gen_style_card(telegram_id)
+        except RateLimitError:
+            await call.message.edit_text("Лимит LLM исчерпан, попробуй позже.")
+            return
+        except Exception:
+            logging.exception("cb_reply_contact: ошибка генерации карточек")
+            await call.message.edit_text("Не удалось сгенерировать анализ — попробуй ещё раз.")
+            return
 
-    if not style_card or not interaction_card:
-        await call.message.edit_text("Не удалось сгенерировать анализ.")
-        return
+    # См. комментарий в _start_reply — нет данных не значит тупик.
+    style_card = style_card or _LIVE_NEUTRAL_STYLE_PLACEHOLDER
+    interaction_card = interaction_card or _NEUTRAL_INTERACTION_PLACEHOLDER
 
     await state.update_data(
         style_card=style_card, interaction_card=interaction_card, contact_id=contact_id
@@ -2590,6 +2608,18 @@ _LIVE_NEUTRAL_STYLE_PLACEHOLDER = (
     "строгой пунктуации, разговорной длиной. Без домыслов о привычках автора "
     "сверх этого. Как только появятся другие данные (JSON-экспорт, другие "
     "переписки), стиль подключится сам и станет точнее."
+)
+
+# Тот же холодный старт, но для карточки собеседника — контакт мог
+# автосоздаться от ОДНОГО исходящего business-сообщения (ещё до первого
+# ответа от собеседника), тогда входящих сэмплов для интеракшн-карточки
+# просто ещё нет. Раньше в этом случае «Ответить за меня» упирался в тупик
+# («Не удалось сгенерировать анализ.») — теперь отвечаем нейтрально по
+# смыслу присланного сообщения, без домыслов о манере письма собеседника.
+_NEUTRAL_INTERACTION_PLACEHOLDER = (
+    "Данных о стиле переписки собеседника пока нет (это первое сообщение с "
+    "ним) — отвечай по смыслу присланного текста, без домыслов о его манере "
+    "письма. Как только накопится история, бот подстроится точнее."
 )
 
 LIVE_NOTES_SUMMARY_EVERY = 4  # раз в сколько сообщений показывать «что я уже понял»
