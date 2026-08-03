@@ -1748,7 +1748,7 @@ async def _run_demo(telegram_id: str, target: Message) -> None:
 def onboarding_kb() -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     b.button(text="📖 Подробная инструкция", callback_data="onb:business")
-    b.button(text="💻 У меня есть комп (JSON)", callback_data="onb:json")
+    b.button(text="👑 У меня есть комп (JSON)", callback_data="onb:json")
     b.button(text="🎬 Попробовать на примере", callback_data="demo")
     b.adjust(1)
     return b.as_markup()
@@ -1901,8 +1901,11 @@ async def cb_onboarding_business(call: CallbackQuery, state: FSMContext, bot: Bo
 
 
 @dp.callback_query(F.data == "onb:json")
-async def cb_onboarding_json(call: CallbackQuery, state: FSMContext) -> None:
+async def cb_onboarding_json(call: CallbackQuery, state: FSMContext, bot: Bot) -> None:
     await call.answer()
+    telegram_id = str(call.from_user.id)
+    if not await _require_premium(bot, call.message, telegram_id):
+        return
     await state.set_state(Setup.waiting_for_json)
     await call.message.answer(
         "Загрузи переписку: Telegram Desktop → открой чат → ⋮ → "
@@ -1975,6 +1978,9 @@ async def handle_document(message: Message, bot: Bot, state: FSMContext) -> None
     telegram_id = str(message.from_user.id)
     my_id = f"user{telegram_id}"
     upsert_user(telegram_id, my_id)
+
+    if not await _require_premium(bot, message, telegram_id):
+        return
 
     current_state = await state.get_state()
     is_setup = current_state == Setup.waiting_for_json
