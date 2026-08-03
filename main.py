@@ -1841,7 +1841,11 @@ async def handle_video(message: Message) -> None:
 
 async def _send_start_menu(message: Message, telegram_id: str) -> None:
     if list_contacts(telegram_id):
-        await message.answer("С возвращением!", reply_markup=main_kb())
+        await message.answer(
+            "С возвращением!\n\n"
+            "Жми «💬 Ответить за меня» или «🔬 Анализ собеседника» 👇",
+            reply_markup=main_kb(),
+        )
         return
 
     welcome_text = (
