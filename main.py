@@ -21,7 +21,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
     BotCommand,
     BusinessConnection,
-    CallbackQuery, Document, ErrorEvent, Message,
+    CallbackQuery, Document, ErrorEvent, FSInputFile, Message,
     InlineKeyboardButton, InlineKeyboardMarkup,
     ReplyKeyboardMarkup, KeyboardButton,
 )
@@ -41,6 +41,8 @@ from config import (
     PREMIUM_CHANNEL_ID,
     PREMIUM_SUBSCRIBE_URL,
     LLM_CACHE_TTL_SEC,
+    ONBOARDING_VIDEO_FILE_ID,
+    ONBOARDING_VIDEO_PATH,
     OPENERS_FOR_HER,
     OPENERS_FOR_HIM,
     REBUILD_THRESHOLD,
@@ -1762,6 +1764,40 @@ def business_connect_kb() -> InlineKeyboardMarkup:
     ])
 
 
+# ── Захват file_id видео-инструкции (только для админа) ──────────────────────
+# Разработчик присылает видео боту напрямую (просто как сообщение) — бот в
+# ответ шлёт его file_id, который нужно прописать в ONBOARDING_VIDEO_FILE_ID
+# (.env на сервере). Видео хранится на серверах Telegram, не в репозитории.
+# Ловим video/animation/video_note все сразу — Telegram-клиент может прислать
+# короткий ролик как GIF (animation) вместо обычного video, и раньше это
+# тихо ни под что не матчилось (Update ... is not handled в логах).
+
+@dp.message(F.video | F.animation | F.video_note)
+async def handle_video(message: Message) -> None:
+    if not ADMIN_TELEGRAM_ID or str(message.from_user.id) != ADMIN_TELEGRAM_ID:
+        return
+
+    if message.video:
+        kind, file_id, warn = "video", message.video.file_id, ""
+    elif message.animation:
+        kind, file_id, warn = "animation (GIF)", message.animation.file_id, ""
+    else:
+        kind, file_id, warn = (
+            "video_note (кружок)", message.video_note.file_id,
+            "\n\n⚠️ У кружков нет подписи (caption) — Telegram API её не "
+            "поддерживает. Для стартового экрана с текстом нужен именно "
+            "обычный video — перешли ролик через 📎 → Галерея, не кружком.",
+        )
+
+    await message.answer(
+        f"Тип: {kind}\nfile_id:\n\n"
+        f"<code>{html.escape(file_id)}</code>\n\n"
+        "Пропиши его в .env на сервере как ONBOARDING_VIDEO_FILE_ID и "
+        f"перезапусти бота.{warn}",
+        parse_mode="HTML",
+    )
+
+
 async def _send_start_menu(message: Message, telegram_id: str) -> None:
     caps = _capabilities_text()
 
@@ -1769,24 +1805,37 @@ async def _send_start_menu(message: Message, telegram_id: str) -> None:
         await message.answer(f"С возвращением!\n\n{caps}", reply_markup=main_kb())
         return
 
-    # TODO: как только будет готова картинка с инструкцией — отправить её сюда
-    # (message.answer_photo(photo, caption=...)) вместо текстового message.answer,
-    # и в первом абзаце после списка функций заменить формулировку на «Инструкция
-    # по подключению — на картинке выше», как в исходном ТЗ.
-    await message.answer(
+    welcome_text = (
         "👋 Добро пожаловать в CueMe!\n\n"
         "Подключи бота к своим чатам — он будет учиться твоему стилю прямо "
         "по живой переписке.\n\n"
-        "Чтобы его подключить нажми на кнопку «⚙️ Настройки профиля» → "
-        "«Автоматизация чатов» → в поле ввода впиши @CueMeChatBot → включи "
-        "«Ответы на сообщения» и выбери чаты, к которым дать доступ (можно "
-        "один).\n\n"
-        "Если появились сложности с настройкой автоматизации чатов, можешь "
-        "перейти к видео-инструкции по кнопке ниже.\n\n"
+        # "Чтобы его подключить нажми на кнопку «⚙️ Настройки профиля» → "
+        # "«Автоматизация чатов» → в поле ввода впиши @CueMeChatBot → включи "
+        # "«Ответы на сообщения» и выбери чаты, к которым дать доступ (можно "
+        # "один).\n\n"
         "Имена и контакты собеседников не сохраняются — только "
-        "анонимизированные паттерны.",
-        reply_markup=business_connect_kb(),
+        "анонимизированные паттерны."
     )
+
+    # Видео-инструкция крепится прямо к этому сообщению (caption). Приоритет:
+    # 1) файл на диске сервера (ONBOARDING_VIDEO_PATH) — грузится в Telegram
+    #    заново при каждой отправке; 2) file_id (уже загруженное ранее видео);
+    # 3) обычный текст, если ни одно из двух не задано.
+    video_path = Path(ONBOARDING_VIDEO_PATH) if ONBOARDING_VIDEO_PATH else None
+    if video_path and video_path.is_file():
+        await message.answer_video(
+            video=FSInputFile(video_path),
+            caption=welcome_text,
+            reply_markup=business_connect_kb(),
+        )
+    elif ONBOARDING_VIDEO_FILE_ID:
+        await message.answer_video(
+            video=ONBOARDING_VIDEO_FILE_ID,
+            caption=welcome_text,
+            reply_markup=business_connect_kb(),
+        )
+    else:
+        await message.answer(welcome_text, reply_markup=business_connect_kb())
 
 
 @dp.message(CommandStart())
