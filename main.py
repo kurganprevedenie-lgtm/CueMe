@@ -439,19 +439,26 @@ async def _require_premium(bot: Bot, target: Message, telegram_id: str) -> bool:
 
 async def _credit_referral_if_pending(bot: Bot, referred_id: str) -> None:
     """Друг реально начал пользоваться (создан первый контакт) → начисляем
-    рефереру бесплатное окно Premium и уведомляем. Идемпотентно: credited-флаг +
-    PRIMARY KEY(referred_id) не дают начислить дважды."""
+    рефереру Premium-награду и уведомляем. Каждый новый друг НАКАПЛИВАЕТ
+    награду — REFERRAL_REWARD_DAYS прибавляются к уже активному окну (если
+    оно ещё не истекло), а не перезаписывают его с текущего момента.
+    Идемпотентно: credited-флаг + PRIMARY KEY(referred_id) не дают начислить
+    дважды за одного и того же друга."""
     referrer_id = get_pending_referral(referred_id)
     if not referrer_id:
         return
-    until = datetime.now(timezone.utc) + timedelta(days=REFERRAL_REWARD_DAYS)
+    now = datetime.now(timezone.utc)
+    current_until = get_deep_analysis_free_until(referrer_id)
+    base = current_until if current_until and current_until > now else now
+    until = base + timedelta(days=REFERRAL_REWARD_DAYS)
     set_deep_analysis_free_until(referrer_id, until)
     mark_referral_credited(referred_id)
     try:
         await bot.send_message(
             int(referrer_id),
             "🎉 Твой друг начал пользоваться CueMe! Держи подарок — "
-            f"{REFERRAL_REWARD_DAYS} дня Premium подписки.",
+            f"+{REFERRAL_REWARD_DAYS} дня Premium подписки "
+            f"(до {until.strftime('%d.%m.%Y %H:%M UTC')}).",
         )
     except Exception:
         logging.warning("referral notify failed: referrer=%s", referrer_id)
