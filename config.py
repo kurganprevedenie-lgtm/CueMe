@@ -52,6 +52,11 @@ ADMIN_TELEGRAM_ID = os.getenv("ADMIN_TELEGRAM_ID", "")
 ONBOARDING_VIDEO_PATH = os.getenv("ONBOARDING_VIDEO_PATH", "")
 ONBOARDING_VIDEO_FILE_ID = os.getenv("ONBOARDING_VIDEO_FILE_ID", "")
 
+# Ссылка на пост в канале с инструкцией по JSON-экспорту (кнопка под подсказкой
+# «начни диалог или экспортируй JSON», когда у юзера ещё нет ни одного контакта).
+# Пока отдельного поста нет — ведёт на канал целиком.
+ONBOARDING_JSON_POST_URL = os.getenv("ONBOARDING_JSON_POST_URL", "https://t.me/CueMee")
+
 # Порядок каскада LLM (через запятую). Дефолт — Gemini основной. На сервере без
 # GEMINI_PROXY имеет смысл поставить groq первым: "groq,gemini,openrouter".
 LLM_PROVIDER_ORDER = os.getenv("LLM_PROVIDER_ORDER", "gemini,groq,openrouter")

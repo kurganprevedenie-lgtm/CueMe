@@ -43,6 +43,7 @@ from config import (
     LLM_CACHE_TTL_SEC,
     ONBOARDING_VIDEO_FILE_ID,
     ONBOARDING_VIDEO_PATH,
+    ONBOARDING_JSON_POST_URL,
     OPENERS_FOR_HER,
     OPENERS_FOR_HIM,
     REBUILD_THRESHOLD,
@@ -1669,20 +1670,20 @@ def _post_connect_features_text() -> str:
     )
 
 
-def _capabilities_text() -> str:
-    return (
-        "Вот что я умею:\n\n"
-        "💬 Ответить за меня — Ты присылаешь сообщение от собеседника, а бот дает варианты ответов\n"
-        "📸 По скриншоту — Пришли скриншот переписки → несколько вариантов ответа.\n"
-        "💫 Новый диалог — Помогу с первого сообщения новому человеку, даже без "
-        "накопленной истории\n"
-        "🔬 Анализ собеседника — совместимость, история отношений, как писать "
-        "этому человеку, подарки\n"
-        "🪞 Анализ своего стиля — твой коммуникативный профиль и советы для дейтинга\n"
-        "💐 Идеальное свидание — идея свидания и подарков под конкретного человека\n\n"
-        f"💎 {FREE_TRIAL_REQUESTS} бесплатных попыток даны на пробный период. Дальше и остальные функции — по подписке.\n"
-        "Статус — /premium.\n"
-        "Полный список команд — /help"
+def _no_dialogs_hint_kb() -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    b.button(text="📖 Инструкция по JSON-экспорту", url=ONBOARDING_JSON_POST_URL)
+    b.adjust(1)
+    return b.as_markup()
+
+
+async def _send_no_dialogs_hint(message: Message) -> None:
+    """Показывается, когда у юзера ещё нет ни одного контакта (диалога) —
+    двумя способами начать: живой разговор через Business или JSON-экспорт."""
+    await message.answer(
+        "Начни диалог с кем-то — или экспортируй чат в формате JSON, "
+        "инструкция в канале 👇",
+        reply_markup=_no_dialogs_hint_kb(),
     )
 
 
@@ -1823,10 +1824,8 @@ async def handle_video(message: Message) -> None:
 
 
 async def _send_start_menu(message: Message, telegram_id: str) -> None:
-    caps = _capabilities_text()
-
     if list_contacts(telegram_id):
-        await message.answer(f"С возвращением!\n\n{caps}", reply_markup=main_kb())
+        await message.answer("С возвращением!", reply_markup=main_kb())
         return
 
     welcome_text = (
@@ -1865,7 +1864,8 @@ async def _send_start_menu(message: Message, telegram_id: str) -> None:
     # сообщении (Telegram допускает только один reply_markup) — поэтому
     # кнопки взаимодействия шлём отдельным коротким сообщением следом, чтобы
     # они были видны сразу, не дожидаясь подключения/загрузки данных.
-    await message.answer(caps, reply_markup=main_kb())
+    await message.answer("Меню открыто 👇", reply_markup=main_kb())
+    await _send_no_dialogs_hint(message)
 
 
 @dp.message(CommandStart())
@@ -1891,8 +1891,9 @@ async def cb_gender_select(call: CallbackQuery, state: FSMContext) -> None:
         # Пол спросили сразу после подключения Автоматизации чатов, ещё до
         # первого реального сообщения — контакта пока нет. Полный экран
         # приветствия (видео + кнопки подключения) тут ни к чему, это уже
-        # пройденный шаг — просто показываем меню возможностей.
-        await call.message.answer(_capabilities_text(), reply_markup=main_kb())
+        # пройденный шаг — просто показываем меню и подсказку начать диалог.
+        await call.message.answer("Меню открыто 👇", reply_markup=main_kb())
+        await _send_no_dialogs_hint(call.message)
 
 
 @dp.message(Command("gender"))
