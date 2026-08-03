@@ -1859,6 +1859,12 @@ async def _send_start_menu(message: Message, telegram_id: str) -> None:
     else:
         await message.answer(welcome_text, reply_markup=business_connect_kb())
 
+    # Reply-клавиатура (main_kb) и inline-клавиатура не уживаются в одном
+    # сообщении (Telegram допускает только один reply_markup) — поэтому
+    # кнопки взаимодействия шлём отдельным коротким сообщением следом, чтобы
+    # они были видны сразу, не дожидаясь подключения/загрузки данных.
+    await message.answer(caps, reply_markup=main_kb())
+
 
 @dp.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext) -> None:
