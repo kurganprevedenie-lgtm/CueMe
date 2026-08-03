@@ -330,6 +330,17 @@ def paywall_kb() -> InlineKeyboardMarkup:
     return b.as_markup()
 
 
+def premium_menu_kb() -> InlineKeyboardMarkup:
+    """Клавиатура под карточкой «👑 Подписка»: оформить + позвать друга
+    (реферальная награда — альтернативный путь получить доступ бесплатно)."""
+    b = InlineKeyboardBuilder()
+    if PREMIUM_SUBSCRIBE_URL:
+        b.button(text="💎 Оформить подписку", url=PREMIUM_SUBSCRIBE_URL)
+    b.button(text="🎁 Пригласи друга", callback_data="show_invite")
+    b.adjust(1)
+    return b.as_markup()
+
+
 async def _send_paywall(target: Message, text: str) -> None:
     await target.answer(text, reply_markup=paywall_kb())
 
@@ -1765,13 +1776,11 @@ async def _business_connect_text(bot: Bot) -> str:
     )
 
 
-def business_connect_kb(telegram_id: str) -> InlineKeyboardMarkup:
-    friends = count_successful_referrals(telegram_id)
+def business_connect_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="⚙️ Настройки профиля", url="tg://settings/edit")],
         [InlineKeyboardButton(text="👀 Видео-инструкция", url="https://t.me/CueMee")],
         [InlineKeyboardButton(text="👑 Подписка", callback_data="show_premium")],
-        [InlineKeyboardButton(text=f"🎁 Друзья: {friends}", callback_data="show_invite")],
         [InlineKeyboardButton(text="✨ Возможности бота", url="https://t.me/CueMee")],
         [InlineKeyboardButton(text="🆘 Поддержка", url="https://t.me/furdokw")],
     ])
@@ -1839,16 +1848,16 @@ async def _send_start_menu(message: Message, telegram_id: str) -> None:
         await message.answer_video(
             video=FSInputFile(video_path),
             caption=welcome_text,
-            reply_markup=business_connect_kb(telegram_id),
+            reply_markup=business_connect_kb(),
         )
     elif ONBOARDING_VIDEO_FILE_ID:
         await message.answer_video(
             video=ONBOARDING_VIDEO_FILE_ID,
             caption=welcome_text,
-            reply_markup=business_connect_kb(telegram_id),
+            reply_markup=business_connect_kb(),
         )
     else:
-        await message.answer(welcome_text, reply_markup=business_connect_kb(telegram_id))
+        await message.answer(welcome_text, reply_markup=business_connect_kb())
 
 
 @dp.message(CommandStart())
@@ -1881,7 +1890,7 @@ async def cb_onboarding_business(call: CallbackQuery, state: FSMContext, bot: Bo
     upsert_user(telegram_id, f"user{call.from_user.id}")
     await call.message.answer(
         await _business_connect_text(bot),
-        reply_markup=business_connect_kb(telegram_id),
+        reply_markup=business_connect_kb(),
     )
 
 
@@ -2075,7 +2084,7 @@ async def cb_setup_contact(call: CallbackQuery, state: FSMContext) -> None:
 async def cmd_connect(message: Message, bot: Bot) -> None:
     await message.answer(
         await _business_connect_text(bot),
-        reply_markup=business_connect_kb(str(message.from_user.id)),
+        reply_markup=business_connect_kb(),
     )
 
 
@@ -3230,7 +3239,7 @@ async def cmd_premium(message: Message, bot: Bot) -> None:
 async def cb_show_premium(call: CallbackQuery, bot: Bot) -> None:
     await call.answer()
     text = await _premium_status_text(bot, str(call.from_user.id))
-    await call.message.answer(text, reply_markup=paywall_kb())
+    await call.message.answer(text, reply_markup=premium_menu_kb())
 
 
 @dp.callback_query(F.data == "show_invite")
