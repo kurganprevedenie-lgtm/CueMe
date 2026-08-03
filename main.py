@@ -1882,7 +1882,17 @@ async def cb_gender_select(call: CallbackQuery, state: FSMContext) -> None:
     await call.answer()
     await call.message.edit_text(f"Принято — обращаюсь как к «{_GENDER_LABELS[gender]}».")
     await state.clear()
-    await _send_start_menu(call.message, telegram_id)
+
+    if list_contacts(telegram_id):
+        # Уже есть хотя бы один контакт (демо/JSON/Business) — полноценный
+        # /start не нужен, сразу показываем меню, как для вернувшегося юзера.
+        await _send_start_menu(call.message, telegram_id)
+    else:
+        # Пол спросили сразу после подключения Автоматизации чатов, ещё до
+        # первого реального сообщения — контакта пока нет. Полный экран
+        # приветствия (видео + кнопки подключения) тут ни к чему, это уже
+        # пройденный шаг — просто показываем меню возможностей.
+        await call.message.answer(_capabilities_text(), reply_markup=main_kb())
 
 
 @dp.message(Command("gender"))
