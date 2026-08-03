@@ -541,9 +541,9 @@ async def _process_redeem(message: Message, code: str) -> None:
 
     save_referral_pending(referrer_id, telegram_id)
     await message.answer(
-        "Принято! Как только ты начнёшь пользоваться ботом (например через "
-        "«🎬 Попробовать на примере») — твой друг получит награду.",
-        reply_markup=onboarding_kb(),
+        "Принято! Как только ты начнёшь пользоваться ботом — твой друг получит награду.\n\n"
+        "Начните с кем-то новый диалог или попробуйте на примере.",
+        reply_markup=demo_only_kb(),
     )
 
 
@@ -1673,16 +1673,17 @@ def _post_connect_features_text() -> str:
 def _no_dialogs_hint_kb() -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     b.button(text="📖 Инструкция по JSON-экспорту", url=ONBOARDING_JSON_POST_URL)
+    b.button(text="🎬 Попробовать на примере", callback_data="demo")
     b.adjust(1)
     return b.as_markup()
 
 
 async def _send_no_dialogs_hint(message: Message) -> None:
     """Показывается, когда у юзера ещё нет ни одного контакта (диалога) —
-    двумя способами начать: живой разговор через Business или JSON-экспорт."""
+    живой разговор через Business, JSON-экспорт или демо на примере."""
     await message.answer(
-        "Начни диалог с кем-то — или экспортируй чат в формате JSON, "
-        "инструкция в канале 👇",
+        "Начни диалог с кем-то — или экспортируй чат в формате JSON\n"
+        "Также вы можете попробовать на примере функции бота.",
         reply_markup=_no_dialogs_hint_kb(),
     )
 
@@ -1754,6 +1755,12 @@ def onboarding_kb() -> InlineKeyboardMarkup:
     b.button(text="👑 У меня есть комп (JSON)", callback_data="onb:json")
     b.button(text="🎬 Попробовать на примере", callback_data="demo")
     b.adjust(1)
+    return b.as_markup()
+
+
+def demo_only_kb() -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    b.button(text="🎬 Попробовать на примере", callback_data="demo")
     return b.as_markup()
 
 
