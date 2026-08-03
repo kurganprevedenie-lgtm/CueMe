@@ -305,7 +305,10 @@ _premium_cache: dict[str, tuple[bool, float]] = {}  # telegram_id -> (is_premium
 async def _is_premium(bot: Bot, telegram_id: str) -> bool:
     """Проверяет членство в PREMIUM_CHANNEL_ID с кэшем на PREMIUM_CACHE_TTL сек,
     чтобы не дёргать Telegram API на каждое сообщение. Пока PREMIUM_CHANNEL_ID
-    не настроен — всегда False (только бесплатные попытки)."""
+    не настроен — всегда False (только бесплатные попытки). Реферальная
+    награда (_has_referral_premium) даёт полный Premium в обход канала."""
+    if _has_referral_premium(telegram_id):
+        return True
     if not PREMIUM_CHANNEL_ID:
         return False
 
@@ -428,15 +431,15 @@ async def _require_premium(bot: Bot, target: Message, telegram_id: str) -> bool:
 
 
 # ── Реферальная программа ─────────────────────────────────────────────────────
-# Пригласивший получает REFERRAL_REWARD_DAYS дней безлимитного «Анализ
-# собеседника», когда друг реально начинает пользоваться ботом (создан первый
-# контакт). Друг вводит персональный код пригласившего командой /redeem —
-# см. cmd_redeem ниже для анти-абуз проверок.
+# Пригласивший получает REFERRAL_REWARD_DAYS дней полной Premium-подписки,
+# когда друг реально начинает пользоваться ботом (создан первый контакт).
+# Друг вводит персональный код пригласившего командой /redeem — см.
+# cmd_redeem ниже для анти-абуз проверок.
 
 
 async def _credit_referral_if_pending(bot: Bot, referred_id: str) -> None:
     """Друг реально начал пользоваться (создан первый контакт) → начисляем
-    рефереру бесплатное окно и уведомляем. Идемпотентно: credited-флаг +
+    рефереру бесплатное окно Premium и уведомляем. Идемпотентно: credited-флаг +
     PRIMARY KEY(referred_id) не дают начислить дважды."""
     referrer_id = get_pending_referral(referred_id)
     if not referrer_id:
@@ -448,14 +451,14 @@ async def _credit_referral_if_pending(bot: Bot, referred_id: str) -> None:
         await bot.send_message(
             int(referrer_id),
             "🎉 Твой друг начал пользоваться CueMe! Держи подарок — "
-            f"{REFERRAL_REWARD_DAYS} дня безлимитного «🔬 Анализ собеседника».",
+            f"{REFERRAL_REWARD_DAYS} дня Premium подписки.",
         )
     except Exception:
         logging.warning("referral notify failed: referrer=%s", referrer_id)
 
 
-def _has_referral_free_deep(telegram_id: str) -> bool:
-    """Активно ли реферальное окно безлимитного «Анализа собеседника»."""
+def _has_referral_premium(telegram_id: str) -> bool:
+    """Активно ли реферальное окно полной Premium-подписки."""
     until = get_deep_analysis_free_until(telegram_id)
     return bool(until and until > datetime.now(timezone.utc))
 
@@ -465,9 +468,9 @@ async def _show_invite(message: Message, bot: Bot, telegram_id: str | None = Non
     code = get_or_create_referral_code(telegram_id)
     count = count_successful_referrals(telegram_id)
 
-    if _has_referral_free_deep(telegram_id):
+    if _has_referral_premium(telegram_id):
         until = get_deep_analysis_free_until(telegram_id)
-        reward_line = f"✅ Безлимитный «Анализ собеседника» активен до {until.strftime('%d.%m.%Y %H:%M UTC')}\n"
+        reward_line = f"✅ Premium подписка (по рефералам) активна до {until.strftime('%d.%m.%Y %H:%M UTC')}\n"
     else:
         reward_line = ""
 
@@ -477,7 +480,7 @@ async def _show_invite(message: Message, bot: Bot, telegram_id: str | None = Non
         f"{reward_line}\n"
         "Скинь другу этот код — пусть введёт его командой /redeem в этом боте. "
         "Как только он реально начнёт пользоваться CueMe — тебе дадутся "
-        f"{REFERRAL_REWARD_DAYS} дня безлимитного «🔬 Анализ собеседника»:\n\n"
+        f"{REFERRAL_REWARD_DAYS} дня Premium подписки:\n\n"
         f"<code>{html.escape(code)}</code>\n\n"
         "(тапни по коду, чтобы скопировать)",
         parse_mode="HTML",
@@ -553,10 +556,10 @@ async def cmd_myref(message: Message) -> None:
     count = count_successful_referrals(telegram_id)
     lines = ["🎁 Награда за рефералов:\n"]
 
-    if _has_referral_free_deep(telegram_id):
+    if _has_referral_premium(telegram_id):
         until = get_deep_analysis_free_until(telegram_id)
         until_str = until.strftime("%d.%m.%Y %H:%M UTC")
-        lines.append(f"✅ Безлимитный «Анализ собеседника» — активен до {until_str}")
+        lines.append(f"✅ Premium подписка — активна до {until_str}")
     else:
         lines.append("⏳ Активной награды нет — пригласи друга через /invite")
 
@@ -1110,11 +1113,10 @@ def deep_analysis_result_kb(contact_id: int) -> InlineKeyboardMarkup:
 async def _run_deep_analysis(
     bot: Bot, target: Message, telegram_id: str, contact_id: int, edit: bool = False
 ) -> None:
-    # Реферальная награда: активное бесплатное окно пропускает подписочный гейт
-    # ТОЛЬКО для «Анализа собеседника». Иначе — обычная проверка подписки.
-    if not _has_referral_free_deep(telegram_id):
-        if not await _require_premium(bot, target, telegram_id):
-            return
+    # Реферальная награда теперь даёт полный Premium (учтено внутри _is_premium,
+    # которую вызывает _require_premium) — отдельной проверки тут больше не нужно.
+    if not await _require_premium(bot, target, telegram_id):
+        return
     contact = get_contact_by_id(contact_id)
     if not contact:
         text = "Контакт не найден."
@@ -3243,7 +3245,7 @@ async def _show_help(message: Message) -> None:
         "💐 Идеальное свидание — идея свидания и подарков под человека\n"
         "🔥 Скрипты общения — готовый вопрос, чтобы расшевелить затихший разговор\n"
         f"🎁 Пригласить друга (/invite) — получить свой код, за друга по коду дадим "
-        f"{REFERRAL_REWARD_DAYS} дня безлимитного «Анализ собеседника»\n\n"
+        f"{REFERRAL_REWARD_DAYS} дня Premium подписки\n\n"
         "<b>⚙️ Аккаунт</b>\n"
         "/contacts — список загруженных чатов\n"
         "/connect — как подключить Автоматизацию чатов (живой поток переписки)\n"

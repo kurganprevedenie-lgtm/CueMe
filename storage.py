@@ -174,7 +174,8 @@ def init_db() -> None:
         _add_column_if_missing(conn, "users", "gender", "TEXT")
         _add_column_if_missing(conn, "users", "demo_trial_used", "INTEGER NOT NULL DEFAULT 0")
         # Реферальная награда: до какого момента (UTC ISO) у пригласившего
-        # безлимитный «Анализ собеседника». NULL = награды нет.
+        # активна полная Premium-подписка (имя колонки историческое — раньше
+        # награда покрывала только «Анализ собеседника»). NULL = награды нет.
         _add_column_if_missing(conn, "users", "deep_analysis_free_until", "TEXT")
         # Личный реферальный код — друг вводит его вручную через /redeem.
         _add_column_if_missing(conn, "users", "referral_code", "TEXT")
@@ -846,7 +847,7 @@ def mark_referral_credited(referred_telegram_id: str) -> None:
 
 
 def set_deep_analysis_free_until(telegram_id: str, until: datetime) -> None:
-    """Ставит окно безлимитного «Анализа собеседника» до until (UTC datetime).
+    """Ставит окно реферальной Premium-награды до until (UTC datetime).
     Создаёт строку users, если её ещё нет (реферер — точно существующий юзер,
     но на всякий случай безопасно)."""
     with _conn() as conn:
@@ -862,7 +863,7 @@ def set_deep_analysis_free_until(telegram_id: str, until: datetime) -> None:
 
 
 def get_deep_analysis_free_until(telegram_id: str) -> datetime | None:
-    """Момент окончания реферального безлимита (tz-aware UTC) или None."""
+    """Момент окончания реферальной Premium-награды (tz-aware UTC) или None."""
     with _conn() as conn:
         row = conn.execute(
             "SELECT deep_analysis_free_until FROM users WHERE telegram_id = ?",
