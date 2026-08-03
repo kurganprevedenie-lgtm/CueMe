@@ -342,7 +342,7 @@ def premium_menu_kb() -> InlineKeyboardMarkup:
 
 
 async def _send_paywall(target: Message, text: str) -> None:
-    await target.answer(text, reply_markup=paywall_kb())
+    await target.answer(text, reply_markup=premium_menu_kb())
 
 
 async def _has_quota(bot: Bot, telegram_id: str) -> bool:
