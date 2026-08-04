@@ -28,6 +28,7 @@ from aiogram.types import (
 from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
 
 from config import (
+    ADMIN_GROUP_CHAT_ID,
     ADMIN_TELEGRAM_ID,
     APP_NAME,
     BOT_TOKEN,
@@ -109,6 +110,7 @@ from storage import (
     get_pending_referral,
     get_referrer_by_code,
     get_trial_used,
+    get_user,
     increment_demo_trial_used,
     increment_trial_used,
     mark_referral_credited,
@@ -1889,9 +1891,18 @@ async def _send_start_menu(message: Message, telegram_id: str) -> None:
 
 
 @dp.message(CommandStart())
-async def cmd_start(message: Message, state: FSMContext) -> None:
+async def cmd_start(message: Message, state: FSMContext, bot: Bot) -> None:
     await state.clear()
-    await _send_start_menu(message, str(message.from_user.id))
+    telegram_id = str(message.from_user.id)
+    is_new = get_user(telegram_id) is None
+    await _send_start_menu(message, telegram_id)
+    if is_new and ADMIN_GROUP_CHAT_ID:
+        username = message.from_user.username
+        who = f"@{username}" if username else f"id{telegram_id} (без username)"
+        try:
+            await bot.send_message(int(ADMIN_GROUP_CHAT_ID), f"🆕 Новый пользователь: {who}")
+        except Exception:
+            logging.warning("admin-group new-user notify failed: %s", who)
 
 
 @dp.callback_query(F.data.in_({"gender:male", "gender:female"}))

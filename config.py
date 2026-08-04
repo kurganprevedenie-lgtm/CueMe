@@ -41,6 +41,10 @@ OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 # LLM-каскад глобально для всего бота, поэтому не должна быть открыта всем).
 ADMIN_TELEGRAM_ID = os.getenv("ADMIN_TELEGRAM_ID", "")
 
+# Chat ID админ-группы для уведомлений о новых пользователях (первый /start
+# вообще). Пусто = уведомления выключены.
+ADMIN_GROUP_CHAT_ID = os.getenv("ADMIN_GROUP_CHAT_ID", "")
+
 # Видео-инструкция по подключению Автоматизации чатов (в стартовом сообщении
 # /start). Два способа, ONBOARDING_VIDEO_PATH проверяется первым:
 # 1) ONBOARDING_VIDEO_PATH — путь к mp4 прямо на сервере (закинуть по
