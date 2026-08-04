@@ -255,6 +255,15 @@ def get_user(telegram_id: str) -> sqlite3.Row | None:
         ).fetchone()
 
 
+def list_all_users() -> list[sqlite3.Row]:
+    """Все пользователи (для админ-отчёта /users) — старые первыми."""
+    with _conn() as conn:
+        return conn.execute(
+            "SELECT telegram_id, gender, created_at, trial_used, "
+            "deep_analysis_free_until FROM users ORDER BY created_at"
+        ).fetchall()
+
+
 def upsert_user(telegram_id: str, my_id: str) -> None:
     with _conn() as conn:
         conn.execute(

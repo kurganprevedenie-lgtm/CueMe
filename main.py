@@ -122,6 +122,7 @@ from storage import (
     get_style_card,
     delete_deep_style_analysis,
     init_db,
+    list_all_users,
     list_contacts,
     save_business_message,
     save_deep_analysis,
@@ -2144,6 +2145,71 @@ async def cmd_connect(message: Message, bot: Bot) -> None:
         await _business_connect_text(bot),
         reply_markup=business_connect_kb(),
     )
+
+
+# ── /users — список всех пользователей + сводка (только для админа) ─────────
+# Шлётся в ADMIN_GROUP_CHAT_ID (если задан), иначе прямым ответом вызвавшему.
+
+def _build_users_report() -> str:
+    now = datetime.now(timezone.utc)
+    users = list_all_users()
+
+    lines = ["👥 Пользователи CueMe:\n"]
+    with_gender = with_any_contact = with_real_contact = with_ref_premium = 0
+
+    for u in users:
+        tid = u["telegram_id"]
+        contacts = list_contacts(tid)
+        real = sum(1 for c in contacts if not _is_demo_contact(c["id"]))
+        demo = len(contacts) - real
+
+        if u["gender"]:
+            with_gender += 1
+        if contacts:
+            with_any_contact += 1
+        if real:
+            with_real_contact += 1
+
+        premium_note = ""
+        until_raw = u["deep_analysis_free_until"]
+        if until_raw:
+            try:
+                until_dt = datetime.fromisoformat(until_raw)
+                if until_dt > now:
+                    premium_note = f" · 👑 до {until_dt.strftime('%d.%m %H:%M')}"
+                    with_ref_premium += 1
+            except ValueError:
+                pass
+
+        gender_label = _GENDER_LABELS.get(u["gender"], "?")
+        lines.append(
+            f"• {tid} · {gender_label} · триал {u['trial_used']} · "
+            f"контактов {real}+{demo}demo{premium_note}"
+        )
+
+    lines.append("")
+    lines.append(f"Всего: {len(users)}")
+    lines.append(f"С полом: {with_gender}")
+    lines.append(f"С реальным контактом: {with_real_contact}")
+    lines.append(f"Только демо/без контактов: {len(users) - with_real_contact}")
+    lines.append(f"С активной реферальной Premium: {with_ref_premium}")
+    return "\n".join(lines)
+
+
+@dp.message(Command("users"))
+async def cmd_users(message: Message, bot: Bot) -> None:
+    if not ADMIN_TELEGRAM_ID or str(message.from_user.id) != ADMIN_TELEGRAM_ID:
+        return
+    report = _build_users_report()
+    # Телеграм режет сообщения на 4096 символов — на всякий случай рубим отчёт кусками.
+    chunks = [report[i:i + 3500] for i in range(0, len(report), 3500)] or [report]
+    target_chat = int(ADMIN_GROUP_CHAT_ID) if ADMIN_GROUP_CHAT_ID else message.chat.id
+    for chunk in chunks:
+        try:
+            await bot.send_message(target_chat, chunk)
+        except Exception:
+            logging.warning("cmd_users: send failed to %s", target_chat)
+            await message.answer(chunk)
 
 
 # ── /provider — переключить LLM-провайдера (только для админа) ───────────────
