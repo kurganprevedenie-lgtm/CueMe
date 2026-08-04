@@ -2150,7 +2150,19 @@ async def cmd_connect(message: Message, bot: Bot) -> None:
 # ── /users — список всех пользователей + сводка (только для админа) ─────────
 # Шлётся в ADMIN_GROUP_CHAT_ID (если задан), иначе прямым ответом вызвавшему.
 
-def _build_users_report() -> str:
+async def _resolve_username(bot: Bot, telegram_id: str) -> str:
+    """username не хранится в БД (его нет в апдейтах Business API) — тянем
+    напрямую у Telegram под отчёт. Без username/при ошибке — сам id как есть."""
+    try:
+        chat = await bot.get_chat(int(telegram_id))
+        if chat.username:
+            return f"@{chat.username}"
+    except Exception:
+        pass
+    return f"id{telegram_id}"
+
+
+async def _build_users_report(bot: Bot) -> str:
     now = datetime.now(timezone.utc)
     users = list_all_users()
 
@@ -2159,6 +2171,7 @@ def _build_users_report() -> str:
 
     for u in users:
         tid = u["telegram_id"]
+        who = await _resolve_username(bot, tid)
         contacts = list_contacts(tid)
         real = sum(1 for c in contacts if not _is_demo_contact(c["id"]))
         demo = len(contacts) - real
@@ -2183,7 +2196,7 @@ def _build_users_report() -> str:
 
         gender_label = _GENDER_LABELS.get(u["gender"], "?")
         lines.append(
-            f"• {tid} · {gender_label} · триал {u['trial_used']} · "
+            f"• {who} · {gender_label} · триал {u['trial_used']} · "
             f"контактов {real}+{demo}demo{premium_note}"
         )
 
@@ -2200,7 +2213,7 @@ def _build_users_report() -> str:
 async def cmd_users(message: Message, bot: Bot) -> None:
     if not ADMIN_TELEGRAM_ID or str(message.from_user.id) != ADMIN_TELEGRAM_ID:
         return
-    report = _build_users_report()
+    report = await _build_users_report(bot)
     # Телеграм режет сообщения на 4096 символов — на всякий случай рубим отчёт кусками.
     chunks = [report[i:i + 3500] for i in range(0, len(report), 3500)] or [report]
     target_chat = int(ADMIN_GROUP_CHAT_ID) if ADMIN_GROUP_CHAT_ID else message.chat.id
