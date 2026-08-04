@@ -101,6 +101,7 @@ from storage import (
     get_business_connection,
     get_contact_by_id,
     get_deep_analysis,
+    get_acquisition_source,
     get_deep_analysis_free_until,
     get_deep_style_analysis,
     get_demo_trial_used,
@@ -139,6 +140,7 @@ from storage import (
     save_running_notes,
     save_style_card,
     record_event,
+    set_acquisition_source,
     set_deep_analysis_free_until,
     set_gender,
     set_llm_cache,
@@ -612,7 +614,8 @@ def more_menu_kb() -> InlineKeyboardMarkup:
 # ── Пол пользователя ─────────────────────────────────────────────────────────
 # Спрашивается НЕ сразу на /start (чтобы не мешать пройти онбординг — демо/
 # JSON/Business), а сразу после того как он реально завершён (см.
-# _maybe_prompt_gender, вызывается в тех же 3 точках, что и зачёт реферала).
+# _maybe_prompt_gender, вызывается в 4 точках: подключение Business,
+# первое business-сообщение, завершение демо, загрузка JSON).
 # GenderGateMiddleware ниже подключает жёсткий гейт уже ПОСЛЕ этого момента —
 # нужен для согласования рода в русском: и когда бот обращается к пользователю
 # напрямую, и в промптах генерации (варианты ответа пишутся от первого лица
@@ -632,6 +635,43 @@ async def _maybe_prompt_gender(bot: Bot, telegram_id: str) -> None:
         await bot.send_message(int(telegram_id), _GENDER_PROMPT_TEXT, reply_markup=gender_kb())
     except Exception:
         logging.warning("gender prompt failed: telegram_id=%s", telegram_id)
+
+
+# ── Источник привлечения ──────────────────────────────────────────────────────
+# Спрашивается ТОЛЬКО на Business-пути (Автоматизация чатов), сразу после
+# подключения (handle_business_connection) — ПЕРЕД вопросом про пол. Демо и
+# JSON-путь этот вопрос не показывают вообще.
+
+_SOURCE_PROMPT_TEXT = "Кстати, как ты о нас узнал?"
+
+
+def source_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📱 TikTok", callback_data="src:tiktok")],
+        [InlineKeyboardButton(text="📸 Instagram", callback_data="src:instagram")],
+        [InlineKeyboardButton(text="📺 YouTube", callback_data="src:youtube")],
+        [InlineKeyboardButton(text="💬 С чата в Telegram", callback_data="src:tgchat")],
+        [InlineKeyboardButton(text="👥 От друга", callback_data="src:friend")],
+        [InlineKeyboardButton(text="🤷 Другое", callback_data="src:other")],
+    ])
+
+
+async def _maybe_prompt_source(bot: Bot, telegram_id: str) -> None:
+    """Спрашивает источник один раз, идемпотентно — no-op если уже отвечал."""
+    if get_acquisition_source(telegram_id) is not None:
+        return
+    try:
+        await bot.send_message(int(telegram_id), _SOURCE_PROMPT_TEXT, reply_markup=source_kb())
+    except Exception:
+        logging.warning("source prompt failed: telegram_id=%s", telegram_id)
+
+
+@dp.callback_query(F.data.startswith("src:"))
+async def cb_source_select(call: CallbackQuery) -> None:
+    source = call.data.split(":", 1)[1]
+    set_acquisition_source(str(call.from_user.id), source)
+    await call.answer()
+    await call.message.edit_text("Принято, спасибо! 🙌")
 
 
 def _contact_words(user_gender: str | None) -> tuple[str, str]:
@@ -1566,6 +1606,7 @@ async def handle_business_connection(event: BusinessConnection, bot: Bot) -> Non
             )
         except Exception:
             logging.warning("business-connect notify failed: owner=%s", event.user.id)
+        await _maybe_prompt_source(bot, owner_id)
         await _maybe_prompt_gender(bot, owner_id)
 
 
@@ -2227,6 +2268,42 @@ async def cmd_users(message: Message, bot: Bot) -> None:
         except Exception:
             logging.warning("cmd_users: send failed to %s", target_chat)
             await message.answer(chunk)
+
+
+# ── /sources — статистика по источникам привлечения (только для админа) ────
+# Считает acquisition_source (спрашивается только на Business-пути).
+
+_SOURCE_LABELS = {
+    "tiktok": "TikTok",
+    "instagram": "Instagram",
+    "youtube": "YouTube",
+    "tgchat": "С чата в Telegram",
+    "friend": "От друга",
+    "other": "Другое",
+}
+
+
+@dp.message(Command("sources"))
+async def cmd_sources(message: Message, bot: Bot) -> None:
+    if not ADMIN_TELEGRAM_ID or str(message.from_user.id) != ADMIN_TELEGRAM_ID:
+        return
+    users = list_all_users()
+    counts: dict[str, int] = {}
+    for u in users:
+        source = u["acquisition_source"]
+        counts[source] = counts.get(source, 0) + 1
+
+    lines = ["📊 Источники (через Автоматизацию чатов):"]
+    for key, label in _SOURCE_LABELS.items():
+        lines.append(f"{label}: {counts.get(key, 0)}")
+    lines.append(f"Не указано: {counts.get(None, 0)}")
+
+    target_chat = int(ADMIN_GROUP_CHAT_ID) if ADMIN_GROUP_CHAT_ID else message.chat.id
+    try:
+        await bot.send_message(target_chat, "\n".join(lines))
+    except Exception:
+        logging.warning("cmd_sources: send failed to %s", target_chat)
+        await message.answer("\n".join(lines))
 
 
 # ── /export — выгрузка переписок юзера в .zip (только для админа) ───────────

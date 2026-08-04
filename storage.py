@@ -172,6 +172,9 @@ def init_db() -> None:
         _add_column_if_missing(conn, "users", "auto_contact_id", "INTEGER")
         _add_column_if_missing(conn, "users", "trial_used", "INTEGER NOT NULL DEFAULT 0")
         _add_column_if_missing(conn, "users", "gender", "TEXT")
+        # Откуда узнал о боте — спрашивается только на Business-пути (Автоматизация
+        # чатов), сразу после подключения. NULL = не спрашивали/не завершили Business.
+        _add_column_if_missing(conn, "users", "acquisition_source", "TEXT")
         _add_column_if_missing(conn, "users", "demo_trial_used", "INTEGER NOT NULL DEFAULT 0")
         # Реферальная награда: до какого момента (UTC ISO) у пригласившего
         # активна полная Premium-подписка (имя колонки историческое — раньше
@@ -256,11 +259,11 @@ def get_user(telegram_id: str) -> sqlite3.Row | None:
 
 
 def list_all_users() -> list[sqlite3.Row]:
-    """Все пользователи (для админ-отчёта /users) — старые первыми."""
+    """Все пользователи (для админ-отчётов /users, /sources) — старые первыми."""
     with _conn() as conn:
         return conn.execute(
             "SELECT telegram_id, gender, created_at, trial_used, "
-            "deep_analysis_free_until FROM users ORDER BY created_at"
+            "deep_analysis_free_until, acquisition_source FROM users ORDER BY created_at"
         ).fetchall()
 
 
@@ -327,6 +330,29 @@ def set_gender(telegram_id: str, gender: str) -> None:
             ON CONFLICT(telegram_id) DO UPDATE SET gender = excluded.gender
             """,
             (telegram_id, f"user{telegram_id}", _now(), gender),
+        )
+
+
+def get_acquisition_source(telegram_id: str) -> str | None:
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT acquisition_source FROM users WHERE telegram_id = ?", (telegram_id,)
+        ).fetchone()
+    return row["acquisition_source"] if row else None
+
+
+def set_acquisition_source(telegram_id: str, source: str) -> None:
+    """Ставит источник привлечения; создаёт строку users, если её ещё нет
+    (спрашивается сразу после подключения Business, до upsert_user из
+    остального онбординга)."""
+    with _conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO users (telegram_id, my_id, created_at, acquisition_source)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(telegram_id) DO UPDATE SET acquisition_source = excluded.acquisition_source
+            """,
+            (telegram_id, f"user{telegram_id}", _now(), source),
         )
 
 
