@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import html
+import io
 import itertools
 import json
 import logging
@@ -9,6 +10,7 @@ import re
 import tempfile
 import time
 import uuid
+import zipfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -20,6 +22,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
     BotCommand,
+    BufferedInputFile,
     BusinessConnection,
     CallbackQuery, Document, ErrorEvent, FSInputFile, Message,
     InlineKeyboardButton, InlineKeyboardMarkup,
@@ -79,6 +82,7 @@ from llm import (
     transcribe_audio,
 )
 from tg_parser import parse_chat
+from tools.export import extract_conversation, to_text
 from storage import (
     count_biz_messages_for_contact,
     count_imported_messages,
@@ -2223,6 +2227,64 @@ async def cmd_users(message: Message, bot: Bot) -> None:
         except Exception:
             logging.warning("cmd_users: send failed to %s", target_chat)
             await message.answer(chunk)
+
+
+# ── /export — выгрузка переписок юзера в .zip (только для админа) ───────────
+# Обходит отсутствие SSH-доступа к серверу: файл прилетает прямо в Telegram.
+
+@dp.message(Command("export"))
+async def cmd_export(message: Message, bot: Bot) -> None:
+    if not ADMIN_TELEGRAM_ID or str(message.from_user.id) != ADMIN_TELEGRAM_ID:
+        return
+    users = list_all_users()
+    if not users:
+        await message.answer("Пользователей пока нет.")
+        return
+
+    b = InlineKeyboardBuilder()
+    for u in users:
+        tid = u["telegram_id"]
+        who = await _resolve_username(bot, tid)
+        b.button(text=who, callback_data=f"export:{tid}")
+    b.adjust(1)
+    await message.answer("Кого экспортировать?", reply_markup=b.as_markup())
+
+
+@dp.callback_query(F.data.startswith("export:"))
+async def cb_export_user(call: CallbackQuery, bot: Bot) -> None:
+    if not ADMIN_TELEGRAM_ID or str(call.from_user.id) != ADMIN_TELEGRAM_ID:
+        await call.answer()
+        return
+    telegram_id = call.data.split(":", 1)[1]
+    await call.answer()
+    who = await _resolve_username(bot, telegram_id)
+
+    contacts = list_contacts(telegram_id)
+    buf = io.BytesIO()
+    added = 0
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for c in contacts:
+            try:
+                export = extract_conversation(c["id"])
+            except ValueError:
+                continue
+            if not export["messages"]:
+                continue
+            safe_name = re.sub(r"[^\w\-]+", "_", export["contact_name"] or f"contact{c['id']}")
+            zf.writestr(f"{safe_name}.json", json.dumps(export, ensure_ascii=False, indent=2))
+            zf.writestr(f"{safe_name}.txt", to_text(export))
+            added += 1
+
+    if added == 0:
+        await call.message.answer(f"У {who} нет сохранённых переписок с сообщениями.")
+        return
+
+    buf.seek(0)
+    filename = f"export_{who.lstrip('@')}.zip"
+    await call.message.answer_document(
+        BufferedInputFile(buf.read(), filename=filename),
+        caption=f"{who} — {added} перепис{'ка' if added == 1 else 'ки' if added < 5 else 'ок'}",
+    )
 
 
 # ── /provider — переключить LLM-провайдера (только для админа) ───────────────
