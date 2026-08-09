@@ -45,16 +45,16 @@ ADMIN_TELEGRAM_ID = os.getenv("ADMIN_TELEGRAM_ID", "")
 # вообще). Пусто = уведомления выключены.
 ADMIN_GROUP_CHAT_ID = os.getenv("ADMIN_GROUP_CHAT_ID", "")
 
-# Видео-инструкция по подключению Автоматизации чатов (в стартовом сообщении
-# /start). Два способа, ONBOARDING_VIDEO_PATH проверяется первым:
-# 1) ONBOARDING_VIDEO_PATH — путь к mp4 прямо на сервере (закинуть по
+# Фото-инструкция по подключению Автоматизации чатов (крепится к
+# единственному стартовому сообщению /start). Два способа, ONBOARDING_PHOTO_PATH
+# проверяется первым:
+# 1) ONBOARDING_PHOTO_PATH — путь к картинке прямо на сервере (закинуть по
 #    SCP/SFTP/USB, В ОБХОД git — бинарник не нужно тащить в репозиторий).
-#    Бот сам загружает файл в Telegram при каждой отправке — для небольшого
-#    ролика и объёма /start это не проблема.
-# 2) ONBOARDING_VIDEO_FILE_ID — если видео уже когда-то отправляли боту
-#    (получить: прислать видео боту от ADMIN_TELEGRAM_ID, см. main.py).
-ONBOARDING_VIDEO_PATH = os.getenv("ONBOARDING_VIDEO_PATH", "")
-ONBOARDING_VIDEO_FILE_ID = os.getenv("ONBOARDING_VIDEO_FILE_ID", "")
+#    Бот сам загружает файл в Telegram при каждой отправке.
+# 2) ONBOARDING_PHOTO_FILE_ID — если фото уже когда-то отправляли боту
+#    (получить: прислать фото боту от ADMIN_TELEGRAM_ID, см. main.py).
+ONBOARDING_PHOTO_PATH = os.getenv("ONBOARDING_PHOTO_PATH", "")
+ONBOARDING_PHOTO_FILE_ID = os.getenv("ONBOARDING_PHOTO_FILE_ID", "")
 
 # Ссылка на пост в канале с инструкцией по JSON-экспорту (кнопка под подсказкой
 # «начни диалог или экспортируй JSON», когда у юзера ещё нет ни одного контакта).
