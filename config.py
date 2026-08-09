@@ -51,6 +51,11 @@ if ADMIN_TELEGRAM_ID:
 # вообще). Пусто = уведомления выключены.
 ADMIN_GROUP_CHAT_ID = os.getenv("ADMIN_GROUP_CHAT_ID", "")
 
+# Свои тестовые аккаунты (username без @, через запятую) — /start с них НЕ
+# триггерит уведомление о новом пользователе в админ-группу.
+_test_usernames_raw = os.getenv("TEST_ACCOUNT_USERNAMES", "")
+TEST_ACCOUNT_USERNAMES = {u.strip().lstrip("@").lower() for u in _test_usernames_raw.split(",") if u.strip()}
+
 # Фото-инструкция по подключению Автоматизации чатов (крепится к
 # единственному стартовому сообщению /start). Два способа, ONBOARDING_PHOTO_PATH
 # проверяется первым:

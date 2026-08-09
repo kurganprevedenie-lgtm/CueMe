@@ -55,6 +55,7 @@ from config import (
     REFRESH_SAMPLES_EVERY_N,
     REVIVE_QUESTIONS,
     SAMPLE_SIZE,
+    TEST_ACCOUNT_USERNAMES,
 )
 from features import detect_reply_situation, extract_features, stage_hint, totals_from_summary, winning_messages
 from llm import (
@@ -1919,8 +1920,9 @@ async def cmd_start(message: Message, state: FSMContext, bot: Bot) -> None:
     telegram_id = str(message.from_user.id)
     is_new = get_user(telegram_id) is None
     await _send_start_menu(message, telegram_id)
-    if is_new and ADMIN_GROUP_CHAT_ID:
-        username = message.from_user.username
+    username = message.from_user.username
+    is_test_account = bool(username) and username.lower() in TEST_ACCOUNT_USERNAMES
+    if is_new and ADMIN_GROUP_CHAT_ID and not is_test_account:
         who = f"@{username}" if username else f"id{telegram_id} (без username)"
         try:
             await bot.send_message(int(ADMIN_GROUP_CHAT_ID), f"🆕 Новый пользователь: {who}")
