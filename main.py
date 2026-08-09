@@ -32,7 +32,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
 
 from config import (
     ADMIN_GROUP_CHAT_ID,
-    ADMIN_TELEGRAM_ID,
+    ADMIN_TELEGRAM_IDS,
     APP_NAME,
     BOT_TOKEN,
     DEMO_TRIAL_LIMIT,
@@ -179,6 +179,13 @@ async def on_unhandled_error(event: ErrorEvent) -> bool:
     except Exception:
         logging.exception("error handler: не удалось уведомить пользователя")
     return True
+
+
+def _is_admin(telegram_id: str | int) -> bool:
+    """Единая проверка доступа к админ-командам (/provider, /users, /export,
+    /sources и т.п.) — по множеству ADMIN_TELEGRAM_IDS (включает
+    ADMIN_TELEGRAM_ID, если задан)."""
+    return bool(ADMIN_TELEGRAM_IDS) and str(telegram_id) in ADMIN_TELEGRAM_IDS
 
 
 BTN_SCREENSHOT    = "📸 По скриншоту"
@@ -1860,7 +1867,7 @@ def business_connect_kb() -> InlineKeyboardMarkup:
 
 @dp.message(F.photo)
 async def handle_photo(message: Message) -> None:
-    if not ADMIN_TELEGRAM_ID or str(message.from_user.id) != ADMIN_TELEGRAM_ID:
+    if not _is_admin(message.from_user.id):
         return
 
     file_id = message.photo[-1].file_id  # последний элемент — самое большое разрешение
@@ -2240,7 +2247,7 @@ async def _build_users_report(bot: Bot) -> str:
 
 @dp.message(Command("users"))
 async def cmd_users(message: Message, bot: Bot) -> None:
-    if not ADMIN_TELEGRAM_ID or str(message.from_user.id) != ADMIN_TELEGRAM_ID:
+    if not _is_admin(message.from_user.id):
         return
     report = await _build_users_report(bot)
     # Телеграм режет сообщения на 4096 символов — на всякий случай рубим отчёт кусками.
@@ -2269,7 +2276,7 @@ _SOURCE_LABELS = {
 
 @dp.message(Command("sources"))
 async def cmd_sources(message: Message, bot: Bot) -> None:
-    if not ADMIN_TELEGRAM_ID or str(message.from_user.id) != ADMIN_TELEGRAM_ID:
+    if not _is_admin(message.from_user.id):
         return
     users = list_all_users()
     counts: dict[str, int] = {}
@@ -2295,7 +2302,7 @@ async def cmd_sources(message: Message, bot: Bot) -> None:
 
 @dp.message(Command("export"))
 async def cmd_export(message: Message, bot: Bot) -> None:
-    if not ADMIN_TELEGRAM_ID or str(message.from_user.id) != ADMIN_TELEGRAM_ID:
+    if not _is_admin(message.from_user.id):
         return
     users = list_all_users()
     if not users:
@@ -2313,7 +2320,7 @@ async def cmd_export(message: Message, bot: Bot) -> None:
 
 @dp.callback_query(F.data.startswith("export:"))
 async def cb_export_user(call: CallbackQuery, bot: Bot) -> None:
-    if not ADMIN_TELEGRAM_ID or str(call.from_user.id) != ADMIN_TELEGRAM_ID:
+    if not _is_admin(call.from_user.id):
         await call.answer()
         return
     telegram_id = call.data.split(":", 1)[1]
@@ -2350,11 +2357,11 @@ async def cb_export_user(call: CallbackQuery, bot: Bot) -> None:
 
 # ── /provider — переключить LLM-провайдера (только для админа) ───────────────
 # Меняет каскад ГЛОБАЛЬНО для всего бота (module-level _forced в llm.py), а не
-# только для вызывающего — поэтому доступ только разработчику по ADMIN_TELEGRAM_ID.
+# только для вызывающего — поэтому доступ только админам (ADMIN_TELEGRAM_IDS).
 
 @dp.message(Command("provider"))
 async def cmd_provider(message: Message) -> None:
-    if not ADMIN_TELEGRAM_ID or str(message.from_user.id) != ADMIN_TELEGRAM_ID:
+    if not _is_admin(message.from_user.id):
         return
     parts = (message.text or "").split(maxsplit=1)
     variants = " · ".join(p.lower() for p in PROVIDER_NAMES) + " · auto"
@@ -3742,7 +3749,7 @@ async def cb_delete_cancel(call: CallbackQuery) -> None:
 
 @dp.message(Command("wipe"))
 async def cmd_wipe(message: Message, bot: Bot) -> None:
-    if not ADMIN_TELEGRAM_ID or str(message.from_user.id) != ADMIN_TELEGRAM_ID:
+    if not _is_admin(message.from_user.id):
         return
     parts = (message.text or "").split(maxsplit=1)
     arg = parts[1].strip() if len(parts) == 2 else ""
@@ -3783,7 +3790,7 @@ async def cmd_wipe(message: Message, bot: Bot) -> None:
 
 @dp.callback_query(F.data.startswith("wipeyes:"))
 async def cb_wipe_confirm(call: CallbackQuery) -> None:
-    if not ADMIN_TELEGRAM_ID or str(call.from_user.id) != ADMIN_TELEGRAM_ID:
+    if not _is_admin(call.from_user.id):
         await call.answer()
         return
     target_id = call.data.split(":", 1)[1]

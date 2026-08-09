@@ -37,9 +37,15 @@ if not GEMINI_API_KEYS and GEMINI_API_KEY:
 # OpenRouter — llama-3.1-8b-instruct:free.
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 
-# telegram_id разработчика — единственный, кому доступна /provider (меняет
-# LLM-каскад глобально для всего бота, поэтому не должна быть открыта всем).
+# telegram_id разработчика — кому доступны админ-команды (/provider, /users,
+# /export, /sources и т.п.), не должны быть открыты всем.
 ADMIN_TELEGRAM_ID = os.getenv("ADMIN_TELEGRAM_ID", "")
+# Несколько админов через запятую (ADMIN_TELEGRAM_ID тоже входит в список
+# автоматически, если задан, — задавать его отдельно не обязательно).
+_admin_ids_raw = os.getenv("ADMIN_TELEGRAM_IDS", "")
+ADMIN_TELEGRAM_IDS = {i.strip() for i in _admin_ids_raw.split(",") if i.strip()}
+if ADMIN_TELEGRAM_ID:
+    ADMIN_TELEGRAM_IDS.add(ADMIN_TELEGRAM_ID)
 
 # Chat ID админ-группы для уведомлений о новых пользователях (первый /start
 # вообще). Пусто = уведомления выключены.
