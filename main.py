@@ -674,11 +674,18 @@ async def _maybe_prompt_source(bot: Bot, telegram_id: str) -> None:
 
 
 @dp.callback_query(F.data.startswith("src:"))
-async def cb_source_select(call: CallbackQuery) -> None:
+async def cb_source_select(call: CallbackQuery, bot: Bot) -> None:
+    telegram_id = str(call.from_user.id)
     source = call.data.split(":", 1)[1]
-    set_acquisition_source(str(call.from_user.id), source)
+    set_acquisition_source(telegram_id, source)
     await call.answer()
-    await call.message.edit_text("Принято, спасибо! 🙌")
+    try:
+        await call.message.delete()
+    except Exception:
+        pass
+    # Пол спрашиваем только теперь — после того как юзер реально ответил на
+    # вопрос про источник, а не одновременно с ним.
+    await _maybe_prompt_gender(bot, telegram_id)
 
 
 def _contact_words(user_gender: str | None) -> tuple[str, str]:
@@ -1608,13 +1615,14 @@ async def handle_business_connection(event: BusinessConnection, bot: Bot) -> Non
         try:
             await bot.send_message(
                 event.user.id,
-                f"✅ Готово, бот подключён!\n\n{_post_connect_features_text()}",
-                parse_mode="HTML",
+                "✅ Готово, бот подключён! CueMe готов помогать тебе в переписках )",
             )
         except Exception:
             logging.warning("business-connect notify failed: owner=%s", event.user.id)
+        await asyncio.sleep(3)
+        # Пол спрашиваем не сразу, а из cb_source_select — ПОСЛЕ того как юзер
+        # реально ответит на вопрос про источник (последовательно, не хором).
         await _maybe_prompt_source(bot, owner_id)
-        await _maybe_prompt_gender(bot, owner_id)
 
 
 def _persist_business_message(
@@ -1714,25 +1722,6 @@ async def handle_business_message(event: Message, bot: Bot) -> None:
 
 
 # ── /start ────────────────────────────────────────────────────────────────────
-
-def _post_connect_features_text() -> str:
-    """Показывается сразу после успешного Business-подключения — чтобы не
-    заставлять пользователя жать /start ещё раз, чтобы увидеть, что уже
-    доступно и что откроется по подписке."""
-    return (
-        f"<b>Уже доступно</b> (первые {FREE_TRIAL_REQUESTS} генераций — бесплатно):\n"
-        "💬 Ответить за меня\n"
-        "📸 По скриншоту\n"
-        "💫 Новый диалог\n"
-        "🔥 Скрипты общения — без ограничений\n\n"
-        "<b>По подписке</b>:\n"
-        "🔬 Анализ собеседника\n"
-        "🪞 Анализ своего стиля\n"
-        "💐 Идеальное свидание\n\n"
-        "Меню с кнопками появится, как только придёт первое сообщение из чата.\n"
-        "/premium — статус подписки, /help — все команды"
-    )
-
 
 def _no_dialogs_hint_kb() -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
