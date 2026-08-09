@@ -35,7 +35,6 @@ from config import (
     ADMIN_TELEGRAM_IDS,
     APP_NAME,
     BOT_TOKEN,
-    DEMO_TRIAL_LIMIT,
     FIRST_BUILD_THRESHOLD,
     FREE_TRIAL_REQUESTS,
     GEMINI_API_KEY,
@@ -105,7 +104,6 @@ from storage import (
     get_acquisition_source,
     get_deep_analysis_free_until,
     get_deep_style_analysis,
-    get_demo_trial_used,
     get_gender,
     get_ideal_date,
     get_llm_cache,
@@ -117,7 +115,6 @@ from storage import (
     get_referrer_by_code,
     get_trial_used,
     get_user,
-    increment_demo_trial_used,
     increment_trial_used,
     mark_referral_credited,
     save_imported_messages,
@@ -394,49 +391,6 @@ async def _charge_trial_if_needed(bot: Bot, telegram_id: str) -> None:
     increment_trial_used(telegram_id)
 
 
-# ── Демо: отдельная тихая квота (не делит счётчик с реальным использованием) ──
-# Демо-контакт определяется ЕДИНСТВЕННО надёжно через original_from_id — НЕ
-# contact_alias (тот всегда случайный uuid4, одинаковый и для демо, и для
-# реальных контактов). _setup_demo прописывает original_from_id жёстко как
-# "demo_boss"/"demo_friend" — у реальных контактов оно всегда другого формата
-# (f"user{tg_id}" business, f"live_{uuid4().hex}" живой диалог, ID из JSON),
-# так что пересечься не может.
-_DEMO_ORIGINAL_IDS = {"demo_boss", "demo_friend"}
-
-
-def _is_demo_contact(contact_id: int | None) -> bool:
-    if not contact_id:
-        return False
-    contact = get_contact_by_id(contact_id)
-    return bool(contact) and contact["original_from_id"] in _DEMO_ORIGINAL_IDS
-
-
-async def _has_demo_quota(bot: Bot, telegram_id: str) -> bool:
-    if await _is_premium(bot, telegram_id):
-        return True
-    return get_demo_trial_used(telegram_id) < DEMO_TRIAL_LIMIT
-
-
-async def _demo_quota_gate(bot: Bot, target: Message, telegram_id: str) -> bool:
-    """Как _quota_gate, но для демо-контактов: отдельный (щедрый) счётчик,
-    и пользователю НЕ намекаем на лимит, пока он не исчерпан — обычные ответы
-    в демо генерируются молча, без упоминания «осталось N из 25»."""
-    if await _has_demo_quota(bot, telegram_id):
-        return True
-    await _send_paywall(
-        target,
-        "Похоже, тебе нравится как это работает 😏 Подключай Premium — и "
-        "получишь то же самое на настоящих переписках, без ограничений."
-    )
-    return False
-
-
-async def _charge_demo_trial_if_needed(bot: Bot, telegram_id: str) -> None:
-    if await _is_premium(bot, telegram_id):
-        return
-    increment_demo_trial_used(telegram_id)
-
-
 async def _require_premium(bot: Bot, target: Message, telegram_id: str) -> bool:
     """Гейт для функций без бесплатного триала (анализ собеседника, стиль
     собеседника, /compare и т.п.) — доступ только по активной подписке."""
@@ -540,13 +494,11 @@ async def _process_redeem(message: Message, code: str) -> None:
     """Анти-абуз для /redeem:
     • код должен существовать (принадлежать реальному пользователю);
     • нельзя погасить свой же код (самоприглашение);
-    • нельзя погасить код, если у тебя УЖЕ есть хоть один РЕАЛЬНЫЙ контакт —
-      значит ты реально пользовался ботом раньше, «новым другом» задним числом
-      стать нельзя (в отличие от старой ссылочной схемы, здесь /redeem доступен
+    • нельзя погасить код, если у тебя УЖЕ есть хоть один контакт — значит
+      ты реально пользовался ботом раньше, «новым другом» задним числом стать
+      нельзя (в отличие от старой ссылочной схемы, здесь /redeem доступен
       только ПОСЛЕ выбора пола, так что users-строка есть у всех — надёжный
-      признак «нового» теперь список контактов, а не факт существования в БД).
-      Демо-контакты (demo_boss/demo_friend) НЕ считаются — бот сам предлагает
-      начать с демо в онбординге, и /redeem может быть введён уже после демо;
+      признак «нового» теперь список контактов, а не факт существования в БД);
     • один человек может погасить код только один раз — save_referral_pending
       это PRIMARY KEY(referred_telegram_id), INSERT OR IGNORE."""
     telegram_id = str(message.from_user.id)
@@ -559,7 +511,7 @@ async def _process_redeem(message: Message, code: str) -> None:
     if referrer_id == telegram_id:
         await message.answer("Это твой собственный код 🙂")
         return
-    if any(not _is_demo_contact(c["id"]) for c in list_contacts(telegram_id)):
+    if list_contacts(telegram_id):
         await message.answer("Похоже, ты уже пользуешься CueMe — этот код не для тебя.")
         return
     if get_pending_referral(telegram_id):
@@ -569,8 +521,7 @@ async def _process_redeem(message: Message, code: str) -> None:
     save_referral_pending(referrer_id, telegram_id)
     await message.answer(
         "Принято! Как только ты начнёшь пользоваться ботом — твой друг получит награду.\n\n"
-        "Начните с кем-то новый диалог или попробуйте на примере.",
-        reply_markup=demo_only_kb(),
+        "Начни с кем-то новый диалог или подключи Автоматизацию чатов — /connect."
     )
 
 
@@ -1480,8 +1431,6 @@ def _best_compatibility_contact(telegram_id: str) -> tuple[str, str] | None:
     анализа ещё нет. Возвращает (имя_контакта, compatibility_text)."""
     best: tuple[int, str, str] | None = None
     for c in list_contacts(telegram_id):
-        if _is_demo_contact(c["id"]):
-            continue
         data = get_deep_analysis(c["id"])
         if not data:
             continue
@@ -1727,95 +1676,17 @@ async def handle_business_message(event: Message, bot: Bot) -> None:
 def _no_dialogs_hint_kb() -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     b.button(text="📖 Инструкция по JSON-экспорту", url=ONBOARDING_JSON_POST_URL)
-    b.button(text="🎬 Попробовать на примере", callback_data="demo")
     b.adjust(1)
     return b.as_markup()
 
 
 async def _send_no_dialogs_hint(message: Message) -> None:
     """Показывается, когда у юзера ещё нет ни одного контакта (диалога) —
-    живой разговор через Business, JSON-экспорт или демо на примере."""
+    живой разговор через Business или JSON-экспорт."""
     await message.answer(
-        "Начни диалог с кем-то — или экспортируй чат в формате JSON\n"
-        "Также вы можете попробовать на примере функции бота.",
+        "Начни диалог с кем-то — или экспортируй чат в формате JSON",
         reply_markup=_no_dialogs_hint_kb(),
     )
-
-
-# ── Демо-режим: готовые примеры-собеседники без загрузки данных ───────────────
-
-_DEMO_STYLE = (
-    "🎙️ Стиль и тон\n"
-    "• пишешь дружелюбно и по делу, без официоза\n\n"
-    "✍️ Как ты строишь сообщения\n"
-    "• законченные мысли средней длины\n\n"
-    "🔤 Регистр и инициатива\n"
-    "• с маленькой буквы, на «ты», эмодзи почти не используешь"
-)
-
-_DEMO_BOSS = (
-    "🎯 Как писать этому человеку\n"
-    "• коротко и по делу, без воды\n"
-    "• на «Вы», вежливо и формально\n"
-    "• конкретика: сроки, цифры, факты\n"
-    "• без сленга и эмодзи\n\n"
-    "🔤 Регистр и язык\n"
-    "• Вы, с большой буквы, деловой тон"
-)
-
-_DEMO_FRIEND = (
-    "🎯 Как писать этому человеку\n"
-    "• неформально, на «ты», тепло\n"
-    "• можно с лёгким юмором, коротко\n"
-    "• сленг ок, эмодзи изредка\n\n"
-    "🔤 Регистр и язык\n"
-    "• ты, с маленькой буквы, расслабленно"
-)
-
-
-def _setup_demo(telegram_id: str) -> None:
-    """Создаёт двух примеров-собеседников с готовыми карточками. Без LLM."""
-    upsert_user(telegram_id, f"user{telegram_id}")
-    save_style_card(telegram_id, _DEMO_STYLE)
-    for orig, name, card in [
-        ("demo_boss",   "Босс (демо)", _DEMO_BOSS),
-        ("demo_friend", "Друг (демо)", _DEMO_FRIEND),
-    ]:
-        cid = get_or_create_contact(telegram_id, orig, name)
-        save_interaction_card(cid, card)
-        save_my_style_per_contact(cid, _DEMO_STYLE, 0)
-
-
-async def _run_demo(telegram_id: str, target: Message) -> None:
-    _setup_demo(telegram_id)
-    await _credit_referral_if_pending(target.bot, telegram_id)
-    await target.answer(
-        "Готово! Создал двух примеров-собеседников:\n"
-        "• Босс (демо) — формальный, на «Вы»\n"
-        "• Друг (демо) — неформальный, на «ты»\n\n"
-        "Нажми «💬 Ответить за меня», выбери одного и пришли любое сообщение "
-        "(например: «как дела, увидимся на этой неделе?») — увидишь, как ответ "
-        "меняется под каждого.\n\n"
-        "ℹ️ В демо твой стиль условный. На твоих данных бот будет писать твоим стилем — "
-        "загрузи экспорт чата, когда захочешь.",
-        reply_markup=main_kb(),
-    )
-    await _maybe_prompt_gender(target.bot, telegram_id)
-
-
-def onboarding_kb() -> InlineKeyboardMarkup:
-    b = InlineKeyboardBuilder()
-    b.button(text="📖 Подробная инструкция", callback_data="onb:business")
-    b.button(text="👑 У меня есть комп (JSON)", callback_data="onb:json")
-    b.button(text="🎬 Попробовать на примере", callback_data="demo")
-    b.adjust(1)
-    return b.as_markup()
-
-
-def demo_only_kb() -> InlineKeyboardMarkup:
-    b = InlineKeyboardBuilder()
-    b.button(text="🎬 Попробовать на примере", callback_data="demo")
-    return b.as_markup()
 
 
 # Выбор устройства (iPhone/Android/десктоп) убран — шаги подключения теперь
@@ -1982,19 +1853,6 @@ async def cb_onboarding_json(call: CallbackQuery, state: FSMContext, bot: Bot) -
         "Загрузи переписку: Telegram Desktop → открой чат → ⋮ → "
         "Экспорт истории чата → формат JSON (без медиа) → пришли файл result.json сюда."
     )
-
-
-@dp.callback_query(F.data == "demo")
-async def cb_demo(call: CallbackQuery, state: FSMContext) -> None:
-    await state.clear()
-    await call.answer()
-    await _run_demo(str(call.from_user.id), call.message)
-
-
-@dp.message(Command("demo"))
-async def cmd_demo(message: Message, state: FSMContext) -> None:
-    await state.clear()
-    await _run_demo(str(message.from_user.id), message)
 
 
 # ── Кнопки главного меню ──────────────────────────────────────────────────────
@@ -2191,21 +2049,17 @@ async def _build_users_report(bot: Bot) -> str:
     users = list_all_users()
 
     lines = ["👥 Пользователи CueMe:\n"]
-    with_gender = with_any_contact = with_real_contact = with_ref_premium = 0
+    with_gender = with_contact = with_ref_premium = 0
 
     for u in users:
         tid = u["telegram_id"]
         who = await _resolve_username(bot, tid)
         contacts = list_contacts(tid)
-        real = sum(1 for c in contacts if not _is_demo_contact(c["id"]))
-        demo = len(contacts) - real
 
         if u["gender"]:
             with_gender += 1
         if contacts:
-            with_any_contact += 1
-        if real:
-            with_real_contact += 1
+            with_contact += 1
 
         premium_note = ""
         until_raw = u["deep_analysis_free_until"]
@@ -2221,14 +2075,13 @@ async def _build_users_report(bot: Bot) -> str:
         gender_label = _GENDER_LABELS.get(u["gender"], "?")
         lines.append(
             f"• {who} · {gender_label} · триал {u['trial_used']} · "
-            f"контактов {real}+{demo}demo{premium_note}"
+            f"контактов {len(contacts)}{premium_note}"
         )
 
     lines.append("")
     lines.append(f"Всего: {len(users)}")
     lines.append(f"С полом: {with_gender}")
-    lines.append(f"С реальным контактом: {with_real_contact}")
-    lines.append(f"Только демо/без контактов: {len(users) - with_real_contact}")
+    lines.append(f"С контактом: {with_contact}")
     lines.append(f"С активной реферальной Premium: {with_ref_premium}")
     return "\n".join(lines)
 
@@ -2697,7 +2550,6 @@ async def _run_variants_generation(
     style_card, interaction_card = ctx["style_card"], ctx["interaction_card"]
     signals = ctx.get("data_signals")
     winning = ctx.get("winning")
-    is_demo = ctx.get("is_demo", False)
     gender = get_gender(str(telegram_id))
     cache_key = _style_cache_key(f"{kind}_variants", "", text, style_card, interaction_card, extra=gender or "")
 
@@ -2712,13 +2564,8 @@ async def _run_variants_generation(
                 variants = None
 
     if variants is None:
-        # Реальный вызов LLM — здесь и только здесь гейт + списание. Демо-контакт
-        # (is_demo из ctx, посчитан один раз при создании ctx) — отдельная тихая
-        # квота, не делит счётчик с реальным использованием.
-        if is_demo:
-            if not await _demo_quota_gate(bot, target, str(telegram_id)):
-                return
-        elif not await _quota_gate(bot, target, str(telegram_id)):
+        # Реальный вызов LLM — здесь и только здесь гейт + списание.
+        if not await _quota_gate(bot, target, str(telegram_id)):
             return
         prev = ctx.get("variants") if force_fresh else None
         try:
@@ -2744,10 +2591,7 @@ async def _run_variants_generation(
 
         # Успех — списываем ОДНУ попытку (не за каждый вариант — это один вызов
         # LLM) и кэшируем, даже если разбор дал меньше вариантов, чем просили.
-        if is_demo:
-            await _charge_demo_trial_if_needed(bot, str(telegram_id))
-        else:
-            await _charge_trial_if_needed(bot, str(telegram_id))
+        await _charge_trial_if_needed(bot, str(telegram_id))
         set_llm_cache(cache_key, json.dumps(variants, ensure_ascii=False))
         try:
             record_event(str(telegram_id), f"gen_{kind}_variants", str(len(variants)))
@@ -2801,12 +2645,8 @@ async def handle_incoming(message: Message, state: FSMContext, bot: Bot) -> None
     # Выйти из режима — любая кнопка меню (handle_menu_button сбрасывает state).
 
     contact_id = data.get("contact_id")
-    is_demo = _is_demo_contact(contact_id)
     telegram_id = str(message.from_user.id)
-    if is_demo:
-        if not await _demo_quota_gate(bot, message, telegram_id):
-            return
-    elif not await _quota_gate(bot, message, telegram_id):
+    if not await _quota_gate(bot, message, telegram_id):
         return
 
     # «Разбор переписки» (_send_reply_analysis) здесь отключён намеренно:
@@ -2818,7 +2658,6 @@ async def handle_incoming(message: Message, state: FSMContext, bot: Bot) -> None
         "style_card": data["style_card"], "interaction_card": data["interaction_card"],
         "data_signals": _reply_data_signals(samples, incoming),
         "winning": _winning_for_contact(str(message.from_user.id), contact_id),
-        "is_demo": is_demo,
     }
     action_id = _new_action(message.from_user.id, ctx)
     await _run_variants_generation(message, ctx, message.from_user.id, bot, action_id, state)
@@ -3271,11 +3110,7 @@ async def _prompt_screenshot_style(
     # ВАЖНО: user_id передаётся отдельным параметром, а не берётся из
     # target.from_user — при edit=True target это call.message, чей
     # .from_user это БОТ, а не пользователь (стандартная ловушка aiogram).
-    is_demo = _is_demo_contact(contact_id)
-    if is_demo:
-        if not await _demo_quota_gate(bot, target, telegram_id):
-            return
-    elif not await _quota_gate(bot, target, telegram_id):
+    if not await _quota_gate(bot, target, telegram_id):
         return
     # Генерация карточек ходит в LLM — без обработки ошибок сбой (лимит/провайдер
     # недоступен) тихо убивал кнопку: спиннер гас, а сообщение не менялось.
@@ -3300,7 +3135,6 @@ async def _prompt_screenshot_style(
         "style_card": style_card, "interaction_card": interaction_card,
         "data_signals": _reply_data_signals(samples, _last_incoming_line(chat_text)),
         "winning": _winning_for_contact(telegram_id, contact_id),
-        "is_demo": is_demo,
     }
     action_id = _new_action(user_id, ctx)
     if edit:
@@ -3419,7 +3253,7 @@ def _progress_line(name: str, done: int, threshold: int, is_first: bool) -> str:
 @dp.message(Command("progress"))
 async def cmd_progress(message: Message) -> None:
     telegram_id = str(message.from_user.id)
-    contacts = [c for c in list_contacts(telegram_id) if not _is_demo_contact(c["id"])]
+    contacts = list_contacts(telegram_id)
     if not contacts:
         await message.answer(
             "Пока нет реальных контактов для отслеживания прогресса — подключи "
@@ -3478,7 +3312,6 @@ async def _show_help(message: Message) -> None:
         "/delete — удалить свои данные\n\n"
         "<b>🎬 Остальное</b>\n"
         "/start — начало работы\n"
-        "/demo — попробовать на примере\n"
         "/help — это сообщение\n\n"
         f"💎 {FREE_TRIAL_REQUESTS} бесплатных попыток на ответ/скриншот, "
         "дальше и остальные функции — по подписке. Статус — /premium.",
@@ -3625,10 +3458,7 @@ async def _show_compare(message: Message, bot: Bot, telegram_id: str | None = No
     telegram_id = telegram_id or str(message.from_user.id)
     if not await _require_premium(bot, message, telegram_id):
         return
-    cards = [
-        c for c in get_all_per_contact_style_cards(telegram_id)
-        if c["original_from_id"] not in _DEMO_ORIGINAL_IDS
-    ]
+    cards = get_all_per_contact_style_cards(telegram_id)
     if len(cards) < 2:
         await message.answer(
             "Нужно минимум 2 разобранных собеседника. "
@@ -3836,7 +3666,6 @@ async def main() -> None:
         BotCommand(command="start",       description="Начало работы"),
         BotCommand(command="gender",      description="Сменить пол"),
         BotCommand(command="help",        description="Список команд"),
-        BotCommand(command="demo",        description="Попробовать на примере"),
         BotCommand(command="connect",     description="Подключить Автоматизацию чатов"),
         BotCommand(command="me",          description="Мой стиль общения"),
         BotCommand(command="stats",       description="Портрет в цифрах"),
