@@ -1673,15 +1673,92 @@ async def handle_business_message(event: Message, bot: Bot) -> None:
 
 # ── /start ────────────────────────────────────────────────────────────────────
 
+def _quickstart_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="💬 Да, есть", callback_data="qs:yes"),
+        InlineKeyboardButton(text="🤷 Пока никого", callback_data="qs:no"),
+    ]])
+
+
 async def _send_no_dialogs_hint(message: Message) -> None:
     """Показывается, когда у юзера ещё нет ни одного контакта (диалога) —
-    живой разговор через Business или JSON-экспорт. Заодно несёт main_kb —
-    единственное место, где reply-клавиатура доходит до юзера на чистом
-    Business-пути (до первого сообщения ещё не было повода её прислать)."""
+    сразу конкретный вопрос с двумя вариантами следующего шага (без
+    свободного выбора среди всех кнопок главного меню — на живых тестерах
+    общий текст с полной клавиатурой не работал, терялись)."""
     await message.answer(
-        f"Начни диалог с кем-то — или экспортируй чат в формате JSON: {ONBOARDING_JSON_POST_URL}",
-        reply_markup=main_kb(),
+        "Готово, бот подключён! Есть кто-то конкретный, с кем сейчас переписываешься?",
+        reply_markup=_quickstart_kb(),
     )
+    # main_kb (reply-клавиатура) — единственное место, где она доходит до
+    # юзера на чистом Business-пути (до первого сообщения ещё не было
+    # повода её прислать). Отдельным скрытым сообщением, чтобы не мешать
+    # тексту вопроса выше — Telegram не даёт пустой текст, поэтому невидимый
+    # символ (zero-width space).
+    await message.answer("​", reply_markup=main_kb())
+
+
+@dp.callback_query(F.data == "qs:yes")
+async def cb_quickstart_yes(call: CallbackQuery, state: FSMContext) -> None:
+    await call.answer()
+    await _start_live_dialogue(call.message, state)
+
+
+def dating_apps_kb() -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    b.button(text="💘 Дайвинчик", url="https://t.me/leomatchbot")
+    b.button(text="⚡ FastLove", url="https://t.me/fastlovetg_bot")
+    b.adjust(1)
+    return b.as_markup()
+
+
+def _quickstart_gender_kb() -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    b.button(text="👩 Ей", callback_data="qsphr:her")
+    b.button(text="👨 Ему", callback_data="qsphr:him")
+    b.adjust(2)
+    return b.as_markup()
+
+
+@dp.callback_query(F.data == "qs:no")
+async def cb_quickstart_no(call: CallbackQuery) -> None:
+    await call.answer()
+    await call.message.answer("Кому бы написал(-а)?", reply_markup=_quickstart_gender_kb())
+
+
+def _quickstart_phrase_next_kb(target: str) -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    b.button(text="🔄 Другой вариант", callback_data=f"qsphr_next:{target}")
+    b.button(text="💘 Дайвинчик", url="https://t.me/leomatchbot")
+    b.button(text="⚡ FastLove", url="https://t.me/fastlovetg_bot")
+    b.adjust(1)
+    return b.as_markup()
+
+
+async def _send_quickstart_phrases(msg: Message, state: FSMContext, target: str) -> None:
+    """Своя, изолированная от phrases:*, ветка — переиспользует только
+    ДАННЫЕ (OPENERS_FOR_HER/HIM), не общий код _send_opener/cb_phrases_gender,
+    чтобы не задеть существующий путь «🎲 Готовые фразы для начала»."""
+    items = OPENERS_FOR_HER if target == "her" else OPENERS_FOR_HIM
+    phrase = await _pick_no_repeat(state, f"qs_opener_shown_{target}", items)
+    intro = "Вот пара фраз для начала — сохрани, пригодятся:"
+    if "[" in phrase:
+        intro += " замени [то, что в скобках] на реальную деталь из анкеты."
+    text = f"{intro}\n\n<code>{html.escape(phrase)}</code>\n\nИщешь пару? Загляни в один из дейтинг-ботов прямо в Telegram — так и попробуешь:"
+    await msg.answer(text, parse_mode="HTML", reply_markup=_quickstart_phrase_next_kb(target))
+
+
+@dp.callback_query(F.data.startswith("qsphr:"))
+async def cb_quickstart_gender(call: CallbackQuery, state: FSMContext) -> None:
+    target = call.data.split(":", 1)[1]  # her | him
+    await call.answer()
+    await _send_quickstart_phrases(call.message, state, target)
+
+
+@dp.callback_query(F.data.startswith("qsphr_next:"))
+async def cb_quickstart_phrase_next(call: CallbackQuery, state: FSMContext) -> None:
+    target = call.data.split(":", 1)[1]
+    await call.answer("Другой вариант")
+    await _send_quickstart_phrases(call.message, state, target)
 
 
 # Выбор устройства (iPhone/Android/десктоп) убран — шаги подключения теперь
