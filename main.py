@@ -196,14 +196,22 @@ BTN_UNIFIED       = "💬 Ответ с CueMe"
 BTN_DEEP          = "🔬 Анализ собеседника"
 BTN_DEEP_STYLE    = "🪞 Анализ своего стиля"
 BTN_DATE          = "💐 Идеальное свидание"
-BTN_REVIVE        = "🔥 Скрипты общения"
-BTN_INVITE        = "🎁 Пригласить друга"
-# BTN_ANALYZE/BTN_MORE — на главном экране, открывают инлайн-подменю с
-# BTN_DEEP/BTN_DEEP_STYLE и BTN_DATE/BTN_REVIVE/BTN_INVITE соответственно
-# (см. analyze_menu_kb/more_menu_kb) — чтобы не перегружать первый экран
-# 9 кнопками сразу.
+# BTN_REVIVE («🔥 Скрипты общения») убрана совсем из главного меню — была
+# внутри BTN_MORE, который тоже убран. _show_revive/cb_revive_next/
+# REVIVE_QUESTIONS не удалены физически, просто больше не достижимы.
+# BTN_REVIVE        = "🔥 Скрипты общения"
+# BTN_INVITE («🎁 Пригласить друга») тоже была только внутри BTN_MORE —
+# приглашение друга доступно через «👑 Подписка» (premium_menu_kb) и /invite.
+# BTN_INVITE        = "🎁 Пригласить друга"
+# BTN_ANALYZE — на главном экране, открывает инлайн-подменю с BTN_DEEP/
+# BTN_DEEP_STYLE (см. analyze_menu_kb) — чтобы не перегружать первый экран.
 BTN_ANALYZE       = "🔬 Разобраться"
-BTN_MORE          = "⚙️ Ещё"
+# BTN_MORE («⚙️ Ещё») убрана — «Идеальное свидание» стала кнопкой первого
+# уровня, «Пригласить друга» доступно через «👑 Подписка»/командой /invite,
+# «Скрипты общения» убраны совсем (см. BTN_REVIVE выше). more_menu_kb()
+# оставлена закомментированной ниже — на случай отката.
+# BTN_MORE          = "⚙️ Ещё"
+BTN_SUBSCRIPTION  = "👑 Подписка"
 BTN_HELP          = "❓ Помощь"
 # BTN_ME («👤 Мой стиль») убрана вместе с командой /me — дублировала
 # BTN_DEEP_STYLE (и была бесплатной лазейкой мимо подписки на неё).
@@ -215,7 +223,7 @@ BTN_HELP          = "❓ Помощь"
 # BTN_REWRITE («📝 Переписать») и /auto удалены совсем — их сценарий (черновик
 # без привязки к входящему) теперь полностью закрывает «💫 Новый диалог».
 _ALL_BTNS = {
-    BTN_UNIFIED, BTN_ANALYZE, BTN_MORE, BTN_HELP,
+    BTN_UNIFIED, BTN_ANALYZE, BTN_DATE, BTN_SUBSCRIPTION, BTN_HELP,
 }
 
 # Защита от параллельных пересборок одного контакта
@@ -551,8 +559,8 @@ def main_kb() -> ReplyKeyboardMarkup:
     # b.row(KeyboardButton(text=BTN_SCREENSHOT), KeyboardButton(text=BTN_REPLY))
     # b.row(KeyboardButton(text=BTN_LIVE))
     b.row(KeyboardButton(text=BTN_UNIFIED))
-    b.row(KeyboardButton(text=BTN_ANALYZE), KeyboardButton(text=BTN_MORE))
-    b.row(KeyboardButton(text=BTN_HELP))
+    b.row(KeyboardButton(text=BTN_ANALYZE), KeyboardButton(text=BTN_DATE))
+    b.row(KeyboardButton(text=BTN_SUBSCRIPTION), KeyboardButton(text=BTN_HELP))
     return b.as_markup(resize_keyboard=True)
 
 
@@ -566,13 +574,17 @@ def analyze_menu_kb() -> InlineKeyboardMarkup:
     return b.as_markup()
 
 
-def more_menu_kb() -> InlineKeyboardMarkup:
-    b = InlineKeyboardBuilder()
-    b.button(text=BTN_DATE, callback_data="menu:date")
-    b.button(text=BTN_REVIVE, callback_data="menu:revive")
-    b.button(text=BTN_INVITE, callback_data="menu:invite")
-    b.adjust(1)
-    return b.as_markup()
+# more_menu_kb убрана вместе с BTN_MORE — «Идеальное свидание» стало кнопкой
+# первого уровня, «Скрипты общения» убраны совсем, «Пригласить друга»
+# доступно через «👑 Подписка»/командой /invite. Не удалена физически —
+# на случай отката.
+# def more_menu_kb() -> InlineKeyboardMarkup:
+#     b = InlineKeyboardBuilder()
+#     b.button(text=BTN_DATE, callback_data="menu:date")
+#     b.button(text=BTN_REVIVE, callback_data="menu:revive")
+#     b.button(text=BTN_INVITE, callback_data="menu:invite")
+#     b.adjust(1)
+#     return b.as_markup()
 
 
 # ── Пол пользователя ─────────────────────────────────────────────────────────
@@ -1953,7 +1965,7 @@ async def cb_onboarding_json(call: CallbackQuery, state: FSMContext, bot: Bot) -
 # ── Кнопки главного меню ──────────────────────────────────────────────────────
 
 @dp.message(F.text.in_(_ALL_BTNS))
-async def handle_menu_button(message: Message, state: FSMContext) -> None:
+async def handle_menu_button(message: Message, state: FSMContext, bot: Bot) -> None:
     await state.clear()
     # if message.text == BTN_SCREENSHOT:
     #     await _start_screenshot(message, state)
@@ -1965,8 +1977,10 @@ async def handle_menu_button(message: Message, state: FSMContext) -> None:
         await _start_unified_reply(message, state)
     elif message.text == BTN_ANALYZE:
         await message.answer("Что разобрать?", reply_markup=analyze_menu_kb())
-    elif message.text == BTN_MORE:
-        await message.answer("Ещё:", reply_markup=more_menu_kb())
+    elif message.text == BTN_DATE:
+        await _show_ideal_date(message, bot)
+    elif message.text == BTN_SUBSCRIPTION:
+        await _show_premium_screen(message, bot, str(message.from_user.id))
     elif message.text == BTN_HELP:
         await _show_help(message)
 
@@ -1982,8 +1996,8 @@ async def cb_submenu(call: CallbackQuery, state: FSMContext, bot: Bot) -> None:
         await _show_deep_style_analysis(call.message, bot, telegram_id)
     elif action == "date":
         await _show_ideal_date(call.message, bot, telegram_id)
-    elif action == "revive":
-        await _show_revive(call.message, state)
+    # elif action == "revive":  # «Скрипты общения» убраны совсем — см. BTN_REVIVE
+    #     await _show_revive(call.message, state)
     elif action == "invite":
         await _show_invite(call.message, bot, telegram_id)
     elif action == "compare":
@@ -3551,7 +3565,7 @@ async def cmd_progress(message: Message) -> None:
 async def _show_help(message: Message) -> None:
     await message.answer(
         "Вот что я умею. На главном экране — кнопка «💬 Ответ с CueMe» плюс "
-        "«🔬 Разобраться» и «⚙️ Ещё» (открывают подменю с остальным):\n\n"
+        "«🔬 Разобраться», «💐 Идеальное свидание» и «👑 Подписка»:\n\n"
         "💬 Ответ с CueMe — пришли скриншот переписки, перешли сообщение или "
         "вставь текст: если контакт уже есть — несколько вариантов ответа "
         "(Флирт/Дружески/Уверенно и т.п.); если нет — заведём новый диалог "
@@ -3565,9 +3579,8 @@ async def _show_help(message: Message) -> None:
         "/deep_style_analysis — твой коммуникативный профиль и советы для дейтинга\n"
         "/compare — сравнить, как ты пишешь разным людям\n"
         "/stats — портрет в цифрах, бесплатно\n\n"
-        "<b>⚙️ Ещё</b> (кнопка в меню)\n"
-        "💐 Идеальное свидание — идея свидания и подарков под человека\n"
-        "🔥 Скрипты общения — готовый вопрос, чтобы расшевелить затихший разговор\n"
+        "<b>💐 Идеальное свидание</b> (кнопка в меню) — идея свидания и подарков под человека\n\n"
+        "<b>👑 Подписка</b> (кнопка в меню) — статус подписки + "
         f"🎁 Пригласить друга (/invite) — получить свой код, за друга по коду дадим "
         f"{REFERRAL_REWARD_DAYS} дня Premium подписки\n\n"
         "<b>⚙️ Аккаунт</b>\n"
@@ -3625,11 +3638,15 @@ async def cmd_premium(message: Message, bot: Bot) -> None:
     await message.answer(text, reply_markup=paywall_kb())
 
 
+async def _show_premium_screen(target: Message, bot: Bot, telegram_id: str) -> None:
+    text = await _premium_status_text(bot, telegram_id)
+    await target.answer(text, reply_markup=premium_menu_kb())
+
+
 @dp.callback_query(F.data == "show_premium")
 async def cb_show_premium(call: CallbackQuery, bot: Bot) -> None:
     await call.answer()
-    text = await _premium_status_text(bot, str(call.from_user.id))
-    await call.message.answer(text, reply_markup=premium_menu_kb())
+    await _show_premium_screen(call.message, bot, str(call.from_user.id))
 
 
 @dp.callback_query(F.data == "show_invite")
