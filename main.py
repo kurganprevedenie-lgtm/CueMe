@@ -1764,7 +1764,7 @@ async def _send_quickstart_phrases(msg: Message, state: FSMContext, target: str)
     intro = "Вот пара фраз для начала — сохрани, пригодятся:"
     if "[" in phrase:
         intro += " замени [то, что в скобках] на реальную деталь из анкеты."
-    text = f"{intro}\n\n<code>{html.escape(phrase)}</code>\n\nИщешь пару? Загляни в один из дейтинг-ботов прямо в Telegram — так и попробуешь:"
+    text = f"{intro}\n\n<code>{html.escape(phrase)}</code>\n\nПосле того как найдешь себе партнера возвращайся и пиши в 💬 Ответ с CueMe"
     await msg.answer(text, parse_mode="HTML", reply_markup=_quickstart_phrase_next_kb(target))
 
 
