@@ -2601,7 +2601,17 @@ async def handle_unified_name(message: Message, state: FSMContext, bot: Bot) -> 
     await state.set_state(LiveDialogue.waiting_for_incoming)
     await state.update_data(contact_id=contact_id, dialogue_history=[])
     await message.answer(f"Готово — «{name}».")
-    await _process_live_incoming(message, state, bot, pending_text, message.from_user.id)
+    try:
+        await _process_live_incoming(message, state, bot, pending_text, message.from_user.id)
+    except Exception:
+        # Страховка для новой автообработки первого сообщения (раньше юзер
+        # мог остаться без ответа и без объяснения — см. фикс в
+        # _process_live_incoming). Состояние уже LiveDialogue.waiting_for_incoming,
+        # так что просто переслать сообщение ещё раз тоже сработает.
+        logging.exception("handle_unified_name: сбой автообработки первого сообщения")
+        await message.answer(
+            "Не получилось обработать первое сообщение — пришли его ещё раз."
+        )
 
 
 @dp.callback_query(F.data.startswith("unified_contact:"))
@@ -2639,7 +2649,13 @@ async def cb_unified_contact(call: CallbackQuery, state: FSMContext, bot: Bot) -
     await state.set_state(ReplyHelp.waiting_for_incoming)
     name = _contact_name(contact)
     await call.message.edit_text(f"Обрабатываю сообщение от {name}...")
-    await _process_reply_incoming(call.message, state, bot, pending_text, call.from_user.id)
+    try:
+        await _process_reply_incoming(call.message, state, bot, pending_text, call.from_user.id)
+    except Exception:
+        logging.exception("cb_unified_contact: сбой автообработки первого сообщения")
+        await call.message.answer(
+            "Не получилось обработать первое сообщение — пришли его ещё раз."
+        )
 
 
 def _format_blocks(blocks: list[dict]) -> str:
@@ -3101,7 +3117,19 @@ async def _process_live_incoming(
         await message.answer("Контекст диалога потерян — начни заново через «💬 Ответ с CueMe».")
         return
 
-    style_card = await _gen_style_card(telegram_id) or _LIVE_NEUTRAL_STYLE_PLACEHOLDER
+    # В отличие от остальных LLM-вызовов в файле, раньше был без try/except —
+    # сбой провайдера (рейтлимит/таймаут) тут тихо убивал автообработку
+    # первого сообщения сразу после создания контакта: юзер видел "Готово —
+    # «имя»." и дальше тишину, без единого намёка на ошибку.
+    try:
+        style_card = await _gen_style_card(telegram_id) or _LIVE_NEUTRAL_STYLE_PLACEHOLDER
+    except RateLimitError:
+        await message.answer("Лимит запросов исчерпан — попробуй через пару минут.")
+        return
+    except Exception:
+        logging.exception("_process_live_incoming: не удалось получить стиль")
+        await message.answer("Сервис сейчас перегружен — попробуй чуть позже.")
+        return
     notes_row = get_running_notes(contact_id)
     running_notes = notes_row["notes_text"] if notes_row else None
     message_count = notes_row["message_count"] if notes_row else 0
