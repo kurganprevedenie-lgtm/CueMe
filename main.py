@@ -186,9 +186,13 @@ def _is_admin(telegram_id: str | int) -> bool:
     return bool(ADMIN_TELEGRAM_IDS) and str(telegram_id) in ADMIN_TELEGRAM_IDS
 
 
-BTN_SCREENSHOT    = "📸 По скриншоту"
-BTN_REPLY         = "💬 Ответить за меня"
-BTN_LIVE          = "💫 Новый диалог"
+# BTN_SCREENSHOT/BTN_REPLY/BTN_LIVE — объединены в BTN_UNIFIED (см. ниже),
+# из main_kb() убраны. Константы и старые ветки-обработчики оставлены
+# закомментированными (не удалены физически) — на случай отката.
+# BTN_SCREENSHOT    = "📸 По скриншоту"
+# BTN_REPLY         = "💬 Ответить за меня"
+# BTN_LIVE          = "💫 Новый диалог"
+BTN_UNIFIED       = "💬 Ответ с CueMe"
 BTN_DEEP          = "🔬 Анализ собеседника"
 BTN_DEEP_STYLE    = "🪞 Анализ своего стиля"
 BTN_DATE          = "💐 Идеальное свидание"
@@ -211,7 +215,7 @@ BTN_HELP          = "❓ Помощь"
 # BTN_REWRITE («📝 Переписать») и /auto удалены совсем — их сценарий (черновик
 # без привязки к входящему) теперь полностью закрывает «💫 Новый диалог».
 _ALL_BTNS = {
-    BTN_SCREENSHOT, BTN_REPLY, BTN_LIVE, BTN_ANALYZE, BTN_MORE, BTN_HELP,
+    BTN_UNIFIED, BTN_ANALYZE, BTN_MORE, BTN_HELP,
 }
 
 # Защита от параллельных пересборок одного контакта
@@ -544,8 +548,9 @@ async def cmd_myref(message: Message) -> None:
 
 def main_kb() -> ReplyKeyboardMarkup:
     b = ReplyKeyboardBuilder()
-    b.row(KeyboardButton(text=BTN_SCREENSHOT), KeyboardButton(text=BTN_REPLY))
-    b.row(KeyboardButton(text=BTN_LIVE))
+    # b.row(KeyboardButton(text=BTN_SCREENSHOT), KeyboardButton(text=BTN_REPLY))
+    # b.row(KeyboardButton(text=BTN_LIVE))
+    b.row(KeyboardButton(text=BTN_UNIFIED))
     b.row(KeyboardButton(text=BTN_ANALYZE), KeyboardButton(text=BTN_MORE))
     b.row(KeyboardButton(text=BTN_HELP))
     return b.as_markup(resize_keyboard=True)
@@ -777,6 +782,14 @@ class Screenshot(StatesGroup):
 class LiveDialogue(StatesGroup):
     waiting_for_name     = State()
     waiting_for_incoming = State()
+
+class UnifiedReply(StatesGroup):
+    """«💬 Ответ с CueMe» — единая точка входа вместо БТН_SCREENSHOT/
+    BTN_REPLY/BTN_LIVE: фото/текст/форвард → определение контакта →
+    приводит к одному из существующих пайплайнов (ReplyHelp для
+    существующего контакта, LiveDialogue для нового)."""
+    waiting_for_input = State()
+    waiting_for_name  = State()
 
 
 # ── Выборка: biz-сообщения + fallback из JSON-семплов ─────────────────────────
@@ -1700,7 +1713,7 @@ async def _send_no_dialogs_hint(message: Message) -> None:
 @dp.callback_query(F.data == "qs:yes")
 async def cb_quickstart_yes(call: CallbackQuery, state: FSMContext) -> None:
     await call.answer()
-    await _start_live_dialogue(call.message, state)
+    await _start_unified_reply(call.message, state)
 
 
 def dating_apps_kb() -> InlineKeyboardMarkup:
@@ -1817,7 +1830,7 @@ async def _send_start_menu(message: Message, telegram_id: str) -> None:
     if list_contacts(telegram_id):
         await message.answer(
             "С возвращением!\n\n"
-            "Жми «💬 Ответить за меня» или «🔬 Анализ собеседника» 👇",
+            "Жми «💬 Ответ с CueMe» или «🔬 Анализ собеседника» 👇",
             reply_markup=main_kb(),
         )
         return
@@ -1934,12 +1947,14 @@ async def cb_onboarding_json(call: CallbackQuery, state: FSMContext, bot: Bot) -
 @dp.message(F.text.in_(_ALL_BTNS))
 async def handle_menu_button(message: Message, state: FSMContext) -> None:
     await state.clear()
-    if message.text == BTN_SCREENSHOT:
-        await _start_screenshot(message, state)
-    elif message.text == BTN_REPLY:
-        await _start_reply(message, state)
-    elif message.text == BTN_LIVE:
-        await _show_live_start(message)
+    # if message.text == BTN_SCREENSHOT:
+    #     await _start_screenshot(message, state)
+    # elif message.text == BTN_REPLY:
+    #     await _start_reply(message, state)
+    # elif message.text == BTN_LIVE:
+    #     await _show_live_start(message)
+    if message.text == BTN_UNIFIED:
+        await _start_unified_reply(message, state)
     elif message.text == BTN_ANALYZE:
         await message.answer("Что разобрать?", reply_markup=analyze_menu_kb())
     elif message.text == BTN_MORE:
@@ -2038,8 +2053,7 @@ async def handle_document(message: Message, bot: Bot, state: FSMContext) -> None
             if style_card and interaction_card:
                 await message.answer(
                     f"Готово! Данные по {name} загружены.\n"
-                    "Жми «💬 Ответить за меня» (подскажу что ответить) или "
-                    "«📸 По скриншоту».",
+                    "Жми «💬 Ответ с CueMe» — подскажу что ответить.",
                     reply_markup=main_kb(),
                 )
             else:
@@ -2084,7 +2098,7 @@ async def cb_setup_contact(call: CallbackQuery, state: FSMContext) -> None:
         await state.clear()
         await call.message.edit_text(
             f"Готово! Данные по {name} загружены.\n"
-            "Жми «💬 Ответить за меня» (подскажу что ответить) или «📸 По скриншоту»."
+            "Жми «💬 Ответ с CueMe» — подскажу что ответить."
         )
         await call.message.answer("Готово к работе 👇", reply_markup=main_kb())
     else:
@@ -2448,6 +2462,37 @@ async def _start_reply(message: Message, state: FSMContext) -> None:
     await message.answer("Кому отвечаешь?", reply_markup=contacts_kb(contacts, "reply"))
 
 
+async def _ensure_reply_cards(
+    target: Message, telegram_id: str, contact_id: int, edit: bool,
+) -> tuple[str, str] | None:
+    """style_card/interaction_card для «Ответить за меня» — генерирует
+    недостающие. None при ошибке (сообщение об ошибке уже отправлено
+    вызывающему). Нет данных не значит тупик — фолбэк на нейтральные
+    плейсхолдеры, как в холодном старте «Живого диалога»."""
+    style_card       = await _style_for_rewrite(telegram_id, contact_id)
+    interaction_card = get_interaction_card(contact_id)
+    if not style_card or not interaction_card:
+        msg_fn = target.edit_text if edit else target.answer
+        await msg_fn("Генерирую анализ — займёт ~20 секунд...")
+        try:
+            if not interaction_card:
+                interaction_card = await _gen_interaction_card(contact_id, telegram_id)
+            if not style_card:
+                style_card = await _gen_style_card(telegram_id)
+        except RateLimitError:
+            await msg_fn("Лимит LLM исчерпан, попробуй позже.")
+            return None
+        except Exception:
+            logging.exception("_ensure_reply_cards: ошибка генерации карточек")
+            await msg_fn("Не удалось сгенерировать анализ — попробуй ещё раз.")
+            return None
+
+    return (
+        style_card or _LIVE_NEUTRAL_STYLE_PLACEHOLDER,
+        interaction_card or _NEUTRAL_INTERACTION_PLACEHOLDER,
+    )
+
+
 @dp.callback_query(F.data.startswith("reply:"))
 async def cb_reply_contact(call: CallbackQuery, state: FSMContext) -> None:
     contact_id  = int(call.data.split(":")[1])
@@ -2460,26 +2505,10 @@ async def cb_reply_contact(call: CallbackQuery, state: FSMContext) -> None:
 
     await call.answer()
 
-    style_card       = await _style_for_rewrite(telegram_id, contact_id)
-    interaction_card = get_interaction_card(contact_id)
-    if not style_card or not interaction_card:
-        await call.message.edit_text("Генерирую анализ — займёт ~20 секунд...")
-        try:
-            if not interaction_card:
-                interaction_card = await _gen_interaction_card(contact_id, telegram_id)
-            if not style_card:
-                style_card = await _gen_style_card(telegram_id)
-        except RateLimitError:
-            await call.message.edit_text("Лимит LLM исчерпан, попробуй позже.")
-            return
-        except Exception:
-            logging.exception("cb_reply_contact: ошибка генерации карточек")
-            await call.message.edit_text("Не удалось сгенерировать анализ — попробуй ещё раз.")
-            return
-
-    # См. комментарий в _start_reply — нет данных не значит тупик.
-    style_card = style_card or _LIVE_NEUTRAL_STYLE_PLACEHOLDER
-    interaction_card = interaction_card or _NEUTRAL_INTERACTION_PLACEHOLDER
+    cards = await _ensure_reply_cards(call.message, telegram_id, contact_id, edit=True)
+    if cards is None:
+        return
+    style_card, interaction_card = cards
 
     await state.update_data(
         style_card=style_card, interaction_card=interaction_card, contact_id=contact_id
@@ -2489,6 +2518,120 @@ async def cb_reply_contact(call: CallbackQuery, state: FSMContext) -> None:
     await call.message.edit_text(
         f"Перешли или вставь сообщение от {name}, на которое нужно ответить:"
     )
+
+
+# ── 💬 Ответ с CueMe (единая точка входа вместо Скриншот/Ответить/Новый диалог) ──
+# Фото/текст/форвард → определение контакта → существующий пайплайн:
+# ReplyHelp для выбранного контакта, LiveDialogue для нового.
+
+async def _start_unified_reply(message: Message, state: FSMContext) -> None:
+    await state.set_state(UnifiedReply.waiting_for_input)
+    await message.answer("Пришли скриншот переписки, перешли сообщение или просто вставь текст")
+
+
+def unified_contacts_kb(contacts: list) -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    for c in contacts:
+        b.button(text=_contact_name(c), callback_data=f"unified_contact:{c['id']}")
+    b.button(text="➕ Другой человек", callback_data="unified_contact:new")
+    b.adjust(1)
+    return b.as_markup()
+
+
+@dp.message(UnifiedReply.waiting_for_input, _not_command)
+async def handle_unified_input(message: Message, state: FSMContext, bot: Bot) -> None:
+    if message.photo:
+        await message.answer("Читаю скриншот...")
+        try:
+            buf = await bot.download(message.photo[-1])
+            incoming = await extract_chat_from_image(buf.read())
+        except Exception:
+            logging.exception("unified: не удалось скачать/распознать скриншот")
+            incoming = ""
+        if not incoming or incoming.strip() == ILLEGIBLE_MARKER:
+            await message.answer("Не смог прочитать скриншот — пришли текст переписки сообщением.")
+            return  # остаёмся в UnifiedReply.waiting_for_input
+    else:
+        txt, _ = await _message_text(bot, message)
+        incoming = (txt or "").strip()
+        if not incoming:
+            await message.answer("Пришли скриншот, перешли сообщение или вставь текст.")
+            return
+
+    telegram_id = str(message.from_user.id)
+    contacts = list_contacts(telegram_id)
+    await state.update_data(pending_text=incoming)
+
+    if not contacts:
+        await state.set_state(UnifiedReply.waiting_for_name)
+        await message.answer(
+            "Как назвать этот диалог? Просто имя или метка, чтобы потом узнать среди контактов."
+        )
+        return
+
+    await message.answer("Кому отвечаем?", reply_markup=unified_contacts_kb(contacts))
+
+
+@dp.message(UnifiedReply.waiting_for_name)
+async def handle_unified_name(message: Message, state: FSMContext, bot: Bot) -> None:
+    name = (message.text or "").strip()
+    if not name:
+        await message.answer("Пришли имя текстом.")
+        return
+
+    data = await state.get_data()
+    pending_text = data.get("pending_text")
+    if not pending_text:
+        await message.answer("Контекст устарел — начни заново через «💬 Ответ с CueMe».")
+        await state.clear()
+        return
+
+    telegram_id = str(message.from_user.id)
+    upsert_user(telegram_id, f"user{telegram_id}")
+    contact_id = get_or_create_contact(telegram_id, f"live_{uuid.uuid4().hex}", name)
+
+    await state.set_state(LiveDialogue.waiting_for_incoming)
+    await state.update_data(contact_id=contact_id, dialogue_history=[])
+    await message.answer(f"Готово — «{name}».")
+    await _process_live_incoming(message, state, bot, pending_text, message.from_user.id)
+
+
+@dp.callback_query(F.data.startswith("unified_contact:"))
+async def cb_unified_contact(call: CallbackQuery, state: FSMContext, bot: Bot) -> None:
+    raw_id = call.data.split(":", 1)[1]
+    data = await state.get_data()
+    pending_text = data.get("pending_text")
+    if not pending_text:
+        await call.answer("Контекст устарел — начни заново через «💬 Ответ с CueMe».", show_alert=True)
+        return
+    await call.answer()
+
+    if raw_id == "new":
+        await state.set_state(UnifiedReply.waiting_for_name)
+        await call.message.edit_text(
+            "Как назвать этот диалог? Просто имя или метка, чтобы потом узнать среди контактов."
+        )
+        return
+
+    contact_id = int(raw_id)
+    telegram_id = str(call.from_user.id)
+    contact = get_contact_by_id(contact_id)
+    if not contact:
+        await call.answer("Контакт не найден.")
+        return
+
+    cards = await _ensure_reply_cards(call.message, telegram_id, contact_id, edit=True)
+    if cards is None:
+        return
+    style_card, interaction_card = cards
+
+    await state.update_data(
+        style_card=style_card, interaction_card=interaction_card, contact_id=contact_id
+    )
+    await state.set_state(ReplyHelp.waiting_for_incoming)
+    name = _contact_name(contact)
+    await call.message.edit_text(f"Обрабатываю сообщение от {name}...")
+    await _process_reply_incoming(call.message, state, bot, pending_text, call.from_user.id)
 
 
 def _format_blocks(blocks: list[dict]) -> str:
@@ -2705,21 +2848,20 @@ async def cb_variants_regen(call: CallbackQuery, state: FSMContext) -> None:
     await _run_variants_generation(call.message, ctx, call.from_user.id, call.bot, action_id, state, force_fresh=True)
 
 
-@dp.message(ReplyHelp.waiting_for_incoming, _not_command)
-async def handle_incoming(message: Message, state: FSMContext, bot: Bot) -> None:
-    txt, _ = await _message_text(bot, message)
-    incoming = (txt or "").strip()
-    if not incoming:
-        await message.answer("Пришли сообщение собеседника текстом или голосовым.")
-        return
-
+async def _process_reply_incoming(
+    message: Message, state: FSMContext, bot: Bot, incoming: str, user_id: int,
+) -> None:
+    """Общий хвост «Ответить за меня»: сборка ctx и генерация вариантов.
+    user_id — ОТДЕЛЬНЫМ параметром (не message.from_user.id) — при вызове
+    из callback-контекста message может быть call.message, чей .from_user
+    это бот, не юзер (стандартная ловушка aiogram, см. _prompt_screenshot_style)."""
+    telegram_id = str(user_id)
     data = await state.get_data()
     # Состояние НЕ сбрасываем — иначе следующее сообщение улетит в общий
     # авто-режим («Переписать») вместо продолжения «Ответить за меня».
     # Выйти из режима — любая кнопка меню (handle_menu_button сбрасывает state).
 
     contact_id = data.get("contact_id")
-    telegram_id = str(message.from_user.id)
     if not await _quota_gate(bot, message, telegram_id):
         return
 
@@ -2731,10 +2873,20 @@ async def handle_incoming(message: Message, state: FSMContext, bot: Bot) -> None
         "kind": "reply", "text": incoming, "result": None, "style": None,
         "style_card": data["style_card"], "interaction_card": data["interaction_card"],
         "data_signals": _reply_data_signals(samples, incoming),
-        "winning": _winning_for_contact(str(message.from_user.id), contact_id),
+        "winning": _winning_for_contact(telegram_id, contact_id),
     }
-    action_id = _new_action(message.from_user.id, ctx)
-    await _run_variants_generation(message, ctx, message.from_user.id, bot, action_id, state)
+    action_id = _new_action(user_id, ctx)
+    await _run_variants_generation(message, ctx, user_id, bot, action_id, state)
+
+
+@dp.message(ReplyHelp.waiting_for_incoming, _not_command)
+async def handle_incoming(message: Message, state: FSMContext, bot: Bot) -> None:
+    txt, _ = await _message_text(bot, message)
+    incoming = (txt or "").strip()
+    if not incoming:
+        await message.answer("Пришли сообщение собеседника текстом или голосовым.")
+        return
+    await _process_reply_incoming(message, state, bot, incoming, message.from_user.id)
 
 
 @dp.message(Command("reply"))
@@ -2923,28 +3075,24 @@ async def handle_live_name(message: Message, state: FSMContext) -> None:
     )
 
 
-@dp.message(LiveDialogue.waiting_for_incoming, _not_command)
-async def handle_live_incoming(message: Message, state: FSMContext, bot: Bot) -> None:
-    txt, _ = await _message_text(bot, message)
-    incoming = (txt or "").strip()
-    if not incoming:
-        contact_gen, _ = _contact_words(get_gender(str(message.from_user.id)))
-        await message.answer(f"Пришли сообщение {contact_gen} текстом или голосовым.")
-        return
-
+async def _process_live_incoming(
+    message: Message, state: FSMContext, bot: Bot, incoming: str, user_id: int,
+) -> None:
+    """Общий хвост «Живого диалога»: сборка ctx и live-коучинг. user_id —
+    отдельным параметром, см. комментарий в _process_reply_incoming."""
+    telegram_id = str(user_id)
     data = await state.get_data()
     # Состояние НЕ сбрасываем — можно форвардить сообщения одно за другим без
     # повторного нажатия кнопки. Выйти из режима — любая кнопка меню.
 
-    if not await _quota_gate(bot, message, str(message.from_user.id)):
+    if not await _quota_gate(bot, message, telegram_id):
         return
 
     contact_id = data.get("contact_id")
     if not contact_id:
-        await message.answer("Контекст диалога потерян — начни заново через «💫 Новый диалог».")
+        await message.answer("Контекст диалога потерян — начни заново через «💬 Ответ с CueMe».")
         return
 
-    telegram_id = str(message.from_user.id)
     style_card = await _gen_style_card(telegram_id) or _LIVE_NEUTRAL_STYLE_PLACEHOLDER
     notes_row = get_running_notes(contact_id)
     running_notes = notes_row["notes_text"] if notes_row else None
@@ -2957,13 +3105,24 @@ async def handle_live_incoming(message: Message, state: FSMContext, bot: Bot) ->
         "dialogue_history": dialogue_history, "message_count": message_count,
         "variants": None,
     }
-    action_id = _new_action(message.from_user.id, ctx)
+    action_id = _new_action(user_id, ctx)
 
     # Короткая история диалога — эфемерно, в FSM; долгая память — running_notes в БД.
     new_history = (dialogue_history + [incoming])[-8:]
     await state.update_data(dialogue_history=new_history)
 
-    await _run_live_coach_step(message, ctx, message.from_user.id, bot, action_id)
+    await _run_live_coach_step(message, ctx, user_id, bot, action_id)
+
+
+@dp.message(LiveDialogue.waiting_for_incoming, _not_command)
+async def handle_live_incoming(message: Message, state: FSMContext, bot: Bot) -> None:
+    txt, _ = await _message_text(bot, message)
+    incoming = (txt or "").strip()
+    if not incoming:
+        contact_gen, _ = _contact_words(get_gender(str(message.from_user.id)))
+        await message.answer(f"Пришли сообщение {contact_gen} текстом или голосовым.")
+        return
+    await _process_live_incoming(message, state, bot, incoming, message.from_user.id)
 
 
 async def _run_live_coach_step(
@@ -3355,15 +3514,15 @@ async def cmd_progress(message: Message) -> None:
 
 async def _show_help(message: Message) -> None:
     await message.answer(
-        "Вот что я умею. На главном экране — 3 кнопки для ответа плюс "
+        "Вот что я умею. На главном экране — кнопка «💬 Ответ с CueMe» плюс "
         "«🔬 Разобраться» и «⚙️ Ещё» (открывают подменю с остальным):\n\n"
-        "💬 Ответить за меня — несколько вариантов ответа: Флирт/Дружески/"
-        "Уверенно (или другое, если сообщение тяжёлое/деликатное)\n"
+        "💬 Ответ с CueMe — пришли скриншот переписки, перешли сообщение или "
+        "вставь текст: если контакт уже есть — несколько вариантов ответа "
+        "(Флирт/Дружески/Уверенно и т.п.); если нет — заведём новый диалог "
+        "(живой коучинг с нуля)\n"
         "/reply — ответить на его сообщение\n"
         "/screenshot — ответить по скриншоту переписки (можно слать скриншоты "
-        "один за другим)\n"
-        "💫 Новый диалог — помогу с первого сообщения новому человеку (живой "
-        "коучинг или готовые открывашки), без накопленной истории\n\n"
+        "один за другим)\n\n"
         "<b>🔬 Разобраться</b> (кнопка в меню)\n"
         "/deep_analysis — совместимость, история отношений, стиль и привычки "
         "собеседника, идеи подарков\n"
