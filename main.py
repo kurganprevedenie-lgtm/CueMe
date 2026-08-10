@@ -1673,19 +1673,14 @@ async def handle_business_message(event: Message, bot: Bot) -> None:
 
 # ── /start ────────────────────────────────────────────────────────────────────
 
-def _no_dialogs_hint_kb() -> InlineKeyboardMarkup:
-    b = InlineKeyboardBuilder()
-    b.button(text="📖 Инструкция по JSON-экспорту", url=ONBOARDING_JSON_POST_URL)
-    b.adjust(1)
-    return b.as_markup()
-
-
 async def _send_no_dialogs_hint(message: Message) -> None:
     """Показывается, когда у юзера ещё нет ни одного контакта (диалога) —
-    живой разговор через Business или JSON-экспорт."""
+    живой разговор через Business или JSON-экспорт. Заодно несёт main_kb —
+    единственное место, где reply-клавиатура доходит до юзера на чистом
+    Business-пути (до первого сообщения ещё не было повода её прислать)."""
     await message.answer(
-        "Начни диалог с кем-то — или экспортируй чат в формате JSON",
-        reply_markup=_no_dialogs_hint_kb(),
+        f"Начни диалог с кем-то — или экспортируй чат в формате JSON: {ONBOARDING_JSON_POST_URL}",
+        reply_markup=main_kb(),
     )
 
 
@@ -1806,22 +1801,24 @@ async def cb_gender_select(call: CallbackQuery, state: FSMContext) -> None:
     gender = call.data.split(":", 1)[1]
     telegram_id = str(call.from_user.id)
     set_gender(telegram_id, gender)
-    await call.answer()
-    await call.message.edit_text(f"Принято — обращаюсь как к «{_GENDER_LABELS[gender]}».")
+    # Подтверждение — всплывающим тостом, не отдельным сообщением в чате.
+    await call.answer(f"Обращаюсь как к «{_GENDER_LABELS[gender]}»")
+    try:
+        await call.message.delete()
+    except Exception:
+        pass
     await state.clear()
 
     if list_contacts(telegram_id):
         # Уже есть хотя бы один контакт (демо/JSON/Business) — вопрос про пол
         # всегда задаётся СРАЗУ после того, как онбординг только что показал
-        # меню и инструкции; повторно слать "С возвращением!" тут не нужно,
-        # подтверждения выбора пола достаточно.
+        # меню и инструкции; повторно слать "С возвращением!" тут не нужно.
         pass
     else:
         # Пол спросили сразу после подключения Автоматизации чатов, ещё до
         # первого реального сообщения — контакта пока нет. Полный экран
-        # приветствия (видео + кнопки подключения) тут ни к чему, это уже
-        # пройденный шаг — просто показываем меню и подсказку начать диалог.
-        await call.message.answer("Меню открыто 👇", reply_markup=main_kb())
+        # приветствия тут ни к чему, это уже пройденный шаг — просто
+        # показываем подсказку начать диалог (несёт и меню-клавиатуру).
         await _send_no_dialogs_hint(call.message)
 
 
