@@ -15,7 +15,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from aiogram import BaseMiddleware, Bot, Dispatcher, F
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -453,8 +453,9 @@ def _has_referral_premium(telegram_id: str) -> bool:
     return bool(until and until > datetime.now(timezone.utc))
 
 
-async def _show_invite(message: Message, bot: Bot, telegram_id: str | None = None) -> None:
-    telegram_id = telegram_id or str(message.from_user.id)
+def _invite_text(telegram_id: str) -> str:
+    """Тело приглашения — общее для /invite и рассылки-напоминания
+    (cmd_broadcast_invite), чтобы формулировка гарантированно не разъезжалась."""
     code = get_or_create_referral_code(telegram_id)
     count = count_successful_referrals(telegram_id)
 
@@ -464,22 +465,90 @@ async def _show_invite(message: Message, bot: Bot, telegram_id: str | None = Non
     else:
         reward_line = ""
 
-    await message.answer(
+    return (
         "🎁 Пригласи друга\n\n"
         f"👥 Приведено друзей: {count}\n"
         f"{reward_line}\n"
-        "Скинь другу этот код — пусть введёт его командой /redeem в этом боте. "
+        "Скинь другу этот код — пусть введёт его командой /redeem в этом боте.\n"
         "Как только он реально начнёт пользоваться CueMe — тебе дадутся "
         f"{REFERRAL_REWARD_DAYS} дня Premium подписки:\n\n"
-        f"<code>{html.escape(code)}</code>\n\n"
-        "(тапни по коду, чтобы скопировать)",
-        parse_mode="HTML",
+        f"<code>/redeem {html.escape(code)}</code>\n\n"
+        "(тапни по коду, чтобы скопировать)"
     )
+
+
+async def _show_invite(message: Message, bot: Bot, telegram_id: str | None = None) -> None:
+    telegram_id = telegram_id or str(message.from_user.id)
+    await message.answer(_invite_text(telegram_id), parse_mode="HTML")
 
 
 @dp.message(Command("invite"))
 async def cmd_invite(message: Message, bot: Bot) -> None:
     await _show_invite(message, bot)
+
+
+# ── /broadcast_invite — разовое напоминание про рефералку ВСЕМ (только админ) ─
+
+@dp.message(Command("broadcast_invite"))
+async def cmd_broadcast_invite(message: Message) -> None:
+    if not _is_admin(message.from_user.id):
+        return
+    users = list_all_users()
+    await message.answer(
+        f"⚠️ Разослать напоминание про рефералку {len(users)} пользователям? "
+        "Действие необратимо.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="✅ Да, разослать", callback_data="bcast:invite:confirm"),
+            InlineKeyboardButton(text="❌ Отмена", callback_data="bcast:invite:cancel"),
+        ]]),
+    )
+
+
+async def _run_broadcast_invite(bot: Bot, requester_id: int) -> None:
+    """Фон — не блокирует основной event loop. Задержка между отправками —
+    под лимиты Telegram Bot API (~30 сообщений/сек)."""
+    users = list_all_users()
+    sent = failed = blocked = 0
+
+    for u in users:
+        telegram_id = u["telegram_id"]
+        try:
+            text = "💡 Кстати, забыл сказать —\n\n" + _invite_text(telegram_id)
+            await bot.send_message(int(telegram_id), text, parse_mode="HTML")
+            sent += 1
+        except TelegramForbiddenError:
+            # Юзер заблокировал бота — ожидаемо на любой массовой рассылке,
+            # не роняет процесс, просто считаем и идём дальше.
+            blocked += 1
+        except Exception:
+            logging.exception("broadcast_invite: сбой для %s", telegram_id)
+            failed += 1
+        await asyncio.sleep(0.05)
+
+    try:
+        await bot.send_message(
+            requester_id,
+            f"✅ Рассылка про рефералку завершена.\n"
+            f"Отправлено: {sent}\nЗаблокировали бота: {blocked}\nОшибок: {failed}",
+        )
+    except Exception:
+        logging.exception("broadcast_invite: не удалось отчитаться перед %s", requester_id)
+
+
+@dp.callback_query(F.data == "bcast:invite:confirm")
+async def cb_broadcast_invite_confirm(call: CallbackQuery, bot: Bot) -> None:
+    if not _is_admin(call.from_user.id):
+        await call.answer()
+        return
+    await call.answer()
+    await call.message.edit_text("Рассылка началась в фоне — пришлю итоги, когда закончится.")
+    asyncio.create_task(_run_broadcast_invite(bot, call.from_user.id))
+
+
+@dp.callback_query(F.data == "bcast:invite:cancel")
+async def cb_broadcast_invite_cancel(call: CallbackQuery) -> None:
+    await call.answer()
+    await call.message.edit_text("Отменено.")
 
 
 class ReferralRedeem(StatesGroup):
