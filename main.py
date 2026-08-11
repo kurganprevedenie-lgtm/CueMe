@@ -1280,7 +1280,7 @@ async def _show_deep_analysis(message: Message, bot: Bot, telegram_id: str | Non
     telegram_id = telegram_id or str(message.from_user.id)
     contacts = list_contacts(telegram_id)
     if not contacts:
-        await message.answer("Сначала загрузи JSON-файл чата.")
+        await _send_no_contacts_hint(message)
         return
 
     if len(contacts) == 1:
@@ -1432,7 +1432,7 @@ async def _show_ideal_date(message: Message, bot: Bot, telegram_id: str | None =
     telegram_id = telegram_id or str(message.from_user.id)
     contacts = list_contacts(telegram_id)
     if not contacts:
-        await message.answer("Сначала загрузи JSON-файл чата.")
+        await _send_no_contacts_hint(message)
         return
 
     if len(contacts) == 1:
@@ -1632,7 +1632,7 @@ async def _run_deep_style_analysis(bot: Bot, target: Message, telegram_id: str) 
 async def _show_deep_style_analysis(message: Message, bot: Bot, telegram_id: str | None = None) -> None:
     telegram_id = telegram_id or str(message.from_user.id)
     if not list_contacts(telegram_id):
-        await message.answer("Сначала загрузи JSON-файл чата.")
+        await _send_no_contacts_hint(message)
         return
     await _run_deep_style_analysis(bot, message, telegram_id)
 
@@ -1789,6 +1789,28 @@ def _quickstart_kb() -> InlineKeyboardMarkup:
         InlineKeyboardButton(text="💬 Да, есть", callback_data="qs:yes"),
         InlineKeyboardButton(text="🤷 Пока никого", callback_data="qs:no"),
     ]])
+
+
+def _no_contacts_kb() -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    # callback_data="qs:yes" — переиспользует существующий cb_quickstart_yes
+    # (получает state через DI aiogram сам), не нужно тащить state через
+    # все функции, которые показывают эту подсказку.
+    b.button(text="💬 Ответ с CueMe", callback_data="qs:yes")
+    return b.as_markup()
+
+
+async def _send_no_contacts_hint(message: Message) -> None:
+    """Единая замена тупикового "Сначала загрузи JSON-файл чата." — во всех
+    местах, требующих хотя бы один контакт. JSON остаётся рабочим опциональным
+    путём (кто с компьютера — дойдёт сам), но дефолтная подсказка ведёт в уже
+    существующий единый флоу, который как раз и создаёт контакт на лету."""
+    await message.answer(
+        "Пока нет ни одного диалога для этого — начни с «💬 Ответ с CueMe», "
+        "перешли туда любое сообщение или скриншот переписки, и я заведу "
+        "первый контакт.",
+        reply_markup=_no_contacts_kb(),
+    )
 
 
 async def _send_no_dialogs_hint(message: Message) -> None:
@@ -2448,7 +2470,7 @@ async def _show_my_style_for(message: Message) -> None:
     telegram_id = str(message.from_user.id)
     contacts = list_contacts(telegram_id)
     if not contacts:
-        await message.answer("Сначала загрузи JSON-файл чата.")
+        await _send_no_contacts_hint(message)
         return
 
     if len(contacts) == 1:
@@ -2538,7 +2560,7 @@ async def _start_reply(message: Message, state: FSMContext) -> None:
     telegram_id = str(message.from_user.id)
     contacts = list_contacts(telegram_id)
     if not contacts:
-        await message.answer("Сначала загрузи JSON-файл чата.")
+        await _send_no_contacts_hint(message)
         return
 
     if len(contacts) == 1:
@@ -3393,7 +3415,7 @@ async def cb_live_regen(call: CallbackQuery) -> None:
 async def _start_screenshot(message: Message, state: FSMContext) -> None:
     telegram_id = str(message.from_user.id)
     if not list_contacts(telegram_id):
-        await message.answer("Сначала загрузи JSON-файл чата.")
+        await _send_no_contacts_hint(message)
         return
     await state.set_state(Screenshot.waiting_for_image)
     await message.answer("Пришли скриншот переписки (или вставь текст диалога), на который нужно ответить:")
