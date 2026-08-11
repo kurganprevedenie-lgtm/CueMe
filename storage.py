@@ -175,6 +175,11 @@ def init_db() -> None:
         # Откуда узнал о боте — спрашивается только на Business-пути (Автоматизация
         # чатов), сразу после подключения. NULL = не спрашивали/не завершили Business.
         _add_column_if_missing(conn, "users", "acquisition_source", "TEXT")
+        # Заблокировал ли юзер бота — узнаём не активной проверкой (такого API у
+        # Telegram нет), а пассивно: ставим 1, когда любая отправка ловит
+        # TelegramForbiddenError; сбрасываем в 0 при следующем /start. "Последний
+        # известный статус", не гарантированно live.
+        _add_column_if_missing(conn, "users", "blocked_bot", "INTEGER NOT NULL DEFAULT 0")
         _add_column_if_missing(conn, "users", "demo_trial_used", "INTEGER NOT NULL DEFAULT 0")
         # Реферальная награда: до какого момента (UTC ISO) у пригласившего
         # активна полная Premium-подписка (имя колонки историческое — раньше
@@ -263,8 +268,25 @@ def list_all_users() -> list[sqlite3.Row]:
     with _conn() as conn:
         return conn.execute(
             "SELECT telegram_id, gender, created_at, trial_used, "
-            "deep_analysis_free_until, acquisition_source FROM users ORDER BY created_at"
+            "deep_analysis_free_until, acquisition_source, blocked_bot "
+            "FROM users ORDER BY created_at"
         ).fetchall()
+
+
+def mark_bot_blocked(telegram_id: str) -> None:
+    """Ставит blocked_bot=1 — вызывать при TelegramForbiddenError на отправке."""
+    with _conn() as conn:
+        conn.execute(
+            "UPDATE users SET blocked_bot = 1 WHERE telegram_id = ?", (telegram_id,)
+        )
+
+
+def mark_bot_unblocked(telegram_id: str) -> None:
+    """Сбрасывает blocked_bot — вызывать при живом /start от юзера."""
+    with _conn() as conn:
+        conn.execute(
+            "UPDATE users SET blocked_bot = 0 WHERE telegram_id = ?", (telegram_id,)
+        )
 
 
 def upsert_user(telegram_id: str, my_id: str) -> None:

@@ -116,6 +116,8 @@ from storage import (
     get_trial_used,
     get_user,
     increment_trial_used,
+    mark_bot_blocked,
+    mark_bot_unblocked,
     mark_referral_credited,
     save_imported_messages,
     get_my_style_last_rebuild_count,
@@ -518,7 +520,9 @@ async def _run_broadcast_invite(bot: Bot, requester_id: int) -> None:
             sent += 1
         except TelegramForbiddenError:
             # Юзер заблокировал бота — ожидаемо на любой массовой рассылке,
-            # не роняет процесс, просто считаем и идём дальше.
+            # не роняет процесс, просто считаем и идём дальше. Заодно
+            # обновляем последний известный статус для отчёта /users.
+            mark_bot_blocked(telegram_id)
             blocked += 1
         except Exception:
             logging.exception("broadcast_invite: сбой для %s", telegram_id)
@@ -678,6 +682,8 @@ async def _maybe_prompt_gender(bot: Bot, telegram_id: str) -> None:
         return
     try:
         await bot.send_message(int(telegram_id), _GENDER_PROMPT_TEXT, reply_markup=gender_kb())
+    except TelegramForbiddenError:
+        mark_bot_blocked(telegram_id)
     except Exception:
         logging.warning("gender prompt failed: telegram_id=%s", telegram_id)
 
@@ -707,6 +713,8 @@ async def _maybe_prompt_source(bot: Bot, telegram_id: str) -> None:
         return
     try:
         await bot.send_message(int(telegram_id), _SOURCE_PROMPT_TEXT, reply_markup=source_kb())
+    except TelegramForbiddenError:
+        mark_bot_blocked(telegram_id)
     except Exception:
         logging.warning("source prompt failed: telegram_id=%s", telegram_id)
 
@@ -1964,6 +1972,7 @@ async def cmd_start(message: Message, state: FSMContext, bot: Bot) -> None:
     await state.clear()
     telegram_id = str(message.from_user.id)
     is_new = get_user(telegram_id) is None
+    mark_bot_unblocked(telegram_id)  # живой /start — юзер точно не заблокировал бота
     await _send_start_menu(message, telegram_id)
     username = message.from_user.username
     is_test_account = bool(username) and username.lower() in TEST_ACCOUNT_USERNAMES
@@ -2228,7 +2237,7 @@ async def _build_users_report(bot: Bot) -> str:
     users = list_all_users()
 
     lines = ["👥 Пользователи CueMe:\n"]
-    with_gender = with_contact = with_ref_premium = 0
+    with_gender = with_contact = with_ref_premium = blocked_count = 0
 
     for u in users:
         tid = u["telegram_id"]
@@ -2251,10 +2260,15 @@ async def _build_users_report(bot: Bot) -> str:
             except ValueError:
                 pass
 
+        if u["blocked_bot"]:
+            blocked_count += 1
+        blocked_note = " · 🚫 заблокировал бота" if u["blocked_bot"] else ""
+        source_note = f" · 📍{_SOURCE_LABELS.get(u['acquisition_source'], 'не указан')}"
+
         gender_label = _GENDER_LABELS.get(u["gender"], "?")
         lines.append(
             f"• {who} · {gender_label} · триал {u['trial_used']} · "
-            f"контактов {len(contacts)}{premium_note}"
+            f"контактов {len(contacts)}{source_note}{premium_note}{blocked_note}"
         )
 
     lines.append("")
@@ -2262,6 +2276,7 @@ async def _build_users_report(bot: Bot) -> str:
     lines.append(f"С полом: {with_gender}")
     lines.append(f"С контактом: {with_contact}")
     lines.append(f"С активной реферальной Premium: {with_ref_premium}")
+    lines.append(f"Заблокировали бота: {blocked_count}")
     return "\n".join(lines)
 
 
