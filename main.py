@@ -1664,11 +1664,20 @@ async def handle_business_connection(event: BusinessConnection, bot: Bot) -> Non
     logging.info("business_connection %s: owner=%s %s", event.id, event.user.id, status)
     if event.is_enabled:
         owner_id = str(event.user.id)
+        # Строка в users нужна СРАЗУ, а не только когда юзер ответит на
+        # источник/пол (set_acquisition_source/set_gender делают upsert) —
+        # иначе если он заблокирует бота раньше, mark_bot_blocked() будет
+        # UPDATE по несуществующей строке (молчаливый no-op), а сам юзер
+        # до ответа останется невидим в /users.
+        upsert_user(owner_id, f"user{owner_id}")
         try:
             await bot.send_message(
                 event.user.id,
                 "✅ Готово, бот подключён! CueMe готов помогать тебе в переписках )",
             )
+        except TelegramForbiddenError:
+            mark_bot_blocked(owner_id)
+            return
         except Exception:
             logging.warning("business-connect notify failed: owner=%s", event.user.id)
         await asyncio.sleep(3)
