@@ -2353,30 +2353,37 @@ async def _build_users_report(bot: Bot) -> list[str]:
         if automation_off:
             automation_off_count += 1
 
-        issues = []
-        if is_blocked:
-            issues.append("🚫 Заблокировал бота")
-        if automation_off:
-            issues.append("🔌 Отключил Автоматизацию чатов")
-        status_line = " · ".join(issues) if issues else "✅ Активен"
-
         last_action_raw = get_last_event_time(tid)
         last_incoming_raw = get_last_incoming_message_time(tid)
         # "Последняя активность" для отсева неактивных — позже из двух
         # сигналов (сам что-то сделал ИЛИ ему написали).
         candidates = [d for d in (last_action_raw, last_incoming_raw) if d]
         last_activity_raw = max(candidates) if candidates else None
+        is_stale = False
         if last_activity_raw:
             try:
                 last_dt = datetime.fromisoformat(last_activity_raw)
                 if last_dt.tzinfo is None:
                     last_dt = last_dt.replace(tzinfo=timezone.utc)
-                if (now - last_dt).days > _INACTIVE_AFTER_DAYS:
-                    inactive_count += 1
+                is_stale = (now - last_dt).days > _INACTIVE_AFTER_DAYS
             except ValueError:
                 pass
         else:
-            inactive_count += 1  # ни одного сигнала активности вообще
+            is_stale = True  # ни одного сигнала активности вообще
+        if is_stale:
+            inactive_count += 1
+
+        # "Активен" (не заблокировал, не отключал автоматизацию) — НЕ значит
+        # "сообщения реально идут". Отдельно помечаем застой, чтобы статус не
+        # выглядел противоречиво рядом с "N дн. назад" по последнему сообщению.
+        issues = []
+        if is_blocked:
+            issues.append("🚫 Заблокировал бота")
+        if automation_off:
+            issues.append("🔌 Отключил Автоматизацию чатов")
+        if is_stale and not is_blocked and not automation_off:
+            issues.append(f"⚠️ Нет активности &gt;{_INACTIVE_AFTER_DAYS} дн.")
+        status_line = " · ".join(issues) if issues else "✅ Активен"
 
         gender_label = _GENDER_LABELS.get(u["gender"], "?")
         source_label = _SOURCE_LABELS.get(u["acquisition_source"], "не указан")
