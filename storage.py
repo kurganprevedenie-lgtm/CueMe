@@ -1277,6 +1277,36 @@ def get_latest_business_connection(owner_user_id: str) -> sqlite3.Row | None:
         ).fetchone()
 
 
+def get_business_connections_history(owner_user_id: str) -> list[sqlite3.Row]:
+    """Все подключения юзера (может переподключаться много раз) — свежие
+    первыми. Для диагностики "когда реально отвалилось"."""
+    with _conn() as conn:
+        return conn.execute(
+            "SELECT connection_id, can_reply, is_enabled, created_at "
+            "FROM business_connections WHERE owner_user_id = ? ORDER BY created_at DESC",
+            (owner_user_id,),
+        ).fetchall()
+
+
+def get_contact_last_messages(owner_user_id: str, contact_id: int) -> dict:
+    """Последняя входящая/исходящая дата business-сообщения для контакта —
+    отличить "этот собеседник замолчал" от "исходящие тоже не идут"."""
+    with _conn() as conn:
+        row = conn.execute(
+            """
+            SELECT
+                MAX(CASE WHEN bm.direction = 'in'  THEN bm.date END) AS last_in,
+                MAX(CASE WHEN bm.direction = 'out' THEN bm.date END) AS last_out
+            FROM business_messages bm
+            JOIN business_chat_refs bcr
+                ON bm.chat_ref = bcr.chat_ref AND bm.owner_user_id = bcr.owner_user_id
+            WHERE bcr.contact_id = ? AND bm.owner_user_id = ?
+            """,
+            (contact_id, owner_user_id),
+        ).fetchone()
+    return {"last_in": row["last_in"], "last_out": row["last_out"]}
+
+
 # ── business messages ─────────────────────────────────────────────────────────
 
 def save_business_message(

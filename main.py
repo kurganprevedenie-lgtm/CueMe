@@ -99,6 +99,8 @@ from storage import (
     get_any_user_samples,
     get_biz_messages_for_contact,
     get_business_connection,
+    get_business_connections_history,
+    get_contact_last_messages,
     get_latest_business_connection,
     get_contact_by_id,
     get_deep_analysis,
@@ -4075,6 +4077,80 @@ async def cb_delete_cancel(call: CallbackQuery) -> None:
     await call.message.edit_text("Удаление отменено.")
 
 
+async def _resolve_target_id(
+    message: Message, bot: Bot, command: str,
+) -> tuple[str, str] | None:
+    """Разбирает "<telegram_id>" или "@username" из текста команды — общий
+    парсинг для /wipe и /inspect. Возвращает (target_id, arg_display) или
+    None (сообщение об ошибке уже отправлено)."""
+    parts = (message.text or "").split(maxsplit=1)
+    arg = parts[1].strip() if len(parts) == 2 else ""
+    usage = f"Использование: {command} <telegram_id> или {command} @username"
+    if not arg:
+        await message.answer(usage)
+        return None
+
+    if arg.isdigit():
+        return arg, arg
+    if arg.startswith("@"):
+        # Резолвим @username → numeric id через Telegram API. Работает только
+        # если бот уже когда-то получал апдейт от этого юзера — иначе getChat падает.
+        try:
+            chat = await bot.get_chat(arg)
+        except TelegramBadRequest:
+            await message.answer(
+                f"Не удалось найти {arg} — бот должен был хотя бы раз получить "
+                "от него сообщение, иначе Telegram не отдаёт chat по username."
+            )
+            return None
+        target_id = str(chat.id)
+        return target_id, f"{arg} ({target_id})"
+
+    await message.answer(usage)
+    return None
+
+
+# ── /inspect — диагностика конкретного юзера (только для админа) ────────────
+# Отличить "этот собеседник просто замолчал" от "Business-соединение реально
+# отвалилось" — история подключений + по каждому контакту отдельно последние
+# входящие/исходящие даты.
+
+@dp.message(Command("inspect"))
+async def cmd_inspect(message: Message, bot: Bot) -> None:
+    if not _is_admin(message.from_user.id):
+        return
+    resolved = await _resolve_target_id(message, bot, "/inspect")
+    if resolved is None:
+        return
+    target_id, _ = resolved
+
+    who = await _resolve_username(bot, target_id)
+    now = datetime.now(timezone.utc)
+    lines = [f"🔎 <b>{html.escape(who)}</b> (id{target_id})\n"]
+
+    conns = get_business_connections_history(target_id)
+    if not conns:
+        lines.append("<b>Business API:</b> подключения не было ни разу.")
+    else:
+        lines.append("<b>История подключений Business API:</b>")
+        for c in conns:
+            status = "🟢 включено" if c["is_enabled"] else "🔴 отключено"
+            lines.append(f"  {status} · с {c['created_at'][:16]} (conn {c['connection_id'][:12]}…)")
+
+    contacts = list_contacts(target_id)
+    lines.append(f"\n<b>Контакты ({len(contacts)}):</b>")
+    if not contacts:
+        lines.append("  нет ни одного контакта")
+    for c in contacts:
+        name = _contact_name(c)
+        spans = get_contact_last_messages(target_id, c["id"])
+        last_in = _relative_label(spans["last_in"], now)
+        last_out = _relative_label(spans["last_out"], now)
+        lines.append(f"  • {html.escape(name)} — входящие: {last_in} · исходящие: {last_out}")
+
+    await message.answer("\n".join(lines), parse_mode="HTML")
+
+
 # ── /wipe — стереть данные ПРОИЗВОЛЬНОГО пользователя (только для админа) ────
 # В отличие от /delete (только свои данные), берёт telegram_id аргументом —
 # для тестовых аккаунтов разработчика, чтобы проверять онбординг/рефералку
@@ -4084,31 +4160,10 @@ async def cb_delete_cancel(call: CallbackQuery) -> None:
 async def cmd_wipe(message: Message, bot: Bot) -> None:
     if not _is_admin(message.from_user.id):
         return
-    parts = (message.text or "").split(maxsplit=1)
-    arg = parts[1].strip() if len(parts) == 2 else ""
-    if not arg:
-        await message.answer("Использование: /wipe <telegram_id> или /wipe @username")
+    resolved = await _resolve_target_id(message, bot, "/wipe")
+    if resolved is None:
         return
-
-    if arg.isdigit():
-        target_id = arg
-    elif arg.startswith("@"):
-        # Резолвим @username → numeric id через Telegram API. Работает только
-        # если бот уже когда-то получал апдейт от этого юзера (обычный случай
-        # для «стереть тестовый аккаунт») — иначе getChat падает.
-        try:
-            chat = await bot.get_chat(arg)
-        except TelegramBadRequest:
-            await message.answer(
-                f"Не удалось найти {arg} — бот должен был хотя бы раз получить "
-                "от него сообщение, иначе Telegram не отдаёт chat по username."
-            )
-            return
-        target_id = str(chat.id)
-        arg = f"{arg} ({target_id})"  # для текста подтверждения
-    else:
-        await message.answer("Использование: /wipe <telegram_id> или /wipe @username")
-        return
+    target_id, arg = resolved
 
     b = InlineKeyboardBuilder()
     b.button(text=f"‼️ Да, стереть {target_id}", callback_data=f"wipeyes:{target_id}")
