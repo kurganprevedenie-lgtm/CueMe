@@ -99,6 +99,7 @@ from storage import (
     get_any_user_samples,
     get_biz_messages_for_contact,
     get_business_connection,
+    get_latest_business_connection,
     get_contact_by_id,
     get_deep_analysis,
     get_acquisition_source,
@@ -2306,7 +2307,8 @@ async def _build_users_report(bot: Bot) -> list[str]:
     users = list_all_users()
 
     blocks = ["👥 <b>Пользователи CueMe</b>"]
-    with_gender = with_contact = with_ref_premium = blocked_count = inactive_count = 0
+    with_gender = with_contact = with_ref_premium = 0
+    blocked_count = automation_off_count = inactive_count = 0
 
     for u in users:
         tid = u["telegram_id"]
@@ -2341,7 +2343,22 @@ async def _build_users_report(bot: Bot) -> list[str]:
         is_blocked = bool(u["blocked_bot"])
         if is_blocked:
             blocked_count += 1
-        status_line = "🚫 Заблокировал бота" if is_blocked else "✅ Активен"
+
+        # Отдельный от blocked_bot сигнал отвала — можно отключить
+        # Автоматизацию чатов в настройках Telegram, не блокируя самого бота
+        # (и наоборот). Берём САМОЕ СВЕЖЕЕ подключение — юзер мог
+        # переподключаться несколько раз, старые connection_id не трогаем.
+        latest_conn = get_latest_business_connection(tid)
+        automation_off = bool(latest_conn) and not latest_conn["is_enabled"]
+        if automation_off:
+            automation_off_count += 1
+
+        issues = []
+        if is_blocked:
+            issues.append("🚫 Заблокировал бота")
+        if automation_off:
+            issues.append("🔌 Отключил Автоматизацию чатов")
+        status_line = " · ".join(issues) if issues else "✅ Активен"
 
         last_action_raw = get_last_event_time(tid)
         last_incoming_raw = get_last_incoming_message_time(tid)
@@ -2381,6 +2398,7 @@ async def _build_users_report(bot: Bot) -> list[str]:
         f"С контактом: {with_contact}\n"
         f"С активной реферальной Premium: {with_ref_premium}\n"
         f"Заблокировали бота: {blocked_count}\n"
+        f"Отключили Автоматизацию чатов: {automation_off_count}\n"
         f"Неактивных (&gt;{_INACTIVE_AFTER_DAYS} дн.): {inactive_count}"
     )
     return blocks

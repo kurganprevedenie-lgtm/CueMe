@@ -1263,6 +1263,20 @@ def get_business_connection(connection_id: str) -> sqlite3.Row | None:
         ).fetchone()
 
 
+def get_latest_business_connection(owner_user_id: str) -> sqlite3.Row | None:
+    """Самое свежее подключение Business API у юзера (может переподключаться
+    несколько раз — connection_id новый каждый раз). is_enabled=0 значит
+    юзер отключил Автоматизацию чатов в настройках Telegram. Для /users —
+    отдельный от blocked_bot сигнал отвала (можно отключить автоматизацию,
+    не блокируя самого бота)."""
+    with _conn() as conn:
+        return conn.execute(
+            "SELECT * FROM business_connections WHERE owner_user_id = ? "
+            "ORDER BY created_at DESC LIMIT 1",
+            (owner_user_id,),
+        ).fetchone()
+
+
 # ── business messages ─────────────────────────────────────────────────────────
 
 def save_business_message(
