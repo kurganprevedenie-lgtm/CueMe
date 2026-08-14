@@ -112,6 +112,13 @@ PREMIUM_CACHE_TTL = int(os.getenv("PREMIUM_CACHE_TTL", "300"))
 # пригласивший, когда его друг реально начинает пользоваться ботом.
 REFERRAL_REWARD_DAYS = int(os.getenv("REFERRAL_REWARD_DAYS", "3"))
 
+# Третий способ получить временный Premium — подписка на ПУБЛИЧНЫЙ промо-канал.
+# ЭТО НЕ PREMIUM_CHANNEL_ID (тот — приватный канал-пропуск Tribute, платный,
+# отдельная механика) — разные каналы, разная логика проверки, не путать.
+# Награда даётся ОДИН раз за всё время (see promo_channel_reward_claimed в БД).
+PROMO_CHANNEL_USERNAME = os.getenv("PROMO_CHANNEL_USERNAME", "@CueMee")
+PROMO_CHANNEL_REWARD_DAYS = int(os.getenv("PROMO_CHANNEL_REWARD_DAYS", "3"))
+
 # Стили ответа для фичи «Ответить по скриншоту».
 # [0] — подпись на кнопке, [1] — инструкция стиля для промпта генерации.
 REPLY_STYLES = {

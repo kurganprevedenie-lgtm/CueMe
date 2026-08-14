@@ -185,6 +185,12 @@ def init_db() -> None:
         # активна полная Premium-подписка (имя колонки историческое — раньше
         # награда покрывала только «Анализ собеседника»). NULL = награды нет.
         _add_column_if_missing(conn, "users", "deep_analysis_free_until", "TEXT")
+        # Награда за подписку на промо-канал (PROMO_CHANNEL_USERNAME — ПУБЛИЧНЫЙ
+        # канал, не путать с приватным PREMIUM_CHANNEL_ID/Tribute). until — окно
+        # текущей награды; claimed — разовый флаг НАВСЕГДА, отписка-подписка
+        # заново повторную награду не даёт (anti-abuse).
+        _add_column_if_missing(conn, "users", "promo_channel_premium_until", "TEXT")
+        _add_column_if_missing(conn, "users", "promo_channel_reward_claimed", "INTEGER NOT NULL DEFAULT 0")
         # Личный реферальный код — друг вводит его вручную через /redeem.
         _add_column_if_missing(conn, "users", "referral_code", "TEXT")
         _create_index_if_missing(conn, "idx_users_referral_code", "users", "referral_code", unique=True)
@@ -914,6 +920,51 @@ def get_deep_analysis_free_until(telegram_id: str) -> datetime | None:
         return None
     try:
         return datetime.fromisoformat(row["deep_analysis_free_until"])
+    except ValueError:
+        return None
+
+
+def set_promo_channel_reward(telegram_id: str, until: datetime) -> None:
+    """Начисляет награду за подписку на промо-канал: ставит окно (until) И
+    НАВСЕГДА поднимает claimed-флаг — вызывать РОВНО ОДИН РАЗ, после
+    реальной проверки подписки через bot.get_chat_member. Создаёт строку
+    users, если её ещё нет."""
+    with _conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO users
+                (telegram_id, my_id, created_at, promo_channel_premium_until, promo_channel_reward_claimed)
+            VALUES (?, ?, ?, ?, 1)
+            ON CONFLICT(telegram_id) DO UPDATE SET
+                promo_channel_premium_until = excluded.promo_channel_premium_until,
+                promo_channel_reward_claimed = 1
+            """,
+            (telegram_id, f"user{telegram_id}", _now(), until.isoformat()),
+        )
+
+
+def has_claimed_promo_reward(telegram_id: str) -> bool:
+    """Разовый anti-abuse флаг — True навсегда после первого начисления,
+    отписка-подписка заново повторную награду не даёт."""
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT promo_channel_reward_claimed FROM users WHERE telegram_id = ?",
+            (telegram_id,),
+        ).fetchone()
+    return bool(row and row["promo_channel_reward_claimed"])
+
+
+def get_promo_channel_premium_until(telegram_id: str) -> datetime | None:
+    """Момент окончания текущего окна промо-награды (tz-aware UTC) или None."""
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT promo_channel_premium_until FROM users WHERE telegram_id = ?",
+            (telegram_id,),
+        ).fetchone()
+    if not row or not row["promo_channel_premium_until"]:
+        return None
+    try:
+        return datetime.fromisoformat(row["promo_channel_premium_until"])
     except ValueError:
         return None
 

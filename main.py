@@ -49,6 +49,8 @@ from config import (
     ONBOARDING_JSON_POST_URL,
     OPENERS_FOR_HER,
     OPENERS_FOR_HIM,
+    PROMO_CHANNEL_USERNAME,
+    PROMO_CHANNEL_REWARD_DAYS,
     REBUILD_THRESHOLD,
     REFERRAL_REWARD_DAYS,
     REFRESH_SAMPLES_EVERY_N,
@@ -108,6 +110,7 @@ from storage import (
     get_deep_analysis_free_until,
     get_deep_style_analysis,
     get_gender,
+    get_promo_channel_premium_until,
     get_ideal_date,
     get_last_event_time,
     get_last_incoming_message_time,
@@ -148,6 +151,8 @@ from storage import (
     set_acquisition_source,
     set_deep_analysis_free_until,
     set_gender,
+    set_promo_channel_reward,
+    has_claimed_promo_reward,
     set_llm_cache,
     update_contact_username,
     upsert_business_connection,
@@ -339,8 +344,11 @@ async def _is_premium(bot: Bot, telegram_id: str) -> bool:
     """Проверяет членство в PREMIUM_CHANNEL_ID с кэшем на PREMIUM_CACHE_TTL сек,
     чтобы не дёргать Telegram API на каждое сообщение. Пока PREMIUM_CHANNEL_ID
     не настроен — всегда False (только бесплатные попытки). Реферальная
-    награда (_has_referral_premium) даёт полный Premium в обход канала."""
+    награда (_has_referral_premium) и награда за подписку на промо-канал
+    (_has_promo_channel_premium) дают полный Premium в обход канала."""
     if _has_referral_premium(telegram_id):
+        return True
+    if _has_promo_channel_premium(telegram_id):
         return True
     if not PREMIUM_CHANNEL_ID:
         return False
@@ -368,12 +376,13 @@ def paywall_kb() -> InlineKeyboardMarkup:
 
 
 def premium_menu_kb() -> InlineKeyboardMarkup:
-    """Клавиатура под карточкой «👑 Подписка»: оформить + позвать друга
-    (реферальная награда — альтернативный путь получить доступ бесплатно)."""
+    """Клавиатура под карточкой «👑 Подписка»: оформить + два бесплатных пути
+    (реферальная награда и подписка на промо-канал)."""
     b = InlineKeyboardBuilder()
     if PREMIUM_SUBSCRIBE_URL:
         b.button(text="💎 Оформить подписку", url=PREMIUM_SUBSCRIBE_URL)
     b.button(text="🎁 Пригласи друга", callback_data="show_invite")
+    b.button(text="📢 Подписаться на канал", callback_data="promo:offer")
     b.adjust(1)
     return b.as_markup()
 
@@ -458,6 +467,62 @@ def _has_referral_premium(telegram_id: str) -> bool:
     """Активно ли реферальное окно полной Premium-подписки."""
     until = get_deep_analysis_free_until(telegram_id)
     return bool(until and until > datetime.now(timezone.utc))
+
+
+def _has_promo_channel_premium(telegram_id: str) -> bool:
+    """Активно ли окно Premium за подписку на промо-канал (PROMO_CHANNEL_USERNAME —
+    ПУБЛИЧНЫЙ канал, не путать с приватным PREMIUM_CHANNEL_ID/Tribute)."""
+    until = get_promo_channel_premium_until(telegram_id)
+    return bool(until and until > datetime.now(timezone.utc))
+
+
+# ── Награда за подписку на промо-канал (ТРЕТИЙ бесплатный путь к Premium) ────
+# PROMO_CHANNEL_USERNAME — ПУБЛИЧНЫЙ промо-канал (t.me/CueMee), НЕ путать с
+# PREMIUM_CHANNEL_ID (приватный канал-пропуск Tribute, платный, отдельная
+# механика в _is_premium). Награда — ОДИН раз за всё время: has_claimed_promo_reward
+# навсегда true после первого начисления, отписка-подписка заново не даёт дубль.
+
+@dp.callback_query(F.data == "promo:offer")
+async def cb_promo_offer(call: CallbackQuery) -> None:
+    await call.answer()
+    if has_claimed_promo_reward(str(call.from_user.id)):
+        await call.message.answer("Ты уже получал эту награду раньше 🙂")
+        return
+    await call.message.answer(
+        f"Подпишись на {PROMO_CHANNEL_USERNAME} и получи "
+        f"{PROMO_CHANNEL_REWARD_DAYS} дня Premium бесплатно:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(
+                text="📢 Открыть канал",
+                url=f"https://t.me/{PROMO_CHANNEL_USERNAME.lstrip('@')}",
+            )],
+            [InlineKeyboardButton(text="✅ Я подписался", callback_data="promo:check")],
+        ]),
+    )
+
+
+@dp.callback_query(F.data == "promo:check")
+async def cb_promo_check(call: CallbackQuery, bot: Bot) -> None:
+    telegram_id = str(call.from_user.id)
+    if has_claimed_promo_reward(telegram_id):
+        await call.answer("Уже получено раньше", show_alert=True)
+        return
+
+    try:
+        member = await bot.get_chat_member(PROMO_CHANNEL_USERNAME, int(telegram_id))
+        subscribed = member.status in ("member", "administrator", "creator")
+    except Exception:
+        logging.exception("promo channel check failed for %s", telegram_id)
+        subscribed = False
+
+    if not subscribed:
+        await call.answer("Не вижу подписки — проверь и попробуй снова", show_alert=True)
+        return
+
+    until = datetime.now(timezone.utc) + timedelta(days=PROMO_CHANNEL_REWARD_DAYS)
+    set_promo_channel_reward(telegram_id, until)
+    await call.answer()
+    await call.message.answer(f"🎉 Готово! {PROMO_CHANNEL_REWARD_DAYS} дня Premium активны.")
 
 
 def _invite_text(telegram_id: str) -> str:
