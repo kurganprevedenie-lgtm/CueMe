@@ -1082,6 +1082,32 @@ def event_funnel() -> dict[str, int]:
     return {r["event_type"]: r["n"] for r in rows}
 
 
+def get_last_event_time(telegram_id: str) -> str | None:
+    """Когда юзер последний раз реально что-то сделал в боте (MAX(ts) из
+    events — record_event пишется на /start и на успешную генерацию).
+    Для отсева неактивных в /users."""
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT MAX(ts) AS last_ts FROM events WHERE user_telegram_id = ?",
+            (telegram_id,),
+        ).fetchone()
+    return row["last_ts"] if row else None
+
+
+def get_last_incoming_message_time(telegram_id: str) -> str | None:
+    """Когда юзеру последний раз ПРИХОДИЛО сообщение от собеседника
+    (direction='in', любой из его контактов) — по business_messages.
+    Не считает imported (JSON) — это исторический разовый снимок, а не
+    признак недавней активности."""
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT MAX(date) AS last_date FROM business_messages "
+            "WHERE owner_user_id = ? AND direction = 'in'",
+            (telegram_id,),
+        ).fetchone()
+    return row["last_date"] if row else None
+
+
 def get_all_dated_my_messages(owner_user_id: str) -> list[dict]:
     """Все исходящие сообщения пользователя (business + imported) по ВСЕМ его
     контактам, с датами — для агрегатного анализа собственного стиля."""

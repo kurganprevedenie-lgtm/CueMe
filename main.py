@@ -106,6 +106,8 @@ from storage import (
     get_deep_style_analysis,
     get_gender,
     get_ideal_date,
+    get_last_event_time,
+    get_last_incoming_message_time,
     get_llm_cache,
     get_interaction_card,
     get_imported_messages,
@@ -2009,6 +2011,10 @@ async def cmd_start(message: Message, state: FSMContext, bot: Bot) -> None:
     # оставался невидим в /users, если дальше ничего не сделал.
     upsert_user(telegram_id, f"user{telegram_id}")
     mark_bot_unblocked(telegram_id)  # живой /start — юзер точно не заблокировал бота
+    try:
+        record_event(telegram_id, "start")  # для "последнее действие" в /users
+    except Exception:
+        logging.exception("cmd_start: не удалось записать событие")
     await _send_start_menu(message, telegram_id)
     username = message.from_user.username
     is_test_account = bool(username) and username.lower() in TEST_ACCOUNT_USERNAMES
@@ -2268,6 +2274,30 @@ async def _resolve_username(bot: Bot, telegram_id: str) -> str:
     return f"id{telegram_id}"
 
 
+_INACTIVE_AFTER_DAYS = 14  # порог для "Неактивных" в сводке /users
+
+
+def _relative_label(iso_str: str | None, now: datetime) -> str:
+    """"3 дня назад" / "сегодня" / "никогда" — для last-action/last-incoming
+    полей в /users. iso_str — дата в формате, который пишут record_event
+    (UTC ISO с tz) или business_messages.date (может быть без tz — в таком
+    случае считаем его тоже UTC, как и остальные даты в проекте)."""
+    if not iso_str:
+        return "никогда"
+    try:
+        dt = datetime.fromisoformat(iso_str)
+    except ValueError:
+        return "никогда"
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    days = (now - dt).days
+    if days <= 0:
+        return "сегодня"
+    if days == 1:
+        return "вчера"
+    return f"{days} дн. назад"
+
+
 async def _build_users_report(bot: Bot) -> list[str]:
     """Возвращает список блоков (шапка, по одному на юзера, сводка) — НЕ
     склеенную строку, чтобы cmd_users мог резать на чанки по границам
@@ -2276,7 +2306,7 @@ async def _build_users_report(bot: Bot) -> list[str]:
     users = list_all_users()
 
     blocks = ["👥 <b>Пользователи CueMe</b>"]
-    with_gender = with_contact = with_ref_premium = blocked_count = 0
+    with_gender = with_contact = with_ref_premium = blocked_count = inactive_count = 0
 
     for u in users:
         tid = u["telegram_id"]
@@ -2313,6 +2343,24 @@ async def _build_users_report(bot: Bot) -> list[str]:
             blocked_count += 1
         status_line = "🚫 Заблокировал бота" if is_blocked else "✅ Активен"
 
+        last_action_raw = get_last_event_time(tid)
+        last_incoming_raw = get_last_incoming_message_time(tid)
+        # "Последняя активность" для отсева неактивных — позже из двух
+        # сигналов (сам что-то сделал ИЛИ ему написали).
+        candidates = [d for d in (last_action_raw, last_incoming_raw) if d]
+        last_activity_raw = max(candidates) if candidates else None
+        if last_activity_raw:
+            try:
+                last_dt = datetime.fromisoformat(last_activity_raw)
+                if last_dt.tzinfo is None:
+                    last_dt = last_dt.replace(tzinfo=timezone.utc)
+                if (now - last_dt).days > _INACTIVE_AFTER_DAYS:
+                    inactive_count += 1
+            except ValueError:
+                pass
+        else:
+            inactive_count += 1  # ни одного сигнала активности вообще
+
         gender_label = _GENDER_LABELS.get(u["gender"], "?")
         source_label = _SOURCE_LABELS.get(u["acquisition_source"], "не указан")
 
@@ -2321,6 +2369,8 @@ async def _build_users_report(bot: Bot) -> list[str]:
             f"    Пол: {gender_label} · Триал: {u['trial_used']}\n"
             f"    Источник: {source_label}\n"
             f"    Контактов: {len(contacts)} · Сообщений: {msg_count}\n"
+            f"    Последнее действие: {_relative_label(last_action_raw, now)} · "
+            f"Последнее сообщение от собеседника: {_relative_label(last_incoming_raw, now)}\n"
             f"    Статус: {status_line}{premium_line}"
         )
 
@@ -2330,7 +2380,8 @@ async def _build_users_report(bot: Bot) -> list[str]:
         f"С полом: {with_gender}\n"
         f"С контактом: {with_contact}\n"
         f"С активной реферальной Premium: {with_ref_premium}\n"
-        f"Заблокировали бота: {blocked_count}"
+        f"Заблокировали бота: {blocked_count}\n"
+        f"Неактивных (&gt;{_INACTIVE_AFTER_DAYS} дн.): {inactive_count}"
     )
     return blocks
 
