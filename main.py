@@ -2003,6 +2003,11 @@ async def cmd_start(message: Message, state: FSMContext, bot: Bot) -> None:
     await state.clear()
     telegram_id = str(message.from_user.id)
     is_new = get_user(telegram_id) is None
+    # Строка в users нужна СРАЗУ на первом /start, а не только когда юзер
+    # дойдёт до конца онбординга (Business/JSON/ответ на вопросы) — иначе
+    # уведомление "🆕 Новый пользователь" в админ-группе улетало, а сам юзер
+    # оставался невидим в /users, если дальше ничего не сделал.
+    upsert_user(telegram_id, f"user{telegram_id}")
     mark_bot_unblocked(telegram_id)  # живой /start — юзер точно не заблокировал бота
     await _send_start_menu(message, telegram_id)
     username = message.from_user.username
@@ -2263,11 +2268,14 @@ async def _resolve_username(bot: Bot, telegram_id: str) -> str:
     return f"id{telegram_id}"
 
 
-async def _build_users_report(bot: Bot) -> str:
+async def _build_users_report(bot: Bot) -> list[str]:
+    """Возвращает список блоков (шапка, по одному на юзера, сводка) — НЕ
+    склеенную строку, чтобы cmd_users мог резать на чанки по границам
+    блоков, а не посреди HTML-тега."""
     now = datetime.now(timezone.utc)
     users = list_all_users()
 
-    lines = ["👥 Пользователи CueMe:\n"]
+    blocks = ["👥 <b>Пользователи CueMe</b>"]
     with_gender = with_contact = with_ref_premium = blocked_count = 0
 
     for u in users:
@@ -2280,51 +2288,81 @@ async def _build_users_report(bot: Bot) -> str:
         if contacts:
             with_contact += 1
 
-        premium_note = ""
+        # Контактов может быть больше, чем реально накопленных переписок —
+        # контакт создаётся уже от одного исходящего business-сообщения,
+        # до того как придёт хоть один входящий. Число сообщений тут же —
+        # чтобы это не выглядело странно в отчёте.
+        msg_count = sum(
+            count_biz_messages_for_contact(tid, c["id"]) + count_imported_messages(c["id"])
+            for c in contacts
+        )
+
+        premium_line = ""
         until_raw = u["deep_analysis_free_until"]
         if until_raw:
             try:
                 until_dt = datetime.fromisoformat(until_raw)
                 if until_dt > now:
-                    premium_note = f" · 👑 до {until_dt.strftime('%d.%m %H:%M')}"
+                    premium_line = f"\n    👑 Premium (реферал) до {until_dt.strftime('%d.%m %H:%M')}"
                     with_ref_premium += 1
             except ValueError:
                 pass
 
-        if u["blocked_bot"]:
+        is_blocked = bool(u["blocked_bot"])
+        if is_blocked:
             blocked_count += 1
-        blocked_note = " · 🚫 заблокировал бота" if u["blocked_bot"] else ""
-        source_note = f" · 📍{_SOURCE_LABELS.get(u['acquisition_source'], 'не указан')}"
+        status_line = "🚫 Заблокировал бота" if is_blocked else "✅ Активен"
 
         gender_label = _GENDER_LABELS.get(u["gender"], "?")
-        lines.append(
-            f"• {who} · {gender_label} · триал {u['trial_used']} · "
-            f"контактов {len(contacts)}{source_note}{premium_note}{blocked_note}"
+        source_label = _SOURCE_LABELS.get(u["acquisition_source"], "не указан")
+
+        blocks.append(
+            f"👤 <b>{html.escape(who)}</b>\n"
+            f"    Пол: {gender_label} · Триал: {u['trial_used']}\n"
+            f"    Источник: {source_label}\n"
+            f"    Контактов: {len(contacts)} · Сообщений: {msg_count}\n"
+            f"    Статус: {status_line}{premium_line}"
         )
 
-    lines.append("")
-    lines.append(f"Всего: {len(users)}")
-    lines.append(f"С полом: {with_gender}")
-    lines.append(f"С контактом: {with_contact}")
-    lines.append(f"С активной реферальной Premium: {with_ref_premium}")
-    lines.append(f"Заблокировали бота: {blocked_count}")
-    return "\n".join(lines)
+    blocks.append(
+        f"📊 <b>Сводка</b>\n"
+        f"Всего: {len(users)}\n"
+        f"С полом: {with_gender}\n"
+        f"С контактом: {with_contact}\n"
+        f"С активной реферальной Premium: {with_ref_premium}\n"
+        f"Заблокировали бота: {blocked_count}"
+    )
+    return blocks
 
 
 @dp.message(Command("users"))
 async def cmd_users(message: Message, bot: Bot) -> None:
     if not _is_admin(message.from_user.id):
         return
-    report = await _build_users_report(bot)
-    # Телеграм режет сообщения на 4096 символов — на всякий случай рубим отчёт кусками.
-    chunks = [report[i:i + 3500] for i in range(0, len(report), 3500)] or [report]
+    blocks = await _build_users_report(bot)
+    # Телеграм режет на 4096 символов — рубим ПО ГРАНИЦАМ блоков (не
+    # посимвольно), иначе легко разрезать HTML-тег пополам и получить
+    # ошибку парсинга у Telegram вместо отчёта.
+    chunks: list[str] = []
+    current = ""
+    for block in blocks:
+        candidate = f"{current}\n\n{block}" if current else block
+        if len(candidate) > 3500:
+            if current:
+                chunks.append(current)
+            current = block
+        else:
+            current = candidate
+    if current:
+        chunks.append(current)
+
     target_chat = int(ADMIN_GROUP_CHAT_ID) if ADMIN_GROUP_CHAT_ID else message.chat.id
     for chunk in chunks:
         try:
-            await bot.send_message(target_chat, chunk)
+            await bot.send_message(target_chat, chunk, parse_mode="HTML")
         except Exception:
             logging.warning("cmd_users: send failed to %s", target_chat)
-            await message.answer(chunk)
+            await message.answer(chunk, parse_mode="HTML")
 
 
 # ── /sources — статистика по источникам привлечения (только для админа) ────
