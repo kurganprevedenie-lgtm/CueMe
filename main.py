@@ -70,7 +70,6 @@ from llm import (
     build_my_style_for_contact,
     build_overall_style,
     build_style_card,
-    compare_my_styles,
     extract_chat_from_image,
     analyze_reply_dynamics,
     get_forced_provider,
@@ -421,7 +420,7 @@ async def _charge_trial_if_needed(bot: Bot, telegram_id: str) -> None:
 
 async def _require_premium(bot: Bot, target: Message, telegram_id: str) -> bool:
     """Гейт для функций без бесплатного триала (анализ собеседника, стиль
-    собеседника, /compare и т.п.) — доступ только по активной подписке."""
+    собеседника и т.п.) — доступ только по активной подписке."""
     if await _is_premium(bot, telegram_id):
         return True
 
@@ -711,8 +710,6 @@ def analyze_menu_kb() -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     b.button(text=BTN_DEEP, callback_data="menu:deep")
     b.button(text=BTN_DEEP_STYLE, callback_data="menu:deepstyle")
-    b.button(text="📈 Сравнить стили", callback_data="menu:compare")
-    b.button(text="📊 Портрет в цифрах", callback_data="menu:stats")
     b.adjust(1)
     return b.as_markup()
 
@@ -2188,10 +2185,6 @@ async def cb_submenu(call: CallbackQuery, state: FSMContext, bot: Bot) -> None:
     #     await _show_revive(call.message, state)
     elif action == "invite":
         await _show_invite(call.message, bot, telegram_id)
-    elif action == "compare":
-        await _show_compare(call.message, bot, telegram_id)
-    elif action == "stats":
-        await _show_stats(call.message, telegram_id)
 
 
 # ── Загрузка JSON-файла ───────────────────────────────────────────────────────
@@ -3872,9 +3865,7 @@ async def _show_help(message: Message) -> None:
         "<b>🔬 Разобраться</b> (кнопка в меню)\n"
         "/deep_analysis — совместимость, история отношений, стиль и привычки "
         "собеседника, идеи подарков\n"
-        "/deep_style_analysis — твой коммуникативный профиль и советы для дейтинга\n"
-        "/compare — сравнить, как ты пишешь разным людям\n"
-        "/stats — портрет в цифрах, бесплатно\n\n"
+        "/deep_style_analysis — твой коммуникативный профиль и советы для дейтинга\n\n"
         "<b>💐 Идеальное свидание</b> (кнопка в меню) — идея свидания и подарков под человека\n\n"
         "<b>👑 Подписка</b> (кнопка в меню) — статус подписки + "
         f"🎁 Пригласить друга (/invite) — получить свой код, за друга по коду дадим "
@@ -3949,115 +3940,6 @@ async def cb_show_premium(call: CallbackQuery, bot: Bot) -> None:
 async def cb_show_invite(call: CallbackQuery, bot: Bot) -> None:
     await call.answer()
     await _show_invite(call.message, bot, str(call.from_user.id))
-
-
-# ── /stats — портрет в цифрах (без LLM) ──────────────────────────────────────
-
-def _all_my_messages(telegram_id: str, contact_id: int) -> list[str]:
-    biz      = get_biz_messages_for_contact(telegram_id, contact_id, "out", 100000)
-    imported = get_imported_messages(contact_id, "out")
-    seen, out = set(), []
-    for t in biz + imported:
-        if t not in seen:
-            seen.add(t)
-            out.append(t)
-    return out
-
-
-def _compute_stats(telegram_id: str) -> str | None:
-    contacts = list_contacts(telegram_id)
-    if not contacts:
-        return None
-
-    per, all_my = [], []
-    for c in contacts:
-        my = _all_my_messages(telegram_id, c["id"])
-        if not my:
-            continue
-        all_my += my
-        per.append({
-            "name": _contact_name(c),
-            "n":    len(my),
-            "avg":  sum(len(t) for t in my) / len(my),
-            "q":    sum(1 for t in my if t.rstrip().endswith("?")) / len(my),
-            "em":   sum(1 for t in my if _EMOJI_RE.search(t)) / len(my),
-        })
-
-    if not all_my:
-        return None
-
-    total = len(all_my)
-    g_avg = sum(len(t) for t in all_my) / total
-    g_q   = sum(1 for t in all_my if t.rstrip().endswith("?")) / total
-    g_em  = sum(1 for t in all_my if _EMOJI_RE.search(t)) / total
-
-    lines = [
-        "📊 Твой портрет в цифрах\n",
-        f"Всего твоих сообщений: {total}",
-        f"Средняя длина: {g_avg:.0f} символов",
-        f"Доля вопросов: {g_q:.0%}",
-        f"Эмодзи в сообщениях: {g_em:.0%}",
-    ]
-
-    if len(per) > 1:
-        longest  = max(per, key=lambda x: x["avg"])
-        shortest = min(per, key=lambda x: x["avg"])
-        most_em  = max(per, key=lambda x: x["em"])
-        lines += [
-            "",
-            f"Длиннее всего пишешь — {longest['name']} ({longest['avg']:.0f} симв.)",
-            f"Короче всего — {shortest['name']} ({shortest['avg']:.0f} симв.)",
-            f"Больше всего эмодзи — {most_em['name']} ({most_em['em']:.0%})",
-        ]
-
-    lines.append("\nПо собеседникам:")
-    for p in sorted(per, key=lambda x: -x["n"]):
-        lines.append(
-            f"• {p['name']}: {p['n']} сообщ., {p['avg']:.0f} симв., "
-            f"вопросы {p['q']:.0%}, эмодзи {p['em']:.0%}"
-        )
-
-    return "\n".join(lines)
-
-
-async def _show_stats(message: Message, telegram_id: str | None = None) -> None:
-    telegram_id = telegram_id or str(message.from_user.id)
-    stats = _compute_stats(telegram_id)
-    if not stats:
-        await message.answer("Пока нет данных. Загрузи JSON-чат или накопи сообщения.")
-        return
-    await message.answer(stats)
-
-
-@dp.message(Command("stats"))
-async def cmd_stats(message: Message) -> None:
-    await _show_stats(message)
-
-
-# ── /compare — сравнение стиля с разными людьми ──────────────────────────────
-
-async def _show_compare(message: Message, bot: Bot, telegram_id: str | None = None) -> None:
-    telegram_id = telegram_id or str(message.from_user.id)
-    if not await _require_premium(bot, message, telegram_id):
-        return
-    cards = get_all_per_contact_style_cards(telegram_id)
-    if len(cards) < 2:
-        await message.answer(
-            "Нужно минимум 2 разобранных собеседника. "
-            "Загрузи ещё чат или дай боту накопить сообщения."
-        )
-        return
-    await message.answer("Сравниваю как ты пишешь разным людям — ~20 секунд...")
-    try:
-        result = await compare_my_styles(cards)
-        await _answer_long(message, result)
-    except Exception as e:
-        await message.answer(f"Ошибка: {e}")
-
-
-@dp.message(Command("compare"))
-async def cmd_compare(message: Message, bot: Bot) -> None:
-    await _show_compare(message, bot)
 
 
 # ── /delete — удалить данные (152-ФЗ) ────────────────────────────────────────
@@ -4303,8 +4185,6 @@ async def main() -> None:
         BotCommand(command="help",        description="Список команд"),
         BotCommand(command="connect",     description="Подключить Автоматизацию чатов"),
         BotCommand(command="me",          description="Мой стиль общения"),
-        BotCommand(command="stats",       description="Портрет в цифрах"),
-        BotCommand(command="compare",     description="Сравнить стиль с разными людьми"),
         BotCommand(command="screenshot",  description="Ответить по скриншоту"),
         BotCommand(command="reply",       description="Помочь ответить собеседнику"),
         BotCommand(command="contacts",    description="Загруженные чаты"),
