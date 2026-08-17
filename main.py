@@ -1190,7 +1190,8 @@ def _periodized_dated_lines(rows: list[dict], target_total: int = 220, buckets: 
         step  = max(1, len(chunk) // per_bucket)
         for r in chunk[::step][:per_bucket]:
             who = "Я" if r["direction"] == "out" else "Собеседник"
-            lines.append(f"{r['date'][:10]} {who}: {r['text']}")
+            when = r["date"][:16].replace("T", " ")
+            lines.append(f"{when} {who}: {r['text']}")
     return lines
 
 
@@ -1265,19 +1266,21 @@ async def _gen_deep_analysis(contact_id: int, owner_user_id: str) -> dict | None
 
     dated_lines = _periodized_dated_lines(rows)
     stats       = _deep_stats_summary(rows)
-    compat, howto, style, flags = await build_deep_analysis(
+    compat, howto, style, flags, message = await build_deep_analysis(
         dated_lines, stats, user_gender=get_gender(owner_user_id),
     )
-    save_deep_analysis(contact_id, compat, howto, style, flags)
+    save_deep_analysis(contact_id, compat, howto, style, flags, message)
     return {
         "compatibility_text": compat, "howto_text": howto,
-        "style_text": style, "flags_text": flags,
+        "style_text": style, "flags_text": flags, "message_text": message,
     }
 
 
 def _format_deep_analysis(name: str, data: dict) -> list[str]:
-    """Собирает все 4 блока в один текст; если не влезает в лимит Telegram —
-    делит на 2 логичных сообщения (1+2 и 3+4), а не режет механически."""
+    """Собирает 4 текстовых блока в один текст; если не влезает в лимит Telegram —
+    делит на 2 логичных сообщения (1+2 и 3+4), а не режет механически. Блок 5
+    (готовое сообщение) не входит сюда — отправляется отдельным tap-to-copy
+    сообщением, см. _run_deep_analysis."""
     header = f"🔬 Анализ собеседника — {name}\n\n"
     block1 = f"💞 Совместимость\n\n{data['compatibility_text']}"
     block2 = f"✍️ Как писать {name}\n\n{data['howto_text']}"
@@ -1335,9 +1338,18 @@ async def _run_deep_analysis(
         return
 
     messages = _format_deep_analysis(name, data)
-    for i, msg in enumerate(messages):
-        last = i == len(messages) - 1
-        await _answer_long(target, msg, reply_markup=deep_analysis_result_kb(contact_id) if last else None)
+    for msg in messages:
+        await _answer_long(target, msg)
+
+    if data["message_text"].strip():
+        text, kw = _copy_block(
+            "✉️ Готовое сообщение (тапни, чтобы скопировать):",
+            data["message_text"].strip(),
+            deep_analysis_result_kb(contact_id),
+        )
+        await target.answer(text, **kw)
+    else:
+        await target.answer("Готово.", reply_markup=deep_analysis_result_kb(contact_id))
 
 
 async def _show_deep_analysis(message: Message, bot: Bot, telegram_id: str | None = None) -> None:
@@ -1626,17 +1638,22 @@ async def _gen_deep_style_analysis(telegram_id: str) -> dict | None:
 
     dated_lines = _periodized_dated_lines(rows)
     stats       = _deep_style_stats_summary(rows)
-    profile, facts, tip = await build_deep_style_analysis(
+    profile, facts, tip, message = await build_deep_style_analysis(
         dated_lines, stats, user_gender=get_gender(telegram_id),
     )
-    save_deep_style_analysis(telegram_id, profile, facts, tip)
-    return {"profile_text": profile, "facts_text": facts, "tip_text": tip}
+    save_deep_style_analysis(telegram_id, profile, facts, tip, message)
+    return {
+        "profile_text": profile, "facts_text": facts,
+        "tip_text": tip, "message_text": message,
+    }
 
 
 def _format_deep_style_analysis(telegram_id: str, data: dict) -> str:
-    """Все 4 блока — одно компактное сообщение. Блок 4 (совместимость) считается
-    заново при каждом показе (не кэшируется вместе с остальными тремя), т.к.
-    deep_analysis других контактов может обновиться позже."""
+    """Текстовые блоки — одно компактное сообщение. Совместимость с лучшим
+    контактом считается заново при каждом показе (не кэшируется вместе с
+    остальными), т.к. deep_analysis других контактов может обновиться позже.
+    Блок «пример сообщения» сюда не входит — отправляется отдельным
+    tap-to-copy сообщением, см. _run_deep_style_analysis."""
     parts = [
         "🪞 Анализ своего стиля",
         data["profile_text"].strip(),
@@ -1693,7 +1710,17 @@ async def _run_deep_style_analysis(bot: Bot, target: Message, telegram_id: str) 
         return
 
     card = _format_deep_style_analysis(telegram_id, data)
-    await _answer_long(target, card, reply_markup=deep_style_result_kb())
+    await _answer_long(target, card)
+
+    if data["message_text"].strip():
+        text, kw = _copy_block(
+            "✉️ Пример сообщения в твоём стиле (тапни, чтобы скопировать):",
+            data["message_text"].strip(),
+            deep_style_result_kb(),
+        )
+        await target.answer(text, **kw)
+    else:
+        await target.answer("Готово.", reply_markup=deep_style_result_kb())
 
 
 async def _show_deep_style_analysis(message: Message, bot: Bot, telegram_id: str | None = None) -> None:
@@ -3863,8 +3890,8 @@ async def _show_help(message: Message) -> None:
         "/screenshot — ответить по скриншоту переписки (можно слать скриншоты "
         "один за другим)\n\n"
         "<b>🔬 Разобраться</b> (кнопка в меню)\n"
-        "/deep_analysis — совместимость, история отношений, стиль и привычки "
-        "собеседника, идеи подарков\n"
+        "/deep_analysis — совместимость, как писать этому человеку, стиль и "
+        "флаги, готовое сообщение\n"
         "/deep_style_analysis — твой коммуникативный профиль и советы для дейтинга\n\n"
         "<b>💐 Идеальное свидание</b> (кнопка в меню) — идея свидания и подарков под человека\n\n"
         "<b>👑 Подписка</b> (кнопка в меню) — статус подписки + "
