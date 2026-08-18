@@ -1174,6 +1174,44 @@ async def _gen_my_style_per_contact(contact_id: int, owner_user_id: str) -> str 
 DEEP_ANALYSIS_MIN_MSGS = 10  # минимум сообщений с каждой стороны, иначе анализ бессмысленен
 
 
+_JUNK_WORDS = {"чо", "лол", "кек", "рофл", "ору", "угар", "мда", "эм", "ауф", "хм"}
+
+
+def _is_junk_message(text: str) -> bool:
+    """Мусор для целей ЦИТИРОВАНИЯ в LLM-анализе (build_deep_analysis) — смех/
+    междометия, голая пунктуация/эмодзи, куцые реакции без контекста типа
+    "сукаааа"/"лол"/"чо". Само сообщение из данных не убирается (см.
+    _periodized_dated_lines) — только помечается как непригодное для цитаты,
+    чтобы модель не приводила его как иллюстративный «бид»/пример. Короткие, но
+    содержательные ответы («да», «нет», «ок») мусором НЕ считаются — это
+    реальные прямые ответы (см. правку про «уход от прямого ответа»)."""
+    t = text.strip()
+    if len(t) <= 1:
+        return True
+    if not re.search(r"[a-zA-Zа-яА-ЯёЁ0-9]", t):
+        return True  # только пунктуация/эмодзи, ни одной буквы или цифры
+    if " " in t:
+        return False  # многословные сообщения не считаем голой репликой
+    low = t.lower().strip(" !?.,)(")
+    if not low:
+        return True
+    if low in _JUNK_WORDS:
+        return True
+    # длинный прогон одного символа с коротким "корнем" — сукаааа, нееееет,
+    # дааааа: схлопываем 3+ повторов подряд и смотрим, что осталось
+    collapsed = re.sub(r"(.)\1{2,}", r"\1", low)
+    if len(collapsed) <= 4 and len(low) >= 6:
+        return True
+    # смеховое чередование ха/ах/хи/хо и т.п. — считаем по доле покрытия, а не
+    # точным совпадением целиком, чтобы ловить и захламлённые вставными буквами
+    # варианты вроде "хехахааххааххаппхахахаха"
+    if len(low) >= 4:
+        hits = len(re.findall(r"ха|ах|хи|их|хе|ех|хо|ох", low))
+        if hits * 2 / len(low) >= 0.6:
+            return True
+    return False
+
+
 def _periodized_dated_lines(rows: list[dict], target_total: int = 220, buckets: int = 6) -> list[str]:
     """Хронологический семпл с равномерным охватом всей истории (не только
     последних сообщений) — бьём на буквенных бакетов по времени и берём
@@ -1191,7 +1229,8 @@ def _periodized_dated_lines(rows: list[dict], target_total: int = 220, buckets: 
         for r in chunk[::step][:per_bucket]:
             who = "Я" if r["direction"] == "out" else "Собеседник"
             when = r["date"][:16].replace("T", " ")
-            lines.append(f"{when} {who}: {r['text']}")
+            tag  = " [шум, не цитировать]" if _is_junk_message(r["text"]) else ""
+            lines.append(f"{when} {who}: {r['text']}{tag}")
     return lines
 
 
