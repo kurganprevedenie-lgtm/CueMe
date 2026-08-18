@@ -91,8 +91,12 @@ LLM вызывается лениво — только при запросе п�
 - Парсинг: stdlib `json`
 - Локальные признаки: `features.py` (чистый Python, без LLM)
 - Парсер JSON-экспорта: `tg_parser.py`
-- LLM: **Groq API**, модель `llama-3.3-70b-versatile` (основная),
-  `llama-3.2-11b-vision-preview` (Vision для скриншотов)
+- LLM: каскад с fallback — **Gemini** (`gemini-2.5-flash`, основной) →
+  **Groq** (`llama-3.3-70b-versatile`) → **Cerebras** (`llama-3.3-70b`,
+  бесплатный тир, опционален) → **Mistral** (`mistral-small-latest`,
+  бесплатный тир, опционален) → **OpenRouter** (`llama-3.3-70b-instruct:free`).
+  Порядок в `LLM_PROVIDER_ORDER` (.env). Vision (скриншоты) — отдельно, Groq/
+  Gemini (см. `VISION_MODEL` в config.py)
 - HTTP: **httpx** с `trust_env=False` (обход SOCKS-прокси)
 - Хранилище: **SQLite** (bot.db)
 - Платежи: Tribute (канал-пропуск, см. «Подписка» ниже) — НЕ Telegram Stars/YooKassa

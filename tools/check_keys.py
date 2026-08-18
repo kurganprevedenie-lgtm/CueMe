@@ -1,5 +1,6 @@
-"""Диагностика живости всех API-ключей (Gemini, Groq, OpenRouter) без ротации —
-каждый ключ бьётся отдельным запросом, чтобы увидеть его реальный статус.
+"""Диагностика живости всех API-ключей (Gemini, Groq, Cerebras, Mistral,
+OpenRouter) без ротации — каждый ключ бьётся отдельным запросом, чтобы увидеть
+его реальный статус.
 
 Запуск на сервере: py -3.13 tools/check_keys.py
 """
@@ -7,7 +8,14 @@ import asyncio
 
 import httpx
 
-from config import GEMINI_API_KEYS, GEMINI_PROXY, GROQ_API_KEYS, OPENROUTER_API_KEY
+from config import (
+    CEREBRAS_API_KEY,
+    GEMINI_API_KEYS,
+    GEMINI_PROXY,
+    GROQ_API_KEYS,
+    MISTRAL_API_KEY,
+    OPENROUTER_API_KEY,
+)
 
 
 def _mask(key: str) -> str:
@@ -42,6 +50,36 @@ async def check_groq(key: str) -> tuple[bool, str]:
     url = "https://api.groq.com/openai/v1/chat/completions"
     payload = {
         "model": "llama-3.3-70b-versatile",
+        "messages": [{"role": "user", "content": "Ответь одним словом: тест пройден?"}],
+        "max_tokens": 20,
+    }
+    async with httpx.AsyncClient(timeout=30.0, trust_env=False) as client:
+        resp = await client.post(url, headers={"Authorization": f"Bearer {key}"}, json=payload)
+    if not resp.is_success:
+        return False, f"HTTP {resp.status_code} — {resp.text[:150]}"
+    text = resp.json()["choices"][0]["message"]["content"].strip()
+    return True, text
+
+
+async def check_cerebras(key: str) -> tuple[bool, str]:
+    url = "https://api.cerebras.ai/v1/chat/completions"
+    payload = {
+        "model": "llama-3.3-70b",
+        "messages": [{"role": "user", "content": "Ответь одним словом: тест пройден?"}],
+        "max_tokens": 20,
+    }
+    async with httpx.AsyncClient(timeout=30.0, trust_env=False) as client:
+        resp = await client.post(url, headers={"Authorization": f"Bearer {key}"}, json=payload)
+    if not resp.is_success:
+        return False, f"HTTP {resp.status_code} — {resp.text[:150]}"
+    text = resp.json()["choices"][0]["message"]["content"].strip()
+    return True, text
+
+
+async def check_mistral(key: str) -> tuple[bool, str]:
+    url = "https://api.mistral.ai/v1/chat/completions"
+    payload = {
+        "model": "mistral-small-latest",
         "messages": [{"role": "user", "content": "Ответь одним словом: тест пройден?"}],
         "max_tokens": 20,
     }
@@ -93,6 +131,8 @@ async def _run_group(title: str, keys: list[str], checker) -> None:
 async def main() -> None:
     await _run_group("Gemini", GEMINI_API_KEYS, check_gemini)
     await _run_group("Groq", GROQ_API_KEYS, check_groq)
+    await _run_group("Cerebras", [CEREBRAS_API_KEY] if CEREBRAS_API_KEY else [], check_cerebras)
+    await _run_group("Mistral", [MISTRAL_API_KEY] if MISTRAL_API_KEY else [], check_mistral)
     await _run_group("OpenRouter", [OPENROUTER_API_KEY] if OPENROUTER_API_KEY else [], check_openrouter)
 
 

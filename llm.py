@@ -1,12 +1,18 @@
 """
 llm.py — обёртки над LLM-провайдерами с каскадным fallback.
 
-Порядок попыток:
-  1. Gemini      (gemini-2.5-flash)           — основной
-  2. Groq        (llama-3.3-70b-versatile)    — fallback 1
-  3. OpenRouter  (meta-llama/llama-3.1-8b-instruct:free) — fallback 2
+Порядок попыток (дефолтный, см. LLM_PROVIDER_ORDER в config.py):
+  1. Gemini      (gemini-2.5-flash)                    — основной
+  2. Groq        (llama-3.3-70b-versatile)             — fallback 1
+  3. Cerebras    (llama-3.3-70b, бесплатный тир)        — fallback 2
+  4. Mistral     (mistral-small-latest, бесплатный тир) — fallback 3
+  5. OpenRouter  (meta-llama/llama-3.3-70b-instruct:free) — fallback 4
 
-Если все три провайдера недоступны — пробрасывается последнее исключение.
+Cerebras/Mistral пропускаются автоматически, если их API-ключ не задан в
+.env (см. CEREBRAS_API_KEY/MISTRAL_API_KEY в .env.example) — остальной
+каскад работает как раньше без них.
+
+Если все провайдеры недоступны — пробрасывается последнее исключение.
 """
 
 import base64
@@ -19,10 +25,12 @@ from abc import ABC, abstractmethod
 import httpx
 
 from config import (
+    CEREBRAS_API_KEY,
     GEMINI_API_KEYS,
     GEMINI_PROXY,
     GROQ_API_KEYS,
     LLM_PROVIDER_ORDER,
+    MISTRAL_API_KEY,
     OPENROUTER_API_KEY,
     REPLY_STYLES,
     VISION_MODEL,
@@ -424,6 +432,74 @@ class GeminiProvider(LLMProvider):
         raise last_exc
 
 
+# ── Cerebras (бесплатный тир, OpenAI-совместимый формат) ─────────────────────
+
+class CerebrasProvider(LLMProvider):
+    name = "Cerebras"
+    _URL   = "https://api.cerebras.ai/v1/chat/completions"
+    _MODEL = "llama-3.3-70b"
+
+    async def ask(self, prompt: str, max_tokens: int) -> str:
+        if not CEREBRAS_API_KEY:
+            raise ProviderError("CEREBRAS_API_KEY не задан")
+
+        async with httpx.AsyncClient(timeout=90.0, trust_env=False) as client:
+            resp = await client.post(
+                self._URL,
+                headers={"Authorization": f"Bearer {CEREBRAS_API_KEY}"},
+                json={
+                    "model": self._MODEL,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "max_tokens": max_tokens,
+                },
+            )
+
+        if resp.status_code == 429:
+            raise RateLimitError("Лимит Cerebras исчерпан.")
+
+        if resp.status_code in (500, 502, 503):
+            raise ProviderError(f"Cerebras {resp.status_code}: {resp.text[:200]}")
+
+        if not resp.is_success:
+            raise ProviderError(f"Cerebras {resp.status_code}: {resp.text[:200]}")
+
+        return resp.json()["choices"][0]["message"]["content"].strip()
+
+
+# ── Mistral (La Plateforme, бесплатный тир, OpenAI-совместимый формат) ───────
+
+class MistralProvider(LLMProvider):
+    name = "Mistral"
+    _URL   = "https://api.mistral.ai/v1/chat/completions"
+    _MODEL = "mistral-small-latest"
+
+    async def ask(self, prompt: str, max_tokens: int) -> str:
+        if not MISTRAL_API_KEY:
+            raise ProviderError("MISTRAL_API_KEY не задан")
+
+        async with httpx.AsyncClient(timeout=90.0, trust_env=False) as client:
+            resp = await client.post(
+                self._URL,
+                headers={"Authorization": f"Bearer {MISTRAL_API_KEY}"},
+                json={
+                    "model": self._MODEL,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "max_tokens": max_tokens,
+                },
+            )
+
+        if resp.status_code == 429:
+            raise RateLimitError("Лимит Mistral исчерпан.")
+
+        if resp.status_code in (500, 502, 503):
+            raise ProviderError(f"Mistral {resp.status_code}: {resp.text[:200]}")
+
+        if not resp.is_success:
+            raise ProviderError(f"Mistral {resp.status_code}: {resp.text[:200]}")
+
+        return resp.json()["choices"][0]["message"]["content"].strip()
+
+
 # ── OpenRouter ────────────────────────────────────────────────────────────────
 
 class OpenRouterProvider(LLMProvider):
@@ -469,9 +545,11 @@ class OpenRouterProvider(LLMProvider):
 _PROVIDER_REGISTRY = {
     "gemini":     GeminiProvider,
     "groq":       GroqProvider,
+    "cerebras":   CerebrasProvider,
+    "mistral":    MistralProvider,
     "openrouter": OpenRouterProvider,
 }
-_DEFAULT_ORDER = ["gemini", "groq", "openrouter"]
+_DEFAULT_ORDER = ["gemini", "groq", "cerebras", "mistral", "openrouter"]
 
 
 def _build_providers() -> list[LLMProvider]:
