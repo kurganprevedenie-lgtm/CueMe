@@ -41,6 +41,14 @@ OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 CEREBRAS_API_KEY = os.getenv("CEREBRAS_API_KEY")
 # Mistral (La Plateforme) — бесплатный тир. Тоже опционален, как Cerebras.
 MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY")
+# Cloudflare Workers AI — бесплатный тир (~10 000 нейронов/день, ~1300 LLM-
+# ответов/день), нужны ОБА значения (account ID из дашборда Cloudflare + API
+# токен с правами Workers AI). Опционален, как Cerebras/Mistral.
+CLOUDFLARE_ACCOUNT_ID = os.getenv("CLOUDFLARE_ACCOUNT_ID")
+CLOUDFLARE_API_TOKEN  = os.getenv("CLOUDFLARE_API_TOKEN")
+# GitHub Models — бесплатный тир от обычного GitHub-аккаунта (Fine-grained
+# PAT с правом models:read). Опционален, как Cerebras/Mistral.
+GITHUB_MODELS_TOKEN = os.getenv("GITHUB_MODELS_TOKEN")
 
 # telegram_id разработчика — кому доступны админ-команды (/provider, /users,
 # /export, /sources и т.п.), не должны быть открыты всем.
@@ -79,7 +87,9 @@ ONBOARDING_JSON_POST_URL = os.getenv("ONBOARDING_JSON_POST_URL", "https://t.me/C
 
 # Порядок каскада LLM (через запятую). Дефолт — Gemini основной. На сервере без
 # GEMINI_PROXY имеет смысл поставить groq первым: "groq,gemini,openrouter".
-LLM_PROVIDER_ORDER = os.getenv("LLM_PROVIDER_ORDER", "gemini,groq,cerebras,mistral,openrouter")
+LLM_PROVIDER_ORDER = os.getenv(
+    "LLM_PROVIDER_ORDER", "gemini,groq,cloudflare,cerebras,mistral,githubmodels,openrouter"
+)
 
 # TTL кэша LLM-ответов (сек). Ключ контент-адресный (включает карточки стиля),
 # поэтому смена карточек инвалидирует запись сама; TTL — страховка от разрастания.

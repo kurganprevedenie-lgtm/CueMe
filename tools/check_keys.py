@@ -1,6 +1,6 @@
-"""Диагностика живости всех API-ключей (Gemini, Groq, Cerebras, Mistral,
-OpenRouter) без ротации — каждый ключ бьётся отдельным запросом, чтобы увидеть
-его реальный статус.
+"""Диагностика живости всех API-ключей (Gemini, Groq, Cloudflare, Cerebras,
+Mistral, GitHub Models, OpenRouter) без ротации — каждый ключ бьётся отдельным
+запросом, чтобы увидеть его реальный статус.
 
 Запуск на сервере: py -3.13 tools/check_keys.py
 """
@@ -10,8 +10,11 @@ import httpx
 
 from config import (
     CEREBRAS_API_KEY,
+    CLOUDFLARE_ACCOUNT_ID,
+    CLOUDFLARE_API_TOKEN,
     GEMINI_API_KEYS,
     GEMINI_PROXY,
+    GITHUB_MODELS_TOKEN,
     GROQ_API_KEYS,
     MISTRAL_API_KEY,
     OPENROUTER_API_KEY,
@@ -91,6 +94,40 @@ async def check_mistral(key: str) -> tuple[bool, str]:
     return True, text
 
 
+async def check_cloudflare(account_id: str, token: str) -> tuple[bool, str]:
+    url = f"https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1/chat/completions"
+    payload = {
+        "model": "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+        "messages": [{"role": "user", "content": "Ответь одним словом: тест пройден?"}],
+        "max_tokens": 20,
+    }
+    async with httpx.AsyncClient(timeout=30.0, trust_env=False) as client:
+        resp = await client.post(url, headers={"Authorization": f"Bearer {token}"}, json=payload)
+    if not resp.is_success:
+        return False, f"HTTP {resp.status_code} — {resp.text[:150]}"
+    text = resp.json()["choices"][0]["message"]["content"].strip()
+    return True, text
+
+
+async def check_github_models(token: str) -> tuple[bool, str]:
+    url = "https://models.github.ai/inference/chat/completions"
+    payload = {
+        "model": "openai/gpt-4o-mini",
+        "messages": [{"role": "user", "content": "Ответь одним словом: тест пройден?"}],
+        "max_tokens": 20,
+    }
+    async with httpx.AsyncClient(timeout=30.0, trust_env=False) as client:
+        resp = await client.post(
+            url,
+            headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"},
+            json=payload,
+        )
+    if not resp.is_success:
+        return False, f"HTTP {resp.status_code} — {resp.text[:150]}"
+    text = resp.json()["choices"][0]["message"]["content"].strip()
+    return True, text
+
+
 async def check_openrouter(key: str) -> tuple[bool, str]:
     url = "https://openrouter.ai/api/v1/chat/completions"
     payload = {
@@ -131,8 +168,22 @@ async def _run_group(title: str, keys: list[str], checker) -> None:
 async def main() -> None:
     await _run_group("Gemini", GEMINI_API_KEYS, check_gemini)
     await _run_group("Groq", GROQ_API_KEYS, check_groq)
+
+    print("\n=== Cloudflare Workers AI ===")
+    if not (CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN):
+        print("  (не задано — нужны оба CLOUDFLARE_ACCOUNT_ID и CLOUDFLARE_API_TOKEN)")
+    else:
+        try:
+            ok, detail = await check_cloudflare(CLOUDFLARE_ACCOUNT_ID, CLOUDFLARE_API_TOKEN)
+        except Exception as e:
+            ok, detail = False, f"исключение: {e}"
+        print(f"  {'OK' if ok else 'FAIL'} -> {detail!r}")
+
     await _run_group("Cerebras", [CEREBRAS_API_KEY] if CEREBRAS_API_KEY else [], check_cerebras)
     await _run_group("Mistral", [MISTRAL_API_KEY] if MISTRAL_API_KEY else [], check_mistral)
+    await _run_group(
+        "GitHub Models", [GITHUB_MODELS_TOKEN] if GITHUB_MODELS_TOKEN else [], check_github_models,
+    )
     await _run_group("OpenRouter", [OPENROUTER_API_KEY] if OPENROUTER_API_KEY else [], check_openrouter)
 
 

@@ -92,11 +92,13 @@ LLM вызывается лениво — только при запросе п�
 - Локальные признаки: `features.py` (чистый Python, без LLM)
 - Парсер JSON-экспорта: `tg_parser.py`
 - LLM: каскад с fallback — **Gemini** (`gemini-2.5-flash`, основной) →
-  **Groq** (`llama-3.3-70b-versatile`) → **Cerebras** (`llama-3.3-70b`,
-  бесплатный тир, опционален) → **Mistral** (`mistral-small-latest`,
-  бесплатный тир, опционален) → **OpenRouter** (`llama-3.3-70b-instruct:free`).
-  Порядок в `LLM_PROVIDER_ORDER` (.env). Vision (скриншоты) — отдельно, Groq/
-  Gemini (см. `VISION_MODEL` в config.py)
+  **Groq** (`llama-3.3-70b-versatile`) → **Cloudflare Workers AI**
+  (`llama-3.3-70b`, бесплатный тир ~1300 запросов/день, опционален) →
+  **Cerebras** (`llama-3.3-70b`, бесплатный тир, опционален) → **Mistral**
+  (`mistral-small-latest`, бесплатный тир, опционален) → **GitHub Models**
+  (`gpt-4o-mini`, бесплатный тир, опционален) → **OpenRouter**
+  (`llama-3.3-70b-instruct:free`). Порядок в `LLM_PROVIDER_ORDER` (.env).
+  Vision (скриншоты) — отдельно, Groq/Gemini (см. `VISION_MODEL` в config.py)
 - HTTP: **httpx** с `trust_env=False` (обход SOCKS-прокси)
 - Хранилище: **SQLite** (bot.db)
 - Платежи: Tribute (канал-пропуск, см. «Подписка» ниже) — НЕ Telegram Stars/YooKassa

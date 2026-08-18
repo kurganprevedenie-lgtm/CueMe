@@ -2,15 +2,17 @@
 llm.py — обёртки над LLM-провайдерами с каскадным fallback.
 
 Порядок попыток (дефолтный, см. LLM_PROVIDER_ORDER в config.py):
-  1. Gemini      (gemini-2.5-flash)                    — основной
-  2. Groq        (llama-3.3-70b-versatile)             — fallback 1
-  3. Cerebras    (llama-3.3-70b, бесплатный тир)        — fallback 2
-  4. Mistral     (mistral-small-latest, бесплатный тир) — fallback 3
-  5. OpenRouter  (meta-llama/llama-3.3-70b-instruct:free) — fallback 4
+  1. Gemini      (gemini-2.5-flash)                      — основной
+  2. Groq        (llama-3.3-70b-versatile)               — fallback 1
+  3. Cloudflare  (llama-3.3-70b, бесплатный тир, ~1300 запросов/день) — fallback 2
+  4. Cerebras    (llama-3.3-70b, бесплатный тир)          — fallback 3
+  5. Mistral     (mistral-small-latest, бесплатный тир)   — fallback 4
+  6. GitHub Models (gpt-4o-mini, бесплатный тир)          — fallback 5
+  7. OpenRouter  (meta-llama/llama-3.3-70b-instruct:free) — fallback 6
 
-Cerebras/Mistral пропускаются автоматически, если их API-ключ не задан в
-.env (см. CEREBRAS_API_KEY/MISTRAL_API_KEY в .env.example) — остальной
-каскад работает как раньше без них.
+Cloudflare/Cerebras/Mistral/GitHub Models пропускаются автоматически, если
+их ключ(и) не заданы в .env (см. .env.example) — остальной каскад работает
+как раньше без них.
 
 Если все провайдеры недоступны — пробрасывается последнее исключение.
 """
@@ -26,8 +28,11 @@ import httpx
 
 from config import (
     CEREBRAS_API_KEY,
+    CLOUDFLARE_ACCOUNT_ID,
+    CLOUDFLARE_API_TOKEN,
     GEMINI_API_KEYS,
     GEMINI_PROXY,
+    GITHUB_MODELS_TOKEN,
     GROQ_API_KEYS,
     LLM_PROVIDER_ORDER,
     MISTRAL_API_KEY,
@@ -432,6 +437,46 @@ class GeminiProvider(LLMProvider):
         raise last_exc
 
 
+# ── Cloudflare Workers AI (бесплатный тир, ~1300 запросов/день, OpenAI-формат) ─
+
+class CloudflareProvider(LLMProvider):
+    name = "Cloudflare"
+    _MODEL = "@cf/meta/llama-3.3-70b-instruct-fp8-fast"
+
+    @staticmethod
+    def _url() -> str:
+        return (
+            f"https://api.cloudflare.com/client/v4/accounts/"
+            f"{CLOUDFLARE_ACCOUNT_ID}/ai/v1/chat/completions"
+        )
+
+    async def ask(self, prompt: str, max_tokens: int) -> str:
+        if not (CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN):
+            raise ProviderError("CLOUDFLARE_ACCOUNT_ID/CLOUDFLARE_API_TOKEN не заданы")
+
+        async with httpx.AsyncClient(timeout=90.0, trust_env=False) as client:
+            resp = await client.post(
+                self._url(),
+                headers={"Authorization": f"Bearer {CLOUDFLARE_API_TOKEN}"},
+                json={
+                    "model": self._MODEL,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "max_tokens": max_tokens,
+                },
+            )
+
+        if resp.status_code == 429:
+            raise RateLimitError("Лимит Cloudflare Workers AI исчерпан (10 000 нейронов/день).")
+
+        if resp.status_code in (500, 502, 503):
+            raise ProviderError(f"Cloudflare {resp.status_code}: {resp.text[:200]}")
+
+        if not resp.is_success:
+            raise ProviderError(f"Cloudflare {resp.status_code}: {resp.text[:200]}")
+
+        return resp.json()["choices"][0]["message"]["content"].strip()
+
+
 # ── Cerebras (бесплатный тир, OpenAI-совместимый формат) ─────────────────────
 
 class CerebrasProvider(LLMProvider):
@@ -500,6 +545,43 @@ class MistralProvider(LLMProvider):
         return resp.json()["choices"][0]["message"]["content"].strip()
 
 
+# ── GitHub Models (бесплатный тир от GitHub-аккаунта, OpenAI-совместимый) ────
+
+class GitHubModelsProvider(LLMProvider):
+    name = "GitHubModels"
+    _URL   = "https://models.github.ai/inference/chat/completions"
+    _MODEL = "openai/gpt-4o-mini"
+
+    async def ask(self, prompt: str, max_tokens: int) -> str:
+        if not GITHUB_MODELS_TOKEN:
+            raise ProviderError("GITHUB_MODELS_TOKEN не задан")
+
+        async with httpx.AsyncClient(timeout=90.0, trust_env=False) as client:
+            resp = await client.post(
+                self._URL,
+                headers={
+                    "Authorization": f"Bearer {GITHUB_MODELS_TOKEN}",
+                    "Accept": "application/vnd.github+json",
+                },
+                json={
+                    "model": self._MODEL,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "max_tokens": max_tokens,
+                },
+            )
+
+        if resp.status_code == 429:
+            raise RateLimitError("Лимит GitHub Models исчерпан.")
+
+        if resp.status_code in (500, 502, 503):
+            raise ProviderError(f"GitHub Models {resp.status_code}: {resp.text[:200]}")
+
+        if not resp.is_success:
+            raise ProviderError(f"GitHub Models {resp.status_code}: {resp.text[:200]}")
+
+        return resp.json()["choices"][0]["message"]["content"].strip()
+
+
 # ── OpenRouter ────────────────────────────────────────────────────────────────
 
 class OpenRouterProvider(LLMProvider):
@@ -543,13 +625,17 @@ class OpenRouterProvider(LLMProvider):
 # ── Каскадный вызов ───────────────────────────────────────────────────────────
 
 _PROVIDER_REGISTRY = {
-    "gemini":     GeminiProvider,
-    "groq":       GroqProvider,
-    "cerebras":   CerebrasProvider,
-    "mistral":    MistralProvider,
-    "openrouter": OpenRouterProvider,
+    "gemini":       GeminiProvider,
+    "groq":         GroqProvider,
+    "cloudflare":   CloudflareProvider,
+    "cerebras":     CerebrasProvider,
+    "mistral":      MistralProvider,
+    "githubmodels": GitHubModelsProvider,
+    "openrouter":   OpenRouterProvider,
 }
-_DEFAULT_ORDER = ["gemini", "groq", "cerebras", "mistral", "openrouter"]
+_DEFAULT_ORDER = [
+    "gemini", "groq", "cloudflare", "cerebras", "mistral", "githubmodels", "openrouter",
+]
 
 
 def _build_providers() -> list[LLMProvider]:
