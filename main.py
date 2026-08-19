@@ -1306,7 +1306,7 @@ async def _gen_deep_analysis(contact_id: int, owner_user_id: str) -> dict | None
     dated_lines = _periodized_dated_lines(rows)
     stats       = _deep_stats_summary(rows)
     compat, howto, flags, message = await build_deep_analysis(
-        dated_lines, stats, user_gender=get_gender(owner_user_id),
+        dated_lines, stats, rows, user_gender=get_gender(owner_user_id),
     )
     save_deep_analysis(contact_id, compat, howto, flags, message)
     return {
@@ -1631,18 +1631,17 @@ def _deep_style_stats_summary(rows: list[dict]) -> str:
 #     return msg1, msg2
 
 
-_COMPAT_NUM_RE = re.compile(r"Совместимость:\s*(\d+)\s*/\s*100")
+_COMPAT_NUM_RE = re.compile(r"—\s*(\d{1,2})\s*/\s*25\b")
 
 
 def _first_compat_reason(compatibility_text: str) -> str:
-    """Первая содержательная строка объяснения (после строки «Совместимость:
-    XX/100 — вердикт») как есть, без LLM — короткий пересказ, не весь текст
-    целиком. Формат объяснения тезисный (без «•»), может начинаться с «→» или
-    быть строкой «Раньше:»/«Сейчас:» — берём первую непустую строку как есть."""
-    for line in compatibility_text.splitlines()[1:]:
-        line = line.strip()
+    """Строка-вывод (1-2 предложения) после заголовка с медалью и строк с
+    пятью осями — короткий пересказ для «лучшая совместимость» в «Анализ
+    своего стиля», не весь текст целиком."""
+    lines = [l.strip() for l in compatibility_text.splitlines()]
+    for line in lines[4:]:  # 0: медаль+сумма, 1: пусто, 2-3: строки осей
         if line:
-            return line.lstrip("→").strip()
+            return line
     return ""
 
 
@@ -1708,7 +1707,7 @@ def _format_deep_style_analysis(telegram_id: str, data: dict) -> str:
         m = _COMPAT_NUM_RE.search(compat_text)
         score = m.group(1) if m else "?"
         reason = _first_compat_reason(compat_text)
-        compat_block = f"💕 Лучше всего складывается с {name} ({score}/100)"
+        compat_block = f"💕 Лучше всего складывается с {name} ({score}/25)"
         if reason:
             compat_block += f"\n{reason}"
         parts.append(compat_block)

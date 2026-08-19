@@ -237,6 +237,102 @@ def winning_messages(dated_msgs: list[dict], max_examples: int = 3,
     return out
 
 
+# ── оси совместимости без LLM (см. compat_axes в llm.py) ──────────────────────
+
+_EXPLAIN_RE = re.compile(
+    r"(занят\w*|работ\w*|дела\w*|сорри|извини\w*|прост\w* не (?:мог|успел))",
+    re.IGNORECASE,
+)
+
+
+def initiative_axis(dated_msgs: list[dict], gap: timedelta = SESSION_GAP) -> tuple[int, str]:
+    """Ось «Инициативность» (0-5): доля пауз ≥gap, после которых первым написал
+    СОБЕСЕДНИК (не автор). Меньше 3 пауз в переписке — данных мало, нейтральные
+    2/5. Порог паузы — тот же SESSION_GAP, что уже используется для границы
+    сессии в extract_features, ради консистентности внутри проекта."""
+    msgs = sorted(
+        (m for m in dated_msgs if m.get("text") and m.get("date")),
+        key=lambda m: m["date"],
+    )
+    pauses = 0
+    contact_first = 0
+    for prev, cur in zip(msgs, msgs[1:]):
+        try:
+            delta = datetime.fromisoformat(cur["date"]) - datetime.fromisoformat(prev["date"])
+        except (ValueError, TypeError):
+            continue
+        if delta >= gap:
+            pauses += 1
+            if cur["direction"] == "in":
+                contact_first += 1
+    if pauses < 3:
+        return 2, "пауз в переписке мало — оценка нейтральная"
+    ratio = contact_first / pauses
+    score = round(min(1.0, max(0.0, ratio)) * 5)
+    return score, f"после паузы первым пишет собеседник в {ratio:.0%} случаев ({contact_first}/{pauses})"
+
+
+def interest_signal_a(dated_msgs: list[dict]) -> tuple[int, str]:
+    """Сигнал A оси «Интерес» (0-5, без LLM): доля сообщений собеседника, где
+    есть и вопрос, и обращение на «ты» («ты/тебе/тебя/твой...») — вопросы,
+    адресованные автору, а не вопросы вообще."""
+    contact_texts = [m["text"] for m in dated_msgs if m.get("direction") == "in" and m.get("text")]
+    if not contact_texts:
+        return 2, "сообщений собеседника нет — оценка нейтральная"
+    addressed = sum(1 for t in contact_texts if "?" in t and _INFORMAL_RE.search(t))
+    ratio = addressed / len(contact_texts)
+    score = round(min(1.0, ratio / 0.3) * 5)  # 30%+ таких вопросов — уже максимум по этому сигналу
+    score = min(5, max(0, score))
+    return score, f"вопросов-обращений к автору — {ratio:.0%} его сообщений ({addressed}/{len(contact_texts)})"
+
+
+def response_speed_axis(dated_msgs: list[dict], gap: timedelta = SESSION_GAP) -> tuple[int, str]:
+    """Ось «Скорость ответов» (0-5, без LLM): базовый балл по средней задержке
+    ответа собеседника внутри сессии (< gap), минус штраф за «необъяснённые»
+    долгие паузы (≥24ч без слов «занят»/«работа»/«дела»/«сорри» в соседних
+    сообщениях — не про другие приложения, только про саму переписку)."""
+    msgs = sorted(
+        (m for m in dated_msgs if m.get("text") and m.get("date")),
+        key=lambda m: m["date"],
+    )
+    latencies = _in_reply_latencies(msgs)
+    if not latencies:
+        return 2, "недостаточно ответов собеседника для оценки — нейтральная"
+
+    avg_sec = sum(latencies) / len(latencies)
+    if avg_sec < 600:
+        base = 5
+    elif avg_sec < 1800:
+        base = 4
+    elif avg_sec < 5400:
+        base = 3
+    elif avg_sec < 10800:
+        base = 2
+    else:
+        base = 1
+
+    long_gap = timedelta(hours=24)
+    unexplained = 0
+    for prev, cur in zip(msgs, msgs[1:]):
+        try:
+            delta = datetime.fromisoformat(cur["date"]) - datetime.fromisoformat(prev["date"])
+        except (ValueError, TypeError):
+            continue
+        if delta < long_gap:
+            continue
+        nearby = (prev["text"] or "") + " " + (cur["text"] or "")
+        if not _EXPLAIN_RE.search(nearby):
+            unexplained += 1
+
+    penalty = min(2.0, max(0, unexplained - 1) * 0.5)
+    score = round(max(0, min(5, base - penalty)))
+    avg_min = avg_sec / 60
+    note = f"средняя задержка ответа ~{avg_min:.0f} мин"
+    if unexplained:
+        note += f", необъяснённых долгих пауз: {unexplained}"
+    return score, note
+
+
 def _in_reply_latencies(msgs: list[dict]) -> list[float]:
     """Секунды: как быстро собеседник ('in') отвечал на сообщение автора ('out'),
     в пределах сессии. msgs — уже отсортированы по дате."""
