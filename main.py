@@ -1305,34 +1305,21 @@ async def _gen_deep_analysis(contact_id: int, owner_user_id: str) -> dict | None
 
     dated_lines = _periodized_dated_lines(rows)
     stats       = _deep_stats_summary(rows)
-    compat, howto, flags, message = await build_deep_analysis(
+    compat = await build_deep_analysis(
         dated_lines, stats, rows, user_gender=get_gender(owner_user_id),
     )
-    save_deep_analysis(contact_id, compat, howto, flags, message)
-    return {
-        "compatibility_text": compat, "howto_text": howto,
-        "flags_text": flags, "message_text": message,
-    }
+    save_deep_analysis(contact_id, compat)
+    return {"compatibility_text": compat}
 
 
-def _format_deep_analysis(name: str, data: dict) -> list[str]:
-    """Собирает 3 текстовых блока в один текст; если не влезает в лимит Telegram —
-    делит на 2 логичных сообщения (1+2 и 3), а не режет механически. Блок
-    «готовое сообщение» не входит сюда — отправляется отдельным tap-to-copy
-    сообщением, см. _run_deep_analysis. Блок «Длина/ритм/язык» убран целиком
-    по фидбеку (недостаточно интересно читать)."""
-    header = f"🔬 Анализ собеседника — {name}\n\n"
-    block1 = f"💞 Совместимость\n\n{data['compatibility_text']}"
-    block2 = f"✍️ Как писать {name}\n\n{data['howto_text']}"
-    block3 = f"🚩💚 Флаги\n\n{data['flags_text']}"
-
-    full = header + f"{block1}\n\n{block2}\n\n{block3}"
-    if len(full) <= TELEGRAM_MAX_LEN:
-        return [full]
-
-    part1 = header + f"{block1}\n\n{block2}"
-    part2 = block3
-    return [part1, part2]
+def _format_deep_analysis(name: str, data: dict) -> str:
+    """Единый блок — 5 осей с обоснованием вместо прежних 4 разрозненных
+    блоков (совместимость/как писать/флаги/готовое сообщение — «как писать» и
+    «флаги» пересказывали то же самое, что теперь показывают оси; «готовое
+    сообщение» дублировало отдельную функцию «Ответить за меня», убрано без
+    замены). Разбивку на несколько сообщений при превышении лимита Telegram
+    делает _answer_long — она режет по границам абзацев, тут не нужно."""
+    return f"🔬 Анализ собеседника — {name}\n\n{data['compatibility_text']}"
 
 
 def deep_analysis_result_kb(contact_id: int) -> InlineKeyboardMarkup:
@@ -1376,19 +1363,9 @@ async def _run_deep_analysis(
         )
         return
 
-    messages = _format_deep_analysis(name, data)
-    for msg in messages:
-        await _answer_long(target, msg)
-
-    if data["message_text"].strip():
-        text, kw = _copy_block(
-            "✉️ Готовое сообщение (тапни, чтобы скопировать):",
-            data["message_text"].strip(),
-            deep_analysis_result_kb(contact_id),
-        )
-        await target.answer(text, **kw)
-    else:
-        await target.answer("Готово.", reply_markup=deep_analysis_result_kb(contact_id))
+    await _answer_long(
+        target, _format_deep_analysis(name, data), reply_markup=deep_analysis_result_kb(contact_id),
+    )
 
 
 async def _show_deep_analysis(message: Message, bot: Bot, telegram_id: str | None = None) -> None:
@@ -1634,21 +1611,24 @@ def _deep_style_stats_summary(rows: list[dict]) -> str:
 _COMPAT_NUM_RE = re.compile(r"—\s*(\d{1,2})\s*/\s*25\b")
 
 
-_AXIS_LINE_RE = re.compile(r"^[^:]+:\s*(\d)/5\s*—\s*.+$")
+_AXIS_HEADER_RE = re.compile(r"^(.+?):\s*(\d)/5\s*$")
 
 
 def _first_compat_reason(compatibility_text: str) -> str:
-    """Строка оси с максимальным баллом (например «Юмор: 5/5 — на шутку про
-    тик-ток ответила встречной подколкой») — короткий пересказ для «лучшая
-    совместимость» в «Анализ своего стиля», не весь текст целиком."""
-    best_line, best_score = "", -1
-    for line in compatibility_text.splitlines():
-        line = line.strip()
-        m = _AXIS_LINE_RE.match(line)
-        if m and int(m.group(1)) > best_score:
-            best_score = int(m.group(1))
-            best_line = line
-    return best_line
+    """Ось с максимальным баллом («Название: N/5», обоснование — на следующей
+    непустой строке) — короткий пересказ для «лучшая совместимость» в «Анализ
+    своего стиля», не весь текст целиком."""
+    lines = compatibility_text.splitlines()
+    best_name, best_score, best_reason = "", -1, ""
+    for i, raw_line in enumerate(lines):
+        m = _AXIS_HEADER_RE.match(raw_line.strip())
+        if not m or int(m.group(2)) <= best_score:
+            continue
+        reason = next((l.strip() for l in lines[i + 1:] if l.strip()), "")
+        best_name, best_score, best_reason = m.group(1), int(m.group(2)), reason
+    if not best_name:
+        return ""
+    return f"{best_name}: {best_score}/5 — {best_reason}" if best_reason else f"{best_name}: {best_score}/5"
 
 
 def _best_compatibility_contact(telegram_id: str) -> tuple[str, str] | None:

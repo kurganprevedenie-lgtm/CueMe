@@ -244,18 +244,35 @@ _EXPLAIN_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Грубый фильтр «не цитировать» для автоматически подбираемых Python-примеров
+# (не LLM-цитат) — тот же принцип, что и _is_junk_message в main.py, но
+# упрощённая копия: features.py не должен импортировать main.py (циклический
+# импорт, main → llm → features).
+_JUNK_WORDS = {"чо", "лол", "кек", "рофл", "ору", "угар", "мда", "эм", "ауф", "хм"}
+
+
+def _looks_junky(text: str) -> bool:
+    t = text.strip()
+    if len(t) <= 1 or " " in t:
+        return len(t) <= 1
+    low = t.lower().strip(" !?.,)(")
+    return low in _JUNK_WORDS or not re.search(r"[a-zA-Zа-яА-ЯёЁ0-9]", t)
+
 
 def initiative_axis(dated_msgs: list[dict], gap: timedelta = SESSION_GAP) -> tuple[int, str]:
     """Ось «Инициативность» (0-5): доля пауз ≥gap, после которых первым написал
-    СОБЕСЕДНИК (не автор). Меньше 3 пауз в переписке — данных мало, нейтральные
-    2/5. Порог паузы — тот же SESSION_GAP, что уже используется для границы
-    сессии в extract_features, ради консистентности внутри проекта."""
+    СОБЕСЕДНИК (не автор), плюс реальная цитата одного такого случая (свежая,
+    без явного мусора вроде голого смеха). Меньше 3 пауз — честно показываем
+    N из M вместо расплывчатого «мало». Порог паузы — тот же SESSION_GAP, что
+    уже используется для границы сессии в extract_features, ради
+    консистентности внутри проекта."""
     msgs = sorted(
         (m for m in dated_msgs if m.get("text") and m.get("date")),
         key=lambda m: m["date"],
     )
     pauses = 0
     contact_first = 0
+    example = ""
     for prev, cur in zip(msgs, msgs[1:]):
         try:
             delta = datetime.fromisoformat(cur["date"]) - datetime.fromisoformat(prev["date"])
@@ -265,11 +282,21 @@ def initiative_axis(dated_msgs: list[dict], gap: timedelta = SESSION_GAP) -> tup
             pauses += 1
             if cur["direction"] == "in":
                 contact_first += 1
-    if pauses < 3:
-        return 2, "пауз в переписке мало — оценка нейтральная"
+                if not _looks_junky(cur["text"]):
+                    example = cur["text"].strip()  # свежие перезаписывают старые
+
+    if pauses == 0:
+        return 2, "пауз ≥4ч в переписке не было — оценка нейтральная"
+
     ratio = contact_first / pauses
     score = round(min(1.0, max(0.0, ratio)) * 5)
-    return score, f"после паузы первым пишет собеседник в {ratio:.0%} случаев"
+    if example:
+        quote = example if len(example) <= 80 else example[:77].rstrip() + "…"
+        return score, (
+            f"После паузы первым пишет собеседник: «{quote}» — так "
+            f"происходит в {contact_first} из {pauses} случаев."
+        )
+    return score, f"После паузы первым пишет собеседник в {contact_first} из {pauses} случаев."
 
 
 def interest_signal_a(dated_msgs: list[dict]) -> tuple[int, str]:
@@ -278,12 +305,15 @@ def interest_signal_a(dated_msgs: list[dict]) -> tuple[int, str]:
     адресованные автору, а не вопросы вообще."""
     contact_texts = [m["text"] for m in dated_msgs if m.get("direction") == "in" and m.get("text")]
     if not contact_texts:
-        return 2, "сообщений собеседника нет — оценка нейтральная"
+        return 2, "Сообщений от собеседника нет — оценка нейтральная."
     addressed = sum(1 for t in contact_texts if "?" in t and _INFORMAL_RE.search(t))
     ratio = addressed / len(contact_texts)
     score = round(min(1.0, ratio / 0.3) * 5)  # 30%+ таких вопросов — уже максимум по этому сигналу
     score = min(5, max(0, score))
-    return score, f"вопросов-обращений к автору — {ratio:.0%} его сообщений"
+    return score, (
+        f"Вопросов, адресованных лично автору («ты...?»), — {addressed} из "
+        f"{len(contact_texts)} сообщений собеседника ({ratio:.0%})."
+    )
 
 
 def response_speed_axis(dated_msgs: list[dict], gap: timedelta = SESSION_GAP) -> tuple[int, str]:
@@ -297,7 +327,7 @@ def response_speed_axis(dated_msgs: list[dict], gap: timedelta = SESSION_GAP) ->
     )
     latencies = _in_reply_latencies(msgs)
     if not latencies:
-        return 2, "недостаточно ответов собеседника для оценки — нейтральная"
+        return 2, "Быстрых ответов внутри сессии не набралось — оценка нейтральная."
 
     avg_sec = sum(latencies) / len(latencies)
     if avg_sec < 600:
@@ -327,9 +357,11 @@ def response_speed_axis(dated_msgs: list[dict], gap: timedelta = SESSION_GAP) ->
     penalty = min(2.0, max(0, unexplained - 1) * 0.5)
     score = round(max(0, min(5, base - penalty)))
     avg_min = avg_sec / 60
-    note = f"средняя задержка ответа ~{avg_min:.0f} мин"
+    note = f"Средняя задержка ответа ~{avg_min:.0f} мин."
     if unexplained:
-        note += f", необъяснённых долгих пауз: {unexplained}"
+        note += f" Пауз без объяснения в переписке — {unexplained}."
+    else:
+        note += " Необъяснённых долгих пауз не было."
     return score, note
 
 

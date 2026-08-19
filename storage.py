@@ -224,6 +224,17 @@ def init_db() -> None:
         if "style_text" in da_cols:
             conn.execute("DELETE FROM deep_analysis")
             conn.execute("ALTER TABLE deep_analysis DROP COLUMN style_text")
+        # 4 разрозненных блока (совместимость/как_писать/флаги/готовое_сообщение)
+        # → ЕДИНЫЙ блок из 5 осей с обоснованием — «как писать» и «флаги» на
+        # практике пересказывали то же самое, что показывают оси; «готовое
+        # сообщение» дублировало отдельную функцию «Ответить за меня».
+        # compatibility_text переиспользован под весь единый текст — новых
+        # колонок не нужно, howto/flags/message больше не используются.
+        if "howto_text" in da_cols:
+            conn.execute("DELETE FROM deep_analysis")
+            conn.execute("ALTER TABLE deep_analysis DROP COLUMN howto_text")
+            conn.execute("ALTER TABLE deep_analysis DROP COLUMN flags_text")
+            conn.execute("ALTER TABLE deep_analysis DROP COLUMN message_text")
         # deep_style_analysis: переход на компактную 3-блочную карточку (архетип/
         # факты/совет) — «история по периодам» и SWOT убраны, совместимость с
         # лучшим контактом теперь отдельный вычисляемый блок без LLM (не хранится
@@ -756,27 +767,17 @@ def get_all_per_contact_style_cards(owner_user_id: str) -> list[dict]:
 #     }
 
 
-def save_deep_analysis(
-    contact_id: int,
-    compatibility_text: str,
-    howto_text: str,
-    flags_text: str,
-    message_text: str,
-) -> None:
+def save_deep_analysis(contact_id: int, compatibility_text: str) -> None:
     with _conn() as conn:
         conn.execute(
             """
-            INSERT INTO deep_analysis
-                (contact_id, compatibility_text, howto_text, flags_text, message_text, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO deep_analysis (contact_id, compatibility_text, updated_at)
+            VALUES (?, ?, ?)
             ON CONFLICT(contact_id) DO UPDATE SET
                 compatibility_text = excluded.compatibility_text,
-                howto_text         = excluded.howto_text,
-                flags_text         = excluded.flags_text,
-                message_text       = excluded.message_text,
                 updated_at         = excluded.updated_at
             """,
-            (contact_id, compatibility_text, howto_text, flags_text, message_text, _now()),
+            (contact_id, compatibility_text, _now()),
         )
 
 
@@ -787,12 +788,7 @@ def get_deep_analysis(contact_id: int) -> dict | None:
         ).fetchone()
     if not row:
         return None
-    return {
-        "compatibility_text": row["compatibility_text"],
-        "howto_text":         row["howto_text"],
-        "flags_text":         row["flags_text"],
-        "message_text":       row["message_text"],
-    }
+    return {"compatibility_text": row["compatibility_text"]}
 
 
 def delete_deep_analysis(contact_id: int) -> None:
