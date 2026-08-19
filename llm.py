@@ -262,7 +262,9 @@ async def _groq_vision(b64: str) -> str:
                     },
                 )
             if resp.is_success:
-                text = resp.json()["choices"][0]["message"]["content"].strip()
+                # content может прийти null (не только "") — reasoning-модель
+                # потратила весь бюджет на размышления, не оставив ответа.
+                text = (resp.json()["choices"][0]["message"].get("content") or "").strip()
                 return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
             if 400 <= resp.status_code < 500:
                 log.warning("Vision(Groq): ключ %s — HTTP %d, пробую следующий",
@@ -349,7 +351,8 @@ class GroqProvider(LLMProvider):
         if not resp.is_success:
             raise ProviderError(f"Groq {resp.status_code}: {resp.text[:200]}")
 
-        return resp.json()["choices"][0]["message"]["content"].strip()
+        # content может прийти null, не только "" — reasoning ушёл весь бюджет.
+        return (resp.json()["choices"][0]["message"].get("content") or "").strip()
 
     async def ask(self, prompt: str, max_tokens: int) -> str:
         """Перебирает ключи Groq по кругу (мультиаккаунтинг), как GeminiProvider."""
@@ -496,7 +499,8 @@ class CloudflareProvider(LLMProvider):
         if not resp.is_success:
             raise ProviderError(f"Cloudflare {resp.status_code}: {resp.text[:200]}")
 
-        return resp.json()["choices"][0]["message"]["content"].strip()
+        # content может прийти null, не только "" — reasoning ушёл весь бюджет.
+        return (resp.json()["choices"][0]["message"].get("content") or "").strip()
 
 
 # ── Cerebras (бесплатный тир, OpenAI-совместимый формат) ─────────────────────
@@ -530,7 +534,8 @@ class CerebrasProvider(LLMProvider):
         if not resp.is_success:
             raise ProviderError(f"Cerebras {resp.status_code}: {resp.text[:200]}")
 
-        return resp.json()["choices"][0]["message"]["content"].strip()
+        # content может прийти null, не только "" — reasoning ушёл весь бюджет.
+        return (resp.json()["choices"][0]["message"].get("content") or "").strip()
 
 
 # ── Mistral (La Plateforme, бесплатный тир, OpenAI-совместимый формат) ───────
@@ -564,7 +569,8 @@ class MistralProvider(LLMProvider):
         if not resp.is_success:
             raise ProviderError(f"Mistral {resp.status_code}: {resp.text[:200]}")
 
-        return resp.json()["choices"][0]["message"]["content"].strip()
+        # content может прийти null, не только "" — reasoning ушёл весь бюджет.
+        return (resp.json()["choices"][0]["message"].get("content") or "").strip()
 
 
 # ── GitHub Models (бесплатный тир от GitHub-аккаунта, OpenAI-совместимый) ────
@@ -601,7 +607,8 @@ class GitHubModelsProvider(LLMProvider):
         if not resp.is_success:
             raise ProviderError(f"GitHub Models {resp.status_code}: {resp.text[:200]}")
 
-        return resp.json()["choices"][0]["message"]["content"].strip()
+        # content может прийти null, не только "" — reasoning ушёл весь бюджет.
+        return (resp.json()["choices"][0]["message"].get("content") or "").strip()
 
 
 # ── OpenRouter ────────────────────────────────────────────────────────────────
@@ -646,7 +653,8 @@ class OpenRouterProvider(LLMProvider):
         if not resp.is_success:
             raise ProviderError(f"OpenRouter {resp.status_code}: {resp.text[:200]}")
 
-        return resp.json()["choices"][0]["message"]["content"].strip()
+        # content может прийти null, не только "" — reasoning ушёл весь бюджет.
+        return (resp.json()["choices"][0]["message"].get("content") or "").strip()
 
 
 # ── Каскадный вызов ───────────────────────────────────────────────────────────
