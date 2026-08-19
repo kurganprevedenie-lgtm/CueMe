@@ -212,13 +212,18 @@ def init_db() -> None:
             conn.execute("ALTER TABLE deep_analysis DROP COLUMN swot_text")
             conn.execute("ALTER TABLE deep_analysis DROP COLUMN gifts_text")
         _add_column_if_missing(conn, "deep_analysis", "howto_text", "TEXT NOT NULL DEFAULT ''")
-        _add_column_if_missing(conn, "deep_analysis", "style_text", "TEXT NOT NULL DEFAULT ''")
         _add_column_if_missing(conn, "deep_analysis", "flags_text", "TEXT NOT NULL DEFAULT ''")
         # 5-й блок «готовое сообщение» — старый 4-блочный кэш структурно неполон,
         # чистим и перегенерируем при следующем открытии.
         if "message_text" not in da_cols:
             conn.execute("DELETE FROM deep_analysis")
         _add_column_if_missing(conn, "deep_analysis", "message_text", "TEXT NOT NULL DEFAULT ''")
+        # Блок «Длина/ритм/язык» (style_text) убран целиком по фидбеку — не
+        # добавлял интереса к чтению. Старый кэш с этой колонкой структурно
+        # неполон под новый 4-блочный формат — чистим и перегенерируем.
+        if "style_text" in da_cols:
+            conn.execute("DELETE FROM deep_analysis")
+            conn.execute("ALTER TABLE deep_analysis DROP COLUMN style_text")
         # deep_style_analysis: переход на компактную 3-блочную карточку (архетип/
         # факты/совет) — «история по периодам» и SWOT убраны, совместимость с
         # лучшим контактом теперь отдельный вычисляемый блок без LLM (не хранится
@@ -755,7 +760,6 @@ def save_deep_analysis(
     contact_id: int,
     compatibility_text: str,
     howto_text: str,
-    style_text: str,
     flags_text: str,
     message_text: str,
 ) -> None:
@@ -763,17 +767,16 @@ def save_deep_analysis(
         conn.execute(
             """
             INSERT INTO deep_analysis
-                (contact_id, compatibility_text, howto_text, style_text, flags_text, message_text, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+                (contact_id, compatibility_text, howto_text, flags_text, message_text, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
             ON CONFLICT(contact_id) DO UPDATE SET
                 compatibility_text = excluded.compatibility_text,
                 howto_text         = excluded.howto_text,
-                style_text         = excluded.style_text,
                 flags_text         = excluded.flags_text,
                 message_text       = excluded.message_text,
                 updated_at         = excluded.updated_at
             """,
-            (contact_id, compatibility_text, howto_text, style_text, flags_text, message_text, _now()),
+            (contact_id, compatibility_text, howto_text, flags_text, message_text, _now()),
         )
 
 
@@ -787,7 +790,6 @@ def get_deep_analysis(contact_id: int) -> dict | None:
     return {
         "compatibility_text": row["compatibility_text"],
         "howto_text":         row["howto_text"],
-        "style_text":         row["style_text"],
         "flags_text":         row["flags_text"],
         "message_text":       row["message_text"],
     }

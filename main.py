@@ -1305,33 +1305,33 @@ async def _gen_deep_analysis(contact_id: int, owner_user_id: str) -> dict | None
 
     dated_lines = _periodized_dated_lines(rows)
     stats       = _deep_stats_summary(rows)
-    compat, howto, style, flags, message = await build_deep_analysis(
+    compat, howto, flags, message = await build_deep_analysis(
         dated_lines, stats, user_gender=get_gender(owner_user_id),
     )
-    save_deep_analysis(contact_id, compat, howto, style, flags, message)
+    save_deep_analysis(contact_id, compat, howto, flags, message)
     return {
         "compatibility_text": compat, "howto_text": howto,
-        "style_text": style, "flags_text": flags, "message_text": message,
+        "flags_text": flags, "message_text": message,
     }
 
 
 def _format_deep_analysis(name: str, data: dict) -> list[str]:
-    """Собирает 4 текстовых блока в один текст; если не влезает в лимит Telegram —
-    делит на 2 логичных сообщения (1+2 и 3+4), а не режет механически. Блок 5
-    (готовое сообщение) не входит сюда — отправляется отдельным tap-to-copy
-    сообщением, см. _run_deep_analysis."""
+    """Собирает 3 текстовых блока в один текст; если не влезает в лимит Telegram —
+    делит на 2 логичных сообщения (1+2 и 3), а не режет механически. Блок
+    «готовое сообщение» не входит сюда — отправляется отдельным tap-to-copy
+    сообщением, см. _run_deep_analysis. Блок «Длина/ритм/язык» убран целиком
+    по фидбеку (недостаточно интересно читать)."""
     header = f"🔬 Анализ собеседника — {name}\n\n"
     block1 = f"💞 Совместимость\n\n{data['compatibility_text']}"
     block2 = f"✍️ Как писать {name}\n\n{data['howto_text']}"
-    block3 = f"📏 Длина, ритм и язык\n\n{data['style_text']}"
-    block4 = f"🚩💚 Флаги\n\n{data['flags_text']}"
+    block3 = f"🚩💚 Флаги\n\n{data['flags_text']}"
 
-    full = header + f"{block1}\n\n{block2}\n\n{block3}\n\n{block4}"
+    full = header + f"{block1}\n\n{block2}\n\n{block3}"
     if len(full) <= TELEGRAM_MAX_LEN:
         return [full]
 
     part1 = header + f"{block1}\n\n{block2}"
-    part2 = f"{block3}\n\n{block4}"
+    part2 = block3
     return [part1, part2]
 
 
@@ -1635,12 +1635,14 @@ _COMPAT_NUM_RE = re.compile(r"Совместимость:\s*(\d+)\s*/\s*100")
 
 
 def _first_compat_reason(compatibility_text: str) -> str:
-    """Первый буллет-пункт compatibility_text (после строки «Совместимость:
-    XX/100») как есть, без LLM — короткий пересказ, не весь текст целиком."""
+    """Первая содержательная строка объяснения (после строки «Совместимость:
+    XX/100 — вердикт») как есть, без LLM — короткий пересказ, не весь текст
+    целиком. Формат объяснения тезисный (без «•»), может начинаться с «→» или
+    быть строкой «Раньше:»/«Сейчас:» — берём первую непустую строку как есть."""
     for line in compatibility_text.splitlines()[1:]:
         line = line.strip()
-        if line.startswith("•"):
-            return line.lstrip("•").strip()
+        if line:
+            return line.lstrip("→").strip()
     return ""
 
 
