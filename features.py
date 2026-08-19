@@ -269,7 +269,7 @@ def initiative_axis(dated_msgs: list[dict], gap: timedelta = SESSION_GAP) -> tup
         return 2, "пауз в переписке мало — оценка нейтральная"
     ratio = contact_first / pauses
     score = round(min(1.0, max(0.0, ratio)) * 5)
-    return score, f"после паузы первым пишет собеседник в {ratio:.0%} случаев ({contact_first}/{pauses})"
+    return score, f"после паузы первым пишет собеседник в {ratio:.0%} случаев"
 
 
 def interest_signal_a(dated_msgs: list[dict]) -> tuple[int, str]:
@@ -283,7 +283,7 @@ def interest_signal_a(dated_msgs: list[dict]) -> tuple[int, str]:
     ratio = addressed / len(contact_texts)
     score = round(min(1.0, ratio / 0.3) * 5)  # 30%+ таких вопросов — уже максимум по этому сигналу
     score = min(5, max(0, score))
-    return score, f"вопросов-обращений к автору — {ratio:.0%} его сообщений ({addressed}/{len(contact_texts)})"
+    return score, f"вопросов-обращений к автору — {ratio:.0%} его сообщений"
 
 
 def response_speed_axis(dated_msgs: list[dict], gap: timedelta = SESSION_GAP) -> tuple[int, str]:

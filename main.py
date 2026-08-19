@@ -1634,15 +1634,21 @@ def _deep_style_stats_summary(rows: list[dict]) -> str:
 _COMPAT_NUM_RE = re.compile(r"—\s*(\d{1,2})\s*/\s*25\b")
 
 
+_AXIS_LINE_RE = re.compile(r"^[^:]+:\s*(\d)/5\s*—\s*.+$")
+
+
 def _first_compat_reason(compatibility_text: str) -> str:
-    """Строка-вывод (1-2 предложения) после заголовка с медалью и строк с
-    пятью осями — короткий пересказ для «лучшая совместимость» в «Анализ
-    своего стиля», не весь текст целиком."""
-    lines = [l.strip() for l in compatibility_text.splitlines()]
-    for line in lines[4:]:  # 0: медаль+сумма, 1: пусто, 2-3: строки осей
-        if line:
-            return line
-    return ""
+    """Строка оси с максимальным баллом (например «Юмор: 5/5 — на шутку про
+    тик-ток ответила встречной подколкой») — короткий пересказ для «лучшая
+    совместимость» в «Анализ своего стиля», не весь текст целиком."""
+    best_line, best_score = "", -1
+    for line in compatibility_text.splitlines():
+        line = line.strip()
+        m = _AXIS_LINE_RE.match(line)
+        if m and int(m.group(1)) > best_score:
+            best_score = int(m.group(1))
+            best_line = line
+    return best_line
 
 
 def _best_compatibility_contact(telegram_id: str) -> tuple[str, str] | None:
