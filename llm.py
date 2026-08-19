@@ -2,13 +2,21 @@
 llm.py — обёртки над LLM-провайдерами с каскадным fallback.
 
 Порядок попыток (дефолтный, см. LLM_PROVIDER_ORDER в config.py):
-  1. Gemini      (gemini-2.5-flash)                      — основной
-  2. Groq        (llama-3.3-70b-versatile)               — fallback 1
+  1. Gemini      (gemini-flash-latest, живой алиас — сам следует за текущей   — основной
+                  рекомендованной flash-моделью Google, не привязан к
+                  конкретной версии, которую Google рано или поздно отключит
+                  для новых ключей, см. миграцию 2026-08 ниже)
+  2. Groq        (openai/gpt-oss-120b, см. миграцию 2026-08)  — fallback 1
   3. Cloudflare  (llama-3.3-70b, бесплатный тир, ~1300 запросов/день) — fallback 2
   4. Cerebras    (llama-3.3-70b, бесплатный тир)          — fallback 3
   5. Mistral     (mistral-small-latest, бесплатный тир)   — fallback 4
   6. GitHub Models (gpt-4o-mini, бесплатный тир)          — fallback 5
-  7. OpenRouter  (meta-llama/llama-3.3-70b-instruct:free) — fallback 6
+  7. OpenRouter  (openai/gpt-oss-20b:free, см. миграцию 2026-08) — fallback 6
+
+Миграция 2026-08: llama-3.3-70b-versatile отключён на Groq, gemini-2.5-flash
+отключён для новых ключей на Gemini, meta-llama/llama-3.3-70b-instruct:free
+снят с бесплатного тира OpenRouter — проверено вживую через /models на
+живых ключах, модели выше подтверждены реальным запросом (см. tools/check_keys.py).
 
 Cloudflare/Cerebras/Mistral/GitHub Models пропускаются автоматически, если
 их ключ(и) не заданы в .env (см. .env.example) — остальной каскад работает
@@ -74,7 +82,7 @@ class LLMProvider(ABC):
 _WHISPER_URL   = "https://api.groq.com/openai/v1/audio/transcriptions"
 _WHISPER_MODEL = "whisper-large-v3-turbo"
 # Gemini flash — мультимодальный резерв для vision и транскрипции (когда Groq недоступен).
-_GEMINI_MM_MODEL = "gemini-2.5-flash"
+_GEMINI_MM_MODEL = "gemini-flash-latest"
 
 
 def _gemini_mm_kwargs() -> dict:
@@ -300,7 +308,16 @@ async def extract_chat_from_image(image_bytes: bytes) -> str:
 class GroqProvider(LLMProvider):
     name = "Groq"
     _URL   = "https://api.groq.com/openai/v1/chat/completions"
-    _MODEL = "llama-3.3-70b-versatile"
+    # llama-3.3-70b-versatile снят Groq с обслуживания (миграция 2026-08) —
+    # openai/gpt-oss-120b рекомендован самим Groq как замена.
+    _MODEL = "openai/gpt-oss-120b"
+
+    # gpt-oss-120b — reasoning-модель: часть max_tokens уходит на внутренние
+    # рассуждения ДО финального content (проверено вживую — на 20 токенах
+    # content пустой, на 200 уже приходит ответ). Даём запас сверх
+    # запрошенного бюджета, иначе короткие вызовы (max_tokens=300 и меньше)
+    # рискуют вернуть пустую строку.
+    _REASONING_BUFFER = 400
 
     async def _ask_with_key(self, prompt: str, max_tokens: int, key: str) -> str:
         async with httpx.AsyncClient(timeout=90.0, trust_env=False) as client:
@@ -310,7 +327,7 @@ class GroqProvider(LLMProvider):
                 json={
                     "model": self._MODEL,
                     "messages": [{"role": "user", "content": prompt}],
-                    "max_tokens": max_tokens,
+                    "max_tokens": max_tokens + self._REASONING_BUFFER,
                 },
             )
 
@@ -355,7 +372,10 @@ class GroqProvider(LLMProvider):
 
 class GeminiProvider(LLMProvider):
     name = "Gemini"
-    _MODEL = "gemini-2.5-flash"
+    # gemini-2.5-flash отключён Google для новых ключей (миграция 2026-08) —
+    # gemini-flash-latest живой алиас на текущую рекомендованную flash-модель,
+    # не требует ручной миграции при следующем отключении версии.
+    _MODEL = "gemini-flash-latest"
 
     @staticmethod
     def _url(key: str) -> str:
@@ -587,9 +607,14 @@ class GitHubModelsProvider(LLMProvider):
 class OpenRouterProvider(LLMProvider):
     name = "OpenRouter"
     _URL   = "https://openrouter.ai/api/v1/chat/completions"
-    # llama-3.1-8b-instruct:free OpenRouter отключил (модель платная теперь,
-    # отдаёт 404 с "unavailable for free") — переехали на 3.3-70b:free.
-    _MODEL = "meta-llama/llama-3.3-70b-instruct:free"
+    # llama-3.1-8b-instruct:free, затем llama-3.3-70b-instruct:free OpenRouter
+    # по очереди убрал из бесплатного тира (404 "unavailable for free") —
+    # свободные модели там меняются часто, см. openrouter.ai/models перед
+    # следующей миграцией. gpt-oss-20b:free проверен вживую на 2026-08.
+    _MODEL = "openai/gpt-oss-20b:free"
+    # Тоже reasoning-модель (см. _REASONING_BUFFER у GroqProvider) — та же
+    # просадка на низком max_tokens подтверждена вживую (20 → пусто, 300 → ок).
+    _REASONING_BUFFER = 400
 
     async def ask(self, prompt: str, max_tokens: int) -> str:
         if not OPENROUTER_API_KEY:
@@ -606,7 +631,7 @@ class OpenRouterProvider(LLMProvider):
                 json={
                     "model": self._MODEL,
                     "messages": [{"role": "user", "content": prompt}],
-                    "max_tokens": max_tokens,
+                    "max_tokens": max_tokens + self._REASONING_BUFFER,
                 },
             )
 

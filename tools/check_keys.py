@@ -28,11 +28,14 @@ def _mask(key: str) -> str:
 async def check_gemini(key: str) -> tuple[bool, str]:
     url = (
         "https://generativelanguage.googleapis.com/v1beta/models/"
-        f"gemini-2.5-flash:generateContent?key={key}"
+        f"gemini-flash-latest:generateContent?key={key}"
     )
     payload = {
         "contents": [{"role": "user", "parts": [{"text": "Ответь одним словом: тест пройден?"}]}],
-        "generationConfig": {"maxOutputTokens": 20, "thinkingConfig": {"thinkingBudget": 0}},
+        # thinkingBudget=0 не всегда полностью гасит "мысли" модели (иногда всё
+        # равно тратит часть бюджета до текста) — берём запас, тот же принцип,
+        # что у reasoning-моделей Groq/OpenRouter ниже.
+        "generationConfig": {"maxOutputTokens": 100, "thinkingConfig": {"thinkingBudget": 0}},
     }
     kwargs = {"timeout": 30.0, "trust_env": False}
     if GEMINI_PROXY:
@@ -52,9 +55,9 @@ async def check_gemini(key: str) -> tuple[bool, str]:
 async def check_groq(key: str) -> tuple[bool, str]:
     url = "https://api.groq.com/openai/v1/chat/completions"
     payload = {
-        "model": "llama-3.3-70b-versatile",
+        "model": "openai/gpt-oss-120b",
         "messages": [{"role": "user", "content": "Ответь одним словом: тест пройден?"}],
-        "max_tokens": 20,
+        "max_tokens": 200,  # gpt-oss тратит часть max_tokens на reasoning до финального content
     }
     async with httpx.AsyncClient(timeout=30.0, trust_env=False) as client:
         resp = await client.post(url, headers={"Authorization": f"Bearer {key}"}, json=payload)
@@ -131,9 +134,9 @@ async def check_github_models(token: str) -> tuple[bool, str]:
 async def check_openrouter(key: str) -> tuple[bool, str]:
     url = "https://openrouter.ai/api/v1/chat/completions"
     payload = {
-        "model": "meta-llama/llama-3.3-70b-instruct:free",
+        "model": "openai/gpt-oss-20b:free",
         "messages": [{"role": "user", "content": "Ответь одним словом: тест пройден?"}],
-        "max_tokens": 20,
+        "max_tokens": 200,  # тоже reasoning-модель, см. комментарий в check_groq
     }
     async with httpx.AsyncClient(timeout=30.0, trust_env=False) as client:
         resp = await client.post(

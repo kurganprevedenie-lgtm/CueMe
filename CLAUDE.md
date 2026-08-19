@@ -94,13 +94,18 @@ LLM вызывается лениво — только при запросе п�
 - Парсинг: stdlib `json`
 - Локальные признаки: `features.py` (чистый Python, без LLM)
 - Парсер JSON-экспорта: `tg_parser.py`
-- LLM: каскад с fallback — **Gemini** (`gemini-2.5-flash`, основной) →
-  **Groq** (`llama-3.3-70b-versatile`) → **Cloudflare Workers AI**
+- LLM: каскад с fallback — **Gemini** (`gemini-flash-latest`, живой алиас,
+  основной) → **Groq** (`openai/gpt-oss-120b`) → **Cloudflare Workers AI**
   (`llama-3.3-70b`, бесплатный тир ~1300 запросов/день, опционален) →
   **Cerebras** (`llama-3.3-70b`, бесплатный тир, опционален) → **Mistral**
   (`mistral-small-latest`, бесплатный тир, опционален) → **GitHub Models**
   (`gpt-4o-mini`, бесплатный тир, опционален) → **OpenRouter**
-  (`llama-3.3-70b-instruct:free`). Порядок в `LLM_PROVIDER_ORDER` (.env).
+  (`openai/gpt-oss-20b:free`). Порядок в `LLM_PROVIDER_ORDER` (.env).
+  Миграция 2026-08: gemini-2.5-flash/llama-3.3-70b-versatile/
+  llama-3.3-70b-instruct:free отключены провайдерами, заменены на модели
+  выше (проверено вживую через `tools/check_keys.py`). gpt-oss — reasoning-
+  модели, тратят часть `max_tokens` на рассуждения до ответа — у
+  GroqProvider/OpenRouterProvider в `llm.py` есть `_REASONING_BUFFER`.
   Vision (скриншоты) — отдельно, Groq/Gemini (см. `VISION_MODEL` в config.py)
 - HTTP: **httpx** с `trust_env=False` (обход SOCKS-прокси)
 - Хранилище: **SQLite** (bot.db)
