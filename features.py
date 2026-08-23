@@ -249,10 +249,13 @@ _EXPLAIN_RE = re.compile(
 # упрощённая копия: features.py не должен импортировать main.py (циклический
 # импорт, main → llm → features).
 _JUNK_WORDS = {"чо", "лол", "кек", "рофл", "ору", "угар", "мда", "эм", "ауф", "хм"}
+_URL_RE = re.compile(r"https?://\S+|(?:^|\s)t\.me/\S+|(?:^|\s)www\.\S+", re.IGNORECASE)
 
 
 def _looks_junky(text: str) -> bool:
     t = text.strip()
+    if _URL_RE.search(t):
+        return True  # голая ссылка — не иллюстрирует ничего, даже если технически подходит под критерий
     if len(t) <= 1 or " " in t:
         return len(t) <= 1
     low = t.lower().strip(" !?.,)(")
