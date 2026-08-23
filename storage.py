@@ -300,7 +300,8 @@ def list_all_users() -> list[sqlite3.Row]:
     with _conn() as conn:
         return conn.execute(
             "SELECT telegram_id, gender, created_at, trial_used, "
-            "deep_analysis_free_until, acquisition_source, blocked_bot "
+            "deep_analysis_free_until, promo_channel_premium_until, "
+            "acquisition_source, blocked_bot "
             "FROM users ORDER BY created_at"
         ).fetchall()
 
@@ -1145,6 +1146,71 @@ def event_funnel() -> dict[str, int]:
             "SELECT event_type, COUNT(*) n FROM events GROUP BY event_type"
         ).fetchall()
     return {r["event_type"]: r["n"] for r in rows}
+
+
+# ── пакетные метрики для отчёта /users ────────────────────────────────────────
+# Одним запросом на ВСЕХ юзеров вместо запроса на каждого: отчёт и так делает
+# тяжёлый проход (get_chat + подсчёт сообщений по контактам), добавлять к нему
+# ещё N×5 обращений к БД незачем.
+
+def event_counts_by_user() -> dict[str, dict[str, int]]:
+    """{telegram_id: {event_type: count}} по всем юзерам разом."""
+    with _conn() as conn:
+        rows = conn.execute(
+            "SELECT user_telegram_id, event_type, COUNT(*) n FROM events "
+            "WHERE user_telegram_id IS NOT NULL "
+            "GROUP BY user_telegram_id, event_type"
+        ).fetchall()
+    out: dict[str, dict[str, int]] = {}
+    for r in rows:
+        out.setdefault(r["user_telegram_id"], {})[r["event_type"]] = r["n"]
+    return out
+
+
+def users_with_deep_analysis() -> set[str]:
+    """Кто хоть раз доходил до «Анализа собеседника» — есть кэш хотя бы по
+    одному своему контакту (deep_analysis живёт по contact_id, поэтому джойн)."""
+    with _conn() as conn:
+        rows = conn.execute(
+            "SELECT DISTINCT c.user_telegram_id AS tid "
+            "FROM deep_analysis da JOIN contacts c ON c.id = da.contact_id"
+        ).fetchall()
+    return {r["tid"] for r in rows}
+
+
+def users_with_deep_style() -> set[str]:
+    """Кто хоть раз открывал «Анализ своего стиля» (🪞). Именно эта таблица —
+    кэш самой фичи; style_cards НЕ подходит, он наполняется побочно при любой
+    генерации (см. users_with_style_card)."""
+    with _conn() as conn:
+        rows = conn.execute(
+            "SELECT user_telegram_id AS tid FROM deep_style_analysis "
+            "WHERE COALESCE(profile_text, '') != ''"
+        ).fetchall()
+    return {r["tid"] for r in rows}
+
+
+def users_with_style_card() -> set[str]:
+    """У кого построена «модель себя» (style_cards). Строится ЛЕНИВО при первой
+    генерации, поэтому по смыслу это «дошёл хотя бы до одной генерации», а не
+    «пользовался анализом стиля»."""
+    with _conn() as conn:
+        rows = conn.execute(
+            "SELECT user_telegram_id AS tid FROM style_cards "
+            "WHERE COALESCE(card_text, '') != ''"
+        ).fetchall()
+    return {r["tid"] for r in rows}
+
+
+def referral_counts_by_user() -> dict[str, int]:
+    """{telegram_id: сколько друзей реально начали пользоваться} — то же, что
+    count_successful_referrals, но на всех разом."""
+    with _conn() as conn:
+        rows = conn.execute(
+            "SELECT referrer_telegram_id AS tid, COUNT(*) n FROM referrals "
+            "WHERE credited = 1 GROUP BY referrer_telegram_id"
+        ).fetchall()
+    return {r["tid"]: r["n"] for r in rows}
 
 
 def get_last_event_time(telegram_id: str) -> str | None:

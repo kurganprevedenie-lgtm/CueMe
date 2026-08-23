@@ -1,4 +1,5 @@
 import asyncio
+import csv
 import hashlib
 import html
 import io
@@ -93,6 +94,7 @@ from storage import (
     delete_deep_analysis,
     delete_ideal_date,
     delete_style_card,
+    event_counts_by_user,
     find_contact_by_original_id,
     get_all_dated_messages,
     get_all_dated_my_messages,
@@ -136,6 +138,7 @@ from storage import (
     init_db,
     list_all_users,
     list_contacts,
+    referral_counts_by_user,
     save_business_message,
     save_deep_analysis,
     save_deep_style_analysis,
@@ -157,6 +160,9 @@ from storage import (
     upsert_business_connection,
     upsert_chat_ref_mapping,
     upsert_user,
+    users_with_deep_analysis,
+    users_with_deep_style,
+    users_with_style_card,
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -2412,16 +2418,62 @@ def _relative_label(iso_str: str | None, now: datetime) -> str:
     return f"{days} дн. назад"
 
 
-async def _build_users_report(bot: Bot) -> list[str]:
-    """Возвращает список блоков (шапка, по одному на юзера, сводка) — НЕ
-    склеенную строку, чтобы cmd_users мог резать на чанки по границам
-    блоков, а не посреди HTML-тега."""
+def _days_since(iso_str: str | None, now: datetime) -> int | None:
+    """Сколько полных дней прошло с даты. None — даты нет/не распарсилась
+    (в CSV уходит пустой ячейкой, а не нулём: «неизвестно» ≠ «сегодня»)."""
+    if not iso_str:
+        return None
+    try:
+        dt = datetime.fromisoformat(iso_str)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return max(0, (now - dt).days)
+
+
+def _csv_dt(iso_str: str | None, fmt: str = "%Y-%m-%d %H:%M") -> str:
+    """Дата для CSV в стабильном ISO-подобном виде (сортируется как текст).
+    Пустая строка, если даты нет."""
+    if not iso_str:
+        return ""
+    try:
+        dt = datetime.fromisoformat(iso_str)
+    except ValueError:
+        return ""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.strftime(fmt)
+
+
+def _yn(value: bool) -> str:
+    return "да" if value else "нет"
+
+
+async def _collect_users_data(bot: Bot) -> tuple[list[dict], dict]:
+    """ОДИН тяжёлый проход по всем юзерам — из него рендерятся и HTML-отчёт
+    (_build_users_report), и CSV (_build_users_csv), чтобы не звать get_chat и
+    подсчёт сообщений дважды. Возвращает (строки по юзерам, агрегаты).
+
+    Метрики по фичам берутся ПАКЕТНО (5 запросов на весь отчёт, не на юзера) —
+    см. event_counts_by_user и соседние в storage.py."""
     now = datetime.now(timezone.utc)
     users = list_all_users()
 
-    blocks = ["👥 <b>Пользователи CueMe</b>"]
-    with_gender = with_contact = with_ref_premium = 0
-    blocked_count = automation_off_count = inactive_count = 0
+    # Пакетные метрики — по одному запросу на всех юзеров сразу.
+    events_by_user = event_counts_by_user()
+    deep_analysis_users = users_with_deep_analysis()
+    deep_style_users = users_with_deep_style()
+    style_card_users = users_with_style_card()
+    referrals_by_user = referral_counts_by_user()
+
+    rows: list[dict] = []
+    totals = {
+        "total": len(users), "with_gender": 0, "with_contact": 0,
+        "with_ref_premium": 0, "blocked": 0, "automation_off": 0, "inactive": 0,
+        "premium_now": 0, "used_reply": 0, "used_screenshot": 0, "used_live": 0,
+        "used_deep_analysis": 0, "used_deep_style": 0, "active_7d": 0,
+    }
 
     for u in users:
         tid = u["telegram_id"]
@@ -2429,9 +2481,9 @@ async def _build_users_report(bot: Bot) -> list[str]:
         contacts = list_contacts(tid)
 
         if u["gender"]:
-            with_gender += 1
+            totals["with_gender"] += 1
         if contacts:
-            with_contact += 1
+            totals["with_contact"] += 1
 
         # Контактов может быть больше, чем реально накопленных переписок —
         # контакт создаётся уже от одного исходящего business-сообщения,
@@ -2449,13 +2501,13 @@ async def _build_users_report(bot: Bot) -> list[str]:
                 until_dt = datetime.fromisoformat(until_raw)
                 if until_dt > now:
                     premium_line = f"\n    👑 Premium (реферал) до {until_dt.strftime('%d.%m %H:%M')}"
-                    with_ref_premium += 1
+                    totals["with_ref_premium"] += 1
             except ValueError:
                 pass
 
         is_blocked = bool(u["blocked_bot"])
         if is_blocked:
-            blocked_count += 1
+            totals["blocked"] += 1
 
         # Отдельный от blocked_bot сигнал отвала — можно отключить
         # Автоматизацию чатов в настройках Telegram, не блокируя самого бота
@@ -2464,7 +2516,7 @@ async def _build_users_report(bot: Bot) -> list[str]:
         latest_conn = get_latest_business_connection(tid)
         automation_off = bool(latest_conn) and not latest_conn["is_enabled"]
         if automation_off:
-            automation_off_count += 1
+            totals["automation_off"] += 1
 
         last_action_raw = get_last_event_time(tid)
         last_incoming_raw = get_last_incoming_message_time(tid)
@@ -2484,7 +2536,7 @@ async def _build_users_report(bot: Bot) -> list[str]:
         else:
             is_stale = True  # ни одного сигнала активности вообще
         if is_stale:
-            inactive_count += 1
+            totals["inactive"] += 1
 
         # "Активен" (не заблокировал, не отключал автоматизацию) — НЕ значит
         # "сообщения реально идут". Отдельно помечаем застой, чтобы статус не
@@ -2498,37 +2550,155 @@ async def _build_users_report(bot: Bot) -> list[str]:
             issues.append(f"⚠️ Нет активности &gt;{_INACTIVE_AFTER_DAYS} дн.")
         status_line = " · ".join(issues) if issues else "✅ Активен"
 
-        gender_label = _GENDER_LABELS.get(u["gender"], "?")
-        source_label = _SOURCE_LABELS.get(u["acquisition_source"], "не указан")
+        # Использование фич — из уже загруженных пакетных срезов, без запросов.
+        ev = events_by_user.get(tid, {})
+        uses_reply = ev.get("gen_reply_variants", 0)
+        uses_screenshot = ev.get("gen_screenshot_variants", 0)
+        uses_live = ev.get("gen_live", 0) + ev.get("gen_live_regen", 0)
+        used_deep_analysis = tid in deep_analysis_users
+        used_deep_style = tid in deep_style_users
 
+        # Premium: _is_premium ходит в Telegram (с кэшем), поэтому зовём ОДИН
+        # раз, а источник доопределяем локальными проверками в том же порядке
+        # приоритета, что внутри самой _is_premium — без второго обращения.
+        is_premium_now = await _is_premium(bot, tid)
+        if not is_premium_now:
+            premium_source = "нет"
+        elif _has_referral_premium(tid):
+            premium_source = "referral"
+        elif _has_promo_channel_premium(tid):
+            premium_source = "promo_channel"
+        else:
+            premium_source = "tribute"
+        if is_premium_now:
+            totals["premium_now"] += 1
+
+        days_since_active = _days_since(last_action_raw, now)
+        active_7d = days_since_active is not None and days_since_active <= 7
+
+        if uses_reply:
+            totals["used_reply"] += 1
+        if uses_screenshot:
+            totals["used_screenshot"] += 1
+        if uses_live:
+            totals["used_live"] += 1
+        if used_deep_analysis:
+            totals["used_deep_analysis"] += 1
+        if used_deep_style:
+            totals["used_deep_style"] += 1
+        if active_7d:
+            totals["active_7d"] += 1
+
+        rows.append({
+            "username": who,
+            "telegram_id": tid,
+            "gender": _GENDER_LABELS.get(u["gender"], "?"),
+            "source": _SOURCE_LABELS.get(u["acquisition_source"], "не указан"),
+            "contacts_count": len(contacts),
+            "messages_count": msg_count,
+            "blocked": is_blocked,
+            "automation_off": automation_off,
+            "signup_date": _csv_dt(u["created_at"], "%Y-%m-%d"),
+            "days_since_signup": _days_since(u["created_at"], now),
+            "last_action_at": _csv_dt(last_action_raw),
+            "last_incoming_at": _csv_dt(last_incoming_raw),
+            "days_since_last_active": days_since_active,
+            "active_last_7d": active_7d,
+            "uses_reply": uses_reply,
+            "uses_screenshot": uses_screenshot,
+            "uses_live": uses_live,
+            "used_deep_analysis": used_deep_analysis,
+            "used_deep_style": used_deep_style,
+            "has_style_card": tid in style_card_users,
+            "is_premium_now": is_premium_now,
+            "premium_source": premium_source,
+            "trial_used": u["trial_used"],
+            "referrals_made": referrals_by_user.get(tid, 0),
+            # только для HTML-отчёта, в CSV не идут
+            "_status_line": status_line,
+            "_premium_line": premium_line,
+            "_last_action_label": _relative_label(last_action_raw, now),
+            "_last_incoming_label": _relative_label(last_incoming_raw, now),
+        })
+
+    return rows, totals
+
+
+def _build_users_report(rows: list[dict], totals: dict) -> list[str]:
+    """Возвращает список блоков (шапка, по одному на юзера, сводка) — НЕ
+    склеенную строку, чтобы cmd_users мог резать на чанки по границам
+    блоков, а не посреди HTML-тега."""
+    blocks = ["👥 <b>Пользователи CueMe</b>"]
+
+    for r in rows:
         blocks.append(
-            f"👤 <b>{html.escape(who)}</b>\n"
-            f"    Пол: {gender_label} · Триал: {u['trial_used']}\n"
-            f"    Источник: {source_label}\n"
-            f"    Контактов: {len(contacts)} · Сообщений: {msg_count}\n"
-            f"    Последнее действие: {_relative_label(last_action_raw, now)} · "
-            f"Последнее сообщение от собеседника: {_relative_label(last_incoming_raw, now)}\n"
-            f"    Статус: {status_line}{premium_line}"
+            f"👤 <b>{html.escape(r['username'])}</b>\n"
+            f"    Пол: {r['gender']} · Триал: {r['trial_used']}\n"
+            f"    Источник: {r['source']}\n"
+            f"    Контактов: {r['contacts_count']} · Сообщений: {r['messages_count']}\n"
+            f"    Последнее действие: {r['_last_action_label']} · "
+            f"Последнее сообщение от собеседника: {r['_last_incoming_label']}\n"
+            f"    Статус: {r['_status_line']}{r['_premium_line']}"
         )
 
     blocks.append(
         f"📊 <b>Сводка</b>\n"
-        f"Всего: {len(users)}\n"
-        f"С полом: {with_gender}\n"
-        f"С контактом: {with_contact}\n"
-        f"С активной реферальной Premium: {with_ref_premium}\n"
-        f"Заблокировали бота: {blocked_count}\n"
-        f"Отключили Автоматизацию чатов: {automation_off_count}\n"
-        f"Неактивных (&gt;{_INACTIVE_AFTER_DAYS} дн.): {inactive_count}"
+        f"Всего: {totals['total']}\n"
+        f"С полом: {totals['with_gender']}\n"
+        f"С контактом: {totals['with_contact']}\n"
+        f"С активной реферальной Premium: {totals['with_ref_premium']}\n"
+        f"Заблокировали бота: {totals['blocked']}\n"
+        f"Отключили Автоматизацию чатов: {totals['automation_off']}\n"
+        f"Неактивных (&gt;{_INACTIVE_AFTER_DAYS} дн.): {totals['inactive']}"
+    )
+    blocks.append(
+        f"🧩 <b>Пользуются функциями</b>\n"
+        f"Ответить за меня: {totals['used_reply']}\n"
+        f"По скриншоту: {totals['used_screenshot']}\n"
+        f"Ответить с CueMe (live): {totals['used_live']}\n"
+        f"Анализ собеседника: {totals['used_deep_analysis']}\n"
+        f"Анализ своего стиля: {totals['used_deep_style']}\n"
+        f"Активны за 7 дней: {totals['active_7d']}\n"
+        f"Premium сейчас: {totals['premium_now']}"
     )
     return blocks
+
+
+# Порядок столбцов CSV. Значения берутся из строк _collect_users_data по этим
+# же ключам, служебные поля с "_" в выгрузку не идут.
+_USERS_CSV_COLUMNS = [
+    "username", "telegram_id", "gender", "source",
+    "contacts_count", "messages_count", "blocked", "automation_off",
+    "signup_date", "days_since_signup", "last_action_at", "last_incoming_at",
+    "days_since_last_active", "active_last_7d",
+    "uses_reply", "uses_screenshot", "uses_live",
+    "used_deep_analysis", "used_deep_style", "has_style_card",
+    "is_premium_now", "premium_source", "trial_used", "referrals_made",
+]
+
+
+def _build_users_csv(rows: list[dict]) -> bytes:
+    """CSV для выгрузки в Excel/Sheets: utf-8-sig (иначе Excel ломает кириллицу)
+    и разделитель ';'. Булевы — «да/нет», отсутствующие числа — пустая ячейка
+    (чтобы «неизвестно» не считалось нулём при подсчёте средних)."""
+    buf = io.StringIO()
+    writer = csv.writer(buf, delimiter=";", lineterminator="\r\n")
+    writer.writerow(_USERS_CSV_COLUMNS)
+    for r in rows:
+        writer.writerow([
+            _yn(r[col]) if isinstance(r[col], bool)
+            else ("" if r[col] is None else r[col])
+            for col in _USERS_CSV_COLUMNS
+        ])
+    return buf.getvalue().encode("utf-8-sig")
 
 
 @dp.message(Command("users"))
 async def cmd_users(message: Message, bot: Bot) -> None:
     if not _is_admin(message.from_user.id):
         return
-    blocks = await _build_users_report(bot)
+    rows, totals = await _collect_users_data(bot)
+    blocks = _build_users_report(rows, totals)
     # Телеграм режет на 4096 символов — рубим ПО ГРАНИЦАМ блоков (не
     # посимвольно), иначе легко разрезать HTML-тег пополам и получить
     # ошибку парсинга у Telegram вместо отчёта.
@@ -2552,6 +2722,18 @@ async def cmd_users(message: Message, bot: Bot) -> None:
         except Exception:
             logging.warning("cmd_users: send failed to %s", target_chat)
             await message.answer(chunk, parse_mode="HTML")
+
+    # Тем же проходом — CSV со всеми метриками (в сообщениях выше только
+    # обзор, в файле — полная таблица для Excel/Sheets).
+    if not rows:
+        return
+    filename = f"cueme_users_{datetime.now(timezone.utc).strftime('%Y%m%d')}.csv"
+    document = BufferedInputFile(_build_users_csv(rows), filename=filename)
+    try:
+        await bot.send_document(target_chat, document)
+    except Exception:
+        logging.warning("cmd_users: csv send failed to %s", target_chat)
+        await message.answer_document(document)
 
 
 # ── /sources — статистика по источникам привлечения (только для админа) ────
