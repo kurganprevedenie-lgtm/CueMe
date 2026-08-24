@@ -252,14 +252,43 @@ _JUNK_WORDS = {"чо", "лол", "кек", "рофл", "ору", "угар", "м
 _URL_RE = re.compile(r"https?://\S+|(?:^|\s)t\.me/\S+|(?:^|\s)www\.\S+", re.IGNORECASE)
 
 
+# Короткие служебные слова/местоимения — не считаются «значимым словом» при
+# проверке содержательности многословных фрагментов ниже.
+_STOP_WORDS = {
+    "и", "а", "но", "да", "на", "в", "во", "с", "со", "у", "от", "до", "за",
+    "по", "из", "не", "ну", "же", "ли", "то", "бы", "он", "она", "оно",
+    "они", "мы", "вы", "я", "ты", "мне", "тебе", "меня", "тебя", "его",
+    "её", "их", "это", "эта", "этот", "эти",
+}
+
+
 def _looks_junky(text: str) -> bool:
     t = text.strip()
     if _URL_RE.search(t):
         return True  # голая ссылка — не иллюстрирует ничего, даже если технически подходит под критерий
-    if len(t) <= 1 or " " in t:
-        return len(t) <= 1
+    if len(t) <= 1:
+        return True
+    if not re.search(r"[a-zA-Zа-яА-ЯёЁ]", t):
+        return True  # только цифры/пунктуация, ни одной буквы
     low = t.lower().strip(" !?.,)(")
-    return low in _JUNK_WORDS or not re.search(r"[a-zA-Zа-яА-ЯёЁ0-9]", t)
+    if low in _JUNK_WORDS:
+        return True
+    # Многословные фрагменты раньше проходили фильтр без проверки вообще
+    # (наличие пробела давало ранний return False) — подтверждено на реальном
+    # примере: «Виллиану 18» (имя/адрес + число, без единого другого слова)
+    # прошло как валидная цитата инициативности. Эвристика (не полноценный
+    # NLP, ловит явные случаи, а не 100%): если в тексте ЕСТЬ цифра И после
+    # вычитания цифр/предлогов/местоимений остаётся ≤1 значимое слово —
+    # считаем мусором (сочетание «одно слово + число, и больше ничего» —
+    # признак фрагмента вроде адреса/уровня/кода, а не обычной реплики). БЕЗ
+    # цифры одно слово не трогаем — иначе сломаются honest однословные
+    # ответы вроде «устала», «работаю».
+    if re.search(r"\d", t):
+        words = re.findall(r"[a-zA-Zа-яА-ЯёЁ]+", low)
+        significant = [w for w in words if len(w) >= 3 and w not in _STOP_WORDS]
+        if len(significant) <= 1:
+            return True
+    return False
 
 
 # v1 (порог паузы = SESSION_GAP, 4ч) — оставлено для отката. Заменено на
@@ -313,13 +342,58 @@ def _looks_junky(text: str) -> bool:
 SIGNIFICANT_GAP = timedelta(hours=12)
 
 
+# v3 (один example, перезаписывался самым свежим) — оставлено для отката.
+# Заменено на список examples (часы, цитата) — показываем 2-3 примера,
+# нагляднее одного. См. новую версию ниже.
+# def initiative_axis(dated_msgs: list[dict], gap: timedelta = SIGNIFICANT_GAP) -> tuple[int, str]:
+#     """Ось «Инициативность» (0-5): доля пауз ≥gap (по умолчанию 12ч — см.
+#     SIGNIFICANT_GAP), после которых первым написал СОБЕСЕДНИК (не автор), плюс
+#     реальная цитата одного такого случая (свежая, без явного мусора вроде
+#     голого смеха). Паузы короче 12ч (включая старую зону сессии 4ч) НЕ
+#     считаются вообще — только разрыв, достаточно долгий, чтобы не быть обычным
+#     перерывом внутри дня. Меньше 3 таких пауз — честно показываем
+#     N из M вместо расплывчатого «мало»."""
+#     msgs = sorted(
+#         (m for m in dated_msgs if m.get("text") and m.get("date")),
+#         key=lambda m: m["date"],
+#     )
+#     pauses = 0
+#     contact_first = 0
+#     example = ""
+#     for prev, cur in zip(msgs, msgs[1:]):
+#         try:
+#             delta = datetime.fromisoformat(cur["date"]) - datetime.fromisoformat(prev["date"])
+#         except (ValueError, TypeError):
+#             continue
+#         if delta >= gap:
+#             pauses += 1
+#             if cur["direction"] == "in":
+#                 contact_first += 1
+#                 if not _looks_junky(cur["text"]):
+#                     example = cur["text"].strip()  # свежие перезаписывают старые
+#
+#     if pauses == 0:
+#         return 2, "пауз ≥12ч в переписке не было — оценка нейтральная"
+#
+#     ratio = contact_first / pauses
+#     score = round(min(1.0, max(0.0, ratio)) * 5)
+#     if example:
+#         quote = example if len(example) <= 80 else example[:77].rstrip() + "…"
+#         return score, (
+#             f"После паузы первым пишет собеседник: «{quote}» — так "
+#             f"происходит в {contact_first} из {pauses} случаев."
+#         )
+#     return score, f"После паузы первым пишет собеседник в {contact_first} из {pauses} случаев."
+
+
 def initiative_axis(dated_msgs: list[dict], gap: timedelta = SIGNIFICANT_GAP) -> tuple[int, str]:
     """Ось «Инициативность» (0-5): доля пауз ≥gap (по умолчанию 12ч — см.
     SIGNIFICANT_GAP), после которых первым написал СОБЕСЕДНИК (не автор), плюс
-    реальная цитата одного такого случая (свежая, без явного мусора вроде
-    голого смеха). Паузы короче 12ч (включая старую зону сессии 4ч) НЕ
-    считаются вообще — только разрыв, достаточно долгий, чтобы не быть обычным
-    перерывом внутри дня. Меньше 3 таких пауз — честно показываем
+    до 3 реальных цитат таких случаев (самые длинные паузы — нагляднее
+    иллюстрируют ось, чем просто последние по времени), каждая с точным
+    числом часов молчания. Паузы короче 12ч (включая старую зону сессии 4ч)
+    НЕ считаются вообще — только разрыв, достаточно долгий, чтобы не быть
+    обычным перерывом внутри дня. Меньше 3 таких пауз — честно показываем
     N из M вместо расплывчатого «мало»."""
     msgs = sorted(
         (m for m in dated_msgs if m.get("text") and m.get("date")),
@@ -327,7 +401,7 @@ def initiative_axis(dated_msgs: list[dict], gap: timedelta = SIGNIFICANT_GAP) ->
     )
     pauses = 0
     contact_first = 0
-    example = ""
+    examples: list[tuple[float, str]] = []  # (часы молчания, цитата) — только для пауз, начатых собеседником
     for prev, cur in zip(msgs, msgs[1:]):
         try:
             delta = datetime.fromisoformat(cur["date"]) - datetime.fromisoformat(prev["date"])
@@ -338,30 +412,70 @@ def initiative_axis(dated_msgs: list[dict], gap: timedelta = SIGNIFICANT_GAP) ->
             if cur["direction"] == "in":
                 contact_first += 1
                 if not _looks_junky(cur["text"]):
-                    example = cur["text"].strip()  # свежие перезаписывают старые
+                    examples.append((delta.total_seconds() / 3600, cur["text"].strip()))
 
     if pauses == 0:
         return 2, "пауз ≥12ч в переписке не было — оценка нейтральная"
 
     ratio = contact_first / pauses
     score = round(min(1.0, max(0.0, ratio)) * 5)
-    if example:
-        quote = example if len(example) <= 80 else example[:77].rstrip() + "…"
-        return score, (
-            f"После паузы первым пишет собеседник: «{quote}» — так "
-            f"происходит в {contact_first} из {pauses} случаев."
-        )
-    return score, f"После паузы первым пишет собеседник в {contact_first} из {pauses} случаев."
+    base = f"После паузы первым пишет собеседник в {contact_first} из {pauses} случаев."
+    if examples:
+        top = sorted(examples, key=lambda e: e[0], reverse=True)[:3]
+        parts = []
+        for i, (hours, quote) in enumerate(top):
+            q = quote if len(quote) <= 80 else quote[:77].rstrip() + "…"
+            suffix = " молчания" if i == 0 else ""
+            parts.append(f"после {round(hours)} ч{suffix} — «{q}»")
+        return score, base + " Например: " + ", ".join(parts) + "."
+    return score, base
+
+
+# v1 (только литерал "?") — оставлено для отката. В живой переписке вопрос
+# часто без "?" ("когда у тебя кончается учеба") — добавлена эвристика по
+# вопросительным словам, см. новую версию ниже.
+# def interest_signal_a(dated_msgs: list[dict]) -> tuple[int, str]:
+#     """Сигнал A оси «Интерес» (0-5, без LLM): доля сообщений собеседника, где
+#     есть и вопрос, и обращение на «ты» («ты/тебе/тебя/твой...») — вопросы,
+#     адресованные автору, а не вопросы вообще."""
+#     contact_texts = [m["text"] for m in dated_msgs if m.get("direction") == "in" and m.get("text")]
+#     if not contact_texts:
+#         return 2, "Сообщений от собеседника нет — оценка нейтральная."
+#     addressed = sum(1 for t in contact_texts if "?" in t and _INFORMAL_RE.search(t))
+#     ratio = addressed / len(contact_texts)
+#     score = round(min(1.0, ratio / 0.3) * 5)  # 30%+ таких вопросов — уже максимум по этому сигналу
+#     score = min(5, max(0, score))
+#     return score, (
+#         f"Вопросов, адресованных лично автору («ты...?»), — {addressed} из "
+#         f"{len(contact_texts)} сообщений собеседника ({ratio:.0%})."
+#     )
+
+
+# Вопросительные слова — вопрос-обращение засчитывается и без литерала "?"
+# (частый случай в живой переписке: "когда у тебя кончается учеба"). Риск
+# ложных срабатываний неравномерный: "куда/откуда/зачем/почему/сколько/
+# какой/чей/ли" почти всегда маркер вопроса, а "что/как/кто/когда" — частые
+# союзы/наречия и в обычных утверждениях ("не знаю, когда ты придёшь") —
+# осознанный компромисс: важна обращённость к автору, не строгая грамматика.
+_QUESTION_WORD_RE = re.compile(
+    r"\b(когда|где|куда|откуда|зачем|почему|сколько|как|что|кто|какой|"
+    r"какая|какое|какие|чей|чья|чьё|ли)\b",
+    re.IGNORECASE,
+)
 
 
 def interest_signal_a(dated_msgs: list[dict]) -> tuple[int, str]:
     """Сигнал A оси «Интерес» (0-5, без LLM): доля сообщений собеседника, где
-    есть и вопрос, и обращение на «ты» («ты/тебе/тебя/твой...») — вопросы,
-    адресованные автору, а не вопросы вообще."""
+    есть (вопрос — литерал «?» ИЛИ вопросительное слово) И обращение на «ты»
+    («ты/тебе/тебя/твой...») — вопросы, адресованные автору, а не вопросы
+    вообще."""
     contact_texts = [m["text"] for m in dated_msgs if m.get("direction") == "in" and m.get("text")]
     if not contact_texts:
         return 2, "Сообщений от собеседника нет — оценка нейтральная."
-    addressed = sum(1 for t in contact_texts if "?" in t and _INFORMAL_RE.search(t))
+    addressed = sum(
+        1 for t in contact_texts
+        if ("?" in t or _QUESTION_WORD_RE.search(t)) and _INFORMAL_RE.search(t)
+    )
     ratio = addressed / len(contact_texts)
     score = round(min(1.0, ratio / 0.3) * 5)  # 30%+ таких вопросов — уже максимум по этому сигналу
     score = min(5, max(0, score))
