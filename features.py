@@ -262,13 +262,65 @@ def _looks_junky(text: str) -> bool:
     return low in _JUNK_WORDS or not re.search(r"[a-zA-Zа-яА-ЯёЁ0-9]", t)
 
 
-def initiative_axis(dated_msgs: list[dict], gap: timedelta = SESSION_GAP) -> tuple[int, str]:
-    """Ось «Инициативность» (0-5): доля пауз ≥gap, после которых первым написал
-    СОБЕСЕДНИК (не автор), плюс реальная цитата одного такого случая (свежая,
-    без явного мусора вроде голого смеха). Меньше 3 пауз — честно показываем
-    N из M вместо расплывчатого «мало». Порог паузы — тот же SESSION_GAP, что
-    уже используется для границы сессии в extract_features, ради
-    консистентности внутри проекта."""
+# v1 (порог паузы = SESSION_GAP, 4ч) — оставлено для отката. Заменено на
+# SIGNIFICANT_GAP (сейчас 12ч): короткие паузы оказались слишком неоднозначны
+# (сон в разных часовых поясах — Business API не даёт данных о поясе, различить
+# сон от охлаждения интереса нечем), выброшены из подсчёта целиком, а не
+# просто занижают/завышают счёт. См. новую версию ниже.
+# def initiative_axis(dated_msgs: list[dict], gap: timedelta = SESSION_GAP) -> tuple[int, str]:
+#     """Ось «Инициативность» (0-5): доля пауз ≥gap, после которых первым написал
+#     СОБЕСЕДНИК (не автор), плюс реальная цитата одного такого случая (свежая,
+#     без явного мусора вроде голого смеха). Меньше 3 пауз — честно показываем
+#     N из M вместо расплывчатого «мало». Порог паузы — тот же SESSION_GAP, что
+#     уже используется для границы сессии в extract_features, ради
+#     консистентности внутри проекта."""
+#     msgs = sorted(
+#         (m for m in dated_msgs if m.get("text") and m.get("date")),
+#         key=lambda m: m["date"],
+#     )
+#     pauses = 0
+#     contact_first = 0
+#     example = ""
+#     for prev, cur in zip(msgs, msgs[1:]):
+#         try:
+#             delta = datetime.fromisoformat(cur["date"]) - datetime.fromisoformat(prev["date"])
+#         except (ValueError, TypeError):
+#             continue
+#         if delta >= gap:
+#             pauses += 1
+#             if cur["direction"] == "in":
+#                 contact_first += 1
+#                 if not _looks_junky(cur["text"]):
+#                     example = cur["text"].strip()  # свежие перезаписывают старые
+#
+#     if pauses == 0:
+#         return 2, "пауз ≥4ч в переписке не было — оценка нейтральная"
+#
+#     ratio = contact_first / pauses
+#     score = round(min(1.0, max(0.0, ratio)) * 5)
+#     if example:
+#         quote = example if len(example) <= 80 else example[:77].rstrip() + "…"
+#         return score, (
+#             f"После паузы первым пишет собеседник: «{quote}» — так "
+#             f"происходит в {contact_first} из {pauses} случаев."
+#         )
+#     return score, f"После паузы первым пишет собеседник в {contact_first} из {pauses} случаев."
+
+
+# Зона 4-12ч (сон vs. охлаждение — Business API не даёт часовой пояс, различить
+# нечем) исключена из подсчёта целиком, а не сглажена — порог один
+# (SIGNIFICANT_GAP), всё что меньше выбрасывается.
+SIGNIFICANT_GAP = timedelta(hours=12)
+
+
+def initiative_axis(dated_msgs: list[dict], gap: timedelta = SIGNIFICANT_GAP) -> tuple[int, str]:
+    """Ось «Инициативность» (0-5): доля пауз ≥gap (по умолчанию 12ч — см.
+    SIGNIFICANT_GAP), после которых первым написал СОБЕСЕДНИК (не автор), плюс
+    реальная цитата одного такого случая (свежая, без явного мусора вроде
+    голого смеха). Паузы короче 12ч (включая старую зону сессии 4ч) НЕ
+    считаются вообще — только разрыв, достаточно долгий, чтобы не быть обычным
+    перерывом внутри дня. Меньше 3 таких пауз — честно показываем
+    N из M вместо расплывчатого «мало»."""
     msgs = sorted(
         (m for m in dated_msgs if m.get("text") and m.get("date")),
         key=lambda m: m["date"],
@@ -289,7 +341,7 @@ def initiative_axis(dated_msgs: list[dict], gap: timedelta = SESSION_GAP) -> tup
                     example = cur["text"].strip()  # свежие перезаписывают старые
 
     if pauses == 0:
-        return 2, "пауз ≥4ч в переписке не было — оценка нейтральная"
+        return 2, "пауз ≥12ч в переписке не было — оценка нейтральная"
 
     ratio = contact_first / pauses
     score = round(min(1.0, max(0.0, ratio)) * 5)
