@@ -64,7 +64,7 @@ from llm import (
     ILLEGIBLE_MARKER,
     PROVIDER_NAMES,
     RateLimitError,
-    build_deep_analysis,
+    build_compatibility_interpretation,
     build_deep_style_analysis,
     build_ideal_date,
     build_interaction_card,
@@ -83,6 +83,7 @@ from llm import (
     suggest_reply_variants,
     transcribe_audio,
 )
+from compatibility_metrics import compute_all as compute_compat_metrics
 from tg_parser import parse_chat
 from tools.export import extract_conversation, to_text
 from storage import (
@@ -1297,127 +1298,288 @@ def _deep_stats_summary(rows: list[dict]) -> str:
 #     return msg1, msg2, msg3
 
 
-async def _gen_deep_analysis(contact_id: int, owner_user_id: str) -> dict | None:
-    """Ленивая генерация с кэшем в deep_analysis. None — данных мало."""
-    cached = get_deep_analysis(contact_id)
-    if cached:
-        return cached
+# v-5axis (единый текст «Название: N/5», медаль 0-25, парсинг текста обратно
+# для Rich Message) — оставлено для отката. Заменено детерминированными
+# метриками (compatibility_metrics.py) + LLM только для интерпретации уже
+# посчитанных фактов (build_compatibility_interpretation в llm.py) — не нужен
+# весь текст переписки в промпте, только 7 готовых фактов, поэтому быстрее и
+# не рискует таймаутом на больших контактах. См. новые версии ниже.
+# async def _gen_deep_analysis(contact_id: int, owner_user_id: str) -> dict | None:
+#     """Ленивая генерация с кэшем в deep_analysis. None — данных мало."""
+#     cached = get_deep_analysis(contact_id)
+#     if cached:
+#         return cached
 
+#     rows = get_all_dated_messages(owner_user_id, contact_id)
+#     my_count = sum(1 for r in rows if r["direction"] == "out" and r["text"])
+#     ct_count = sum(1 for r in rows if r["direction"] == "in" and r["text"])
+#     if my_count < DEEP_ANALYSIS_MIN_MSGS or ct_count < DEEP_ANALYSIS_MIN_MSGS:
+#         return None
+
+#     dated_lines = _periodized_dated_lines(rows)
+#     stats       = _deep_stats_summary(rows)
+#     compat = await build_deep_analysis(
+#         dated_lines, stats, rows, user_gender=get_gender(owner_user_id),
+#     )
+#     save_deep_analysis(contact_id, compat)
+#     return {"compatibility_text": compat}
+
+
+# def _format_deep_analysis(name: str, data: dict) -> str:
+#     """Единый блок — 5 осей с обоснованием вместо прежних 4 разрозненных
+#     блоков (совместимость/как писать/флаги/готовое сообщение — «как писать» и
+#     «флаги» пересказывали то же самое, что теперь показывают оси; «готовое
+#     сообщение» дублировало отдельную функцию «Ответить за меня», убрано без
+#     замены). Разбивку на несколько сообщений при превышении лимита Telegram
+#     делает _answer_long — она режет по границам абзацев, тут не нужно.
+#     Это plain-text ФОЛБЭК для _run_deep_analysis — основной путь теперь Rich
+#     Message (см. _parse_compat_text/_build_rich_analysis_html), этот формат
+#     остаётся на случай, если Rich Message не отправился."""
+#     return f"🔬 Анализ собеседника — {name}\n\n{data['compatibility_text']}"
+
+
+# def _parse_compat_text(compatibility_text: str) -> tuple[str, list[tuple[str, int, str]], str] | None:
+#     """Разбирает уже готовый текст build_deep_analysis (медаль+сумма, 5 осей
+#     «Название: N/5» + обоснование, финальная строка 👉 совет) обратно на
+#     структурные куски для Rich Message. build_deep_analysis НЕ меняется —
+#     это чисто раскладка уже сгенерированного текста, не новая генерация.
+#     None, если структура неожиданная (не 5 осей/нет совета) — сигнал сразу
+#     уйти в текстовый фолбэк, не пытаясь звать Rich Message API вслепую."""
+#     lines = compatibility_text.splitlines()
+#     if not lines:
+#         return None
+#     medal_line = lines[0].strip()
+#     axes: list[tuple[str, int, str]] = []
+#     advice = ""
+#     i = 1
+#     n = len(lines)
+#     while i < n:
+#         line = lines[i].strip()
+#         if not line:
+#             i += 1
+#             continue
+#         m = _AXIS_HEADER_RE.match(line)
+#         if m:
+#             axis_name, score = m.group(1), int(m.group(2))
+#             i += 1
+#             body_lines = []
+#             while i < n and lines[i].strip() and not _AXIS_HEADER_RE.match(lines[i].strip()):
+#                 body_lines.append(lines[i].strip())
+#                 i += 1
+#             axes.append((axis_name, score, " ".join(body_lines)))
+#             continue
+#         if line.startswith("👉"):
+#             advice = line.lstrip("👉").strip()
+#             i += 1
+#             continue
+#         i += 1  # неожиданная строка — пропускаем, не валим весь парсинг
+
+#     if len(axes) != 5 or not advice:
+#         return None
+#     return medal_line, axes, advice
+
+
+# def _short_phrase(text: str, max_len: int = 55) -> str:
+#     """Первое предложение уже готового текста оси, обрезанное по длине —
+#     компактная «суть» для ячейки таблицы. Без LLM: не просим модель отдельно
+#     генерировать короткую версию (нет возможности прогнать живой тест на
+#     промпт прямо сейчас), просто урезаем то, что она уже написала."""
+#     text = text.strip()
+#     if not text:
+#         return "—"
+#     m = re.match(r"(.+?[.!?])(?:\s|$)", text)
+#     first = m.group(1) if m else text
+#     if len(first) > max_len:
+#         first = first[: max_len - 1].rstrip() + "…"
+#     return first
+
+
+# def _build_rich_analysis_html(
+#     name: str, medal_line: str, axes: list[tuple[str, int, str]], advice: str,
+# ) -> str:
+#     """HTML для sendRichMessage (Bot API 10.1+, aiogram InputRichMessage.html):
+#     таблица с 5 баллами сразу видна, полное обоснование — в <details> без
+#     open (свёрнуто по умолчанию), совет — <mark> акцентом."""
+#     esc = html.escape
+#     rows = "\n".join(
+#         f'<tr><td align="left">{esc(axis_name)}</td>'
+#         f'<td align="center">{score}/5</td>'
+#         f'<td align="left">{esc(_short_phrase(body))}</td></tr>'
+#         for axis_name, score, body in axes
+#     )
+#     detail_paras = "\n".join(
+#         f"<p><b>{esc(axis_name)}</b> — {score}/5. {esc(body)}</p>"
+#         for axis_name, score, body in axes
+#     )
+#     return (
+#         f"<h2>🔬 Анализ собеседника — {esc(name)}</h2>\n"
+#         f"<h3>{esc(medal_line)}</h3>\n"
+#         "<table>\n"
+#         '<tr><th align="left">Показатель</th><th align="center">Балл</th>'
+#         '<th align="left">Суть</th></tr>\n'
+#         f"{rows}\n"
+#         "</table>\n"
+#         "<details>\n"
+#         "<summary>Показать обоснование</summary>\n"
+#         f"{detail_paras}\n"
+#         "</details>\n"
+#         f"<p><mark>👉 {esc(advice)}</mark></p>"
+#     )
+
+
+# def deep_analysis_result_kb(contact_id: int) -> InlineKeyboardMarkup:
+#     b = InlineKeyboardBuilder()
+#     b.button(text="🔄 Обновить анализ", callback_data=f"deepan_refresh:{contact_id}")
+#     return b.as_markup()
+
+
+# async def _run_deep_analysis(
+#     bot: Bot, target: Message, telegram_id: str, contact_id: int, edit: bool = False
+# ) -> None:
+#     # Реферальная награда теперь даёт полный Premium (учтено внутри _is_premium,
+#     # которую вызывает _require_premium) — отдельной проверки тут больше не нужно.
+#     if not await _require_premium(bot, target, telegram_id):
+#         return
+#     contact = get_contact_by_id(contact_id)
+#     if not contact:
+#         text = "Контакт не найден."
+#         await (target.edit_text(text) if edit else target.answer(text))
+#         return
+#     name = _contact_name(contact)
+
+#     wait_text = f"Готовлю анализ собеседника — {name}. Это займёт ~30 секунд..."
+#     await (target.edit_text(wait_text) if edit else target.answer(wait_text))
+
+#     try:
+#         data = await _gen_deep_analysis(contact_id, telegram_id)
+#     except RateLimitError:
+#         await target.answer("Лимит LLM исчерпан, попробуй позже.")
+#         return
+#     except Exception:
+#         logging.exception("deep_analysis: ошибка генерации")
+#         await target.answer("Не удалось сгенерировать анализ — попробуй ещё раз.")
+#         return
+
+#     if not data:
+#         await target.answer(
+#             f"Пока маловато данных по {name} для анализа собеседника — нужно минимум "
+#             f"{DEEP_ANALYSIS_MIN_MSGS} сообщений с обеих сторон (JSON-экспорт или "
+#             "накопление через Автоматизацию чатов)."
+#         )
+#         return
+
+#     # Rich Message (таблица + сворачиваемое обоснование) — основной путь;
+#     # ЛЮБОЙ сбой (парсинг текста, отказ Bot API, нет капабилити у клиента и
+#     # т.п.) откатывается на обычный текст, чтобы пользователь в любом случае
+#     # получил результат — это платная core-фича, тишины быть не должно.
+#     parsed = _parse_compat_text(data["compatibility_text"])
+#     sent_rich = False
+#     if parsed is not None:
+#         medal_line, axes, advice = parsed
+#         try:
+#             rich_html = _build_rich_analysis_html(name, medal_line, axes, advice)
+#             await bot.send_rich_message(
+#                 chat_id=target.chat.id,
+#                 rich_message=InputRichMessage(html=rich_html),
+#                 reply_markup=deep_analysis_result_kb(contact_id),
+#             )
+#             sent_rich = True
+#         except Exception:
+#             logging.exception("deep_analysis: Rich Message не отправился, откат на текст")
+
+#     if not sent_rich:
+#         await _answer_long(
+#             target, _format_deep_analysis(name, data), reply_markup=deep_analysis_result_kb(contact_id),
+#         )
+
+
+async def _gen_deep_analysis(contact_id: int, owner_user_id: str) -> dict | None:
+    """Ленивая генерация с кэшем в deep_analysis, инвалидация по REBUILD_THRESHOLD
+    (тот же паттерн, что my_style_per_contact) — не пересчитываем на каждый
+    запрос. None — данных мало. Метрики (compatibility_metrics.py) считаются
+    по ВСЕЙ истории контакта без семплирования — это дёшево (текст+дата+
+    направление, без LLM), в отличие от старой системы, которой нужна была
+    урезанная выборка под лимит промпта."""
     rows = get_all_dated_messages(owner_user_id, contact_id)
     my_count = sum(1 for r in rows if r["direction"] == "out" and r["text"])
     ct_count = sum(1 for r in rows if r["direction"] == "in" and r["text"])
     if my_count < DEEP_ANALYSIS_MIN_MSGS or ct_count < DEEP_ANALYSIS_MIN_MSGS:
         return None
 
-    dated_lines = _periodized_dated_lines(rows)
-    stats       = _deep_stats_summary(rows)
-    compat = await build_deep_analysis(
-        dated_lines, stats, rows, user_gender=get_gender(owner_user_id),
+    total_count = count_biz_messages_for_contact(owner_user_id, contact_id) + count_imported_messages(contact_id)
+    cached = get_deep_analysis(contact_id)
+    if cached and total_count - cached["last_rebuild_count"] < REBUILD_THRESHOLD:
+        return cached
+
+    metrics = compute_compat_metrics(rows)
+    interpretations, advice = await build_compatibility_interpretation(
+        metrics, user_gender=get_gender(owner_user_id),
     )
-    save_deep_analysis(contact_id, compat)
-    return {"compatibility_text": compat}
+    for key, text in interpretations.items():
+        metrics[key]["interpretation"] = text
+
+    metrics_json = json.dumps(metrics, ensure_ascii=False)
+    save_deep_analysis(contact_id, metrics_json, advice, total_count)
+    return {"metrics_json": metrics_json, "advice_text": advice, "last_rebuild_count": total_count}
 
 
-def _format_deep_analysis(name: str, data: dict) -> str:
-    """Единый блок — 5 осей с обоснованием вместо прежних 4 разрозненных
-    блоков (совместимость/как писать/флаги/готовое сообщение — «как писать» и
-    «флаги» пересказывали то же самое, что теперь показывают оси; «готовое
-    сообщение» дублировало отдельную функцию «Ответить за меня», убрано без
-    замены). Разбивку на несколько сообщений при превышении лимита Telegram
-    делает _answer_long — она режет по границам абзацев, тут не нужно.
-    Это plain-text ФОЛБЭК для _run_deep_analysis — основной путь теперь Rich
-    Message (см. _parse_compat_text/_build_rich_analysis_html), этот формат
-    остаётся на случай, если Rich Message не отправился."""
-    return f"🔬 Анализ собеседника — {name}\n\n{data['compatibility_text']}"
-
-
-def _parse_compat_text(compatibility_text: str) -> tuple[str, list[tuple[str, int, str]], str] | None:
-    """Разбирает уже готовый текст build_deep_analysis (медаль+сумма, 5 осей
-    «Название: N/5» + обоснование, финальная строка 👉 совет) обратно на
-    структурные куски для Rich Message. build_deep_analysis НЕ меняется —
-    это чисто раскладка уже сгенерированного текста, не новая генерация.
-    None, если структура неожиданная (не 5 осей/нет совета) — сигнал сразу
-    уйти в текстовый фолбэк, не пытаясь звать Rich Message API вслепую."""
-    lines = compatibility_text.splitlines()
-    if not lines:
-        return None
-    medal_line = lines[0].strip()
-    axes: list[tuple[str, int, str]] = []
-    advice = ""
-    i = 1
-    n = len(lines)
-    while i < n:
-        line = lines[i].strip()
-        if not line:
-            i += 1
-            continue
-        m = _AXIS_HEADER_RE.match(line)
-        if m:
-            axis_name, score = m.group(1), int(m.group(2))
-            i += 1
-            body_lines = []
-            while i < n and lines[i].strip() and not _AXIS_HEADER_RE.match(lines[i].strip()):
-                body_lines.append(lines[i].strip())
-                i += 1
-            axes.append((axis_name, score, " ".join(body_lines)))
-            continue
-        if line.startswith("👉"):
-            advice = line.lstrip("👉").strip()
-            i += 1
-            continue
-        i += 1  # неожиданная строка — пропускаем, не валим весь парсинг
-
-    if len(axes) != 5 or not advice:
-        return None
-    return medal_line, axes, advice
-
-
-def _short_phrase(text: str, max_len: int = 55) -> str:
-    """Первое предложение уже готового текста оси, обрезанное по длине —
-    компактная «суть» для ячейки таблицы. Без LLM: не просим модель отдельно
-    генерировать короткую версию (нет возможности прогнать живой тест на
-    промпт прямо сейчас), просто урезаем то, что она уже написала."""
-    text = text.strip()
+def _short_words(text: str, max_words: int = 5) -> str:
+    """3-5 слов сути для ячейки таблицы — из уже готовой интерпретации/факта,
+    без отдельного LLM-вызова на короткую версию."""
+    text = (text or "").strip()
     if not text:
         return "—"
-    m = re.match(r"(.+?[.!?])(?:\s|$)", text)
-    first = m.group(1) if m else text
-    if len(first) > max_len:
-        first = first[: max_len - 1].rstrip() + "…"
-    return first
+    words = text.split()
+    short = " ".join(words[:max_words]).rstrip(".,;:")
+    if len(words) > max_words:
+        short += "…"
+    return short
 
 
-def _build_rich_analysis_html(
-    name: str, medal_line: str, axes: list[tuple[str, int, str]], advice: str,
-) -> str:
+def _build_rich_analysis_html(name: str, metrics: dict, advice: str) -> str:
     """HTML для sendRichMessage (Bot API 10.1+, aiogram InputRichMessage.html):
-    таблица с 5 баллами сразу видна, полное обоснование — в <details> без
-    open (свёрнуто по умолчанию), совет — <mark> акцентом."""
+    таблица с 6 метриками сразу видна, полные интерпретации — в <details> без
+    open (свёрнуто по умолчанию), совет — <mark> акцентом. metrics — dict в
+    порядке compatibility_metrics.METRICS, каждое значение {"label","short",
+    "fact","interpretation"}."""
     esc = html.escape
     rows = "\n".join(
-        f'<tr><td align="left">{esc(axis_name)}</td>'
-        f'<td align="center">{score}/5</td>'
-        f'<td align="left">{esc(_short_phrase(body))}</td></tr>'
-        for axis_name, score, body in axes
+        f'<tr><td align="left">{esc(m["label"])}</td>'
+        f'<td align="center">{esc(m["short"])}</td>'
+        f'<td align="left">{esc(_short_words(m.get("interpretation") or m["fact"]))}</td></tr>'
+        for m in metrics.values()
     )
     detail_paras = "\n".join(
-        f"<p><b>{esc(axis_name)}</b> — {score}/5. {esc(body)}</p>"
-        for axis_name, score, body in axes
+        f"<p><b>{esc(m['label'])}</b>: {esc(m.get('interpretation') or m['fact'])}</p>"
+        for m in metrics.values()
     )
     return (
         f"<h2>🔬 Анализ собеседника — {esc(name)}</h2>\n"
-        f"<h3>{esc(medal_line)}</h3>\n"
         "<table>\n"
-        '<tr><th align="left">Показатель</th><th align="center">Балл</th>'
+        '<tr><th align="left">Метрика</th><th align="center">Значение</th>'
         '<th align="left">Суть</th></tr>\n'
         f"{rows}\n"
         "</table>\n"
         "<details>\n"
-        "<summary>Показать обоснование</summary>\n"
+        "<summary>Показать подробности</summary>\n"
         f"{detail_paras}\n"
         "</details>\n"
         f"<p><mark>👉 {esc(advice)}</mark></p>"
     )
+
+
+def _format_deep_analysis_text(name: str, metrics: dict, advice: str) -> str:
+    """Plain-text ФОЛБЭК для _run_deep_analysis, если Rich Message не
+    отправился — таблица моноширинным блоком, подробности обычным текстом,
+    без сворачивания (в чистом тексте сворачивать нечем)."""
+    header = f"🔬 Анализ собеседника — {html.escape(name)}\n\n"
+    table_lines = [f"{m['label']}: {m['short']}" for m in metrics.values()]
+    table = "<pre>" + html.escape("\n".join(table_lines)) + "</pre>"
+    details = "\n\n".join(
+        f"<b>{html.escape(m['label'])}</b>: {html.escape(m.get('interpretation') or m['fact'])}"
+        for m in metrics.values()
+    )
+    return f"{header}{table}\n\n{details}\n\n👉 {html.escape(advice)}"
 
 
 def deep_analysis_result_kb(contact_id: int) -> InlineKeyboardMarkup:
@@ -1440,7 +1602,7 @@ async def _run_deep_analysis(
         return
     name = _contact_name(contact)
 
-    wait_text = f"Готовлю анализ собеседника — {name}. Это займёт ~30 секунд..."
+    wait_text = f"Готовлю анализ собеседника — {name}. Это займёт ~20 секунд..."
     await (target.edit_text(wait_text) if edit else target.answer(wait_text))
 
     try:
@@ -1461,28 +1623,29 @@ async def _run_deep_analysis(
         )
         return
 
-    # Rich Message (таблица + сворачиваемое обоснование) — основной путь;
-    # ЛЮБОЙ сбой (парсинг текста, отказ Bot API, нет капабилити у клиента и
-    # т.п.) откатывается на обычный текст, чтобы пользователь в любом случае
-    # получил результат — это платная core-фича, тишины быть не должно.
-    parsed = _parse_compat_text(data["compatibility_text"])
+    metrics = json.loads(data["metrics_json"])
+    advice = data["advice_text"]
+
+    # Rich Message (таблица + сворачиваемые подробности) — основной путь;
+    # ЛЮБОЙ сбой (отказ Bot API, нет капабилити у клиента и т.п.) откатывается
+    # на обычный текст, чтобы пользователь в любом случае получил результат —
+    # это платная core-фича, тишины быть не должно.
     sent_rich = False
-    if parsed is not None:
-        medal_line, axes, advice = parsed
-        try:
-            rich_html = _build_rich_analysis_html(name, medal_line, axes, advice)
-            await bot.send_rich_message(
-                chat_id=target.chat.id,
-                rich_message=InputRichMessage(html=rich_html),
-                reply_markup=deep_analysis_result_kb(contact_id),
-            )
-            sent_rich = True
-        except Exception:
-            logging.exception("deep_analysis: Rich Message не отправился, откат на текст")
+    try:
+        rich_html = _build_rich_analysis_html(name, metrics, advice)
+        await bot.send_rich_message(
+            chat_id=target.chat.id,
+            rich_message=InputRichMessage(html=rich_html),
+            reply_markup=deep_analysis_result_kb(contact_id),
+        )
+        sent_rich = True
+    except Exception:
+        logging.exception("deep_analysis: Rich Message не отправился, откат на текст")
 
     if not sent_rich:
         await _answer_long(
-            target, _format_deep_analysis(name, data), reply_markup=deep_analysis_result_kb(contact_id),
+            target, _format_deep_analysis_text(name, metrics, advice),
+            reply_markup=deep_analysis_result_kb(contact_id), parse_mode="HTML",
         )
 
 
@@ -1726,45 +1889,79 @@ def _deep_style_stats_summary(rows: list[dict]) -> str:
 #     return msg1, msg2
 
 
-_COMPAT_NUM_RE = re.compile(r"—\s*(\d{1,2})\s*/\s*25\b")
+# v-5axis (регекс по тексту «Название: N/5», медаль «—N/25») — оставлено для
+# отката. Новая система метрик не даёт единого сравнимого числа/медали —
+# ранжируем по доле тёплой лексики (warmth_conflict) как единственной
+# метрике, которая по смыслу сравнима между разными контактами («с кем
+# теплее»). См. новые версии ниже.
+# _COMPAT_NUM_RE = re.compile(r"—\s*(\d{1,2})\s*/\s*25\b")
+# _AXIS_HEADER_RE = re.compile(r"^(.+?):\s*(\d)/5\s*$")
+#
+#
+# def _first_compat_reason(compatibility_text: str) -> str:
+#     """Ось с максимальным баллом («Название: N/5», обоснование — на следующей
+#     непустой строке) — короткий пересказ для «лучшая совместимость» в «Анализ
+#     своего стиля», не весь текст целиком."""
+#     lines = compatibility_text.splitlines()
+#     best_name, best_score, best_reason = "", -1, ""
+#     for i, raw_line in enumerate(lines):
+#         m = _AXIS_HEADER_RE.match(raw_line.strip())
+#         if not m or int(m.group(2)) <= best_score:
+#             continue
+#         reason = next((l.strip() for l in lines[i + 1:] if l.strip()), "")
+#         best_name, best_score, best_reason = m.group(1), int(m.group(2)), reason
+#     if not best_name:
+#         return ""
+#     return f"{best_name}: {best_score}/5 — {best_reason}" if best_reason else f"{best_name}: {best_score}/5"
+#
+#
+# def _best_compatibility_contact(telegram_id: str) -> tuple[str, str] | None:
+#     """Контакт с максимальной совместимостью среди тех, для кого «Анализ
+#     собеседника» УЖЕ проводился (get_deep_analysis — без форсирования
+#     генерации, без LLM-вызовов, быстро). None, если ни для одного контакта
+#     анализа ещё нет. Возвращает (имя_контакта, compatibility_text)."""
+#     best: tuple[int, str, str] | None = None
+#     for c in list_contacts(telegram_id):
+#         data = get_deep_analysis(c["id"])
+#         if not data:
+#             continue
+#         m = _COMPAT_NUM_RE.search(data["compatibility_text"])
+#         if not m:
+#             continue
+#         score = int(m.group(1))
+#         if best is None or score > best[0]:
+#             best = (score, _contact_name(c), data["compatibility_text"])
+#     if best is None:
+#         return None
+#     return best[1], best[2]
 
 
-_AXIS_HEADER_RE = re.compile(r"^(.+?):\s*(\d)/5\s*$")
+_WARMTH_PCT_RE = re.compile(r"💚(\d+)%")
 
 
-def _first_compat_reason(compatibility_text: str) -> str:
-    """Ось с максимальным баллом («Название: N/5», обоснование — на следующей
-    непустой строке) — короткий пересказ для «лучшая совместимость» в «Анализ
-    своего стиля», не весь текст целиком."""
-    lines = compatibility_text.splitlines()
-    best_name, best_score, best_reason = "", -1, ""
-    for i, raw_line in enumerate(lines):
-        m = _AXIS_HEADER_RE.match(raw_line.strip())
-        if not m or int(m.group(2)) <= best_score:
-            continue
-        reason = next((l.strip() for l in lines[i + 1:] if l.strip()), "")
-        best_name, best_score, best_reason = m.group(1), int(m.group(2)), reason
-    if not best_name:
-        return ""
-    return f"{best_name}: {best_score}/5 — {best_reason}" if best_reason else f"{best_name}: {best_score}/5"
-
-
-def _best_compatibility_contact(telegram_id: str) -> tuple[str, str] | None:
-    """Контакт с максимальной совместимостью среди тех, для кого «Анализ
+def _best_compatibility_contact(telegram_id: str) -> tuple[str, dict] | None:
+    """Контакт с максимальной долей тёплой лексики среди тех, для кого «Анализ
     собеседника» УЖЕ проводился (get_deep_analysis — без форсирования
     генерации, без LLM-вызовов, быстро). None, если ни для одного контакта
-    анализа ещё нет. Возвращает (имя_контакта, compatibility_text)."""
-    best: tuple[int, str, str] | None = None
+    анализа ещё нет. Возвращает (имя_контакта, metrics-словарь)."""
+    best: tuple[int, str, dict] | None = None
     for c in list_contacts(telegram_id):
         data = get_deep_analysis(c["id"])
         if not data:
             continue
-        m = _COMPAT_NUM_RE.search(data["compatibility_text"])
+        try:
+            metrics = json.loads(data["metrics_json"])
+        except (ValueError, TypeError):
+            continue
+        warmth = metrics.get("warmth_conflict")
+        if not warmth:
+            continue
+        m = _WARMTH_PCT_RE.search(warmth.get("short", ""))
         if not m:
             continue
         score = int(m.group(1))
         if best is None or score > best[0]:
-            best = (score, _contact_name(c), data["compatibility_text"])
+            best = (score, _contact_name(c), metrics)
     if best is None:
         return None
     return best[1], best[2]
@@ -1807,11 +2004,11 @@ def _format_deep_style_analysis(telegram_id: str, data: dict) -> str:
 
     best = _best_compatibility_contact(telegram_id)
     if best:
-        name, compat_text = best
-        m = _COMPAT_NUM_RE.search(compat_text)
-        score = m.group(1) if m else "?"
-        reason = _first_compat_reason(compat_text)
-        compat_block = f"💕 Лучше всего складывается с {name} ({score}/25)"
+        name, metrics = best
+        warmth = metrics.get("warmth_conflict", {})
+        score_label = warmth.get("short", "?")
+        reason = warmth.get("interpretation") or warmth.get("fact", "")
+        compat_block = f"💕 Теплее всего складывается с {name} ({score_label})"
         if reason:
             compat_block += f"\n{reason}"
         parts.append(compat_block)

@@ -235,6 +235,18 @@ def init_db() -> None:
             conn.execute("ALTER TABLE deep_analysis DROP COLUMN howto_text")
             conn.execute("ALTER TABLE deep_analysis DROP COLUMN flags_text")
             conn.execute("ALTER TABLE deep_analysis DROP COLUMN message_text")
+        # 5 осей + медаль → детерминированные метрики (compatibility_metrics.py,
+        # без LLM) + LLM только для интерпретации уже посчитанных фактов —
+        # compatibility_text (единый текст под старую 5-осевую систему) больше
+        # не пишется, новые данные идут в metrics_json/advice_text. Старый кэш
+        # структурно несовместим (там был текст «Название: N/5», тут JSON с
+        # интерпретациями) — чистим. last_rebuild_count — тот же паттерн
+        # авто-инвалидации по REBUILD_THRESHOLD, что у my_style_per_contact.
+        if "metrics_json" not in da_cols:
+            conn.execute("DELETE FROM deep_analysis")
+        _add_column_if_missing(conn, "deep_analysis", "metrics_json", "TEXT NOT NULL DEFAULT ''")
+        _add_column_if_missing(conn, "deep_analysis", "advice_text", "TEXT NOT NULL DEFAULT ''")
+        _add_column_if_missing(conn, "deep_analysis", "last_rebuild_count", "INTEGER NOT NULL DEFAULT 0")
         # deep_style_analysis: переход на компактную 3-блочную карточку (архетип/
         # факты/совет) — «история по периодам» и SWOT убраны, совместимость с
         # лучшим контактом теперь отдельный вычисляемый блок без LLM (не хранится
@@ -768,17 +780,53 @@ def get_all_per_contact_style_cards(owner_user_id: str) -> list[dict]:
 #     }
 
 
-def save_deep_analysis(contact_id: int, compatibility_text: str) -> None:
+# v-5axis (единый текст «Название: N/5» под старую систему медалей) —
+# оставлено для отката. Заменено метриками (metrics_json/advice_text), см.
+# новые версии ниже.
+# def save_deep_analysis(contact_id: int, compatibility_text: str) -> None:
+#     with _conn() as conn:
+#         conn.execute(
+#             """
+#             INSERT INTO deep_analysis (contact_id, compatibility_text, updated_at)
+#             VALUES (?, ?, ?)
+#             ON CONFLICT(contact_id) DO UPDATE SET
+#                 compatibility_text = excluded.compatibility_text,
+#                 updated_at         = excluded.updated_at
+#             """,
+#             (contact_id, compatibility_text, _now()),
+#         )
+#
+#
+# def get_deep_analysis(contact_id: int) -> dict | None:
+#     with _conn() as conn:
+#         row = conn.execute(
+#             "SELECT * FROM deep_analysis WHERE contact_id = ?", (contact_id,)
+#         ).fetchone()
+#     if not row:
+#         return None
+#     return {"compatibility_text": row["compatibility_text"]}
+
+
+def save_deep_analysis(
+    contact_id: int, metrics_json: str, advice_text: str, rebuild_count: int,
+) -> None:
+    """metrics_json — сериализованный dict {key: {"label","short","fact","interpretation"}}
+    (см. compatibility_metrics.py + build_compatibility_interpretation в llm.py).
+    rebuild_count — общее число сообщений контакта на момент сохранения, для
+    авто-инвалидации по REBUILD_THRESHOLD (тот же паттерн, что my_style_per_contact)."""
     with _conn() as conn:
         conn.execute(
             """
-            INSERT INTO deep_analysis (contact_id, compatibility_text, updated_at)
-            VALUES (?, ?, ?)
+            INSERT INTO deep_analysis
+                (contact_id, compatibility_text, metrics_json, advice_text, last_rebuild_count, updated_at)
+            VALUES (?, '', ?, ?, ?, ?)
             ON CONFLICT(contact_id) DO UPDATE SET
-                compatibility_text = excluded.compatibility_text,
+                metrics_json       = excluded.metrics_json,
+                advice_text        = excluded.advice_text,
+                last_rebuild_count = excluded.last_rebuild_count,
                 updated_at         = excluded.updated_at
             """,
-            (contact_id, compatibility_text, _now()),
+            (contact_id, metrics_json, advice_text, rebuild_count, _now()),
         )
 
 
@@ -787,9 +835,13 @@ def get_deep_analysis(contact_id: int) -> dict | None:
         row = conn.execute(
             "SELECT * FROM deep_analysis WHERE contact_id = ?", (contact_id,)
         ).fetchone()
-    if not row:
+    if not row or not row["metrics_json"]:
         return None
-    return {"compatibility_text": row["compatibility_text"]}
+    return {
+        "metrics_json":       row["metrics_json"],
+        "advice_text":        row["advice_text"],
+        "last_rebuild_count": row["last_rebuild_count"],
+    }
 
 
 def delete_deep_analysis(contact_id: int) -> None:
