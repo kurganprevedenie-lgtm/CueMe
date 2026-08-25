@@ -25,7 +25,7 @@ from aiogram.types import (
     BotCommand,
     BufferedInputFile,
     BusinessConnection,
-    CallbackQuery, Document, ErrorEvent, FSInputFile, Message,
+    CallbackQuery, Document, ErrorEvent, FSInputFile, InputRichMessage, Message,
     InlineKeyboardButton, InlineKeyboardMarkup,
     ReplyKeyboardMarkup, KeyboardButton,
 )
@@ -1324,8 +1324,100 @@ def _format_deep_analysis(name: str, data: dict) -> str:
     «флаги» пересказывали то же самое, что теперь показывают оси; «готовое
     сообщение» дублировало отдельную функцию «Ответить за меня», убрано без
     замены). Разбивку на несколько сообщений при превышении лимита Telegram
-    делает _answer_long — она режет по границам абзацев, тут не нужно."""
+    делает _answer_long — она режет по границам абзацев, тут не нужно.
+    Это plain-text ФОЛБЭК для _run_deep_analysis — основной путь теперь Rich
+    Message (см. _parse_compat_text/_build_rich_analysis_html), этот формат
+    остаётся на случай, если Rich Message не отправился."""
     return f"🔬 Анализ собеседника — {name}\n\n{data['compatibility_text']}"
+
+
+def _parse_compat_text(compatibility_text: str) -> tuple[str, list[tuple[str, int, str]], str] | None:
+    """Разбирает уже готовый текст build_deep_analysis (медаль+сумма, 5 осей
+    «Название: N/5» + обоснование, финальная строка 👉 совет) обратно на
+    структурные куски для Rich Message. build_deep_analysis НЕ меняется —
+    это чисто раскладка уже сгенерированного текста, не новая генерация.
+    None, если структура неожиданная (не 5 осей/нет совета) — сигнал сразу
+    уйти в текстовый фолбэк, не пытаясь звать Rich Message API вслепую."""
+    lines = compatibility_text.splitlines()
+    if not lines:
+        return None
+    medal_line = lines[0].strip()
+    axes: list[tuple[str, int, str]] = []
+    advice = ""
+    i = 1
+    n = len(lines)
+    while i < n:
+        line = lines[i].strip()
+        if not line:
+            i += 1
+            continue
+        m = _AXIS_HEADER_RE.match(line)
+        if m:
+            axis_name, score = m.group(1), int(m.group(2))
+            i += 1
+            body_lines = []
+            while i < n and lines[i].strip() and not _AXIS_HEADER_RE.match(lines[i].strip()):
+                body_lines.append(lines[i].strip())
+                i += 1
+            axes.append((axis_name, score, " ".join(body_lines)))
+            continue
+        if line.startswith("👉"):
+            advice = line.lstrip("👉").strip()
+            i += 1
+            continue
+        i += 1  # неожиданная строка — пропускаем, не валим весь парсинг
+
+    if len(axes) != 5 or not advice:
+        return None
+    return medal_line, axes, advice
+
+
+def _short_phrase(text: str, max_len: int = 55) -> str:
+    """Первое предложение уже готового текста оси, обрезанное по длине —
+    компактная «суть» для ячейки таблицы. Без LLM: не просим модель отдельно
+    генерировать короткую версию (нет возможности прогнать живой тест на
+    промпт прямо сейчас), просто урезаем то, что она уже написала."""
+    text = text.strip()
+    if not text:
+        return "—"
+    m = re.match(r"(.+?[.!?])(?:\s|$)", text)
+    first = m.group(1) if m else text
+    if len(first) > max_len:
+        first = first[: max_len - 1].rstrip() + "…"
+    return first
+
+
+def _build_rich_analysis_html(
+    name: str, medal_line: str, axes: list[tuple[str, int, str]], advice: str,
+) -> str:
+    """HTML для sendRichMessage (Bot API 10.1+, aiogram InputRichMessage.html):
+    таблица с 5 баллами сразу видна, полное обоснование — в <details> без
+    open (свёрнуто по умолчанию), совет — <mark> акцентом."""
+    esc = html.escape
+    rows = "\n".join(
+        f'<tr><td align="left">{esc(axis_name)}</td>'
+        f'<td align="center">{score}/5</td>'
+        f'<td align="left">{esc(_short_phrase(body))}</td></tr>'
+        for axis_name, score, body in axes
+    )
+    detail_paras = "\n".join(
+        f"<p><b>{esc(axis_name)}</b> — {score}/5. {esc(body)}</p>"
+        for axis_name, score, body in axes
+    )
+    return (
+        f"<h2>🔬 Анализ собеседника — {esc(name)}</h2>\n"
+        f"<h3>{esc(medal_line)}</h3>\n"
+        "<table>\n"
+        '<tr><th align="left">Показатель</th><th align="center">Балл</th>'
+        '<th align="left">Суть</th></tr>\n'
+        f"{rows}\n"
+        "</table>\n"
+        "<details>\n"
+        "<summary>Показать обоснование</summary>\n"
+        f"{detail_paras}\n"
+        "</details>\n"
+        f"<p><mark>👉 {esc(advice)}</mark></p>"
+    )
 
 
 def deep_analysis_result_kb(contact_id: int) -> InlineKeyboardMarkup:
@@ -1369,9 +1461,29 @@ async def _run_deep_analysis(
         )
         return
 
-    await _answer_long(
-        target, _format_deep_analysis(name, data), reply_markup=deep_analysis_result_kb(contact_id),
-    )
+    # Rich Message (таблица + сворачиваемое обоснование) — основной путь;
+    # ЛЮБОЙ сбой (парсинг текста, отказ Bot API, нет капабилити у клиента и
+    # т.п.) откатывается на обычный текст, чтобы пользователь в любом случае
+    # получил результат — это платная core-фича, тишины быть не должно.
+    parsed = _parse_compat_text(data["compatibility_text"])
+    sent_rich = False
+    if parsed is not None:
+        medal_line, axes, advice = parsed
+        try:
+            rich_html = _build_rich_analysis_html(name, medal_line, axes, advice)
+            await bot.send_rich_message(
+                chat_id=target.chat.id,
+                rich_message=InputRichMessage(html=rich_html),
+                reply_markup=deep_analysis_result_kb(contact_id),
+            )
+            sent_rich = True
+        except Exception:
+            logging.exception("deep_analysis: Rich Message не отправился, откат на текст")
+
+    if not sent_rich:
+        await _answer_long(
+            target, _format_deep_analysis(name, data), reply_markup=deep_analysis_result_kb(contact_id),
+        )
 
 
 async def _show_deep_analysis(message: Message, bot: Bot, telegram_id: str | None = None) -> None:
