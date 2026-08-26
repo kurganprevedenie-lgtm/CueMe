@@ -247,6 +247,14 @@ def init_db() -> None:
         _add_column_if_missing(conn, "deep_analysis", "metrics_json", "TEXT NOT NULL DEFAULT ''")
         _add_column_if_missing(conn, "deep_analysis", "advice_text", "TEXT NOT NULL DEFAULT ''")
         _add_column_if_missing(conn, "deep_analysis", "last_rebuild_count", "INTEGER NOT NULL DEFAULT 0")
+        # v2 метрик: добавлена динамика переписки (адаптивная группировка
+        # день/неделя/месяц) отдельным блоком + ВЫВОД-синтез всех метрик,
+        # раньше был только advice_text. Старый кэш без этих полей неполон —
+        # чистим при первом появлении новых колонок.
+        if "dynamics_text" not in da_cols:
+            conn.execute("DELETE FROM deep_analysis")
+        _add_column_if_missing(conn, "deep_analysis", "dynamics_text", "TEXT NOT NULL DEFAULT ''")
+        _add_column_if_missing(conn, "deep_analysis", "synthesis_text", "TEXT NOT NULL DEFAULT ''")
         # deep_style_analysis: переход на компактную 3-блочную карточку (архетип/
         # факты/совет) — «история по периодам» и SWOT убраны, совместимость с
         # лучшим контактом теперь отдельный вычисляемый блок без LLM (не хранится
@@ -807,26 +815,68 @@ def get_all_per_contact_style_cards(owner_user_id: str) -> list[dict]:
 #     return {"compatibility_text": row["compatibility_text"]}
 
 
+# v2-без-динамики (только metrics_json/advice_text) — оставлено для отката.
+# Заменено на версию с dynamics_text (динамика переписки, адаптивная
+# группировка) и synthesis_text (ВЫВОД-синтез) — см. новую версию ниже.
+# def save_deep_analysis(
+#     contact_id: int, metrics_json: str, advice_text: str, rebuild_count: int,
+# ) -> None:
+#     with _conn() as conn:
+#         conn.execute(
+#             """
+#             INSERT INTO deep_analysis
+#                 (contact_id, compatibility_text, metrics_json, advice_text, last_rebuild_count, updated_at)
+#             VALUES (?, '', ?, ?, ?, ?)
+#             ON CONFLICT(contact_id) DO UPDATE SET
+#                 metrics_json       = excluded.metrics_json,
+#                 advice_text        = excluded.advice_text,
+#                 last_rebuild_count = excluded.last_rebuild_count,
+#                 updated_at         = excluded.updated_at
+#             """,
+#             (contact_id, metrics_json, advice_text, rebuild_count, _now()),
+#         )
+#
+#
+# def get_deep_analysis(contact_id: int) -> dict | None:
+#     with _conn() as conn:
+#         row = conn.execute(
+#             "SELECT * FROM deep_analysis WHERE contact_id = ?", (contact_id,)
+#         ).fetchone()
+#     if not row or not row["metrics_json"]:
+#         return None
+#     return {
+#         "metrics_json":       row["metrics_json"],
+#         "advice_text":        row["advice_text"],
+#         "last_rebuild_count": row["last_rebuild_count"],
+#     }
+
+
 def save_deep_analysis(
-    contact_id: int, metrics_json: str, advice_text: str, rebuild_count: int,
+    contact_id: int, metrics_json: str, dynamics_text: str, synthesis_text: str,
+    advice_text: str, rebuild_count: int,
 ) -> None:
     """metrics_json — сериализованный dict {key: {"label","short","fact","interpretation"}}
     (см. compatibility_metrics.py + build_compatibility_interpretation в llm.py).
+    dynamics_text — интерпретация динамики переписки (адаптивная группировка
+    день/неделя/месяц), synthesis_text — ВЫВОД (синтез всех метрик разом).
     rebuild_count — общее число сообщений контакта на момент сохранения, для
     авто-инвалидации по REBUILD_THRESHOLD (тот же паттерн, что my_style_per_contact)."""
     with _conn() as conn:
         conn.execute(
             """
             INSERT INTO deep_analysis
-                (contact_id, compatibility_text, metrics_json, advice_text, last_rebuild_count, updated_at)
-            VALUES (?, '', ?, ?, ?, ?)
+                (contact_id, compatibility_text, metrics_json, dynamics_text,
+                 synthesis_text, advice_text, last_rebuild_count, updated_at)
+            VALUES (?, '', ?, ?, ?, ?, ?, ?)
             ON CONFLICT(contact_id) DO UPDATE SET
                 metrics_json       = excluded.metrics_json,
+                dynamics_text      = excluded.dynamics_text,
+                synthesis_text     = excluded.synthesis_text,
                 advice_text        = excluded.advice_text,
                 last_rebuild_count = excluded.last_rebuild_count,
                 updated_at         = excluded.updated_at
             """,
-            (contact_id, metrics_json, advice_text, rebuild_count, _now()),
+            (contact_id, metrics_json, dynamics_text, synthesis_text, advice_text, rebuild_count, _now()),
         )
 
 
@@ -839,6 +889,8 @@ def get_deep_analysis(contact_id: int) -> dict | None:
         return None
     return {
         "metrics_json":       row["metrics_json"],
+        "dynamics_text":      row["dynamics_text"],
+        "synthesis_text":     row["synthesis_text"],
         "advice_text":        row["advice_text"],
         "last_rebuild_count": row["last_rebuild_count"],
     }
