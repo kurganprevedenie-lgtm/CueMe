@@ -1705,6 +1705,15 @@ def deep_analysis_result_kb(contact_id: int) -> InlineKeyboardMarkup:
 #         )
 
 
+_METRIC_EMOJI = {
+    "balance": "⚖️",
+    "response_speed": "⏱️",
+    "initiation": "🙋",
+    "long_pauses": "⏸️",
+    "warmth_conflict": "🌡️",
+    "circadian": "🕒",
+}
+
 _MAX_TREND_ROWS = 12  # длинная история (месяцы) может дать 30+ периодов — не годится для одной таблицы в сообщении
 
 
@@ -1718,9 +1727,10 @@ def _trend_table_rows(vt: dict) -> list[dict]:
 
 def _build_rich_analysis_html(name: str, metrics: dict, dynamics_text: str, synthesis: str, advice: str) -> str:
     """HTML для sendRichMessage (Bot API 10.1+, aiogram InputRichMessage.html):
-    <h3>-заголовок + обычный абзац <p> под ним на каждую метрику,
-    отдельная секция «Динамика переписки» с настоящей таблицей периодов,
-    «Вывод» — синтез, «Что дальше» — совет обычным текстом, без выделения."""
+    <h3>-заголовок с эмодзи по смыслу метрики + <blockquote> под ним на
+    каждую метрику, отдельная секция «Динамика переписки» с настоящей
+    таблицей периодов, «Вывод» — синтез, «Что дальше» — совет обычным
+    текстом, без выделения."""
     esc = html.escape
     meta = metrics.get("_meta") or {}
     vt = metrics.get("_volume_trend") or {}
@@ -1733,7 +1743,8 @@ def _build_rich_analysis_html(name: str, metrics: dict, dynamics_text: str, synt
         )
 
     metric_blocks = "\n".join(
-        f"<h3>{esc(m['label'])}</h3>\n<p>{esc(m.get('interpretation') or m['fact'])}</p>"
+        f"<h3>{_METRIC_EMOJI.get(key, '')} {esc(m['label'])}</h3>\n"
+        f"<blockquote>{esc(m.get('interpretation') or m['fact'])}</blockquote>"
         for key, m in metrics.items() if not key.startswith("_")
     )
 
@@ -1760,11 +1771,11 @@ def _build_rich_analysis_html(name: str, metrics: dict, dynamics_text: str, synt
         f"<h2>🔬 Анализ собеседника — {esc(name)}</h2>\n"
         f"{subtitle}"
         f"{metric_blocks}\n"
-        "<h3>Динамика переписки</h3>\n"
+        "<h3>📈 Динамика переписки</h3>\n"
         f"{trend_table}"
-        f"<p>{esc(dynamics_text)}</p>\n"
-        "<h3>Вывод</h3>\n"
-        f"<p>{esc(synthesis)}</p>\n"
+        f"<blockquote>{esc(dynamics_text)}</blockquote>\n"
+        "<h3>🧩 Вывод</h3>\n"
+        f"<blockquote>{esc(synthesis)}</blockquote>\n"
         "<h3>👉 Что дальше</h3>\n"
         f"<p>{esc(advice)}</p>"
     )
@@ -1785,7 +1796,7 @@ def _format_deep_analysis_text(name: str, metrics: dict, dynamics_text: str, syn
     header += "\n"
 
     metric_parts = "\n\n".join(
-        f"<b>{html.escape(m['label'])}</b>\n{html.escape(m.get('interpretation') or m['fact'])}"
+        f"<b>{_METRIC_EMOJI.get(key, '')} {html.escape(m['label'])}</b>\n{html.escape(m.get('interpretation') or m['fact'])}"
         for key, m in metrics.items() if not key.startswith("_")
     )
 
@@ -1798,8 +1809,8 @@ def _format_deep_analysis_text(name: str, metrics: dict, dynamics_text: str, syn
 
     return (
         f"{header}{metric_parts}\n\n"
-        f"<b>Динамика переписки</b>\n{trend_table}{html.escape(dynamics_text)}\n\n"
-        f"<b>Вывод</b>\n{html.escape(synthesis)}\n\n"
+        f"📈 <b>Динамика переписки</b>\n{trend_table}{html.escape(dynamics_text)}\n\n"
+        f"🧩 <b>Вывод</b>\n{html.escape(synthesis)}\n\n"
         f"👉 <b>Что дальше</b>\n{html.escape(advice)}"
     )
 
