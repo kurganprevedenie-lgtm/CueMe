@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
 from config import CONFLICT_WORDS, WARMTH_WORDS
+from features import _looks_junky
 
 _WARMTH_RE = re.compile("|".join(re.escape(w) for w in WARMTH_WORDS), re.IGNORECASE)
 _CONFLICT_RE = re.compile("|".join(re.escape(w) for w in CONFLICT_WORDS), re.IGNORECASE)
@@ -122,16 +123,37 @@ def long_pauses(rows: list[dict], threshold_hours: int = 24) -> tuple[int, list[
 
 # ── 5. Тепло / конфликт ──────────────────────────────────────────────────────
 
-def warmth_conflict(rows: list[dict]) -> tuple[int, float, int, float]:
-    """(тёплых сообщений, % тёплых, конфликтных сообщений, % конфликтных) —
-    % от общего объёма сообщений (обе стороны вместе)."""
+def warmth_conflict(
+    rows: list[dict],
+) -> tuple[int, float, int, float, list[tuple[str, str]], list[tuple[str, str]]]:
+    """(тёплых сообщений, % тёплых, конфликтных сообщений, % конфликтных,
+    примеры тёплых, примеры конфликтных) — % от общего объёма сообщений (обе
+    стороны вместе). Примеры — до 2 самых СВЕЖИХ совпадений на категорию,
+    (direction, текст сообщения); отфильтрованы через ту же _looks_junky, что
+    и цитаты в features.initiative_axis (не пропускает голые ссылки/эмодзи/
+    однобуквенный мусор), чтобы не процитировать что-то нечитаемое."""
     msgs = [r for r in rows if r.get("text")]
     total = len(msgs)
     if total == 0:
-        return 0, 0.0, 0, 0.0
+        return 0, 0.0, 0, 0.0, [], []
     warm = sum(1 for r in msgs if _WARMTH_RE.search(r["text"].lower()))
     conflict = sum(1 for r in msgs if _CONFLICT_RE.search(r["text"].lower()))
-    return warm, warm / total, conflict, conflict / total
+
+    warm_examples: list[tuple[str, str]] = []
+    conflict_examples: list[tuple[str, str]] = []
+    for r in reversed(_sorted_texted(rows)):  # с конца — свежие сообщения первыми
+        if len(warm_examples) >= 2 and len(conflict_examples) >= 2:
+            break
+        text = r["text"]
+        if _looks_junky(text):
+            continue
+        low = text.lower()
+        if len(warm_examples) < 2 and _WARMTH_RE.search(low):
+            warm_examples.append((r["direction"], text.strip()))
+        if len(conflict_examples) < 2 and _CONFLICT_RE.search(low):
+            conflict_examples.append((r["direction"], text.strip()))
+
+    return warm, warm / total, conflict, conflict / total, warm_examples, conflict_examples
 
 
 # ── 6. Циркадное совпадение ──────────────────────────────────────────────────
@@ -316,7 +338,7 @@ def compute_all(rows: list[dict]) -> dict[str, dict]:
         ),
     }
 
-    warm_n, warm_pct, conf_n, conf_pct = warmth_conflict(rows)
+    warm_n, warm_pct, conf_n, conf_pct, warm_examples, conflict_examples = warmth_conflict(rows)
     out["warmth_conflict"] = {
         "label": "Тепло / конфликт",
         "short": f"💚{warm_n} / 🚩{conf_n}",
@@ -328,6 +350,11 @@ def compute_all(rows: list[dict]) -> dict[str, dict]:
             f"Тёплая лексика — в {warm_n} сообщениях ({warm_pct:.0%} от объёма), "
             f"конфликтная — в {conf_n} ({conf_pct:.0%})."
         ),
+        # Реальные цитаты — main.py дописывает их отдельной строкой поверх
+        # fact/interpretation (см. _warmth_examples_suffix), в LLM-промпт
+        # интерпретации НЕ идут (там участвует только fact).
+        "warm_examples": warm_examples,
+        "conflict_examples": conflict_examples,
     }
 
     my_peak, ct_peak, overlap_label = circadian_overlap(rows)

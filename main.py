@@ -1894,6 +1894,36 @@ _METRIC_EMOJI = {
     "circadian": "🕒",
 }
 
+def _direction_label(direction: str) -> str:
+    return "ты" if direction == "out" else "собеседник"
+
+
+def _warmth_examples_suffix(m: dict) -> str:
+    """Доп. строка с реальными цитатами ТОЛЬКО для секции «Тепло / конфликт»
+    (warm_examples/conflict_examples — см. compatibility_metrics.warmth_conflict) —
+    остальные метрики этих полей не имеют, суффикс для них пустой. Цитаты
+    обрезаются до 80 символов, тот же паттерн, что у initiative_axis в
+    features.py. Добавляется ПОСЛЕ interpretation/fact, а не встраивается в
+    промпт интерпретации — LLM переписывает только смысл факта и не видит
+    сырые цитаты, значит не может их исказить/потерять."""
+    warm = m.get("warm_examples") or []
+    conflict = m.get("conflict_examples") or []
+    if not warm and not conflict:
+        return ""
+
+    def _quote(text: str) -> str:
+        return text if len(text) <= 80 else text[:77].rstrip() + "…"
+
+    parts = [
+        f"тепло: «{_quote(text)}» ({_direction_label(direction)})"
+        for direction, text in warm
+    ] + [
+        f"конфликт: «{_quote(text)}» ({_direction_label(direction)})"
+        for direction, text in conflict
+    ]
+    return " Например, " + "; ".join(parts) + "."
+
+
 _MAX_TREND_ROWS = 12  # длинная история (месяцы) может дать 30+ периодов — не годится для одной таблицы в сообщении
 
 
@@ -1922,11 +1952,17 @@ def _build_rich_analysis_html(name: str, metrics: dict, dynamics_text: str, synt
             f"{esc(meta.get('date_to', ''))}</i></p>\n"
         )
 
-    metric_blocks = "\n".join(
-        f"<h3>{_METRIC_EMOJI.get(key, '')} {esc(m['label'])}</h3>\n"
-        f"<blockquote>{esc(m.get('interpretation') or m['fact'])}</blockquote>"
-        for key, m in metrics.items() if not key.startswith("_")
-    )
+    metric_block_parts = []
+    for key, m in metrics.items():
+        if key.startswith("_"):
+            continue
+        text = m.get("interpretation") or m["fact"]
+        if key == "warmth_conflict":
+            text += _warmth_examples_suffix(m)
+        metric_block_parts.append(
+            f"<h3>{_METRIC_EMOJI.get(key, '')} {esc(m['label'])}</h3>\n<blockquote>{esc(text)}</blockquote>"
+        )
+    metric_blocks = "\n".join(metric_block_parts)
 
     trend_rows = _trend_table_rows(vt)
     if trend_rows:
@@ -1975,10 +2011,17 @@ def _format_deep_analysis_text(name: str, metrics: dict, dynamics_text: str, syn
         header += f"<i>{meta['total']} сообщений, {html.escape(meta.get('date_from', ''))} — {html.escape(meta.get('date_to', ''))}</i>\n"
     header += "\n"
 
-    metric_parts = "\n\n".join(
-        f"<b>{_METRIC_EMOJI.get(key, '')} {html.escape(m['label'])}</b>\n{html.escape(m.get('interpretation') or m['fact'])}"
-        for key, m in metrics.items() if not key.startswith("_")
-    )
+    metric_part_list = []
+    for key, m in metrics.items():
+        if key.startswith("_"):
+            continue
+        text = m.get("interpretation") or m["fact"]
+        if key == "warmth_conflict":
+            text += _warmth_examples_suffix(m)
+        metric_part_list.append(
+            f"<b>{_METRIC_EMOJI.get(key, '')} {html.escape(m['label'])}</b>\n{html.escape(text)}"
+        )
+    metric_parts = "\n\n".join(metric_part_list)
 
     trend_rows = _trend_table_rows(vt)
     if trend_rows:
