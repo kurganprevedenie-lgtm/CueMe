@@ -10,10 +10,15 @@
 
     # человекочитаемый текст:
     python -m tools.export --contact 3 --out chat.txt
+
+    # визуальный HTML (пузыри слева/справа, как в мессенджере):
+    python -m tools.export --contact 3 --out chat.html
 """
 import argparse
+import html
 import json
 import sys
+from datetime import datetime
 from pathlib import Path
 
 import storage
@@ -54,6 +59,154 @@ def to_text(export: dict) -> str:
     )
 
 
+_RU_MONTHS_GEN = {
+    1: "января", 2: "февраля", 3: "марта", 4: "апреля", 5: "мая", 6: "июня",
+    7: "июля", 8: "августа", 9: "сентября", 10: "октября", 11: "ноября", 12: "декабря",
+}
+
+
+def _fmt_day(dt: datetime) -> str:
+    label = f"{dt.day} {_RU_MONTHS_GEN[dt.month]}"
+    if dt.year != datetime.now().year:
+        label += f" {dt.year}"
+    return label
+
+
+def to_html(export: dict) -> str:
+    """Визуальный HTML-экспорт — самостоятельный файл (инлайновый <style>, без
+    внешних зависимостей), открывается локально в браузере без интернета.
+    Сообщения автора (from_id == my_id) — пузырём справа, собеседника — слева,
+    с разделителем даты между днями, в духе типичного чат-интерфейса.
+
+    Медиа-плейсхолдер (фото/голосовое без текста) — ЧИСТО подстраховка на
+    случай пустого text: storage.get_all_dated_messages уже фильтрует такие
+    сообщения на уровне SQL (WHERE text IS NOT NULL AND text != ''), поэтому
+    extract_conversation физически не отдаёт медиа-only сообщения — to_text()
+    по той же причине их никак не обрабатывает, этот код в реальности не
+    срабатывает, пока структура данных (messages: from_id/from/text/date) не
+    начнёт нести отдельный признак типа сообщения."""
+    name = export.get("contact_name") or "собеседник"
+    my_id = export.get("my_id")
+
+    rows_html: list[str] = []
+    last_day: str | None = None
+    for m in export["messages"]:
+        try:
+            dt = datetime.fromisoformat(m["date"])
+        except (ValueError, TypeError):
+            dt = None
+
+        day_key = (m.get("date") or "")[:10]
+        if dt is not None and day_key != last_day:
+            rows_html.append(f'<div class="day-sep"><span>{html.escape(_fmt_day(dt))}</span></div>')
+            last_day = day_key
+
+        text = (m.get("text") or "").strip()
+        if text:
+            body = html.escape(text).replace("\n", "<br>")
+        else:
+            body = "📷 Без текста"  # медиа-плейсхолдер, см. докстринг выше
+
+        time_label = dt.strftime("%H:%M") if dt is not None else ""
+        side = "out" if m.get("from_id") == my_id else "in"
+        rows_html.append(
+            f'<div class="row {side}"><div class="bubble">'
+            f'<div class="bubble-text">{body}</div>'
+            f'<div class="bubble-time">{time_label}</div>'
+            f'</div></div>'
+        )
+
+    return f"""<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Переписка с {html.escape(name)}</title>
+<style>
+  :root {{
+    --bg: #e9edf1;
+    --header-bg: #ffffff;
+    --out-bg: #d9fdd3;
+    --in-bg: #ffffff;
+    --text: #111b21;
+    --meta: #667781;
+    --sep-bg: #d9dee3;
+  }}
+  * {{ box-sizing: border-box; }}
+  body {{
+    margin: 0;
+    background: var(--bg);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    color: var(--text);
+  }}
+  .header {{
+    position: sticky;
+    top: 0;
+    z-index: 1;
+    background: var(--header-bg);
+    padding: 14px 16px;
+    font-size: 17px;
+    font-weight: 600;
+    border-bottom: 1px solid #d1d7db;
+  }}
+  .chat {{
+    max-width: 760px;
+    margin: 0 auto;
+    padding: 12px 10px 24px;
+  }}
+  .day-sep {{
+    display: flex;
+    justify-content: center;
+    margin: 14px 0;
+  }}
+  .day-sep span {{
+    background: var(--sep-bg);
+    color: var(--meta);
+    font-size: 12.5px;
+    padding: 4px 12px;
+    border-radius: 8px;
+  }}
+  .row {{
+    display: flex;
+    margin: 3px 0;
+  }}
+  .row.out {{ justify-content: flex-end; }}
+  .row.in  {{ justify-content: flex-start; }}
+  .bubble {{
+    max-width: 75%;
+    padding: 6px 9px 5px;
+    border-radius: 9px;
+    box-shadow: 0 1px 0.5px rgba(0, 0, 0, .08);
+  }}
+  .row.out .bubble {{ background: var(--out-bg); border-top-right-radius: 2px; }}
+  .row.in  .bubble {{ background: var(--in-bg);  border-top-left-radius: 2px; }}
+  .bubble-text {{
+    font-size: 14.5px;
+    line-height: 1.35;
+    white-space: pre-wrap;
+    word-wrap: break-word;
+  }}
+  .bubble-time {{
+    font-size: 11px;
+    color: var(--meta);
+    text-align: right;
+    margin-top: 2px;
+  }}
+  @media (max-width: 480px) {{
+    .bubble {{ max-width: 85%; }}
+  }}
+</style>
+</head>
+<body>
+<div class="header">Переписка с {html.escape(name)}</div>
+<div class="chat">
+{"".join(rows_html)}
+</div>
+</body>
+</html>
+"""
+
+
 def list_contacts() -> list[dict]:
     """Все контакты с числом сохранённых сообщений — чтобы узнать contact_id."""
     with storage._conn() as conn:
@@ -70,7 +223,7 @@ def list_contacts() -> list[dict]:
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="Извлечь переписку контакта из bot.db")
     ap.add_argument("--contact", type=int, help="contact_id из таблицы contacts")
-    ap.add_argument("--out", help="файл (.json — формат экспорта; .txt — читаемый)")
+    ap.add_argument("--out", help="файл (.json — формат экспорта; .txt — читаемый; .html — визуальный)")
     ap.add_argument("--list", action="store_true", help="показать контакты с id и числом сообщений")
     ap.add_argument("--db", default=None, help="путь к БД (по умолчанию bot.db)")
     args = ap.parse_args(argv)
@@ -101,13 +254,17 @@ def main(argv=None) -> int:
         print(f"У контакта id={args.contact} нет сохранённых сообщений.")
         return 1
 
-    content = to_text(export) if args.out.endswith(".txt") else json.dumps(
-        export, ensure_ascii=False, indent=2)
+    if args.out.endswith(".txt"):
+        content = to_text(export)
+    elif args.out.endswith(".html"):
+        content = to_html(export)
+    else:
+        content = json.dumps(export, ensure_ascii=False, indent=2)
     Path(args.out).write_text(content, encoding="utf-8")
 
     print(f"Извлечено сообщений: {n} (контакт «{export['contact_name']}», my_id={export['my_id']})")
     print(f"Файл: {args.out}")
-    if not args.out.endswith(".txt"):
+    if args.out.endswith(".json"):
         print(f"Прогнать eval:  PYTHONPATH=. python eval/run_eval.py "
               f"--export {args.out} --my-id {export['my_id']}")
     return 0

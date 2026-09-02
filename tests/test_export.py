@@ -4,7 +4,7 @@ import pytest
 
 import storage
 from tg_parser import parse_chat
-from tools.export import extract_conversation, to_text
+from tools.export import extract_conversation, to_html, to_text
 
 
 @pytest.fixture
@@ -54,6 +54,27 @@ def test_to_text_format(db):
     cid, *_ = _seed()
     txt = to_text(extract_conversation(cid))
     assert "Я: привет" in txt and "Аня: хай!" in txt
+
+
+def test_to_html_bubbles_and_escaping(db):
+    cid, owner, my, cfid, name = _seed()
+    out = to_html(extract_conversation(cid))
+    assert f"Переписка с {name}" in out
+    # "привет"/"как ты" — мои (out), "хай!" — собеседника (in)
+    assert '<div class="row out">' in out and '<div class="row in">' in out
+    assert "привет" in out and "хай!" in out
+    assert "12 июля" not in out and "1 июля" in out  # разделитель дня
+
+
+def test_to_html_escapes_user_text(db):
+    storage.upsert_user("u2", "me2")
+    cid = storage.get_or_create_contact("u2", "user2", "Тест")
+    storage.save_imported_messages(cid, [
+        {"direction": "in", "text": "<script>alert(1)</script>", "date": "2026-07-01T10:00:00+00:00"},
+    ])
+    out = to_html(extract_conversation(cid))
+    assert "<script>alert(1)</script>" not in out
+    assert "&lt;script&gt;" in out
 
 
 def test_list_contacts_with_counts(db):

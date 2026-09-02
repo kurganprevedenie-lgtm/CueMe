@@ -90,7 +90,7 @@ from llm import (
 )
 from compatibility_metrics import compute_all as compute_compat_metrics
 from tg_parser import parse_chat
-from tools.export import extract_conversation, to_text
+from tools.export import extract_conversation, to_html, to_text
 from storage import (
     count_biz_messages_for_contact,
     count_imported_messages,
@@ -3574,6 +3574,7 @@ async def cb_export_user(call: CallbackQuery, bot: Bot) -> None:
             safe_name = re.sub(r"[^\w\-]+", "_", export["contact_name"] or f"contact{c['id']}")
             zf.writestr(f"{safe_name}.json", json.dumps(export, ensure_ascii=False, indent=2))
             zf.writestr(f"{safe_name}.txt", to_text(export))
+            zf.writestr(f"{safe_name}.html", to_html(export))
             added += 1
 
     if added == 0:
