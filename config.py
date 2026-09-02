@@ -147,6 +147,16 @@ REFERRAL_REWARD_DAYS = int(os.getenv("REFERRAL_REWARD_DAYS", "3"))
 PROMO_CHANNEL_USERNAME = os.getenv("PROMO_CHANNEL_USERNAME", "@CueMee")
 PROMO_CHANNEL_REWARD_DAYS = int(os.getenv("PROMO_CHANNEL_REWARD_DAYS", "3"))
 
+# Второй способ оплаты — Telegram Stars (XTR), параллельно Tribute, НЕ через
+# членство в приватном канале-пропуске: своё независимое окно Premium
+# (users.stars_premium_until). День/неделя — разовая покупка, месяц — нативная
+# Stars-подписка с автопродлением (см. STARS_SUBSCRIPTION_PERIOD).
+STAR_PRICE_DAY = int(os.getenv("STAR_PRICE_DAY", "15"))
+STAR_PRICE_WEEK = int(os.getenv("STAR_PRICE_WEEK", "60"))
+STAR_PRICE_MONTH = int(os.getenv("STAR_PRICE_MONTH", "175"))
+# Telegram Stars поддерживает РОВНО одно значение периода подписки — 30 дней.
+STARS_SUBSCRIPTION_PERIOD = 2592000
+
 # Стили ответа для фичи «Ответить по скриншоту».
 # [0] — подпись на кнопке, [1] — инструкция стиля для промпта генерации.
 REPLY_STYLES = {

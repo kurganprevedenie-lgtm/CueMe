@@ -27,6 +27,7 @@ from aiogram.types import (
     BusinessConnection,
     CallbackQuery, Document, ErrorEvent, FSInputFile, InputRichMessage, Message,
     InlineKeyboardButton, InlineKeyboardMarkup,
+    LabeledPrice, PreCheckoutQuery,
     ReplyKeyboardMarkup, KeyboardButton,
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
@@ -57,6 +58,10 @@ from config import (
     REFRESH_SAMPLES_EVERY_N,
     REVIVE_QUESTIONS,
     SAMPLE_SIZE,
+    STAR_PRICE_DAY,
+    STAR_PRICE_WEEK,
+    STAR_PRICE_MONTH,
+    STARS_SUBSCRIPTION_PERIOD,
     TEST_ACCOUNT_USERNAMES,
 )
 from features import detect_reply_situation, extract_features, stage_hint, totals_from_summary, winning_messages
@@ -123,6 +128,7 @@ from storage import (
     get_or_create_referral_code,
     get_pending_referral,
     get_referrer_by_code,
+    get_stars_premium_until,
     get_trial_used,
     get_user,
     increment_trial_used,
@@ -151,10 +157,12 @@ from storage import (
     save_running_notes,
     save_style_card,
     record_event,
+    record_star_payment,
     set_acquisition_source,
     set_deep_analysis_free_until,
     set_gender,
     set_promo_channel_reward,
+    set_stars_premium_until,
     has_claimed_promo_reward,
     set_llm_cache,
     update_contact_username,
@@ -350,11 +358,15 @@ async def _is_premium(bot: Bot, telegram_id: str) -> bool:
     """Проверяет членство в PREMIUM_CHANNEL_ID с кэшем на PREMIUM_CACHE_TTL сек,
     чтобы не дёргать Telegram API на каждое сообщение. Пока PREMIUM_CHANNEL_ID
     не настроен — всегда False (только бесплатные попытки). Реферальная
-    награда (_has_referral_premium) и награда за подписку на промо-канал
-    (_has_promo_channel_premium) дают полный Premium в обход канала."""
+    награда (_has_referral_premium), награда за подписку на промо-канал
+    (_has_promo_channel_premium) и оплата Telegram Stars (_has_stars_premium)
+    дают полный Premium в обход канала — Stars НЕ добавляет в приватный канал,
+    это независимое окно доступа, см. users.stars_premium_until."""
     if _has_referral_premium(telegram_id):
         return True
     if _has_promo_channel_premium(telegram_id):
+        return True
+    if _has_stars_premium(telegram_id):
         return True
     if not PREMIUM_CHANNEL_ID:
         return False
@@ -377,18 +389,34 @@ def paywall_kb() -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     if PREMIUM_SUBSCRIBE_URL:
         b.button(text="💎 Оформить подписку", url=PREMIUM_SUBSCRIBE_URL)
+    b.button(text="⭐ Оплатить Stars", callback_data="stars_menu")
     b.adjust(1)
     return b.as_markup()
 
 
 def premium_menu_kb() -> InlineKeyboardMarkup:
-    """Клавиатура под карточкой «👑 Подписка»: оформить + два бесплатных пути
-    (реферальная награда и подписка на промо-канал)."""
+    """Клавиатура под карточкой «👑 Подписка»: оформить (Tribute) + оплата
+    Stars прямо в Telegram + два бесплатных пути (реферальная награда и
+    подписка на промо-канал)."""
     b = InlineKeyboardBuilder()
     if PREMIUM_SUBSCRIBE_URL:
         b.button(text="💎 Оформить подписку", url=PREMIUM_SUBSCRIBE_URL)
+    b.button(text="⭐ Оплатить Stars", callback_data="stars_menu")
     b.button(text="🎁 Пригласи друга", callback_data="show_invite")
     b.button(text="📢 Подписаться на канал", callback_data="promo:offer")
+    b.adjust(1)
+    return b.as_markup()
+
+
+def stars_tariff_kb() -> InlineKeyboardMarkup:
+    """Тарифы Stars: день/неделя — разовая покупка, месяц — нативная
+    Stars-подписка с автопродлением (помечена отдельно, т.к. отменяется
+    иначе — через настройки Telegram, не через бота)."""
+    b = InlineKeyboardBuilder()
+    b.button(text=f"⭐ День — {STAR_PRICE_DAY} Stars", callback_data="stars_buy:day")
+    b.button(text=f"⭐ Неделя — {STAR_PRICE_WEEK} Stars", callback_data="stars_buy:week")
+    b.button(text=f"⭐ Месяц (автопродление) — {STAR_PRICE_MONTH} Stars", callback_data="stars_buy:month")
+    b.button(text="‹ Назад", callback_data="stars_back")
     b.adjust(1)
     return b.as_markup()
 
@@ -482,6 +510,13 @@ def _has_promo_channel_premium(telegram_id: str) -> bool:
     return bool(until and until > datetime.now(timezone.utc))
 
 
+def _has_stars_premium(telegram_id: str) -> bool:
+    """Активно ли окно Premium, купленное за Telegram Stars — независимо от
+    членства в приватном канале Tribute (см. _run_stars_successful_payment)."""
+    until = get_stars_premium_until(telegram_id)
+    return bool(until and until > datetime.now(timezone.utc))
+
+
 # ── Награда за подписку на промо-канал (ТРЕТИЙ бесплатный путь к Premium) ────
 # PROMO_CHANNEL_USERNAME — ПУБЛИЧНЫЙ промо-канал (t.me/CueMee), НЕ путать с
 # PREMIUM_CHANNEL_ID (приватный канал-пропуск Tribute, платный, отдельная
@@ -529,6 +564,151 @@ async def cb_promo_check(call: CallbackQuery, bot: Bot) -> None:
     set_promo_channel_reward(telegram_id, until)
     await call.answer()
     await call.message.answer(f"🎉 Готово! {PROMO_CHANNEL_REWARD_DAYS} дня Premium активны.")
+
+
+# ── Stars-подписка (Telegram Stars, XTR) ──────────────────────────────────────
+# Второй, независимый способ оплаты рядом с Tribute — НЕ канал-пропуск: Stars
+# просто открывает окно users.stars_premium_until (см. _has_stars_premium),
+# без членства в PREMIUM_CHANNEL_ID. День/неделя — разовая покупка (Telegram
+# не поддерживает Stars-подписки короче 30 дней), продлевать нужно вручную —
+# бот предложит это через _premium_status_text/paywall, когда окно истекло.
+# Месяц — нативная Stars-подписка (subscription_period=STARS_SUBSCRIPTION_PERIOD,
+# ровно 30 дней — единственное значение, которое принимает Telegram) с
+# автопродлением; списывается Telegram-ом самостоятельно, отменяется
+# пользователем через настройки Telegram, не через бота.
+
+_STARS_TIERS = {
+    "day":   {"stars": STAR_PRICE_DAY,   "days": 1,  "title": "CueMe Premium — 1 день"},
+    "week":  {"stars": STAR_PRICE_WEEK,  "days": 7,  "title": "CueMe Premium — 1 неделя"},
+    "month": {"stars": STAR_PRICE_MONTH, "days": 30, "title": "CueMe Premium — 1 месяц (автопродление)"},
+}
+
+
+@dp.callback_query(F.data == "stars_menu")
+async def cb_stars_menu(call: CallbackQuery) -> None:
+    await call.answer()
+    await call.message.answer(
+        "⭐ Оплата Telegram Stars — прямо в Telegram, без сторонних сайтов. "
+        "Выбери тариф:",
+        reply_markup=stars_tariff_kb(),
+    )
+
+
+@dp.callback_query(F.data == "stars_back")
+async def cb_stars_back(call: CallbackQuery, bot: Bot) -> None:
+    await call.answer()
+    await _show_premium_screen(call.message, bot, str(call.from_user.id))
+
+
+@dp.callback_query(F.data.startswith("stars_buy:"))
+async def cb_stars_buy(call: CallbackQuery, bot: Bot) -> None:
+    tier = call.data.split(":", 1)[1]
+    tier_info = _STARS_TIERS.get(tier)
+    await call.answer()
+    if not tier_info:
+        return
+
+    telegram_id = str(call.from_user.id)
+    stars = tier_info["stars"]
+    title = tier_info["title"]
+    description = (
+        "Доступ ко всем функциям CueMe (переписать, анализ собеседника, "
+        "анализ стиля и т.д.) на выбранный срок."
+    )
+    # payload — служебный, не показывается юзеру: tier нужен в successful_payment,
+    # чтобы понять, сколько дней/автопродление начислить; telegram_id и рандомный
+    # хвост — на случай отладки по логам, при обработке доверяем call.from_user, не payload.
+    payload = f"stars:{tier}:{telegram_id}:{uuid.uuid4().hex[:8]}"
+    prices = [LabeledPrice(label=title, amount=stars)]
+
+    if tier == "month":
+        # sendInvoice в этой версии Bot API/aiogram НЕ принимает subscription_period —
+        # нативная Stars-подписка создаётся только через createInvoiceLink, поэтому
+        # для месяца шлём ссылку с Pay-кнопкой, а не инвойс напрямую в чат.
+        try:
+            link = await bot.create_invoice_link(
+                title=title, description=description, payload=payload,
+                currency="XTR", prices=prices, provider_token="",
+                subscription_period=STARS_SUBSCRIPTION_PERIOD,
+            )
+        except Exception:
+            logging.exception("stars: не удалось создать invoice link (месяц) для %s", telegram_id)
+            await call.message.answer("Не получилось создать ссылку на оплату — попробуй ещё раз позже.")
+            return
+        b = InlineKeyboardBuilder()
+        b.button(text=f"⭐ Оформить за {stars} Stars", url=link)
+        await call.message.answer(
+            f"{title}\n\nАвтопродление каждые 30 дней, отменить можно в любой "
+            "момент в настройках Telegram → Мои подписки.",
+            reply_markup=b.as_markup(),
+        )
+        return
+
+    try:
+        await bot.send_invoice(
+            chat_id=call.message.chat.id, title=title, description=description,
+            payload=payload, currency="XTR", prices=prices, provider_token="",
+        )
+    except Exception:
+        logging.exception("stars: не удалось отправить инвойс (%s) для %s", tier, telegram_id)
+        await call.message.answer("Не получилось выставить счёт — попробуй ещё раз позже.")
+
+
+@dp.pre_checkout_query()
+async def process_stars_pre_checkout(pre_checkout_query: PreCheckoutQuery, bot: Bot) -> None:
+    """ok=True после базовой валидации payload — своих провайдер-проверок для
+    Stars не требуется (provider_token=''), но формат должен быть наш и
+    сумма — ровно тарифная, иначе отклоняем, чтобы не провести левый платёж."""
+    parts = pre_checkout_query.invoice_payload.split(":")
+    ok = (
+        len(parts) == 4
+        and parts[0] == "stars"
+        and parts[1] in _STARS_TIERS
+        and pre_checkout_query.currency == "XTR"
+        and pre_checkout_query.total_amount == _STARS_TIERS[parts[1]]["stars"]
+    )
+    await bot.answer_pre_checkout_query(
+        pre_checkout_query.id, ok=ok,
+        error_message=None if ok else "Счёт устарел или повреждён — попробуй оплатить заново.",
+    )
+
+
+@dp.message(F.successful_payment)
+async def process_stars_successful_payment(message: Message, bot: Bot) -> None:
+    sp = message.successful_payment
+    if sp.currency != "XTR":
+        return  # не наш платёж — Tribute вообще не идёт через Bot Payments API
+
+    parts = sp.invoice_payload.split(":")
+    if len(parts) != 4 or parts[0] != "stars" or parts[1] not in _STARS_TIERS:
+        logging.warning("stars: successful_payment с неожиданным payload %r", sp.invoice_payload)
+        return
+
+    tier = parts[1]
+    telegram_id = str(message.from_user.id)  # доверяем from_user, не payload
+    is_subscription = sp.subscription_expiration_date is not None
+
+    if is_subscription:
+        expires_at = datetime.fromtimestamp(sp.subscription_expiration_date, tz=timezone.utc)
+    else:
+        expires_at = datetime.now(timezone.utc) + timedelta(days=_STARS_TIERS[tier]["days"])
+
+    # Telegram может задублировать доставку successful_payment — record_star_payment
+    # идемпотентен по charge_id (UNIQUE), применяем окно Premium только на первой записи.
+    is_new = record_star_payment(
+        telegram_id=telegram_id, tier=tier, stars_amount=sp.total_amount,
+        charge_id=sp.telegram_payment_charge_id, is_subscription=is_subscription,
+        expires_at=expires_at,
+    )
+    if not is_new:
+        return
+
+    set_stars_premium_until(telegram_id, expires_at)
+    record_event(telegram_id, "stars_payment", f"{tier}:{sp.total_amount}")
+
+    until_label = expires_at.strftime("%d.%m.%Y %H:%M UTC")
+    extra = " Продлится автоматически, спишется ещё раз через 30 дней." if is_subscription else ""
+    await message.answer(f"🎉 Готово! Premium активен до {until_label}.{extra}")
 
 
 def _invite_text(telegram_id: str) -> str:
@@ -4254,7 +4434,7 @@ async def _run_live_coach_step(
     if force_fresh:
         if not await _quota_gate(bot, target, str(telegram_id)):
 
-            
+             
             return
         try:
             variants = await suggest_reply_variants(
@@ -4976,6 +5156,7 @@ async def main() -> None:
             "business_message",
             "edited_business_message",
             "deleted_business_messages",
+            "pre_checkout_query",
         ],
     )
 

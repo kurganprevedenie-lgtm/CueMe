@@ -167,6 +167,17 @@ def init_db() -> None:
                 credited             INTEGER NOT NULL DEFAULT 0,  -- 0 = награда ещё не начислена
                 PRIMARY KEY (referred_telegram_id)
             );
+
+            CREATE TABLE IF NOT EXISTS star_payments (
+                id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                telegram_id      TEXT NOT NULL,
+                tier             TEXT NOT NULL,   -- 'day' | 'week' | 'month'
+                stars_amount     INTEGER NOT NULL,
+                charge_id        TEXT NOT NULL UNIQUE,  -- telegram_payment_charge_id: идемпотентность + возвраты
+                is_subscription  INTEGER NOT NULL DEFAULT 0,
+                expires_at       TEXT NOT NULL,   -- окно Premium ПОСЛЕ этого платежа (UTC ISO)
+                created_at       TEXT NOT NULL
+            );
         """)
         _add_column_if_missing(conn, "users", "auto_mode", "INTEGER DEFAULT 0")
         _add_column_if_missing(conn, "users", "auto_contact_id", "INTEGER")
@@ -273,6 +284,10 @@ def init_db() -> None:
         if "message_text" not in dsa_cols:
             conn.execute("DELETE FROM deep_style_analysis")
         _add_column_if_missing(conn, "deep_style_analysis", "message_text", "TEXT NOT NULL DEFAULT ''")
+        # Stars-подписка: независимое окно Premium, без привязки к членству в
+        # приватном канале Tribute (это отдельный, параллельный способ оплаты,
+        # тот же паттерн *_until, что у реферальной и промо-наград выше).
+        _add_column_if_missing(conn, "users", "stars_premium_until", "TEXT")
 
         # Индексы под горячие выборки (пересборка карточек, чтение истории)
         _create_index_if_missing(
@@ -1083,6 +1098,63 @@ def get_promo_channel_premium_until(telegram_id: str) -> datetime | None:
         return datetime.fromisoformat(row["promo_channel_premium_until"])
     except ValueError:
         return None
+
+
+# ── Stars-подписка (Telegram Stars, независимо от канала-пропуска Tribute) ────
+
+def set_stars_premium_until(telegram_id: str, until: datetime) -> None:
+    """Ставит окно Stars-Premium до until (UTC datetime). Создаёт строку users,
+    если её ещё нет."""
+    with _conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO users (telegram_id, my_id, created_at, stars_premium_until)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(telegram_id) DO UPDATE SET
+                stars_premium_until = excluded.stars_premium_until
+            """,
+            (telegram_id, f"user{telegram_id}", _now(), until.isoformat()),
+        )
+
+
+def get_stars_premium_until(telegram_id: str) -> datetime | None:
+    """Момент окончания текущего окна Stars-Premium (tz-aware UTC) или None."""
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT stars_premium_until FROM users WHERE telegram_id = ?",
+            (telegram_id,),
+        ).fetchone()
+    if not row or not row["stars_premium_until"]:
+        return None
+    try:
+        return datetime.fromisoformat(row["stars_premium_until"])
+    except ValueError:
+        return None
+
+
+def record_star_payment(
+    telegram_id: str, tier: str, stars_amount: int, charge_id: str,
+    is_subscription: bool, expires_at: datetime,
+) -> bool:
+    """Логирует платёж Stars (нужен для будущих возвратов через
+    bot.refund_star_payment по charge_id и для истории). charge_id UNIQUE —
+    Telegram может задублировать доставку successful_payment, поэтому это
+    ещё и идемпотентность: возвращает False (ничего не сделал), если такой
+    charge_id уже записан, иначе True — вызывающий код применяет
+    set_stars_premium_until только при True."""
+    with _conn() as conn:
+        try:
+            conn.execute(
+                """
+                INSERT INTO star_payments
+                    (telegram_id, tier, stars_amount, charge_id, is_subscription, expires_at, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (telegram_id, tier, stars_amount, charge_id, int(is_subscription), expires_at.isoformat(), _now()),
+            )
+        except sqlite3.IntegrityError:
+            return False
+    return True
 
 
 def count_successful_referrals(telegram_id: str) -> int:
