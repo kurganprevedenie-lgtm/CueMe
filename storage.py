@@ -178,7 +178,40 @@ def init_db() -> None:
                 expires_at       TEXT NOT NULL,   -- окно Premium ПОСЛЕ этого платежа (UTC ISO)
                 created_at       TEXT NOT NULL
             );
+
+            -- Каждый вариант ответа, который бот РЕАЛЬНО показал пользователю
+            -- (после генерации, до отправки — считаем и неиспользованные, нужно
+            -- для % использования). contact_id может быть NULL (скриншот без
+            -- ещё созданного контакта). matched — засчитана ли уже в одно из
+            -- исходящих сообщений (см. suggestion_matches), чтобы не отдать её
+            -- повторно как кандидата на сопоставление.
+            CREATE TABLE IF NOT EXISTS suggestions (
+                id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                telegram_id      TEXT NOT NULL,
+                contact_id       INTEGER,
+                suggestion_text  TEXT NOT NULL,
+                suggestion_type  TEXT NOT NULL,   -- 'reply' | 'screenshot' | 'live'
+                created_at       TEXT NOT NULL,
+                matched          INTEGER NOT NULL DEFAULT 0
+            );
+
+            -- Сопоставление реального исходящего business-сообщения с подсказкой,
+            -- которую бот показал ранее (см. main._match_outgoing_to_suggestion).
+            -- UNIQUE на business_message_id — одно исходящее засчитывается максимум
+            -- в одну подсказку (берём лучший ratio при генерации, см. вызывающий код).
+            CREATE TABLE IF NOT EXISTS suggestion_matches (
+                id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+                business_message_id  INTEGER NOT NULL UNIQUE,
+                suggestion_id        INTEGER NOT NULL,
+                ratio                REAL NOT NULL,
+                match_kind           TEXT NOT NULL,   -- 'exact' (ratio>=0.85) | 'edited' (0.5-0.85)
+                created_at           TEXT NOT NULL
+            );
         """)
+        _create_index_if_missing(
+            conn, "idx_suggestions_lookup", "suggestions",
+            "telegram_id, contact_id, matched, created_at",
+        )
         _add_column_if_missing(conn, "users", "auto_mode", "INTEGER DEFAULT 0")
         _add_column_if_missing(conn, "users", "auto_contact_id", "INTEGER")
         _add_column_if_missing(conn, "users", "trial_used", "INTEGER NOT NULL DEFAULT 0")
@@ -1625,9 +1658,11 @@ def save_business_message(
     date: str,
     tg_message_id: int | None,
     raw_meta: dict,
-) -> bool:
-    """Сохраняет business-сообщение. Возвращает True, если ряд вставлен, и False,
-    если это дубль (повторная доставка того же connection_id+chat_ref+tg_message_id)."""
+) -> int | None:
+    """Сохраняет business-сообщение. Возвращает id вставленного ряда, или None,
+    если это дубль (повторная доставка того же connection_id+chat_ref+tg_message_id) —
+    id нужен вызывающему коду, чтобы привязать к сообщению результат сопоставления
+    с подсказкой (см. suggestion_matches/mark_suggestion_matched)."""
     with _conn() as conn:
         cur = conn.execute(
             """
@@ -1647,7 +1682,116 @@ def save_business_message(
                 json.dumps(raw_meta, ensure_ascii=False),
             ),
         )
-        return cur.rowcount > 0
+        return cur.lastrowid if cur.rowcount > 0 else None
+
+
+# ── suggestions (использование подсказок бота в реальной переписке) ───────────
+
+def save_suggestions(
+    telegram_id: str, contact_id: int | None, suggestion_type: str, texts: list[str],
+) -> None:
+    """Сохраняет каждый вариант, который бот показал пользователю — ДО того,
+    использует он его или нет (нужно для % использования, см.
+    suggestion_stats_by_user)."""
+    if not texts:
+        return
+    now = _now()
+    with _conn() as conn:
+        conn.executemany(
+            """
+            INSERT INTO suggestions (telegram_id, contact_id, suggestion_text, suggestion_type, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            [(telegram_id, contact_id, t, suggestion_type, now) for t in texts],
+        )
+
+
+def get_recent_unmatched_suggestions(
+    telegram_id: str, contact_id: int | None, since: str,
+) -> list[sqlite3.Row]:
+    """Ещё не засчитанные подсказки этого юзера (+ контакта, если задан) не
+    старше `since` (UTC ISO) — кандидаты для сопоставления с новым исходящим
+    business-сообщением."""
+    with _conn() as conn:
+        if contact_id is None:
+            return conn.execute(
+                """
+                SELECT * FROM suggestions
+                WHERE telegram_id = ? AND contact_id IS NULL AND matched = 0 AND created_at >= ?
+                """,
+                (telegram_id, since),
+            ).fetchall()
+        return conn.execute(
+            """
+            SELECT * FROM suggestions
+            WHERE telegram_id = ? AND contact_id = ? AND matched = 0 AND created_at >= ?
+            """,
+            (telegram_id, contact_id, since),
+        ).fetchall()
+
+
+def mark_suggestion_matched(
+    suggestion_id: int, business_message_id: int, ratio: float, match_kind: str,
+) -> None:
+    """Помечает подсказку использованной (больше не попадёт в get_recent_
+    unmatched_suggestions — не даёт засчитаться дважды на разные исходящие)
+    и привязывает результат сопоставления к конкретному business-сообщению."""
+    with _conn() as conn:
+        conn.execute("UPDATE suggestions SET matched = 1 WHERE id = ?", (suggestion_id,))
+        conn.execute(
+            """
+            INSERT INTO suggestion_matches
+                (business_message_id, suggestion_id, ratio, match_kind, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(business_message_id) DO UPDATE SET
+                suggestion_id = excluded.suggestion_id,
+                ratio = excluded.ratio,
+                match_kind = excluded.match_kind,
+                created_at = excluded.created_at
+            """,
+            (business_message_id, suggestion_id, ratio, match_kind, _now()),
+        )
+
+
+def get_business_message_matches_for_contact(
+    owner_user_id: str, contact_id: int,
+) -> dict[tuple[str, str], dict]:
+    """{(date, text): {"ratio", "match_kind"}} для всех исходящих business-
+    сообщений этого контакта, засчитанных как использование подсказки —
+    экспорт (tools/export.py) сверяет по тому же (date, text), что уже
+    отдаёт get_all_dated_messages (тот же необработанный date/text из
+    business_messages, без переформатирования)."""
+    with _conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT bm.date, bm.text, sm.ratio, sm.match_kind
+            FROM suggestion_matches sm
+            JOIN business_messages bm ON bm.id = sm.business_message_id
+            JOIN business_chat_refs bcr
+                ON bm.chat_ref = bcr.chat_ref AND bm.owner_user_id = bcr.owner_user_id
+            WHERE bcr.contact_id = ? AND bm.owner_user_id = ?
+            """,
+            (contact_id, owner_user_id),
+        ).fetchall()
+    return {(r["date"], r["text"]): {"ratio": r["ratio"], "match_kind": r["match_kind"]} for r in rows}
+
+
+def suggestion_stats_by_user() -> list[sqlite3.Row]:
+    """На каждого telegram_id: всего подсказок показано, сколько использовано
+    как есть (ratio>=0.85) и с правками (0.5<=ratio<0.85) — для /suggestion_stats."""
+    with _conn() as conn:
+        return conn.execute(
+            """
+            SELECT s.telegram_id AS telegram_id,
+                   COUNT(*) AS total,
+                   SUM(CASE WHEN sm.ratio >= 0.85 THEN 1 ELSE 0 END) AS exact_n,
+                   SUM(CASE WHEN sm.ratio >= 0.5 AND sm.ratio < 0.85 THEN 1 ELSE 0 END) AS edited_n
+            FROM suggestions s
+            LEFT JOIN suggestion_matches sm ON sm.suggestion_id = s.id
+            GROUP BY s.telegram_id
+            ORDER BY total DESC
+            """
+        ).fetchall()
 
 
 # ── auto mode ─────────────────────────────────────────────────────────────────

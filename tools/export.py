@@ -39,24 +39,50 @@ def extract_conversation(contact_id: int) -> dict:
 
     rows = storage.get_all_dated_messages(owner, contact_id)
     rows.sort(key=lambda r: r["date"])
-    messages = [
-        {
+    # (date, text) исходящего business-сообщения → результат сопоставления с
+    # подсказкой CueMe (main._match_outgoing_to_suggestion) — тот же
+    # необработанный date/text, что и в rows выше, так что ключ совпадает
+    # напрямую, без дополнительной нормализации.
+    matches = storage.get_business_message_matches_for_contact(owner, contact_id)
+    messages = []
+    for r in rows:
+        m = {
             "type": "message",
             "from_id": my_id if r["direction"] == "out" else contact_fid,
             "from": "Я" if r["direction"] == "out" else name,
             "text": r["text"],
             "date": r["date"],
         }
-        for r in rows
-    ]
+        if r["direction"] == "out":
+            match = matches.get((r["date"], r["text"]))
+            if match:
+                m["cueme_match"] = match
+        messages.append(m)
     return {"my_id": my_id, "contact_name": name, "messages": messages}
 
 
+def _cueme_badge(match: dict | None) -> str:
+    """«🤖 CueMe (92%)» — использовано как есть (ratio>=0.85, процент совпадения);
+    «🤖 CueMe (с правками)» — использовано с правками (0.5<=ratio<0.85)."""
+    if not match:
+        return ""
+    if match["match_kind"] == "exact":
+        return f"🤖 CueMe ({match['ratio']:.0%})"
+    return "🤖 CueMe (с правками)"
+
+
 def to_text(export: dict) -> str:
-    """Человекочитаемая выгрузка: «[дата] Кто: текст»."""
-    return "\n".join(
-        f"[{m['date']}] {m['from']}: {m['text']}" for m in export["messages"]
-    )
+    """Человекочитаемая выгрузка: «[дата] Кто: текст» — плюс короткая приписка
+    «🤖 CueMe (N%)» / «🤖 CueMe (с правками)» в конце строки, если исходящее
+    сообщение засчитано как использование подсказки (см. cueme_match)."""
+    lines = []
+    for m in export["messages"]:
+        line = f"[{m['date']}] {m['from']}: {m['text']}"
+        badge = _cueme_badge(m.get("cueme_match"))
+        if badge:
+            line += f"  {badge}"
+        lines.append(line)
+    return "\n".join(lines)
 
 
 _RU_MONTHS_GEN = {
@@ -109,9 +135,12 @@ def to_html(export: dict) -> str:
 
         time_label = dt.strftime("%H:%M") if dt is not None else ""
         side = "out" if m.get("from_id") == my_id else "in"
+        badge = _cueme_badge(m.get("cueme_match"))
+        badge_html = f'<div class="cueme-badge">{html.escape(badge)}</div>' if badge else ""
         rows_html.append(
             f'<div class="row {side}"><div class="bubble">'
             f'<div class="bubble-text">{body}</div>'
+            f"{badge_html}"
             f'<div class="bubble-time">{time_label}</div>'
             f'</div></div>'
         )
@@ -191,6 +220,15 @@ def to_html(export: dict) -> str:
     color: var(--meta);
     text-align: right;
     margin-top: 2px;
+  }}
+  .cueme-badge {{
+    display: inline-block;
+    font-size: 10.5px;
+    color: #2563eb;
+    background: #e8efff;
+    padding: 1px 7px;
+    border-radius: 6px;
+    margin-top: 4px;
   }}
   @media (max-width: 480px) {{
     .bubble {{ max-width: 85%; }}

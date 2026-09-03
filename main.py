@@ -1,5 +1,6 @@
 import asyncio
 import csv
+import difflib
 import hashlib
 import html
 import io
@@ -8,6 +9,7 @@ import json
 import logging
 import random
 import re
+import string
 import tempfile
 import time
 import uuid
@@ -110,6 +112,7 @@ from storage import (
     get_business_connection,
     get_business_connections_history,
     get_contact_last_messages,
+    get_recent_unmatched_suggestions,
     get_latest_business_connection,
     get_contact_by_id,
     get_deep_analysis,
@@ -145,6 +148,7 @@ from storage import (
     init_db,
     list_all_users,
     list_contacts,
+    mark_suggestion_matched,
     referral_counts_by_user,
     save_business_message,
     save_deep_analysis,
@@ -156,6 +160,8 @@ from storage import (
     save_referral_pending,
     save_running_notes,
     save_style_card,
+    save_suggestions,
+    suggestion_stats_by_user,
     record_event,
     record_star_payment,
     set_acquisition_source,
@@ -2566,6 +2572,54 @@ async def handle_business_connection(event: BusinessConnection, bot: Bot) -> Non
         await _maybe_prompt_source(bot, owner_id)
 
 
+# ── Использование подсказок CueMe в реальной переписке ────────────────────────
+# Порог совпадения (SequenceMatcher.ratio, 0-1) между текстом реального
+# исходящего сообщения и одной из подсказок, которые бот показывал за
+# последние 24ч этому контакту: >=0.85 — «как есть», 0.5-0.85 — «с правками»,
+# ниже — не считается использованием (случайное совпадение отдельных слов).
+_SUGGESTION_EXACT_RATIO = 0.85
+_SUGGESTION_EDITED_RATIO = 0.5
+_SUGGESTION_MATCH_WINDOW = timedelta(hours=24)
+_EDGE_PUNCT = string.punctuation + "«»—–…\"'"
+
+
+def _normalize_for_match(text: str) -> str:
+    """Нижний регистр, схлопнутые пробелы, пунктуация обрезана ТОЛЬКО по
+    краям (не внутри — иначе «без изменений» и правки было бы не отличить)."""
+    t = re.sub(r"\s+", " ", text.lower()).strip()
+    return t.strip(_EDGE_PUNCT).strip()
+
+
+def _match_outgoing_to_suggestion(
+    owner_id: str, contact_id: int | None, text: str | None, business_message_id: int,
+) -> None:
+    """Сравнивает реальное исходящее сообщение с недавними (<=24ч) ещё не
+    засчитанными подсказками этого контакта — если находит совпадение выше
+    порога, помечает ЛУЧШУЮ (по ratio) подсказку использованной. Чисто
+    CPU-сравнение (difflib), без сети/LLM — безопасно звать синхронно внутри
+    _persist_business_message (уже выполняется в asyncio.to_thread)."""
+    if not text or not contact_id:
+        return
+    since = (datetime.now(timezone.utc) - _SUGGESTION_MATCH_WINDOW).isoformat()
+    candidates = get_recent_unmatched_suggestions(owner_id, contact_id, since)
+    if not candidates:
+        return
+
+    norm_out = _normalize_for_match(text)
+    best_row, best_ratio = None, 0.0
+    for row in candidates:
+        ratio = difflib.SequenceMatcher(
+            None, norm_out, _normalize_for_match(row["suggestion_text"]),
+        ).ratio()
+        if ratio > best_ratio:
+            best_row, best_ratio = row, ratio
+
+    if best_row is None or best_ratio < _SUGGESTION_EDITED_RATIO:
+        return
+    match_kind = "exact" if best_ratio >= _SUGGESTION_EXACT_RATIO else "edited"
+    mark_suggestion_matched(best_row["id"], business_message_id, best_ratio, match_kind)
+
+
 def _persist_business_message(
     *, conn_id: str, owner_id: str, chat_ref: str, direction: str,
     text: str | None, is_voice: bool, date: str, tg_message_id: int,
@@ -2573,14 +2627,15 @@ def _persist_business_message(
     chat_username: str | None, sender_username: str | None,
 ) -> int | None:
     """Синхронная DB-часть обработки business-сообщения: сохранение + резолв контакта
-    + троттлинг refresh. Возвращает contact_id для пересборки (или None).
-    Выполняется в asyncio.to_thread, чтобы не блокировать event loop на живом потоке."""
-    inserted = save_business_message(
+    + троттлинг refresh + сопоставление с подсказками CueMe (для исходящих).
+    Возвращает contact_id для пересборки (или None). Выполняется в
+    asyncio.to_thread, чтобы не блокировать event loop на живом потоке."""
+    message_id = save_business_message(
         connection_id=conn_id, owner_user_id=owner_id, chat_ref=chat_ref,
         direction=direction, text=text, date=date, tg_message_id=tg_message_id,
         raw_meta=_msg_meta(text, is_voice),
     )
-    if not inserted:
+    if message_id is None:
         # Повторная доставка того же сообщения — не триггерим пересборку.
         logging.info(
             "business_message дубль пропущен: conn=%s chat_ref=%s msg_id=%s",
@@ -2614,6 +2669,9 @@ def _persist_business_message(
         upsert_chat_ref_mapping(owner_id, chat_ref, cid)
         if direction == "in" and sender_username:
             update_contact_username(cid, sender_username)
+
+    if direction == "out":
+        _match_outgoing_to_suggestion(owner_id, cid, text, message_id)
 
     # Освежаем message_samples (без LLM, дёшево), но не чаще раза в N сообщений
     if _should_refresh_samples(cid):
@@ -3526,6 +3584,51 @@ async def cmd_sources(message: Message, bot: Bot) -> None:
         await message.answer("\n".join(lines))
 
 
+# ── /suggestion_stats — использование подсказок CueMe (только для админа) ───
+# Считает по каждому юзеру: сколько вариантов ответа бот показал, сколько из
+# них реально ушло собеседнику — как есть (ratio>=0.85) и с правками
+# (0.5-0.85), см. main._match_outgoing_to_suggestion / storage.suggestion_stats_by_user.
+
+@dp.message(Command("suggestion_stats"))
+async def cmd_suggestion_stats(message: Message, bot: Bot) -> None:
+    if not _is_admin(message.from_user.id):
+        return
+    rows = suggestion_stats_by_user()
+    if not rows:
+        await message.answer("Подсказок пока не показывали никому.")
+        return
+
+    lines = ["🤖 Использование подсказок CueMe:"]
+    total_all = exact_all = edited_all = 0
+    for r in rows:
+        who = await _resolve_username(bot, r["telegram_id"])
+        total, exact_n, edited_n = r["total"], r["exact_n"] or 0, r["edited_n"] or 0
+        used = exact_n + edited_n
+        pct = used / total if total else 0.0
+        lines.append(
+            f"{who}: {used}/{total} использовано ({pct:.0%}) — "
+            f"как есть {exact_n}, с правками {edited_n}"
+        )
+        total_all += total
+        exact_all += exact_n
+        edited_all += edited_n
+
+    used_all = exact_all + edited_all
+    pct_all = used_all / total_all if total_all else 0.0
+    lines.append("")
+    lines.append(
+        f"Итого: {used_all}/{total_all} использовано ({pct_all:.0%}) — "
+        f"как есть {exact_all}, с правками {edited_all}"
+    )
+
+    target_chat = int(ADMIN_GROUP_CHAT_ID) if ADMIN_GROUP_CHAT_ID else message.chat.id
+    try:
+        await bot.send_message(target_chat, "\n".join(lines))
+    except Exception:
+        logging.warning("cmd_suggestion_stats: send failed to %s", target_chat)
+        await message.answer("\n".join(lines))
+
+
 # ── /export — выгрузка переписок юзера в .zip (только для админа) ───────────
 # Обходит отсутствие SSH-доступа к серверу: файл прилетает прямо в Telegram.
 
@@ -4055,6 +4158,20 @@ def _format_variants(variants: list[tuple[str, str]]) -> str:
     return "Вот несколько вариантов — выбирай или комбинируй.\n\n" + "\n\n".join(blocks)
 
 
+def _save_shown_suggestions(
+    telegram_id: str, contact_id: int | None, kind: str, variants: list[tuple[str, str]],
+) -> None:
+    """Сохраняет тексты всех показанных пользователю вариантов — ДО того, как
+    известно, использует он что-то из них (кандидаты на сопоставление с
+    реальными исходящими, см. _match_outgoing_to_suggestion). Вызывать сразу
+    при показе, для КАЖДОГО показа (включая «Другие варианты» — это тоже
+    реально увиденные подсказки, могут быть использованы так же, как первые)."""
+    try:
+        save_suggestions(telegram_id, contact_id, kind, [text for _, text in variants])
+    except Exception:
+        logging.exception("suggestions: не удалось сохранить показанные варианты")
+
+
 # _VARIANT_KINDS — какие ctx["kind"] поддерживают вариантную генерацию.
 # «🎯 Другой тон» (точечный выбор одного стиля) убран — оставлена только
 # перегенерация; вместе с ней ушла и старая style_pick_kb-инфраструктура.
@@ -4136,6 +4253,7 @@ async def _run_variants_generation(
         await target.answer("Не получилось сгенерировать варианты — попробуй ещё раз.")
         return
 
+    _save_shown_suggestions(str(telegram_id), ctx.get("contact_id"), kind, variants)
     ctx["variants"] = variants
     await _answer_long(
         target, _format_variants(variants), reply_markup=variants_result_kb(action_id), parse_mode="HTML",
@@ -4188,6 +4306,7 @@ async def _process_reply_incoming(
     samples = get_message_samples(contact_id) if contact_id else None
     ctx = {
         "kind": "reply", "text": incoming, "result": None, "style": None,
+        "contact_id": contact_id,
         "style_card": data["style_card"], "interaction_card": data["interaction_card"],
         "data_signals": _reply_data_signals(samples, incoming),
         "winning": _winning_for_contact(telegram_id, contact_id),
@@ -4496,6 +4615,7 @@ async def _run_live_coach_step(
         if not variants:
             await target.answer("Не получилось сгенерировать варианты — попробуй ещё раз.")
             return
+        _save_shown_suggestions(str(telegram_id), contact_id, "live", variants)
         ctx["variants"] = variants
         await _answer_long(
             target, _format_variants(variants), reply_markup=live_variants_kb(action_id), parse_mode="HTML",
@@ -4546,6 +4666,7 @@ async def _run_live_coach_step(
         await target.answer("Не получилось сгенерировать совет — попробуй ещё раз.")
         return
 
+    _save_shown_suggestions(str(telegram_id), contact_id, "live", variants)
     ctx["variants"] = variants
     ctx["running_notes"] = updated_notes
     await _answer_long(
@@ -4696,6 +4817,7 @@ async def _prompt_screenshot_style(
     samples = get_message_samples(contact_id)
     ctx = {
         "kind": "screenshot", "chat_text": chat_text, "result": None, "style": None,
+        "contact_id": contact_id,
         "style_card": style_card, "interaction_card": interaction_card,
         "data_signals": _reply_data_signals(samples, _last_incoming_line(chat_text)),
         "winning": _winning_for_contact(telegram_id, contact_id),
