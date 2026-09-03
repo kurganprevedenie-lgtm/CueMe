@@ -18,8 +18,47 @@ from datetime import datetime, timedelta
 from config import CONFLICT_WORDS, WARMTH_WORDS
 from features import _looks_junky
 
+# НЕ анкерим на границу слова (сознательно, после проверки — см. докстринг
+# ниже): словари хранят стемы («ссор», «злит», «люблю», «целую»), которые
+# по-русски регулярно стоят ПОСЛЕ приставки — «поссорились», «разозлит»,
+# «обозлит», «полюблю», «поцелую» — всё это НАСТОЯЩИЕ теплые/конфликтные
+# формы, но стем в них НЕ в начале слова. \b или лукбихайнд «не после буквы»
+# перед стемом отсёк бы все эти случаи как побочный эффект — то есть сломал
+# бы то, что словарь и так, а не то, что было в баг-репорте. Разбор реального
+# примера («ХПХПХПХПХПХПХПХ Я ДУМАЛА ТЫ РАССТРОИЛСЯ» матчит «расстроил» —
+# формально корректный матч, «расстроился» ДЕЙСТВИТЕЛЬНО начинается с этого
+# стема) показал, что причина ложного срабатывания — не позиция подстроки, а
+# смеховой контекст сообщения целиком. Поэтому границу оставляем прежней
+# (substring), а настоящий фикс — фильтр смехового спама ниже.
 _WARMTH_RE = re.compile("|".join(re.escape(w) for w in WARMTH_WORDS), re.IGNORECASE)
 _CONFLICT_RE = re.compile("|".join(re.escape(w) for w in CONFLICT_WORDS), re.IGNORECASE)
+
+# Смеховой спам («хахаха», «ахахах», «ХПХПХПХПХП», «кекекек») — общий шаблон
+# «короткий слог 2-4 символа подряд 3+ раза», а не перечисление вариантов
+# написания смеха: ловит любые вариации, не только заранее угаданные. Плюс
+# несколько типовых smeh-маркеров, которые сами по себе не повторяются
+# («кек», «лол», «ору») и потому под общий паттерн не подпадают.
+_LAUGH_REPEAT_RE = re.compile(r"([a-zа-яё]{2,4})\1{2,}", re.IGNORECASE)
+_LAUGH_WORD_RE = re.compile(r"\b(кек+|лол+|ору{2,})\b", re.IGNORECASE)
+
+
+def _is_laugh_spam(text: str) -> bool:
+    """Сообщение похоже на смеховой спам, а не на осмысленный текст — такое
+    НЕ считаем конфликтом, даже если формально задело словарное слово (см.
+    warmth_conflict: «ХПХПХПХПХПХПХПХ Я ДУМАЛА ТЫ РАССТРОИЛСЯ» матчит стем
+    «расстроил», но по сути это смех, а не ссора)."""
+    return bool(_LAUGH_REPEAT_RE.search(text) or _LAUGH_WORD_RE.search(text))
+
+
+# 2-е лицо в сообщении — сигнал, что конфликтное слово адресовано СОБЕСЕДНИКУ
+# напрямую («ты заебал»), а не просто упомянуто в другом контексте. Используется
+# как приоритет при выборе, какие 2 примера показать (не жёсткий фильтр —
+# сообщение без «ты» всё ещё считается конфликтом, просто ниже приоритетом
+# для цитаты).
+_SECOND_PERSON_RE = re.compile(
+    r"\b(ты|тебя|тебе|тобой|твой|твоя|твоё|твои|твоего|твоей|твоим|твоих|твою)\b",
+    re.IGNORECASE,
+)
 
 
 def _sorted_texted(rows: list[dict]) -> list[dict]:
@@ -123,37 +162,77 @@ def long_pauses(rows: list[dict], threshold_hours: int = 24) -> tuple[int, list[
 
 # ── 5. Тепло / конфликт ──────────────────────────────────────────────────────
 
+def _weeks_span(rows: list[dict]) -> float:
+    """Сколько недель охватывает переписка (по датам с текстом) — минимум 1,
+    чтобы частота «в неделю» не улетала в небо на паре сообщений за один день."""
+    dated = _sorted_texted(rows)
+    if len(dated) < 2:
+        return 1.0
+    first, last = _parse_dt(dated[0]["date"]), _parse_dt(dated[-1]["date"])
+    if not first or not last:
+        return 1.0
+    return max((last - first).days / 7.0, 1.0)
+
+
 def warmth_conflict(
     rows: list[dict],
-) -> tuple[int, float, int, float, list[tuple[str, str]], list[tuple[str, str]]]:
+) -> tuple[int, float, int, float, list[tuple[str, str]], list[tuple[str, str]], float]:
     """(тёплых сообщений, % тёплых, конфликтных сообщений, % конфликтных,
-    примеры тёплых, примеры конфликтных) — % от общего объёма сообщений (обе
-    стороны вместе). Примеры — до 2 самых СВЕЖИХ совпадений на категорию,
-    (direction, текст сообщения); отфильтрованы через ту же _looks_junky, что
-    и цитаты в features.initiative_axis (не пропускает голые ссылки/эмодзи/
-    однобуквенный мусор), чтобы не процитировать что-то нечитаемое."""
+    примеры тёплых, примеры конфликтных, недель в переписке).
+
+    % оставлен в возврате (main.py читает warmth_pct напрямую для сравнения
+    контактов между собой в «лучшая совместимость», см. main._best_compatibility_
+    contact) — но НЕ используется как заглавная метрика в тексте карточки:
+    доля от ВСЕЙ переписки (включая бытовую) занижает результат — 132 тёплых
+    сообщения могут дать всего 2%, хотя абсолютно это много. Текст карточки
+    (main.py compute_all → fact) строится на абсолютном числе + частоте в
+    неделю, weeks — общий делитель для обеих метрик.
+
+    Конфликтные слова матчатся С ФИЛЬТРОМ смехового спама (_is_laugh_spam) —
+    иначе «ХПХПХПХПХПХПХПХ Я ДУМАЛА ТЫ РАССТРОИЛСЯ» (стем «расстроил» внутри
+    «расстроился») засчитывался бы как конфликт, будучи по сути смехом.
+    Тёплые слова этому фильтру не подвергаются — там риск подобной ложной
+    тревоги не стоит того, чтобы усложнять.
+
+    Примеры — до 2 совпадений на категорию, (direction, текст сообщения),
+    отфильтрованы через ту же _looks_junky, что и цитаты в
+    features.initiative_axis (не пропускает голые ссылки/эмодзи/однобуквенный
+    мусор). Тёплые — самые свежие первыми. Конфликтные — сперва адресованные
+    собеседнику напрямую (есть «ты/тебя/тебе...» в том же сообщении —
+    _SECOND_PERSON_RE), внутри каждой группы тоже свежие первыми: «ты заебал
+    на меня бочку катить» показательнее случайного «бесит» без адресата."""
     msgs = [r for r in rows if r.get("text")]
     total = len(msgs)
     if total == 0:
-        return 0, 0.0, 0, 0.0, [], []
+        return 0, 0.0, 0, 0.0, [], [], 1.0
+
     warm = sum(1 for r in msgs if _WARMTH_RE.search(r["text"].lower()))
-    conflict = sum(1 for r in msgs if _CONFLICT_RE.search(r["text"].lower()))
+    conflict = sum(
+        1 for r in msgs
+        if _CONFLICT_RE.search(r["text"].lower()) and not _is_laugh_spam(r["text"])
+    )
 
     warm_examples: list[tuple[str, str]] = []
-    conflict_examples: list[tuple[str, str]] = []
+    # (адресовано_2му_лицу, direction, текст) — сортируем по приоритету ниже,
+    # затем берём первые 2.
+    conflict_candidates: list[tuple[bool, str, str]] = []
     for r in reversed(_sorted_texted(rows)):  # с конца — свежие сообщения первыми
-        if len(warm_examples) >= 2 and len(conflict_examples) >= 2:
-            break
         text = r["text"]
         if _looks_junky(text):
             continue
         low = text.lower()
         if len(warm_examples) < 2 and _WARMTH_RE.search(low):
             warm_examples.append((r["direction"], text.strip()))
-        if len(conflict_examples) < 2 and _CONFLICT_RE.search(low):
-            conflict_examples.append((r["direction"], text.strip()))
+        if _CONFLICT_RE.search(low) and not _is_laugh_spam(text):
+            addressed = bool(_SECOND_PERSON_RE.search(low))
+            conflict_candidates.append((addressed, r["direction"], text.strip()))
 
-    return warm, warm / total, conflict, conflict / total, warm_examples, conflict_examples
+    # stable sort по (адресовано первым), порядок появления (уже свежие→старые) сохраняется.
+    conflict_candidates.sort(key=lambda c: not c[0])
+    conflict_examples = [(direction, text) for _, direction, text in conflict_candidates[:2]]
+
+    weeks = _weeks_span(rows)
+    return warm, warm / total, conflict, conflict / total, warm_examples, conflict_examples, weeks
 
 
 # ── 6. Циркадное совпадение ──────────────────────────────────────────────────
@@ -277,6 +356,36 @@ def _fmt_seconds(sec: float) -> str:
     return f"{sec / 3600:.1f} ч"
 
 
+def _ru_count_word(n: int, one: str, few: str, many: str) -> str:
+    """Склонение по числу: 1 → one, 2-4 → few, 5-20/0/остальное → many
+    (стандартное русское правило с исключением 11-14)."""
+    if n % 10 == 1 and n % 100 != 11:
+        return one
+    if 2 <= n % 10 <= 4 and not (12 <= n % 100 <= 14):
+        return few
+    return many
+
+
+def _fmt_times_per_week(rate: float) -> str:
+    """«5 раз в неделю» / «1.5 раза в неделю» — целое склоняется по числу,
+    дробное всегда «раза» (стандартная русская норма для нецелых)."""
+    if abs(rate - round(rate)) < 0.05:
+        n = round(rate)
+        word = _ru_count_word(n, "раз", "раза", "раз")
+        return f"{n} {word} в неделю"
+    return f"{rate:.1f} раза в неделю"
+
+
+def _fmt_weeks_span(weeks: float) -> str:
+    """«идёт {фраза}» — accusative для длительности: «идёт неделю» / «идёт
+    3 недели» / «идёт 25 недель»."""
+    if weeks < 1.5:
+        return "меньше недели"
+    n = round(weeks)
+    word = _ru_count_word(n, "неделю", "недели", "недель")
+    return f"{n} {word}"
+
+
 def compute_all(rows: list[dict]) -> dict[str, dict]:
     """Считает все метрики и сразу форматирует (short, fact) для каждой —
     возвращает {key: {"label", "short", "fact"}}, тот же контракт, что
@@ -338,17 +447,23 @@ def compute_all(rows: list[dict]) -> dict[str, dict]:
         ),
     }
 
-    warm_n, warm_pct, conf_n, conf_pct, warm_examples, conflict_examples = warmth_conflict(rows)
+    warm_n, warm_pct, conf_n, conf_pct, warm_examples, conflict_examples, weeks = warmth_conflict(rows)
     out["warmth_conflict"] = {
         "label": "Тепло / конфликт",
         "short": f"💚{warm_n} / 🚩{conf_n}",
-        # числом, не только текстом внутри fact/short — main.py читает это
-        # напрямую для «лучшая совместимость» в «Анализ своего стиля»
-        # (сравнение между контактами), а не парсит регуляркой готовый текст.
+        # % оставлен как ЧИСЛО в словаре (не в тексте fact ниже) — main.py
+        # читает warmth_pct напрямую для «лучшая совместимость» в «Анализ
+        # своего стиля» (сравнение между контактами), а не парсит регуляркой
+        # готовый текст. В САМ fact доля от объёма больше не идёт: доля от
+        # ВСЕЙ переписки (включая бытовую) занижает результат — 132 тёплых
+        # сообщения могут дать 2%, хотя абсолютно это много (см. warmth_conflict).
         "warmth_pct": warm_pct,
         "fact": (
-            f"Тёплая лексика — в {warm_n} сообщениях ({warm_pct:.0%} от объёма), "
-            f"конфликтная — в {conf_n} ({conf_pct:.0%})."
+            f"Тёплых сообщений — {warm_n}, в среднем {_fmt_times_per_week(warm_n / weeks)}. "
+            f"Конфликтных — {conf_n}, в среднем {_fmt_times_per_week(conf_n / weeks)} "
+            f"(переписка идёт {_fmt_weeks_span(weeks)}). Частота тут не мера качества "
+            "отношений: в новых или бурных парах обычно больше и тёплых, и конфликтных "
+            "слов, а в давних стабильных тепло часто проявляется делами, а не текстом."
         ),
         # Реальные цитаты — main.py дописывает их отдельной строкой поверх
         # fact/interpretation (см. _warmth_examples_suffix), в LLM-промпт
