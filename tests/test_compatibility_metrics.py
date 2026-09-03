@@ -100,8 +100,10 @@ def test_examples_filtered_junk_and_freshest_first():
 
 
 def test_occurrence_count_separate_from_message_flag():
-    # "люблю люблю люблю" — ОДНО тёплое сообщение (флаг), но 3 occurrence.
-    rows = [_row(0, "out", "люблю люблю люблю")]
+    # "люблю тебя люблю тебя люблю тебя" — ОДНО тёплое сообщение (флаг), но
+    # 3 occurrence (у каждого вхождения "тебя" рядом — направленность на
+    # собеседника подтверждена без LLM).
+    rows = [_row(0, "out", "люблю тебя люблю тебя люблю тебя")]
     result = warmth(rows)
     assert result.warm_n == 1
     assert result.occurrences["out"]["люблю"] == 3
@@ -124,6 +126,48 @@ def test_no_conflict_fields_left():
     wc = metrics["warmth_conflict"]
     assert "conflict_examples" not in wc
     assert wc["short"] == "💚0"
+
+
+def test_feeling_verb_with_second_person_counts_without_llm():
+    rows = [_row(0, "in", "скучаю по тебе очень"), _row(1, "in", "я тебя обожаю")]
+    result = warmth(rows)
+    assert result.warm_n == 2
+    assert result.ambiguous_candidates == []
+
+
+def test_feeling_verb_toward_object_not_counted_and_not_sent_to_llm():
+    # Реальный кейс из бага: "обожаю" направлено на фильм — не на собеседника.
+    # Явно посторонний объект рядом (фильм) — исключается сразу, LLM не зовём.
+    rows = [_row(0, "out", "бля как же я обожаю этот фильм")]
+    result = warmth(rows)
+    assert result.warm_n == 0
+    assert result.ambiguous_candidates == []
+    assert result.warm_examples == []
+
+
+def test_feeling_verb_toward_third_person_not_counted_and_not_sent_to_llm():
+    # Реальный кейс из бага: "я обожаю её" — третье лицо, не собеседник.
+    rows = [_row(0, "out", "я обожаю её")]
+    result = warmth(rows)
+    assert result.warm_n == 0
+    assert result.ambiguous_candidates == []
+
+
+def test_feeling_verb_undirected_goes_to_llm_candidates():
+    # Глагол есть, но ни "тебя", ни явно постороннего объекта рядом нет —
+    # неопределённость, кандидат на ту же LLM-проверку, что и AMBIGUOUS_PRAISE_WORDS.
+    rows = [_row(0, "in", "обожаю просто")]
+    result = warmth(rows)
+    assert result.warm_n == 0
+    assert len(result.ambiguous_candidates) == 1
+    assert result.ambiguous_candidates[0][2] == "обожаю"
+
+
+def test_feeling_verb_confirmed_by_llm_counts():
+    rows = [_row(0, "in", "обожаю просто")]
+    confirmed = {("in", "обожаю просто")}
+    result = warmth(rows, confirmed_ambiguous=confirmed)
+    assert result.warm_n == 1
 
 
 def test_compute_all_accepts_confirmed_ambiguous():

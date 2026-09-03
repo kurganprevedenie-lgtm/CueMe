@@ -21,8 +21,12 @@ from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
-from config import AMBIGUOUS_PRAISE_WORDS, WARM_EMOJI, WARM_LEXICON
+from config import AMBIGUOUS_PRAISE_WORDS, FEELING_VERBS, WARM_EMOJI, WARM_LEXICON
 from features import _looks_junky
+
+# Каноническое имя по стему — для occurrence-подсчёта, не важно, вокативное
+# слово это или глагол чувств (см. warmth()).
+_CANON_BY_STEM = {**WARM_LEXICON, **FEELING_VERBS, **AMBIGUOUS_PRAISE_WORDS}
 
 # Матчинг — по границе слова С ЛЕВОЙ стороны стема, не по вхождению
 # подстроки: стемы — намеренно префиксы словоформ («любим» должен матчить
@@ -35,6 +39,29 @@ _AMBIGUOUS_PATTERNS = {
     stem: re.compile(rf"\b{re.escape(stem)}\w*", re.IGNORECASE)
     for stem in AMBIGUOUS_PRAISE_WORDS
 }
+_FEELING_PATTERNS = {
+    stem: re.compile(rf"\b{re.escape(stem)}\w*", re.IGNORECASE)
+    for stem in FEELING_VERBS
+}
+
+# Направленность глагола чувств (FEELING_VERBS) — ищется в окне ±_NEARBY_CHARS
+# символов вокруг совпадения (примерно 5-6 слов в каждую сторону), не по
+# всему сообщению целиком: «тебя»/«её» в другом конце длинного сообщения не
+# должны определять направленность конкретного глагола.
+_NEARBY_CHARS = 40
+_SECOND_PERSON_NEAR_RE = re.compile(r"\b(тебя|тебе|тобой)\b", re.IGNORECASE)
+_THIRD_PARTY_OR_OBJECT_RE = re.compile(
+    r"\b(её|его|их|"
+    r"фильм\w*|музык\w*|сериал\w*|игр\w*|книг\w*|готовит\w*|песн\w*|"
+    r"работ\w*|учёб\w*|учеб\w*|погод\w*|природ\w*|кофе|чай)\b",
+    re.IGNORECASE,
+)
+
+
+def _has_nearby(text: str, pattern: re.Pattern, match: re.Match) -> bool:
+    start = max(0, match.start() - _NEARBY_CHARS)
+    end = min(len(text), match.end() + _NEARBY_CHARS)
+    return bool(pattern.search(text[start:end]))
 
 
 def _sorted_texted(rows: list[dict]) -> list[dict]:
@@ -154,7 +181,7 @@ def _weeks_span(rows: list[dict]) -> float:
 
 
 def _classify_warm(text: str) -> tuple[dict[str, int], bool, str | None]:
-    """Один разбор сообщения на все три категории сразу — ЕДИНАЯ точка
+    """Один разбор сообщения на все категории сразу — ЕДИНАЯ точка
     классификации, которую используют и подсчёт (warmth), и сбор примеров
     (_collect_warm_examples), и safety-проверка перед добавлением в примеры.
     Раньше баг «пример не содержит тёплых слов» бывал именно от того, что
@@ -163,15 +190,33 @@ def _classify_warm(text: str) -> tuple[dict[str, int], bool, str | None]:
     структурно исключает этот класс ошибки.
 
     Возвращает:
-    - {стем: число вхождений} по WARM_LEXICON (для occurrence-подсчёта)
+    - {стем: число вхождений} — WARM_LEXICON (вокативные обращения, без
+      проверки направленности — она тут не нужна, само обращение и есть
+      адресат) + FEELING_VERBS, но ТОЛЬКО те вхождения глагола, у которых
+      рядом (см. _NEARBY_CHARS) нашлось «тебя»/«тебе»/«тобой» — остальные
+      вхождения глагола либо явно не про собеседника (рядом «её»/«его»/
+      «их» или неодушевлённый объект — фильм/музыка/работа и т.п., тогда
+      просто не считаются вообще), либо неопределённые (тогда см. ниже)
     - есть ли тёплый эмодзи (точное совпадение символа)
-    - стем из AMBIGUOUS_PRAISE_WORDS, если WARM_LEXICON/эмодзи не нашлось,
-      но неоднозначное слово похвалы есть (кандидат на LLM-проверку)."""
+    - стем-кандидат на LLM-проверку, если прямого совпадения/эмодзи не
+      нашлось: из AMBIGUOUS_PRAISE_WORDS (общая похвала вроде «молодец») ИЛИ
+      из FEELING_VERBS с неопределённой направленностью (глагол есть, но
+      рядом нет ни «тебя», ни явно постороннего объекта)."""
     stem_hits: dict[str, int] = {}
     for stem, pattern in _WARM_PATTERNS.items():
         found = pattern.findall(text)
         if found:
             stem_hits[stem] = len(found)
+
+    feeling_ambiguous_stem: str | None = None
+    for stem, pattern in _FEELING_PATTERNS.items():
+        for m in pattern.finditer(text):
+            if _has_nearby(text, _SECOND_PERSON_NEAR_RE, m):
+                stem_hits[stem] = stem_hits.get(stem, 0) + 1
+            elif _has_nearby(text, _THIRD_PARTY_OR_OBJECT_RE, m):
+                continue  # явно не про собеседника — не считаем вообще
+            elif feeling_ambiguous_stem is None:
+                feeling_ambiguous_stem = stem  # неопределённость — кандидат на LLM
 
     has_emoji = any(e in text for e in WARM_EMOJI)
 
@@ -181,6 +226,8 @@ def _classify_warm(text: str) -> tuple[dict[str, int], bool, str | None]:
             if pattern.search(text):
                 ambiguous_stem = stem
                 break
+        if ambiguous_stem is None:
+            ambiguous_stem = feeling_ambiguous_stem
 
     return stem_hits, has_emoji, ambiguous_stem
 
@@ -294,7 +341,7 @@ def warmth(
         stem_hits, has_emoji, ambiguous_stem = _classify_warm(text)
 
         for stem, count in stem_hits.items():
-            occurrences[direction][WARM_LEXICON[stem]] += count
+            occurrences[direction][_CANON_BY_STEM[stem]] += count
 
         is_warm = bool(stem_hits) or has_emoji
         if not is_warm and ambiguous_stem:
@@ -302,7 +349,7 @@ def warmth(
                 is_warm = (direction, text) in confirmed_ambiguous
             else:
                 ambiguous_candidates.append(
-                    (direction, text, AMBIGUOUS_PRAISE_WORDS[ambiguous_stem])
+                    (direction, text, _CANON_BY_STEM[ambiguous_stem])
                 )
 
         if is_warm:
