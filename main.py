@@ -77,6 +77,7 @@ from llm import (
     build_my_style_for_contact,
     build_overall_style,
     build_style_card,
+    classify_ambiguous_praise,
     extract_chat_from_image,
     analyze_reply_dynamics,
     get_forced_provider,
@@ -89,7 +90,7 @@ from llm import (
     suggest_reply_variants,
     transcribe_audio,
 )
-from compatibility_metrics import compute_all as compute_compat_metrics
+from compatibility_metrics import compute_all as compute_compat_metrics, warmth as compute_warmth
 from tg_parser import parse_chat
 from tools.export import extract_conversation, to_html, to_text
 from storage import (
@@ -1798,7 +1799,30 @@ async def _gen_deep_analysis(contact_id: int, owner_user_id: str) -> dict | None
     if cached and total_count - cached["last_rebuild_count"] < REBUILD_THRESHOLD:
         return cached
 
-    metrics = compute_compat_metrics(rows)
+    # Неоднозначные слова похвалы («молодец»/«умница» — AMBIGUOUS_PRAISE_WORDS
+    # в config.py) требуют LLM-подтверждения, что это тёплое обращение к
+    # партнёру, а не нейтральная похвала за дело. Разведочный проход БЕЗ
+    # confirmed_ambiguous ничего не досчитывает лишнего, только собирает
+    # кандидатов — если их нет (подавляющее большинство контактов), второй
+    # проход не нужен вообще, LLM не зовём зря.
+    provisional_warmth = compute_warmth(rows)
+    confirmed_ambiguous: set[tuple[str, str]] = set()
+    if provisional_warmth.ambiguous_candidates:
+        try:
+            texts = [c[1] for c in provisional_warmth.ambiguous_candidates]
+            verdicts = await classify_ambiguous_praise(texts)
+            confirmed_ambiguous = {
+                (c[0], c[1])
+                for c, ok in zip(provisional_warmth.ambiguous_candidates, verdicts)
+                if ok
+            }
+        except Exception:
+            logging.exception(
+                "deep_analysis: не удалось LLM-проверить неоднозначные похвалы — "
+                "считаем их все нейтральными",
+            )
+
+    metrics = compute_compat_metrics(rows, confirmed_ambiguous=confirmed_ambiguous)
     volume_trend = metrics.pop("_volume_trend")
     interpretations, dynamics_text, synthesis, advice = await build_compatibility_interpretation(
         metrics, volume_trend, user_gender=get_gender(owner_user_id),

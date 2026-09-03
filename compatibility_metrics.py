@@ -1,5 +1,5 @@
-"""compatibility_metrics.py — детерминированные метрики «Анализа собеседника»,
-БЕЗ LLM. Каждая функция берёт rows (список {"date": ISO-строка, "direction":
+"""compatibility_metrics.py — детерминированные метрики «Анализа собеседника».
+Каждая функция берёт rows (список {"date": ISO-строка, "direction":
 "in"/"out", "text": str}, вся история контакта — business + imported).
 
 Возвращает СЫРЫЕ ТИПИЗИРОВАННЫЕ ЧИСЛА (не готовые строки) — форматирование в
@@ -9,16 +9,32 @@
 Работает на том, что реально доступно через Business API прямо сейчас: text,
 date, direction. БЕЗ реакций, БЕЗ длительности голосовых, БЕЗ фото — эти поля
 физически не собираются (см. raw_meta в main.py: только length/has_emoji/voice).
-"""
+
+Модуль почти целиком БЕЗ LLM — единственное исключение: warmth() опционально
+принимает уже готовый набор LLM-подтверждённых «неоднозначных похвал»
+(confirmed_ambiguous), сам LLM не зовёт. Сам вызов — в llm.classify_
+ambiguous_praise, оркестрация (сначала найти кандидатов, потом досчитать
+warmth() с подтверждениями) — в main.py."""
+import logging
 import re
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
-from config import WARMTH_WORDS
+from config import AMBIGUOUS_PRAISE_WORDS, WARM_EMOJI, WARM_LEXICON
 from features import _looks_junky
 
-_WARMTH_RE = re.compile("|".join(re.escape(w) for w in WARMTH_WORDS), re.IGNORECASE)
+# Матчинг — по границе слова С ЛЕВОЙ стороны стема, не по вхождению
+# подстроки: стемы — намеренно префиксы словоформ («любим» должен матчить
+# «любимая»), поэтому \b только слева (\w* справа сам найдёт конец слова).
+_WARM_PATTERNS = {
+    stem: re.compile(rf"\b{re.escape(stem)}\w*", re.IGNORECASE)
+    for stem in WARM_LEXICON
+}
+_AMBIGUOUS_PATTERNS = {
+    stem: re.compile(rf"\b{re.escape(stem)}\w*", re.IGNORECASE)
+    for stem in AMBIGUOUS_PRAISE_WORDS
+}
 
 
 def _sorted_texted(rows: list[dict]) -> list[dict]:
@@ -137,40 +153,167 @@ def _weeks_span(rows: list[dict]) -> float:
     return max((last - first).days / 7.0, 1.0)
 
 
-def warmth(rows: list[dict]) -> tuple[int, float, list[tuple[str, str]], float]:
-    """(тёплых сообщений, % тёплых, примеры тёплых, недель в переписке).
+def _classify_warm(text: str) -> tuple[dict[str, int], bool, str | None]:
+    """Один разбор сообщения на все три категории сразу — ЕДИНАЯ точка
+    классификации, которую используют и подсчёт (warmth), и сбор примеров
+    (_collect_warm_examples), и safety-проверка перед добавлением в примеры.
+    Раньше баг «пример не содержит тёплых слов» бывал именно от того, что
+    текст для примера брался из другого списка/сообщения, чем то, где
+    реально нашлось совпадение — общая функция на одном и том же text
+    структурно исключает этот класс ошибки.
 
-    % оставлен в возврате (main.py читает warmth_pct напрямую для сравнения
-    контактов между собой в «лучшая совместимость», см. main._best_compatibility_
-    contact) — но НЕ используется как заглавная метрика в тексте карточки:
-    доля от ВСЕЙ переписки (включая бытовую) занижает результат — 132 тёплых
-    сообщения могут дать всего 2%, хотя абсолютно это много. Текст карточки
-    (main.py compute_all → fact) строится на абсолютном числе + частоте в
-    неделю, weeks — делитель.
+    Возвращает:
+    - {стем: число вхождений} по WARM_LEXICON (для occurrence-подсчёта)
+    - есть ли тёплый эмодзи (точное совпадение символа)
+    - стем из AMBIGUOUS_PRAISE_WORDS, если WARM_LEXICON/эмодзи не нашлось,
+      но неоднозначное слово похвалы есть (кандидат на LLM-проверку)."""
+    stem_hits: dict[str, int] = {}
+    for stem, pattern in _WARM_PATTERNS.items():
+        found = pattern.findall(text)
+        if found:
+            stem_hits[stem] = len(found)
 
-    Примеры — до 2 самых СВЕЖИХ совпадений, (direction, текст сообщения),
-    отфильтрованы через ту же _looks_junky, что и цитаты в
-    features.initiative_axis (не пропускает голые ссылки/эмодзи/однобуквенный
-    мусор)."""
-    msgs = [r for r in rows if r.get("text")]
-    total = len(msgs)
-    if total == 0:
-        return 0, 0.0, [], 1.0
+    has_emoji = any(e in text for e in WARM_EMOJI)
 
-    warm = sum(1 for r in msgs if _WARMTH_RE.search(r["text"].lower()))
+    ambiguous_stem = None
+    if not stem_hits and not has_emoji:
+        for stem, pattern in _AMBIGUOUS_PATTERNS.items():
+            if pattern.search(text):
+                ambiguous_stem = stem
+                break
 
-    warm_examples: list[tuple[str, str]] = []
+    return stem_hits, has_emoji, ambiguous_stem
+
+
+def _message_is_warm(
+    text: str, direction: str, confirmed_ambiguous: set[tuple[str, str]] | None,
+) -> bool:
+    """(а) прямое совпадение WARM_LEXICON, ИЛИ (б) тёплый эмодзи, ИЛИ
+    (в) неоднозначная похвала, но ТОЛЬКО если LLM её подтвердила
+    (confirmed_ambiguous содержит (direction, text)). Без подтверждения
+    (confirmed_ambiguous=None — кандидаты ещё не проверены LLM, или
+    подтверждения не было) неоднозначные слова тёплыми НЕ считаются."""
+    stem_hits, has_emoji, ambiguous_stem = _classify_warm(text)
+    if stem_hits or has_emoji:
+        return True
+    if ambiguous_stem and confirmed_ambiguous is not None:
+        return (direction, text) in confirmed_ambiguous
+    return False
+
+
+def _collect_warm_examples(
+    rows: list[dict], confirmed_ambiguous: set[tuple[str, str]] | None,
+) -> list[tuple[str, str]]:
+    """До 2 самых СВЕЖИХ тёплых сообщений, (direction, текст), отфильтрованы
+    через ту же _looks_junky, что и цитаты в features.initiative_axis (не
+    пропускает голые ссылки/эмодзи/однобуквенный мусор)."""
+    examples: list[tuple[str, str]] = []
     for r in reversed(_sorted_texted(rows)):  # с конца — свежие сообщения первыми
-        if len(warm_examples) >= 2:
+        if len(examples) >= 2:
             break
         text = r["text"]
         if _looks_junky(text):
             continue
-        if _WARMTH_RE.search(text.lower()):
-            warm_examples.append((r["direction"], text.strip()))
+        if not _message_is_warm(text, r["direction"], confirmed_ambiguous):
+            continue
+        # Safety-проверка (не полагаемся только на факт, что _message_is_warm
+        # уже True выше) — независимая перепроверка ИМЕННО того текста,
+        # который сейчас пойдёт в примеры, прямо перед append. Ловит
+        # регрессию, если будущая правка случайно подставит не тот text/r.
+        stem_hits, has_emoji, ambiguous_stem = _classify_warm(text)
+        confirmed = bool(
+            ambiguous_stem and confirmed_ambiguous
+            and (r["direction"], text) in confirmed_ambiguous
+        )
+        if not (stem_hits or has_emoji or confirmed):
+            logging.warning(
+                "warmth: сообщение прошло отбор, но повторная проверка не "
+                "находит совпадения — не беру в примеры: %r", text[:80],
+            )
+            continue
+        examples.append((r["direction"], text.strip()))
+    return examples
 
+
+@dataclass
+class WarmthResult:
+    warm_n: int
+    warm_pct: float
+    warm_examples: list[tuple[str, str]]
+    weeks: float
+    # {"out": Counter(canon -> count), "in": Counter(...)} — occurrence-подсчёт
+    # по словам (не по сообщениям), для топ-слов; естественного места в
+    # карточке пока нет, просто отдаём числом на будущее.
+    occurrences: dict[str, Counter] = field(default_factory=lambda: {"out": Counter(), "in": Counter()})
+    # (direction, text, canon) — сообщения с AMBIGUOUS_PRAISE_WORDS, ещё НЕ
+    # проверенные LLM. Непусто только при вызове с confirmed_ambiguous=None
+    # (первый, «разведочный» проход) — см. main.py-оркестрацию в докстринге
+    # warmth() ниже.
+    ambiguous_candidates: list[tuple[str, str, str]] = field(default_factory=list)
+
+    def __iter__(self):
+        # Обратная совместимость со старым контрактом (warm_n, warm_pct,
+        # warm_examples, weeks) = warmth(rows) — main.compute_all распаковывает
+        # именно так.
+        return iter((self.warm_n, self.warm_pct, self.warm_examples, self.weeks))
+
+
+def warmth(
+    rows: list[dict], confirmed_ambiguous: set[tuple[str, str]] | None = None,
+) -> WarmthResult:
+    """Считает тёплые сообщения. Два прохода при неоднозначных словах похвалы
+    («молодец»/«умница» и т.п. — см. AMBIGUOUS_PRAISE_WORDS в config.py):
+
+    1) warmth(rows) — confirmed_ambiguous не передан. Неоднозначные слова НЕ
+       засчитываются, зато собираются в result.ambiguous_candidates.
+    2) Если ambiguous_candidates непусты — main.py прогоняет их тексты через
+       llm.classify_ambiguous_praise (батч, один вызов LLM на контакт) и
+       строит set подтверждённых (direction, text).
+    3) warmth(rows, confirmed_ambiguous=тот_set) — финальный, авторитетный
+       результат: подтверждённые неоднозначные фразы теперь считаются тёплыми.
+
+    Если ambiguous_candidates после шага 1 пуст — шаг 3 не нужен, результат
+    шага 1 уже финальный (экономит LLM-вызов на подавляющем большинстве
+    контактов, где таких слов вообще не было).
+
+    % (warm_pct) — как раньше читается main.py напрямую для «лучшая
+    совместимость» между контактами, в текст карточки НЕ идёт (доля от всей
+    переписки занижает результат — см. compute_all)."""
+    msgs = [r for r in rows if r.get("text")]
+    total = len(msgs)
+    if total == 0:
+        return WarmthResult(warm_n=0, warm_pct=0.0, warm_examples=[], weeks=1.0)
+
+    occurrences: dict[str, Counter] = {"out": Counter(), "in": Counter()}
+    ambiguous_candidates: list[tuple[str, str, str]] = []
+    warm_n = 0
+
+    for r in msgs:
+        text = r["text"]
+        direction = r["direction"]
+        stem_hits, has_emoji, ambiguous_stem = _classify_warm(text)
+
+        for stem, count in stem_hits.items():
+            occurrences[direction][WARM_LEXICON[stem]] += count
+
+        is_warm = bool(stem_hits) or has_emoji
+        if not is_warm and ambiguous_stem:
+            if confirmed_ambiguous is not None:
+                is_warm = (direction, text) in confirmed_ambiguous
+            else:
+                ambiguous_candidates.append(
+                    (direction, text, AMBIGUOUS_PRAISE_WORDS[ambiguous_stem])
+                )
+
+        if is_warm:
+            warm_n += 1
+
+    warm_examples = _collect_warm_examples(rows, confirmed_ambiguous)
     weeks = _weeks_span(rows)
-    return warm, warm / total, warm_examples, weeks
+    return WarmthResult(
+        warm_n=warm_n, warm_pct=warm_n / total, warm_examples=warm_examples,
+        weeks=weeks, occurrences=occurrences, ambiguous_candidates=ambiguous_candidates,
+    )
 
 
 # ── 6. Циркадное совпадение ──────────────────────────────────────────────────
@@ -324,11 +467,18 @@ def _fmt_weeks_span(weeks: float) -> str:
     return f"{n} {word}"
 
 
-def compute_all(rows: list[dict]) -> dict[str, dict]:
+def compute_all(
+    rows: list[dict], confirmed_ambiguous: set[tuple[str, str]] | None = None,
+) -> dict[str, dict]:
     """Считает все метрики и сразу форматирует (short, fact) для каждой —
     возвращает {key: {"label", "short", "fact"}}, тот же контракт, что
     ждут main.py/llm.py, но числа внутри fact теперь и абсолютные, и %,
-    посчитанные из типизированных функций выше, не строками напрямую."""
+    посчитанные из типизированных функций выше, не строками напрямую.
+
+    confirmed_ambiguous — прокидывается в warmth() как есть (LLM-подтверждённые
+    неоднозначные похвалы, см. warmth() докстринг); None на первом,
+    «разведочном» проходе — main.py вызывает compute_all дважды только если
+    у warmth() нашлись ambiguous_candidates."""
     out: dict[str, dict] = {}
 
     n_author, n_contact, ratio = balance(rows)
@@ -385,7 +535,9 @@ def compute_all(rows: list[dict]) -> dict[str, dict]:
         ),
     }
 
-    warm_n, warm_pct, warm_examples, weeks = warmth(rows)
+    warmth_result = warmth(rows, confirmed_ambiguous=confirmed_ambiguous)
+    warm_n, warm_pct = warmth_result.warm_n, warmth_result.warm_pct
+    warm_examples, weeks = warmth_result.warm_examples, warmth_result.weeks
     out["warmth_conflict"] = {
         "label": "Тепло",
         "short": f"💚{warm_n}",
@@ -406,6 +558,12 @@ def compute_all(rows: list[dict]) -> dict[str, dict]:
         # fact/interpretation (см. _warmth_examples_suffix), в LLM-промпт
         # интерпретации НЕ идут (там участвует только fact).
         "warm_examples": warm_examples,
+        # occurrence-подсчёт по словам (не по сообщениям) — для топ-слов,
+        # естественного места в карточке пока нет, просто отдаём числом.
+        "warm_occurrences": {
+            "out": dict(warmth_result.occurrences["out"]),
+            "in": dict(warmth_result.occurrences["in"]),
+        },
     }
 
     my_peak, ct_peak, overlap_label = circadian_overlap(rows)
