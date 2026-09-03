@@ -1200,97 +1200,10 @@ def count_successful_referrals(telegram_id: str) -> int:
     return row["cnt"] if row else 0
 
 
-# ── deep style analysis (кэш анализа своего стиля, агрегат) ───────────────────
-
-# v1 (профиль/история по периодам/swot/советы) — оставлено для отката. Заменено
-# компактной 3-блочной карточкой (архетип/факты/совет) — см. миграцию в init_db,
-# дропающую history_text/swot_text/tips_text.
-# def save_deep_style_analysis(
-#     user_telegram_id: str,
-#     profile_text: str,
-#     history_text: str,
-#     swot_text: str,
-#     tips_text: str,
-# ) -> None:
-#     with _conn() as conn:
-#         conn.execute(
-#             """
-#             INSERT INTO deep_style_analysis
-#                 (user_telegram_id, profile_text, history_text, swot_text, tips_text, updated_at)
-#             VALUES (?, ?, ?, ?, ?, ?)
-#             ON CONFLICT(user_telegram_id) DO UPDATE SET
-#                 profile_text = excluded.profile_text,
-#                 history_text = excluded.history_text,
-#                 swot_text    = excluded.swot_text,
-#                 tips_text    = excluded.tips_text,
-#                 updated_at   = excluded.updated_at
-#             """,
-#             (user_telegram_id, profile_text, history_text, swot_text, tips_text, _now()),
-#         )
-#
-#
-# def get_deep_style_analysis(user_telegram_id: str) -> dict | None:
-#     with _conn() as conn:
-#         row = conn.execute(
-#             "SELECT * FROM deep_style_analysis WHERE user_telegram_id = ?",
-#             (user_telegram_id,),
-#         ).fetchone()
-#     if not row:
-#         return None
-#     return {
-#         "profile_text": row["profile_text"],
-#         "history_text": row["history_text"],
-#         "swot_text":    row["swot_text"],
-#         "tips_text":    row["tips_text"],
-#     }
-
-
-def save_deep_style_analysis(
-    user_telegram_id: str,
-    profile_text: str,
-    facts_text: str,
-    tip_text: str,
-    message_text: str,
-) -> None:
-    with _conn() as conn:
-        conn.execute(
-            """
-            INSERT INTO deep_style_analysis
-                (user_telegram_id, profile_text, facts_text, tip_text, message_text, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?)
-            ON CONFLICT(user_telegram_id) DO UPDATE SET
-                profile_text = excluded.profile_text,
-                facts_text   = excluded.facts_text,
-                tip_text     = excluded.tip_text,
-                message_text = excluded.message_text,
-                updated_at   = excluded.updated_at
-            """,
-            (user_telegram_id, profile_text, facts_text, tip_text, message_text, _now()),
-        )
-
-
-def get_deep_style_analysis(user_telegram_id: str) -> dict | None:
-    with _conn() as conn:
-        row = conn.execute(
-            "SELECT * FROM deep_style_analysis WHERE user_telegram_id = ?",
-            (user_telegram_id,),
-        ).fetchone()
-    if not row:
-        return None
-    return {
-        "profile_text": row["profile_text"],
-        "facts_text":   row["facts_text"],
-        "tip_text":     row["tip_text"],
-        "message_text": row["message_text"],
-    }
-
-
-def delete_deep_style_analysis(user_telegram_id: str) -> None:
-    with _conn() as conn:
-        conn.execute(
-            "DELETE FROM deep_style_analysis WHERE user_telegram_id = ?", (user_telegram_id,)
-        )
-
+# deep style analysis («Анализ своего стиля») убран совсем по запросу —
+# функции save/get/delete_deep_style_analysis удалены. Таблица
+# deep_style_analysis в схеме (init_db ниже) намеренно НЕ дропнута —
+# разрушительная миграция не была нужна, просто больше не пишем/не читаем.
 
 # ── LLM cache (контент-адресный кэш ответов генерации) ────────────────────────
 
@@ -1383,18 +1296,6 @@ def users_with_deep_analysis() -> set[str]:
         rows = conn.execute(
             "SELECT DISTINCT c.user_telegram_id AS tid "
             "FROM deep_analysis da JOIN contacts c ON c.id = da.contact_id"
-        ).fetchall()
-    return {r["tid"] for r in rows}
-
-
-def users_with_deep_style() -> set[str]:
-    """Кто хоть раз открывал «Анализ своего стиля» (🪞). Именно эта таблица —
-    кэш самой фичи; style_cards НЕ подходит, он наполняется побочно при любой
-    генерации (см. users_with_style_card)."""
-    with _conn() as conn:
-        rows = conn.execute(
-            "SELECT user_telegram_id AS tid FROM deep_style_analysis "
-            "WHERE COALESCE(profile_text, '') != ''"
         ).fetchall()
     return {r["tid"] for r in rows}
 

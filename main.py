@@ -72,7 +72,6 @@ from llm import (
     PROVIDER_NAMES,
     RateLimitError,
     build_compatibility_interpretation,
-    build_deep_style_analysis,
     build_ideal_date,
     build_interaction_card,
     build_my_style_for_contact,
@@ -118,7 +117,6 @@ from storage import (
     get_deep_analysis,
     get_acquisition_source,
     get_deep_analysis_free_until,
-    get_deep_style_analysis,
     get_gender,
     get_promo_channel_premium_until,
     get_ideal_date,
@@ -144,7 +142,6 @@ from storage import (
     get_or_create_contact,
     get_running_notes,
     get_style_card,
-    delete_deep_style_analysis,
     init_db,
     list_all_users,
     list_contacts,
@@ -152,7 +149,6 @@ from storage import (
     referral_counts_by_user,
     save_business_message,
     save_deep_analysis,
-    save_deep_style_analysis,
     save_ideal_date,
     save_interaction_card,
     save_message_samples,
@@ -176,7 +172,6 @@ from storage import (
     upsert_chat_ref_mapping,
     upsert_user,
     users_with_deep_analysis,
-    users_with_deep_style,
     users_with_style_card,
 )
 
@@ -226,7 +221,11 @@ def _is_admin(telegram_id: str | int) -> bool:
 # BTN_LIVE          = "💫 Новый диалог"
 BTN_UNIFIED       = "💬 Ответ с CueMe"
 BTN_DEEP          = "🔬 Анализ собеседника"
-BTN_DEEP_STYLE    = "🪞 Анализ своего стиля"
+# BTN_DEEP_STYLE («🪞 Анализ своего стиля») убрана совсем по запросу — вместе
+# со всей веткой (_gen_deep_style_analysis/_format_deep_style_analysis/
+# _run_deep_style_analysis/_show_deep_style_analysis, /deep_style_analysis,
+# deep_style_analysis-таблица в storage.py, build_deep_style_analysis в
+# llm.py). Остаётся только «Анализ собеседника».
 BTN_DATE          = "💐 Идеальное свидание"
 # BTN_REVIVE («🔥 Скрипты общения») убрана совсем из главного меню — была
 # внутри BTN_MORE, который тоже убран. _show_revive/cb_revive_next/
@@ -235,8 +234,8 @@ BTN_DATE          = "💐 Идеальное свидание"
 # BTN_INVITE («🎁 Пригласить друга») тоже была только внутри BTN_MORE —
 # приглашение друга доступно через «👑 Подписка» (premium_menu_kb) и /invite.
 # BTN_INVITE        = "🎁 Пригласить друга"
-# BTN_ANALYZE — на главном экране, открывает инлайн-подменю с BTN_DEEP/
-# BTN_DEEP_STYLE (см. analyze_menu_kb) — чтобы не перегружать первый экран.
+# BTN_ANALYZE — на главном экране, открывает инлайн-подменю с BTN_DEEP
+# (см. analyze_menu_kb) — чтобы не перегружать первый экран.
 BTN_ANALYZE       = "🔬 Разобраться"
 # BTN_MORE («⚙️ Ещё») убрана — «Идеальное свидание» стала кнопкой первого
 # уровня, «Пригласить друга» доступно через «👑 Подписка»/командой /invite,
@@ -246,7 +245,8 @@ BTN_ANALYZE       = "🔬 Разобраться"
 BTN_SUBSCRIPTION  = "👑 Подписка"
 BTN_HELP          = "❓ Помощь"
 # BTN_ME («👤 Мой стиль») убрана вместе с командой /me — дублировала
-# BTN_DEEP_STYLE (и была бесплатной лазейкой мимо подписки на неё).
+# «Анализ своего стиля» (и была бесплатной лазейкой мимо подписки на неё;
+# сам «Анализ своего стиля» тоже убран совсем, см. пометку у BTN_DEEP выше).
 # BTN_MY_STYLE_FOR («🎯 Мой стиль с ним») убрана из меню, но _show_my_style_for
 # не удалена — можно вернуть кнопку одной правкой.
 # BTN_CONTACT («🔍 Стиль собеседника») удалена совсем — её interaction_card
@@ -902,7 +902,6 @@ def main_kb() -> ReplyKeyboardMarkup:
 def analyze_menu_kb() -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     b.button(text=BTN_DEEP, callback_data="menu:deep")
-    b.button(text=BTN_DEEP_STYLE, callback_data="menu:deepstyle")
     b.adjust(1)
     return b.as_markup()
 
@@ -2305,253 +2304,6 @@ async def cb_ideal_date_contact(call: CallbackQuery, bot: Bot) -> None:
     await _run_ideal_date(bot, call.message, telegram_id, contact_id, edit=True)
 
 
-# ── 🪞 Анализ своего стиля (агрегат по всем контактам) ────────────────────────
-
-DEEP_STYLE_MIN_MSGS = 20  # минимум своих сообщений суммарно, иначе анализ бессмысленен
-
-
-def _deep_style_stats_summary(rows: list[dict]) -> str:
-    dates = sorted(r["date"] for r in rows if r["text"])
-    date_from = dates[0][:10] if dates else "?"
-    date_to   = dates[-1][:10] if dates else "?"
-    avg = sum(len(r["text"]) for r in rows) / len(rows) if rows else 0
-    return (
-        f"Период: {date_from} — {date_to}\n"
-        f"Всего сообщений: {len(rows)}, средняя длина {avg:.0f} симв."
-    )
-
-
-# v1 (профиль/история по периодам/swot/советы, 2 сообщения) — оставлено для
-# отката. Заменено компактной 3-блочной карточкой (архетип/факты/совет) одним
-# сообщением + вычисляемым блоком совместимости без LLM (см. ниже).
-# async def _gen_deep_style_analysis(telegram_id: str) -> dict | None:
-#     """Ленивая генерация с кэшем в deep_style_analysis. None — данных мало."""
-#     cached = get_deep_style_analysis(telegram_id)
-#     if cached:
-#         return cached
-#
-#     rows = get_all_dated_my_messages(telegram_id)
-#     if len(rows) < DEEP_STYLE_MIN_MSGS:
-#         return None
-#
-#     dated_lines = _periodized_dated_lines(rows)
-#     stats       = _deep_style_stats_summary(rows)
-#     profile, history, swot, tips = await build_deep_style_analysis(
-#         dated_lines, stats, user_gender=get_gender(telegram_id),
-#     )
-#     save_deep_style_analysis(telegram_id, profile, history, swot, tips)
-#     return {
-#         "profile_text": profile, "history_text": history,
-#         "swot_text": swot, "tips_text": tips,
-#     }
-#
-#
-# def _format_deep_style_analysis(data: dict) -> tuple[str, str]:
-#     msg1 = (
-#         "🪞 Анализ своего стиля\n\n"
-#         f"🎙️ Коммуникативный профиль\n\n{data['profile_text']}\n\n"
-#         f"📖 Как менялся твой стиль\n\n{data['history_text']}"
-#     )
-#     msg2 = (
-#         f"🧭 Сильные стороны, проблемы и точки роста\n\n{data['swot_text']}\n\n"
-#         f"🎯 Рекомендации для дейтинга\n\n{data['tips_text']}"
-#     )
-#     return msg1, msg2
-
-
-# v-5axis (регекс по тексту «Название: N/5», медаль «—N/25») — оставлено для
-# отката. Новая система метрик не даёт единого сравнимого числа/медали —
-# ранжируем по доле тёплой лексики (warmth_conflict) как единственной
-# метрике, которая по смыслу сравнима между разными контактами («с кем
-# теплее»). См. новые версии ниже.
-# _COMPAT_NUM_RE = re.compile(r"—\s*(\d{1,2})\s*/\s*25\b")
-# _AXIS_HEADER_RE = re.compile(r"^(.+?):\s*(\d)/5\s*$")
-#
-#
-# def _first_compat_reason(compatibility_text: str) -> str:
-#     """Ось с максимальным баллом («Название: N/5», обоснование — на следующей
-#     непустой строке) — короткий пересказ для «лучшая совместимость» в «Анализ
-#     своего стиля», не весь текст целиком."""
-#     lines = compatibility_text.splitlines()
-#     best_name, best_score, best_reason = "", -1, ""
-#     for i, raw_line in enumerate(lines):
-#         m = _AXIS_HEADER_RE.match(raw_line.strip())
-#         if not m or int(m.group(2)) <= best_score:
-#             continue
-#         reason = next((l.strip() for l in lines[i + 1:] if l.strip()), "")
-#         best_name, best_score, best_reason = m.group(1), int(m.group(2)), reason
-#     if not best_name:
-#         return ""
-#     return f"{best_name}: {best_score}/5 — {best_reason}" if best_reason else f"{best_name}: {best_score}/5"
-#
-#
-# def _best_compatibility_contact(telegram_id: str) -> tuple[str, str] | None:
-#     """Контакт с максимальной совместимостью среди тех, для кого «Анализ
-#     собеседника» УЖЕ проводился (get_deep_analysis — без форсирования
-#     генерации, без LLM-вызовов, быстро). None, если ни для одного контакта
-#     анализа ещё нет. Возвращает (имя_контакта, compatibility_text)."""
-#     best: tuple[int, str, str] | None = None
-#     for c in list_contacts(telegram_id):
-#         data = get_deep_analysis(c["id"])
-#         if not data:
-#             continue
-#         m = _COMPAT_NUM_RE.search(data["compatibility_text"])
-#         if not m:
-#             continue
-#         score = int(m.group(1))
-#         if best is None or score > best[0]:
-#             best = (score, _contact_name(c), data["compatibility_text"])
-#     if best is None:
-#         return None
-#     return best[1], best[2]
-
-
-def _best_compatibility_contact(telegram_id: str) -> tuple[str, dict] | None:
-    """Контакт с максимальной долей тёплой лексики среди тех, для кого «Анализ
-    собеседника» УЖЕ проводился (get_deep_analysis — без форсирования
-    генерации, без LLM-вызовов, быстро). None, если ни для одного контакта
-    анализа ещё нет. Возвращает (имя_контакта, metrics-словарь).
-    warmth_pct читается напрямую как число (compatibility_metrics.py кладёт
-    его в metrics явным полем) — не парсится регуляркой из готового текста,
-    формат которого может поменяться независимо от этой функции."""
-    best: tuple[float, str, dict] | None = None
-    for c in list_contacts(telegram_id):
-        data = get_deep_analysis(c["id"])
-        if not data:
-            continue
-        try:
-            metrics = json.loads(data["metrics_json"])
-        except (ValueError, TypeError):
-            continue
-        warmth = metrics.get("warmth_conflict")
-        if not warmth or "warmth_pct" not in warmth:
-            continue
-        score = warmth["warmth_pct"]
-        if best is None or score > best[0]:
-            best = (score, _contact_name(c), metrics)
-    if best is None:
-        return None
-    return best[1], best[2]
-
-
-async def _gen_deep_style_analysis(telegram_id: str) -> dict | None:
-    """Ленивая генерация с кэшем в deep_style_analysis. None — данных мало."""
-    cached = get_deep_style_analysis(telegram_id)
-    if cached:
-        return cached
-
-    rows = get_all_dated_my_messages(telegram_id)
-    if len(rows) < DEEP_STYLE_MIN_MSGS:
-        return None
-
-    dated_lines = _periodized_dated_lines(rows)
-    stats       = _deep_style_stats_summary(rows)
-    profile, facts, tip, message = await build_deep_style_analysis(
-        dated_lines, stats, user_gender=get_gender(telegram_id),
-    )
-    save_deep_style_analysis(telegram_id, profile, facts, tip, message)
-    return {
-        "profile_text": profile, "facts_text": facts,
-        "tip_text": tip, "message_text": message,
-    }
-
-
-def _format_deep_style_analysis(telegram_id: str, data: dict) -> str:
-    """Текстовые блоки — одно компактное сообщение. Совместимость с лучшим
-    контактом считается заново при каждом показе (не кэшируется вместе с
-    остальными), т.к. deep_analysis других контактов может обновиться позже.
-    Блок «пример сообщения» сюда не входит — отправляется отдельным
-    tap-to-copy сообщением, см. _run_deep_style_analysis."""
-    parts = [
-        "🪞 Анализ своего стиля",
-        data["profile_text"].strip(),
-        data["facts_text"].strip(),
-        data["tip_text"].strip(),
-    ]
-
-    best = _best_compatibility_contact(telegram_id)
-    if best:
-        name, metrics = best
-        warmth = metrics.get("warmth_conflict", {})
-        score_label = warmth.get("short", "?")
-        reason = warmth.get("interpretation") or warmth.get("fact", "")
-        compat_block = f"💕 Теплее всего складывается с {name} ({score_label})"
-        if reason:
-            compat_block += f"\n{reason}"
-        parts.append(compat_block)
-    else:
-        parts.append(
-            "Запусти «Анализ собеседника» хотя бы для одного контакта, чтобы "
-            "увидеть тут сравнение."
-        )
-
-    return "\n\n".join(parts)
-
-
-def deep_style_result_kb() -> InlineKeyboardMarkup:
-    b = InlineKeyboardBuilder()
-    b.button(text="🔄 Обновить анализ", callback_data="deepstyle_refresh")
-    return b.as_markup()
-
-
-async def _run_deep_style_analysis(bot: Bot, target: Message, telegram_id: str) -> None:
-    if not await _require_premium(bot, target, telegram_id):
-        return
-    await target.answer("Готовлю анализ своего стиля. Это займёт ~30 секунд...")
-
-    try:
-        data = await _gen_deep_style_analysis(telegram_id)
-    except RateLimitError:
-        await target.answer("Лимит LLM исчерпан, попробуй позже.")
-        return
-    except Exception:
-        logging.exception("deep_style_analysis: ошибка генерации")
-        await target.answer("Не удалось сгенерировать анализ — попробуй ещё раз.")
-        return
-
-    if not data:
-        await target.answer(
-            f"Пока маловато данных для анализа своего стиля — нужно минимум "
-            f"{DEEP_STYLE_MIN_MSGS} твоих сообщений суммарно (JSON-экспорт или "
-            "накопление через Автоматизацию чатов)."
-        )
-        return
-
-    card = _format_deep_style_analysis(telegram_id, data)
-    await _answer_long(target, card)
-
-    if data["message_text"].strip():
-        text, kw = _copy_block(
-            "✉️ Пример сообщения в твоём стиле (тапни, чтобы скопировать):",
-            data["message_text"].strip(),
-            deep_style_result_kb(),
-        )
-        await target.answer(text, **kw)
-    else:
-        await target.answer("Готово.", reply_markup=deep_style_result_kb())
-
-
-async def _show_deep_style_analysis(message: Message, bot: Bot, telegram_id: str | None = None) -> None:
-    telegram_id = telegram_id or str(message.from_user.id)
-    if not list_contacts(telegram_id):
-        await _send_no_contacts_hint(message)
-        return
-    await _run_deep_style_analysis(bot, message, telegram_id)
-
-
-@dp.message(Command("deep_style_analysis"))
-async def cmd_deep_style_analysis(message: Message, bot: Bot) -> None:
-    await _show_deep_style_analysis(message, bot)
-
-
-@dp.callback_query(F.data == "deepstyle_refresh")
-async def cb_deep_style_analysis_refresh(call: CallbackQuery, bot: Bot) -> None:
-    telegram_id = str(call.from_user.id)
-    await call.answer("Пересобираю анализ...")
-    delete_deep_style_analysis(telegram_id)
-    await _run_deep_style_analysis(bot, call.message, telegram_id)
-
-
 # ── Business API ──────────────────────────────────────────────────────────────
 
 @dp.business_connection()
@@ -3064,8 +2816,6 @@ async def cb_submenu(call: CallbackQuery, state: FSMContext, bot: Bot) -> None:
     await call.answer()
     if action == "deep":
         await _show_deep_analysis(call.message, bot, telegram_id)
-    elif action == "deepstyle":
-        await _show_deep_style_analysis(call.message, bot, telegram_id)
     elif action == "date":
         await _show_ideal_date(call.message, bot, telegram_id)
     # elif action == "revive":  # «Скрипты общения» убраны совсем — см. BTN_REVIVE
@@ -3126,7 +2876,6 @@ async def handle_document(message: Message, bot: Bot, state: FSMContext) -> None
     await _maybe_prompt_gender(bot, telegram_id)
 
     delete_style_card(telegram_id)
-    delete_deep_style_analysis(telegram_id)
 
     name = chat.meta.contact_name
 
@@ -3291,7 +3040,6 @@ async def _collect_users_data(bot: Bot) -> tuple[list[dict], dict]:
     # Пакетные метрики — по одному запросу на всех юзеров сразу.
     events_by_user = event_counts_by_user()
     deep_analysis_users = users_with_deep_analysis()
-    deep_style_users = users_with_deep_style()
     style_card_users = users_with_style_card()
     referrals_by_user = referral_counts_by_user()
 
@@ -3300,7 +3048,7 @@ async def _collect_users_data(bot: Bot) -> tuple[list[dict], dict]:
         "total": len(users), "with_gender": 0, "with_contact": 0,
         "with_ref_premium": 0, "blocked": 0, "automation_off": 0, "inactive": 0,
         "premium_now": 0, "used_reply": 0, "used_screenshot": 0, "used_live": 0,
-        "used_deep_analysis": 0, "used_deep_style": 0, "active_7d": 0,
+        "used_deep_analysis": 0, "active_7d": 0,
     }
 
     for u in users:
@@ -3384,7 +3132,6 @@ async def _collect_users_data(bot: Bot) -> tuple[list[dict], dict]:
         uses_screenshot = ev.get("gen_screenshot_variants", 0)
         uses_live = ev.get("gen_live", 0) + ev.get("gen_live_regen", 0)
         used_deep_analysis = tid in deep_analysis_users
-        used_deep_style = tid in deep_style_users
 
         # Premium: _is_premium ходит в Telegram (с кэшем), поэтому зовём ОДИН
         # раз, а источник доопределяем локальными проверками в том же порядке
@@ -3412,8 +3159,6 @@ async def _collect_users_data(bot: Bot) -> tuple[list[dict], dict]:
             totals["used_live"] += 1
         if used_deep_analysis:
             totals["used_deep_analysis"] += 1
-        if used_deep_style:
-            totals["used_deep_style"] += 1
         if active_7d:
             totals["active_7d"] += 1
 
@@ -3436,7 +3181,6 @@ async def _collect_users_data(bot: Bot) -> tuple[list[dict], dict]:
             "uses_screenshot": uses_screenshot,
             "uses_live": uses_live,
             "used_deep_analysis": used_deep_analysis,
-            "used_deep_style": used_deep_style,
             "has_style_card": tid in style_card_users,
             "is_premium_now": is_premium_now,
             "premium_source": premium_source,
@@ -3485,7 +3229,6 @@ def _build_users_report(rows: list[dict], totals: dict) -> list[str]:
         f"По скриншоту: {totals['used_screenshot']}\n"
         f"Ответить с CueMe (live): {totals['used_live']}\n"
         f"Анализ собеседника: {totals['used_deep_analysis']}\n"
-        f"Анализ своего стиля: {totals['used_deep_style']}\n"
         f"Активны за 7 дней: {totals['active_7d']}\n"
         f"Premium сейчас: {totals['premium_now']}"
     )
@@ -3500,7 +3243,7 @@ _USERS_CSV_COLUMNS = [
     "signup_date", "days_since_signup", "last_action_at", "last_incoming_at",
     "days_since_last_active", "active_last_7d",
     "uses_reply", "uses_screenshot", "uses_live",
-    "used_deep_analysis", "used_deep_style", "has_style_card",
+    "used_deep_analysis", "has_style_card",
     "is_premium_now", "premium_source", "trial_used", "referrals_made",
 ]
 
@@ -4994,8 +4737,7 @@ async def _show_help(message: Message) -> None:
         "один за другим)\n\n"
         "<b>🔬 Разобраться</b> (кнопка в меню)\n"
         "/deep_analysis — совместимость, как писать этому человеку, стиль и "
-        "флаги, готовое сообщение\n"
-        "/deep_style_analysis — твой коммуникативный профиль и советы для дейтинга\n\n"
+        "флаги, готовое сообщение\n\n"
         "<b>💐 Идеальное свидание</b> (кнопка в меню) — идея свидания и подарков под человека\n\n"
         "<b>👑 Подписка</b> (кнопка в меню) — статус подписки + "
         f"🎁 Пригласить друга (/invite) — получить свой код, за друга по коду дадим "
@@ -5320,7 +5062,6 @@ async def main() -> None:
         BotCommand(command="contacts",    description="Загруженные чаты"),
         BotCommand(command="progress",    description="Прогресс накопления по контактам"),
         BotCommand(command="deep_analysis", description="Анализ собеседника"),
-        BotCommand(command="deep_style_analysis", description="Анализ своего стиля"),
         BotCommand(command="premium",     description="Статус подписки"),
         BotCommand(command="delete",      description="Удалить свои данные"),
         BotCommand(command="rebuild",     description="Пересобрать все карточки"),
