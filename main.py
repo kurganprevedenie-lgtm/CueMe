@@ -1937,12 +1937,27 @@ def _trend_table_rows(vt: dict) -> list[dict]:
     return periods[-_MAX_TREND_ROWS:]
 
 
+def _rich_heading(text: str) -> str:
+    """Жирный заголовок внутри Rich Message: <p><b>...</b></p>, НЕ
+    <h2>/<h3> (heading-блок, RichBlockSectionHeading в Bot API 10.1+).
+    Heading-блок — отдельный тип блока со своим "size" (1-6), и каждый
+    Telegram-клиент вправе рисовать его собственной типографикой — на
+    iPhone это оказался крупный засечный шрифт, на десктопе/вебе — обычный
+    текст. Bold-текст ВНУТРИ параграфа (RichBlockParagraph) такому не
+    подвержен — это тот же механизм, что уже даёт одинаковый на всех
+    платформах blockquote (тоже просто paragraph-контент, не отдельный
+    блок-тип). Единая точка форматирования жирных заголовков во всей
+    карточке — и для общего заголовка, и для заголовков метрик/секций, не
+    два разных места."""
+    return f"<p><b>{html.escape(text)}</b></p>"
+
+
 def _build_rich_analysis_html(name: str, metrics: dict, dynamics_text: str, synthesis: str, advice: str) -> str:
     """HTML для sendRichMessage (Bot API 10.1+, aiogram InputRichMessage.html):
-    <h3>-заголовок с эмодзи по смыслу метрики + <blockquote> под ним на
-    каждую метрику, отдельная секция «Динамика переписки» с настоящей
-    таблицей периодов, «Вывод» — синтез, «Что дальше» — совет обычным
-    текстом, без выделения."""
+    жирный заголовок (см. _rich_heading — НЕ <h2>/<h3>) с эмодзи по смыслу
+    метрики + <blockquote> под ним на каждую метрику, отдельная секция
+    «Динамика переписки» с настоящей таблицей периодов, «Вывод» — синтез,
+    «Что дальше» — совет обычным текстом, без выделения."""
     esc = html.escape
     meta = metrics.get("_meta") or {}
     vt = metrics.get("_volume_trend") or {}
@@ -1961,8 +1976,9 @@ def _build_rich_analysis_html(name: str, metrics: dict, dynamics_text: str, synt
         text = m.get("interpretation") or m["fact"]
         if key == "warmth_conflict":
             text += _warmth_examples_suffix(m)
+        heading = f"{_METRIC_EMOJI.get(key, '')} {m['label']}".strip()
         metric_block_parts.append(
-            f"<h3>{_METRIC_EMOJI.get(key, '')} {esc(m['label'])}</h3>\n<blockquote>{esc(text)}</blockquote>"
+            f"{_rich_heading(heading)}\n<blockquote>{esc(text)}</blockquote>"
         )
     metric_blocks = "\n".join(metric_block_parts)
 
@@ -1986,15 +2002,15 @@ def _build_rich_analysis_html(name: str, metrics: dict, dynamics_text: str, synt
         trend_table = ""
 
     return (
-        f"<h2>🔬 Анализ собеседника — {esc(name)}</h2>\n"
+        f"{_rich_heading(f'🔬 Анализ собеседника — {name}')}\n"
         f"{subtitle}"
         f"{metric_blocks}\n"
-        "<h3>📈 Динамика переписки</h3>\n"
+        f"{_rich_heading('📈 Динамика переписки')}\n"
         f"{trend_table}"
         f"<blockquote>{esc(dynamics_text)}</blockquote>\n"
-        "<h3>🧩 Вывод</h3>\n"
+        f"{_rich_heading('🧩 Вывод')}\n"
         f"<blockquote>{esc(synthesis)}</blockquote>\n"
-        "<h3>👉 Что дальше</h3>\n"
+        f"{_rich_heading('👉 Что дальше')}\n"
         f"<p>{esc(advice)}</p>"
     )
 
