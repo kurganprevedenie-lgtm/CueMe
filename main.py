@@ -1899,27 +1899,23 @@ def _direction_label(direction: str) -> str:
 
 
 def _warmth_examples_suffix(m: dict) -> str:
-    """Доп. строка с реальными цитатами ТОЛЬКО для секции «Тепло / конфликт»
-    (warm_examples/conflict_examples — см. compatibility_metrics.warmth_conflict) —
-    остальные метрики этих полей не имеют, суффикс для них пустой. Цитаты
-    обрезаются до 80 символов, тот же паттерн, что у initiative_axis в
-    features.py. Добавляется ПОСЛЕ interpretation/fact, а не встраивается в
-    промпт интерпретации — LLM переписывает только смысл факта и не видит
-    сырые цитаты, значит не может их исказить/потерять."""
+    """Доп. строка с реальными цитатами ТОЛЬКО для секции «Тепло»
+    (warm_examples — см. compatibility_metrics.warmth) — остальные метрики
+    этого поля не имеют, суффикс для них пустой. Цитаты обрезаются до 80
+    символов, тот же паттерн, что у initiative_axis в features.py.
+    Добавляется ПОСЛЕ interpretation/fact, а не встраивается в промпт
+    интерпретации — LLM переписывает только смысл факта и не видит сырые
+    цитаты, значит не может их исказить/потерять."""
     warm = m.get("warm_examples") or []
-    conflict = m.get("conflict_examples") or []
-    if not warm and not conflict:
+    if not warm:
         return ""
 
     def _quote(text: str) -> str:
         return text if len(text) <= 80 else text[:77].rstrip() + "…"
 
     parts = [
-        f"тепло: «{_quote(text)}» ({_direction_label(direction)})"
+        f"«{_quote(text)}» ({_direction_label(direction)})"
         for direction, text in warm
-    ] + [
-        f"конфликт: «{_quote(text)}» ({_direction_label(direction)})"
-        for direction, text in conflict
     ]
     return " Например, " + "; ".join(parts) + "."
 
