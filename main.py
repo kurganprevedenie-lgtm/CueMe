@@ -235,9 +235,10 @@ BTN_DATE          = "💐 Идеальное свидание"
 # BTN_INVITE («🎁 Пригласить друга») тоже была только внутри BTN_MORE —
 # приглашение друга доступно через «👑 Подписка» (premium_menu_kb) и /invite.
 # BTN_INVITE        = "🎁 Пригласить друга"
-# BTN_ANALYZE — на главном экране, открывает инлайн-подменю с BTN_DEEP
-# (см. analyze_menu_kb) — чтобы не перегружать первый экран.
-BTN_ANALYZE       = "🔬 Разобраться"
+# BTN_ANALYZE («🔬 Разобраться») убрана совсем по запросу — раньше открывала
+# инлайн-подменю (analyze_menu_kb) с единственной кнопкой BTN_DEEP (после
+# того как «Анализ своего стиля» убрали, подменю на один пункт стало лишним
+# тапом) — теперь BTN_DEEP прямо на главном экране, без промежуточного шага.
 # BTN_MORE («⚙️ Ещё») убрана — «Идеальное свидание» стала кнопкой первого
 # уровня, «Пригласить друга» доступно через «👑 Подписка»/командой /invite,
 # «Скрипты общения» убраны совсем (см. BTN_REVIVE выше). more_menu_kb()
@@ -256,7 +257,7 @@ BTN_HELP          = "❓ Помощь"
 # BTN_REWRITE («📝 Переписать») и /auto удалены совсем — их сценарий (черновик
 # без привязки к входящему) теперь полностью закрывает «💫 Новый диалог».
 _ALL_BTNS = {
-    BTN_UNIFIED, BTN_ANALYZE, BTN_DATE, BTN_SUBSCRIPTION, BTN_HELP,
+    BTN_UNIFIED, BTN_DEEP, BTN_DATE, BTN_SUBSCRIPTION, BTN_HELP,
 }
 
 # Защита от параллельных пересборок одного контакта
@@ -895,16 +896,9 @@ def main_kb() -> ReplyKeyboardMarkup:
     # b.row(KeyboardButton(text=BTN_SCREENSHOT), KeyboardButton(text=BTN_REPLY))
     # b.row(KeyboardButton(text=BTN_LIVE))
     b.row(KeyboardButton(text=BTN_UNIFIED))
-    b.row(KeyboardButton(text=BTN_ANALYZE), KeyboardButton(text=BTN_DATE))
+    b.row(KeyboardButton(text=BTN_DEEP), KeyboardButton(text=BTN_DATE))
     b.row(KeyboardButton(text=BTN_SUBSCRIPTION), KeyboardButton(text=BTN_HELP))
     return b.as_markup(resize_keyboard=True)
-
-
-def analyze_menu_kb() -> InlineKeyboardMarkup:
-    b = InlineKeyboardBuilder()
-    b.button(text=BTN_DEEP, callback_data="menu:deep")
-    b.adjust(1)
-    return b.as_markup()
 
 
 # more_menu_kb убрана вместе с BTN_MORE — «Идеальное свидание» стало кнопкой
@@ -2823,8 +2817,8 @@ async def handle_menu_button(message: Message, state: FSMContext, bot: Bot) -> N
     #     await _show_live_start(message)
     if message.text == BTN_UNIFIED:
         await _start_unified_reply(message, state)
-    elif message.text == BTN_ANALYZE:
-        await message.answer("Что разобрать?", reply_markup=analyze_menu_kb())
+    elif message.text == BTN_DEEP:
+        await _show_deep_analysis(message, bot)
     elif message.text == BTN_DATE:
         await _show_ideal_date(message, bot)
     elif message.text == BTN_SUBSCRIPTION:
@@ -2838,9 +2832,7 @@ async def cb_submenu(call: CallbackQuery, state: FSMContext, bot: Bot) -> None:
     action = call.data.split(":", 1)[1]
     telegram_id = str(call.from_user.id)
     await call.answer()
-    if action == "deep":
-        await _show_deep_analysis(call.message, bot, telegram_id)
-    elif action == "date":
+    if action == "date":
         await _show_ideal_date(call.message, bot, telegram_id)
     # elif action == "revive":  # «Скрипты общения» убраны совсем — см. BTN_REVIVE
     #     await _show_revive(call.message, state)
@@ -4751,7 +4743,7 @@ async def cmd_progress(message: Message) -> None:
 async def _show_help(message: Message) -> None:
     await message.answer(
         "Вот что я умею. На главном экране — кнопка «💬 Ответ с CueMe» плюс "
-        "«🔬 Разобраться», «💐 Идеальное свидание» и «👑 Подписка»:\n\n"
+        "«🔬 Анализ собеседника», «💐 Идеальное свидание» и «👑 Подписка»:\n\n"
         "💬 Ответ с CueMe — пришли скриншот переписки, перешли сообщение или "
         "вставь текст: если контакт уже есть — несколько вариантов ответа "
         "(Флирт/Дружески/Уверенно и т.п.); если нет — заведём новый диалог "
@@ -4759,7 +4751,7 @@ async def _show_help(message: Message) -> None:
         "/reply — ответить на его сообщение\n"
         "/screenshot — ответить по скриншоту переписки (можно слать скриншоты "
         "один за другим)\n\n"
-        "<b>🔬 Разобраться</b> (кнопка в меню)\n"
+        "<b>🔬 Анализ собеседника</b> (кнопка в меню)\n"
         "/deep_analysis — совместимость, как писать этому человеку, стиль и "
         "флаги, готовое сообщение\n\n"
         "<b>💐 Идеальное свидание</b> (кнопка в меню) — идея свидания и подарков под человека\n\n"
