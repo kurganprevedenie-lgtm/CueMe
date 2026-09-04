@@ -3024,6 +3024,12 @@ def _yn(value: bool) -> str:
     return "да" if value else "нет"
 
 
+_PREMIUM_SOURCE_LABELS = {
+    "referral": "реферал", "promo_channel": "промо-канал",
+    "stars": "Stars", "tribute": "Tribute", "нет": "—",
+}
+
+
 async def _collect_users_data(bot: Bot) -> tuple[list[dict], dict]:
     """ОДИН тяжёлый проход по всем юзерам — из него рендерятся и HTML-отчёт
     (_build_users_report), и CSV (_build_users_csv), чтобы не звать get_chat и
@@ -3066,17 +3072,6 @@ async def _collect_users_data(bot: Bot) -> tuple[list[dict], dict]:
             count_biz_messages_for_contact(tid, c["id"]) + count_imported_messages(c["id"])
             for c in contacts
         )
-
-        premium_line = ""
-        until_raw = u["deep_analysis_free_until"]
-        if until_raw:
-            try:
-                until_dt = datetime.fromisoformat(until_raw)
-                if until_dt > now:
-                    premium_line = f"\n    👑 Premium (реферал) до {until_dt.strftime('%d.%m %H:%M')}"
-                    totals["with_ref_premium"] += 1
-            except ValueError:
-                pass
 
         is_blocked = bool(u["blocked_bot"])
         if is_blocked:
@@ -3131,19 +3126,35 @@ async def _collect_users_data(bot: Bot) -> tuple[list[dict], dict]:
         used_deep_analysis = tid in deep_analysis_users
 
         # Premium: _is_premium ходит в Telegram (с кэшем), поэтому зовём ОДИН
-        # раз, а источник доопределяем локальными проверками в том же порядке
-        # приоритета, что внутри самой _is_premium — без второго обращения.
+        # раз, а источник/срок доопределяем через _premium_expiry_info — та
+        # же функция, что строит текст под кнопкой «Подписка» (раньше тут
+        # был отдельный, более бедный расчёт: не проверял Stars вообще и всё,
+        # что не реферал/промо-канал, молча относил к Tribute).
         is_premium_now = await _is_premium(bot, tid)
-        if not is_premium_now:
-            premium_source = "нет"
-        elif _has_referral_premium(tid):
-            premium_source = "referral"
-        elif _has_promo_channel_premium(tid):
-            premium_source = "promo_channel"
-        else:
-            premium_source = "tribute"
+        premium_until: datetime | None = None
+        premium_is_subscription = False
         if is_premium_now:
+            premium_source, premium_until, premium_is_subscription = _premium_expiry_info(tid)
             totals["premium_now"] += 1
+            if premium_source == "referral":
+                totals["with_ref_premium"] += 1
+        else:
+            premium_source = "нет"
+
+        premium_remaining = (
+            _format_remaining(premium_until - now) if premium_until else ""
+        )
+        premium_line = ""
+        if is_premium_now:
+            label = _PREMIUM_SOURCE_LABELS.get(premium_source, premium_source)
+            if premium_until:
+                suffix = " (автопродление)" if premium_is_subscription else ""
+                premium_line = (
+                    f"\n    👑 Premium: {label}{suffix} до "
+                    f"{premium_until.strftime('%d.%m %H:%M')} UTC (осталось {premium_remaining})"
+                )
+            else:
+                premium_line = f"\n    👑 Premium: {label} (дата окончания неизвестна)"
 
         days_since_active = _days_since(last_action_raw, now)
         active_7d = days_since_active is not None and days_since_active <= 7
@@ -3181,6 +3192,9 @@ async def _collect_users_data(bot: Bot) -> tuple[list[dict], dict]:
             "has_style_card": tid in style_card_users,
             "is_premium_now": is_premium_now,
             "premium_source": premium_source,
+            "premium_until": premium_until.isoformat() if premium_until else "",
+            "premium_remaining": premium_remaining,
+            "premium_auto_renew": premium_is_subscription if is_premium_now else "",
             "trial_used": u["trial_used"],
             "referrals_made": referrals_by_user.get(tid, 0),
             # только для HTML-отчёта, в CSV не идут
@@ -3251,7 +3265,8 @@ _USERS_CSV_COLUMNS = [
     "days_since_last_active", "active_last_7d",
     "uses_reply", "uses_screenshot", "uses_live",
     "used_deep_analysis", "has_style_card",
-    "is_premium_now", "premium_source", "trial_used", "referrals_made",
+    "is_premium_now", "premium_source", "premium_until", "premium_remaining",
+    "premium_auto_renew", "trial_used", "referrals_made",
 ]
 
 
@@ -4819,33 +4834,59 @@ def _format_until(dt: datetime) -> str:
     return f"{dt.day} {_RU_MONTHS_GEN[dt.month]} {dt.year}, {dt.strftime('%H:%M')} UTC"
 
 
-def _premium_expiry_line(telegram_id: str) -> str:
-    """Строка «сколько осталось + способ оплаты» для активного Premium, или
-    "" если срок неизвестен (Tribute — см. ниже). Порядок проверки — тот же
-    приоритет, что уже использует _is_premium (реферал → промо-канал →
-    Stars → членство в канале Tribute), поэтому если ни один источник с
-    известной датой не сработал, а _is_premium всё равно True — остаётся
-    только Tribute."""
+def _premium_expiry_info(telegram_id: str) -> tuple[str, datetime | None, bool]:
+    """(источник, until, is_subscription) — общий разбор ДЛЯ ЛЮБОГО активного
+    Premium, переиспользуется и в тексте «Подписка» (_premium_expiry_line), и
+    в экспорте /users (_collect_users_data): раньше там был отдельный, более
+    бедный расчёт premium_source, который не проверял Stars вообще и всё, что
+    не реферал/промо-канал, молча относил к Tribute — эта функция единая
+    точка правды и для текста, и для экспорта.
+
+    Порядок проверки — тот же приоритет, что уже использует _is_premium
+    (реферал → промо-канал → Stars → членство в канале Tribute): источник
+    "tribute" возвращается, только если ни один из первых трёх не дал
+    активного окна — это ПОДРАЗУМЕВАЕТ, что _is_premium(telegram_id) уже
+    True (иначе Premium вообще нет, вызывать не нужно). until=None только
+    для Tribute — точной даты окончания бот не знает (Tribute продлевает/
+    отменяет подписку на своей стороне, боту доступен только факт членства
+    через get_chat_member). is_subscription — True только для Stars-тарифа
+    "месяц" (нативная подписка с автопродлением), иначе False."""
     now = datetime.now(timezone.utc)
 
     until = get_deep_analysis_free_until(telegram_id)
     if until and until > now:
-        return (
-            f"🎁 Реферальная награда — действует до {_format_until(until)} "
-            f"(осталось {_format_remaining(until - now)})."
-        )
+        return "referral", until, False
 
     until = get_promo_channel_premium_until(telegram_id)
     if until and until > now:
-        return (
-            f"📢 Награда за подписку на канал — действует до {_format_until(until)} "
-            f"(осталось {_format_remaining(until - now)})."
-        )
+        return "promo_channel", until, False
 
     until = get_stars_premium_until(telegram_id)
     if until and until > now:
         payment = get_latest_star_payment(telegram_id)
-        if payment and payment["is_subscription"]:
+        return "stars", until, bool(payment and payment["is_subscription"])
+
+    return "tribute", None, False
+
+
+def _premium_expiry_line(telegram_id: str) -> str:
+    """Строка «сколько осталось + способ оплаты» для активного Premium —
+    для пользователя (текст под кнопкой «Подписка»)."""
+    now = datetime.now(timezone.utc)
+    source, until, is_subscription = _premium_expiry_info(telegram_id)
+
+    if source == "referral":
+        return (
+            f"🎁 Реферальная награда — действует до {_format_until(until)} "
+            f"(осталось {_format_remaining(until - now)})."
+        )
+    if source == "promo_channel":
+        return (
+            f"📢 Награда за подписку на канал — действует до {_format_until(until)} "
+            f"(осталось {_format_remaining(until - now)})."
+        )
+    if source == "stars":
+        if is_subscription:
             return (
                 f"⭐ Stars-подписка (автопродление) — следующее списание "
                 f"{_format_until(until)} (через {_format_remaining(until - now)}). "
@@ -4856,10 +4897,7 @@ def _premium_expiry_line(telegram_id: str) -> str:
             f"(осталось {_format_remaining(until - now)})."
         )
 
-    # Ни одного источника с известной датой — по приоритету _is_premium
-    # остаётся только членство в приватном канале Tribute. САМОГО срока
-    # окончания бот не знает: Tribute продлевает/отменяет подписку на своей
-    # стороне, боту доступен только текущий факт членства (get_chat_member).
+    # source == "tribute" — until=None, точную дату окончания бот не знает.
     return (
         "💎 Подписка оформлена через Tribute — продление и отмена на их "
         "стороне, точную дату окончания бот не знает."
