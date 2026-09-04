@@ -299,6 +299,14 @@ def init_db() -> None:
             conn.execute("DELETE FROM deep_analysis")
         _add_column_if_missing(conn, "deep_analysis", "dynamics_text", "TEXT NOT NULL DEFAULT ''")
         _add_column_if_missing(conn, "deep_analysis", "synthesis_text", "TEXT NOT NULL DEFAULT ''")
+        # Секция «Тепло» заменена на «Кто чаще задаёт вопросы» — изменилась не
+        # схема таблицы, а СОДЕРЖИМОЕ metrics_json (ключ warmth_conflict вместо
+        # questions), а карточка рендерит ровно то, что лежит в JSON. Поэтому
+        # чистим не по колонкам, а по самому JSON — иначе юзер с уже собранным
+        # анализом видел бы удалённую секцию до накопления REBUILD_THRESHOLD
+        # новых сообщений. Идемпотентно: пересобранные строки этого ключа уже
+        # не содержат, повторный запуск никого не трогает.
+        conn.execute("DELETE FROM deep_analysis WHERE metrics_json LIKE '%warmth_conflict%'")
         # deep_style_analysis: переход на компактную 3-блочную карточку (архетип/
         # факты/совет) — «история по периодам» и SWOT убраны, совместимость с
         # лучшим контактом теперь отдельный вычисляемый блок без LLM (не хранится

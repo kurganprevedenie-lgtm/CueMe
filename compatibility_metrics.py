@@ -10,58 +10,15 @@
 date, direction. БЕЗ реакций, БЕЗ длительности голосовых, БЕЗ фото — эти поля
 физически не собираются (см. raw_meta в main.py: только length/has_emoji/voice).
 
-Модуль почти целиком БЕЗ LLM — единственное исключение: warmth() опционально
-принимает уже готовый набор LLM-подтверждённых «неоднозначных похвал»
-(confirmed_ambiguous), сам LLM не зовёт. Сам вызов — в llm.classify_
-ambiguous_praise, оркестрация (сначала найти кандидатов, потом досчитать
-warmth() с подтверждениями) — в main.py."""
-import logging
+Модуль целиком БЕЗ LLM: каждая метрика считается по тексту детерминированно.
+Раньше исключением была секция «Тепло» (словарь тёплых слов + LLM-проверка
+неоднозначных кандидатов) — убрана целиком, см. блок «5. Тепло» ниже."""
 import re
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
-from config import AMBIGUOUS_PRAISE_WORDS, FEELING_VERBS, WARM_EMOJI, WARM_LEXICON
 from features import _looks_junky
-
-# Каноническое имя по стему — для occurrence-подсчёта, не важно, вокативное
-# слово это или глагол чувств (см. warmth()).
-_CANON_BY_STEM = {**WARM_LEXICON, **FEELING_VERBS, **AMBIGUOUS_PRAISE_WORDS}
-
-# Матчинг — по границе слова С ЛЕВОЙ стороны стема, не по вхождению
-# подстроки: стемы — намеренно префиксы словоформ («любим» должен матчить
-# «любимая»), поэтому \b только слева (\w* справа сам найдёт конец слова).
-_WARM_PATTERNS = {
-    stem: re.compile(rf"\b{re.escape(stem)}\w*", re.IGNORECASE)
-    for stem in WARM_LEXICON
-}
-_AMBIGUOUS_PATTERNS = {
-    stem: re.compile(rf"\b{re.escape(stem)}\w*", re.IGNORECASE)
-    for stem in AMBIGUOUS_PRAISE_WORDS
-}
-_FEELING_PATTERNS = {
-    stem: re.compile(rf"\b{re.escape(stem)}\w*", re.IGNORECASE)
-    for stem in FEELING_VERBS
-}
-
-# Направленность глагола чувств (FEELING_VERBS) — ищется в окне ±_NEARBY_CHARS
-# символов вокруг совпадения (примерно 5-6 слов в каждую сторону), не по
-# всему сообщению целиком: «тебя»/«её» в другом конце длинного сообщения не
-# должны определять направленность конкретного глагола.
-_NEARBY_CHARS = 40
-_SECOND_PERSON_NEAR_RE = re.compile(r"\b(тебя|тебе|тобой)\b", re.IGNORECASE)
-_THIRD_PARTY_OR_OBJECT_RE = re.compile(
-    r"\b(её|его|их|"
-    r"фильм\w*|музык\w*|сериал\w*|игр\w*|книг\w*|готовит\w*|песн\w*|"
-    r"работ\w*|учёб\w*|учеб\w*|погод\w*|природ\w*|кофе|чай)\b",
-    re.IGNORECASE,
-)
-
-
-def _has_nearby(text: str, pattern: re.Pattern, match: re.Match) -> bool:
-    start = max(0, match.start() - _NEARBY_CHARS)
-    end = min(len(text), match.end() + _NEARBY_CHARS)
-    return bool(pattern.search(text[start:end]))
 
 
 def _sorted_texted(rows: list[dict]) -> list[dict]:
@@ -163,204 +120,311 @@ def long_pauses(rows: list[dict], threshold_hours: int = 24) -> tuple[int, list[
     return len(dates), dates
 
 
-# ── 5. Тепло ───────────────────────────────────────────────────────────────
-# Конфликтную сторону метрики убрали целиком (была источником ложных
-# срабатываний на сарказм/смех и сомнительных к показу цитат мата) — считаем
-# только тёплую лексику.
+# ── 5. Кто чаще задаёт вопросы ──────────────────────────────────────────────
+# На этом месте была секция «Тепло» (словарь тёплых слов + LLM-проверка
+# неоднозначных кандидатов). Убрана целиком, НЕ из-за отдельных багов, а
+# потому что метод принципиально не работает: словарь не видит контекст, и
+# любое совпадение стема засчитывалось теплом независимо от того, к кому
+# оно обращено — «обожаю этот фильм», «молодец, успел среагировать», «я
+# обожаю её» одинаково попадали в тёплые. Точечные фиксы (границы слова,
+# проверка направленности глаголов по соседним словам, LLM-подтверждение
+# неоднозначной похвалы) каждый раз ловили свой частный случай и оставляли
+# следующий — потому что контекст в принципе не восстанавливается словарём.
+# Старый код оставлен закомментированным ниже целиком (вместе со словарями
+# в config.py и llm.classify_ambiguous_praise) — на случай, если решим
+# вернуться к теме уже не словарным методом.
+#
+# Вместо неё — детерминированная метрика того же класса, что остальные оси:
+# кто чаще задаёт вопросы (см. question_balance ниже).
 
-def _weeks_span(rows: list[dict]) -> float:
-    """Сколько недель охватывает переписка (по датам с текстом) — минимум 1,
-    чтобы частота «в неделю» не улетала в небо на паре сообщений за один день."""
-    dated = _sorted_texted(rows)
-    if len(dated) < 2:
-        return 1.0
-    first, last = _parse_dt(dated[0]["date"]), _parse_dt(dated[-1]["date"])
-    if not first or not last:
-        return 1.0
-    return max((last - first).days / 7.0, 1.0)
+# Вопрос ищется В ЛЮБОМ месте сообщения, не только в конце: «а ты как? я
+# норм» — тоже вопрос. Считаем ПО СООБЩЕНИЯМ (сообщение либо вопрос, либо
+# нет), а не по числу «?» — поэтому «ты где???» это один вопрос, а не три,
+# без отдельной обработки серий знаков.
+_QUESTION_RE = re.compile(r"\?")
 
-
-def _classify_warm(text: str) -> tuple[dict[str, int], bool, str | None]:
-    """Один разбор сообщения на все категории сразу — ЕДИНАЯ точка
-    классификации, которую используют и подсчёт (warmth), и сбор примеров
-    (_collect_warm_examples), и safety-проверка перед добавлением в примеры.
-    Раньше баг «пример не содержит тёплых слов» бывал именно от того, что
-    текст для примера брался из другого списка/сообщения, чем то, где
-    реально нашлось совпадение — общая функция на одном и том же text
-    структурно исключает этот класс ошибки.
-
-    Возвращает:
-    - {стем: число вхождений} — WARM_LEXICON (вокативные обращения, без
-      проверки направленности — она тут не нужна, само обращение и есть
-      адресат) + FEELING_VERBS, но ТОЛЬКО те вхождения глагола, у которых
-      рядом (см. _NEARBY_CHARS) нашлось «тебя»/«тебе»/«тобой» — остальные
-      вхождения глагола либо явно не про собеседника (рядом «её»/«его»/
-      «их» или неодушевлённый объект — фильм/музыка/работа и т.п., тогда
-      просто не считаются вообще), либо неопределённые (тогда см. ниже)
-    - есть ли тёплый эмодзи (точное совпадение символа)
-    - стем-кандидат на LLM-проверку, если прямого совпадения/эмодзи не
-      нашлось: из AMBIGUOUS_PRAISE_WORDS (общая похвала вроде «молодец») ИЛИ
-      из FEELING_VERBS с неопределённой направленностью (глагол есть, но
-      рядом нет ни «тебя», ни явно постороннего объекта)."""
-    stem_hits: dict[str, int] = {}
-    for stem, pattern in _WARM_PATTERNS.items():
-        found = pattern.findall(text)
-        if found:
-            stem_hits[stem] = len(found)
-
-    feeling_ambiguous_stem: str | None = None
-    for stem, pattern in _FEELING_PATTERNS.items():
-        for m in pattern.finditer(text):
-            if _has_nearby(text, _SECOND_PERSON_NEAR_RE, m):
-                stem_hits[stem] = stem_hits.get(stem, 0) + 1
-            elif _has_nearby(text, _THIRD_PARTY_OR_OBJECT_RE, m):
-                continue  # явно не про собеседника — не считаем вообще
-            elif feeling_ambiguous_stem is None:
-                feeling_ambiguous_stem = stem  # неопределённость — кандидат на LLM
-
-    has_emoji = any(e in text for e in WARM_EMOJI)
-
-    ambiguous_stem = None
-    if not stem_hits and not has_emoji:
-        for stem, pattern in _AMBIGUOUS_PATTERNS.items():
-            if pattern.search(text):
-                ambiguous_stem = stem
-                break
-        if ambiguous_stem is None:
-            ambiguous_stem = feeling_ambiguous_stem
-
-    return stem_hits, has_emoji, ambiguous_stem
+# Ниже какого отношения долей считаем, что спрашивают примерно поровну —
+# 1.25 (25% разницы) выбран как «заметно на глаз»: при 8% против 9% вывод
+# «спрашивает чаще» был бы шумом, а не наблюдением.
+_QUESTION_PARITY_RATIO = 1.25
 
 
-def _message_is_warm(
-    text: str, direction: str, confirmed_ambiguous: set[tuple[str, str]] | None,
-) -> bool:
-    """(а) прямое совпадение WARM_LEXICON, ИЛИ (б) тёплый эмодзи, ИЛИ
-    (в) неоднозначная похвала, но ТОЛЬКО если LLM её подтвердила
-    (confirmed_ambiguous содержит (direction, text)). Без подтверждения
-    (confirmed_ambiguous=None — кандидаты ещё не проверены LLM, или
-    подтверждения не было) неоднозначные слова тёплыми НЕ считаются."""
-    stem_hits, has_emoji, ambiguous_stem = _classify_warm(text)
-    if stem_hits or has_emoji:
-        return True
-    if ambiguous_stem and confirmed_ambiguous is not None:
-        return (direction, text) in confirmed_ambiguous
-    return False
+def question_balance(rows: list[dict]) -> tuple[int, int, int, int, list[tuple[str, str]]]:
+    """(вопросов автора, вопросов собеседника, всего сообщений автора,
+    всего сообщений собеседника, примеры-вопросы).
+
+    Доли считаются вызывающим кодом из этих же чисел (compute_all) — важна
+    именно доля, а не абсолют: 120 вопросов на 2000 сообщений и 60 на 300 —
+    это «реже» и «чаще», хотя абсолютное число говорит обратное.
+
+    Примеры — (direction, текст сообщения), до 2 штук, самые свежие первыми,
+    у того, кто спрашивает чаще по доле; если разница в долях меньше
+    _QUESTION_PARITY_RATIO — по одному от каждого, чтобы не создавать
+    впечатление перекоса там, где его нет. Мусор отсекается тем же
+    _looks_junky, что и цитаты в остальных осях: голый «?», «???» без
+    текста и ссылки в примеры не попадают."""
+    msgs = [r for r in rows if r.get("text")]
+    author_total = sum(1 for r in msgs if r["direction"] == "out")
+    contact_total = len(msgs) - author_total
+
+    author_q = sum(
+        1 for r in msgs if r["direction"] == "out" and _QUESTION_RE.search(r["text"])
+    )
+    contact_q = sum(
+        1 for r in msgs if r["direction"] == "in" and _QUESTION_RE.search(r["text"])
+    )
+
+    author_share = author_q / author_total if author_total else 0.0
+    contact_share = contact_q / contact_total if contact_total else 0.0
+    examples = _collect_question_examples(rows, author_share, contact_share)
+    return author_q, contact_q, author_total, contact_total, examples
 
 
-def _collect_warm_examples(
-    rows: list[dict], confirmed_ambiguous: set[tuple[str, str]] | None,
+def _collect_question_examples(
+    rows: list[dict], author_share: float, contact_share: float,
 ) -> list[tuple[str, str]]:
-    """До 2 самых СВЕЖИХ тёплых сообщений, (direction, текст), отфильтрованы
-    через ту же _looks_junky, что и цитаты в features.initiative_axis (не
-    пропускает голые ссылки/эмодзи/однобуквенный мусор)."""
+    """До 2 реальных вопросов, свежие первыми. Кому принадлежат — зависит от
+    перекоса долей (см. докстринг question_balance): при заметной разнице
+    оба примера у того, кто спрашивает чаще, при сопоставимых долях — по
+    одному с каждой стороны."""
+    hi, lo = max(author_share, contact_share), min(author_share, contact_share)
+    if lo > 0:
+        parity = hi / lo < _QUESTION_PARITY_RATIO
+    else:
+        # Одна сторона не задаёт вопросов вообще — это уже перекос, не паритет
+        # (кроме случая, когда вопросов нет ни у кого: примеров всё равно не будет).
+        parity = hi == 0
+    leader = "out" if author_share >= contact_share else "in"
+
+    if parity:
+        # По одному с каждой стороны: сначала лидер (пусть и незначительный),
+        # чтобы порядок примеров не выглядел случайным.
+        wanted = {leader: 1, ("in" if leader == "out" else "out"): 1}
+    else:
+        wanted = {leader: 2}
+
     examples: list[tuple[str, str]] = []
+    seen: set[str] = set()
     for r in reversed(_sorted_texted(rows)):  # с конца — свежие сообщения первыми
         if len(examples) >= 2:
             break
-        text = r["text"]
-        if _looks_junky(text):
+        direction = r["direction"]
+        if wanted.get(direction, 0) <= 0:
             continue
-        if not _message_is_warm(text, r["direction"], confirmed_ambiguous):
+        text = r["text"].strip()
+        if not _QUESTION_RE.search(text) or _looks_junky(text):
             continue
-        # Safety-проверка (не полагаемся только на факт, что _message_is_warm
-        # уже True выше) — независимая перепроверка ИМЕННО того текста,
-        # который сейчас пойдёт в примеры, прямо перед append. Ловит
-        # регрессию, если будущая правка случайно подставит не тот text/r.
-        stem_hits, has_emoji, ambiguous_stem = _classify_warm(text)
-        confirmed = bool(
-            ambiguous_stem and confirmed_ambiguous
-            and (r["direction"], text) in confirmed_ambiguous
-        )
-        if not (stem_hits or has_emoji or confirmed):
-            logging.warning(
-                "warmth: сообщение прошло отбор, но повторная проверка не "
-                "находит совпадения — не беру в примеры: %r", text[:80],
-            )
+        # Один и тот же вопрос дважды («как дела?» человек задаёт регулярно)
+        # выглядел бы как недоработка, а не как два примера — дедупим по
+        # нормализованному тексту, берём следующий подходящий.
+        key = " ".join(text.lower().split())
+        if key in seen:
             continue
-        examples.append((r["direction"], text.strip()))
+        seen.add(key)
+        wanted[direction] -= 1
+        examples.append((direction, text))
     return examples
 
 
-@dataclass
-class WarmthResult:
-    warm_n: int
-    warm_pct: float
-    warm_examples: list[tuple[str, str]]
-    weeks: float
-    # {"out": Counter(canon -> count), "in": Counter(...)} — occurrence-подсчёт
-    # по словам (не по сообщениям), для топ-слов; естественного места в
-    # карточке пока нет, просто отдаём числом на будущее.
-    occurrences: dict[str, Counter] = field(default_factory=lambda: {"out": Counter(), "in": Counter()})
-    # (direction, text, canon) — сообщения с AMBIGUOUS_PRAISE_WORDS, ещё НЕ
-    # проверенные LLM. Непусто только при вызове с confirmed_ambiguous=None
-    # (первый, «разведочный» проход) — см. main.py-оркестрацию в докстринге
-    # warmth() ниже.
-    ambiguous_candidates: list[tuple[str, str, str]] = field(default_factory=list)
-
-    def __iter__(self):
-        # Обратная совместимость со старым контрактом (warm_n, warm_pct,
-        # warm_examples, weeks) = warmth(rows) — main.compute_all распаковывает
-        # именно так.
-        return iter((self.warm_n, self.warm_pct, self.warm_examples, self.weeks))
-
-
-def warmth(
-    rows: list[dict], confirmed_ambiguous: set[tuple[str, str]] | None = None,
-) -> WarmthResult:
-    """Считает тёплые сообщения. Два прохода при неоднозначных словах похвалы
-    («молодец»/«умница» и т.п. — см. AMBIGUOUS_PRAISE_WORDS в config.py):
-
-    1) warmth(rows) — confirmed_ambiguous не передан. Неоднозначные слова НЕ
-       засчитываются, зато собираются в result.ambiguous_candidates.
-    2) Если ambiguous_candidates непусты — main.py прогоняет их тексты через
-       llm.classify_ambiguous_praise (батч, один вызов LLM на контакт) и
-       строит set подтверждённых (direction, text).
-    3) warmth(rows, confirmed_ambiguous=тот_set) — финальный, авторитетный
-       результат: подтверждённые неоднозначные фразы теперь считаются тёплыми.
-
-    Если ambiguous_candidates после шага 1 пуст — шаг 3 не нужен, результат
-    шага 1 уже финальный (экономит LLM-вызов на подавляющем большинстве
-    контактов, где таких слов вообще не было).
-
-    % (warm_pct) — как раньше читается main.py напрямую для «лучшая
-    совместимость» между контактами, в текст карточки НЕ идёт (доля от всей
-    переписки занижает результат — см. compute_all)."""
-    msgs = [r for r in rows if r.get("text")]
-    total = len(msgs)
-    if total == 0:
-        return WarmthResult(warm_n=0, warm_pct=0.0, warm_examples=[], weeks=1.0)
-
-    occurrences: dict[str, Counter] = {"out": Counter(), "in": Counter()}
-    ambiguous_candidates: list[tuple[str, str, str]] = []
-    warm_n = 0
-
-    for r in msgs:
-        text = r["text"]
-        direction = r["direction"]
-        stem_hits, has_emoji, ambiguous_stem = _classify_warm(text)
-
-        for stem, count in stem_hits.items():
-            occurrences[direction][_CANON_BY_STEM[stem]] += count
-
-        is_warm = bool(stem_hits) or has_emoji
-        if not is_warm and ambiguous_stem:
-            if confirmed_ambiguous is not None:
-                is_warm = (direction, text) in confirmed_ambiguous
-            else:
-                ambiguous_candidates.append(
-                    (direction, text, _CANON_BY_STEM[ambiguous_stem])
-                )
-
-        if is_warm:
-            warm_n += 1
-
-    warm_examples = _collect_warm_examples(rows, confirmed_ambiguous)
-    weeks = _weeks_span(rows)
-    return WarmthResult(
-        warm_n=warm_n, warm_pct=warm_n / total, warm_examples=warm_examples,
-        weeks=weeks, occurrences=occurrences, ambiguous_candidates=ambiguous_candidates,
-    )
+# # ── 5. Тепло ───────────────────────────────────────────────────────────────
+# # Конфликтную сторону метрики убрали целиком (была источником ложных
+# # срабатываний на сарказм/смех и сомнительных к показу цитат мата) — считаем
+# # только тёплую лексику.
+#
+# def _weeks_span(rows: list[dict]) -> float:
+#     """Сколько недель охватывает переписка (по датам с текстом) — минимум 1,
+#     чтобы частота «в неделю» не улетала в небо на паре сообщений за один день."""
+#     dated = _sorted_texted(rows)
+#     if len(dated) < 2:
+#         return 1.0
+#     first, last = _parse_dt(dated[0]["date"]), _parse_dt(dated[-1]["date"])
+#     if not first or not last:
+#         return 1.0
+#     return max((last - first).days / 7.0, 1.0)
+#
+#
+# def _classify_warm(text: str) -> tuple[dict[str, int], bool, str | None]:
+#     """Один разбор сообщения на все категории сразу — ЕДИНАЯ точка
+#     классификации, которую используют и подсчёт (warmth), и сбор примеров
+#     (_collect_warm_examples), и safety-проверка перед добавлением в примеры.
+#     Раньше баг «пример не содержит тёплых слов» бывал именно от того, что
+#     текст для примера брался из другого списка/сообщения, чем то, где
+#     реально нашлось совпадение — общая функция на одном и том же text
+#     структурно исключает этот класс ошибки.
+#
+#     Возвращает:
+#     - {стем: число вхождений} — WARM_LEXICON (вокативные обращения, без
+#       проверки направленности — она тут не нужна, само обращение и есть
+#       адресат) + FEELING_VERBS, но ТОЛЬКО те вхождения глагола, у которых
+#       рядом (см. _NEARBY_CHARS) нашлось «тебя»/«тебе»/«тобой» — остальные
+#       вхождения глагола либо явно не про собеседника (рядом «её»/«его»/
+#       «их» или неодушевлённый объект — фильм/музыка/работа и т.п., тогда
+#       просто не считаются вообще), либо неопределённые (тогда см. ниже)
+#     - есть ли тёплый эмодзи (точное совпадение символа)
+#     - стем-кандидат на LLM-проверку, если прямого совпадения/эмодзи не
+#       нашлось: из AMBIGUOUS_PRAISE_WORDS (общая похвала вроде «молодец») ИЛИ
+#       из FEELING_VERBS с неопределённой направленностью (глагол есть, но
+#       рядом нет ни «тебя», ни явно постороннего объекта)."""
+#     stem_hits: dict[str, int] = {}
+#     for stem, pattern in _WARM_PATTERNS.items():
+#         found = pattern.findall(text)
+#         if found:
+#             stem_hits[stem] = len(found)
+#
+#     feeling_ambiguous_stem: str | None = None
+#     for stem, pattern in _FEELING_PATTERNS.items():
+#         for m in pattern.finditer(text):
+#             if _has_nearby(text, _SECOND_PERSON_NEAR_RE, m):
+#                 stem_hits[stem] = stem_hits.get(stem, 0) + 1
+#             elif _has_nearby(text, _THIRD_PARTY_OR_OBJECT_RE, m):
+#                 continue  # явно не про собеседника — не считаем вообще
+#             elif feeling_ambiguous_stem is None:
+#                 feeling_ambiguous_stem = stem  # неопределённость — кандидат на LLM
+#
+#     has_emoji = any(e in text for e in WARM_EMOJI)
+#
+#     ambiguous_stem = None
+#     if not stem_hits and not has_emoji:
+#         for stem, pattern in _AMBIGUOUS_PATTERNS.items():
+#             if pattern.search(text):
+#                 ambiguous_stem = stem
+#                 break
+#         if ambiguous_stem is None:
+#             ambiguous_stem = feeling_ambiguous_stem
+#
+#     return stem_hits, has_emoji, ambiguous_stem
+#
+#
+# def _message_is_warm(
+#     text: str, direction: str, confirmed_ambiguous: set[tuple[str, str]] | None,
+# ) -> bool:
+#     """(а) прямое совпадение WARM_LEXICON, ИЛИ (б) тёплый эмодзи, ИЛИ
+#     (в) неоднозначная похвала, но ТОЛЬКО если LLM её подтвердила
+#     (confirmed_ambiguous содержит (direction, text)). Без подтверждения
+#     (confirmed_ambiguous=None — кандидаты ещё не проверены LLM, или
+#     подтверждения не было) неоднозначные слова тёплыми НЕ считаются."""
+#     stem_hits, has_emoji, ambiguous_stem = _classify_warm(text)
+#     if stem_hits or has_emoji:
+#         return True
+#     if ambiguous_stem and confirmed_ambiguous is not None:
+#         return (direction, text) in confirmed_ambiguous
+#     return False
+#
+#
+# def _collect_warm_examples(
+#     rows: list[dict], confirmed_ambiguous: set[tuple[str, str]] | None,
+# ) -> list[tuple[str, str]]:
+#     """До 2 самых СВЕЖИХ тёплых сообщений, (direction, текст), отфильтрованы
+#     через ту же _looks_junky, что и цитаты в features.initiative_axis (не
+#     пропускает голые ссылки/эмодзи/однобуквенный мусор)."""
+#     examples: list[tuple[str, str]] = []
+#     for r in reversed(_sorted_texted(rows)):  # с конца — свежие сообщения первыми
+#         if len(examples) >= 2:
+#             break
+#         text = r["text"]
+#         if _looks_junky(text):
+#             continue
+#         if not _message_is_warm(text, r["direction"], confirmed_ambiguous):
+#             continue
+#         # Safety-проверка (не полагаемся только на факт, что _message_is_warm
+#         # уже True выше) — независимая перепроверка ИМЕННО того текста,
+#         # который сейчас пойдёт в примеры, прямо перед append. Ловит
+#         # регрессию, если будущая правка случайно подставит не тот text/r.
+#         stem_hits, has_emoji, ambiguous_stem = _classify_warm(text)
+#         confirmed = bool(
+#             ambiguous_stem and confirmed_ambiguous
+#             and (r["direction"], text) in confirmed_ambiguous
+#         )
+#         if not (stem_hits or has_emoji or confirmed):
+#             logging.warning(
+#                 "warmth: сообщение прошло отбор, но повторная проверка не "
+#                 "находит совпадения — не беру в примеры: %r", text[:80],
+#             )
+#             continue
+#         examples.append((r["direction"], text.strip()))
+#     return examples
+#
+#
+# @dataclass
+# class WarmthResult:
+#     warm_n: int
+#     warm_pct: float
+#     warm_examples: list[tuple[str, str]]
+#     weeks: float
+#     # {"out": Counter(canon -> count), "in": Counter(...)} — occurrence-подсчёт
+#     # по словам (не по сообщениям), для топ-слов; естественного места в
+#     # карточке пока нет, просто отдаём числом на будущее.
+#     occurrences: dict[str, Counter] = field(default_factory=lambda: {"out": Counter(), "in": Counter()})
+#     # (direction, text, canon) — сообщения с AMBIGUOUS_PRAISE_WORDS, ещё НЕ
+#     # проверенные LLM. Непусто только при вызове с confirmed_ambiguous=None
+#     # (первый, «разведочный» проход) — см. main.py-оркестрацию в докстринге
+#     # warmth() ниже.
+#     ambiguous_candidates: list[tuple[str, str, str]] = field(default_factory=list)
+#
+#     def __iter__(self):
+#         # Обратная совместимость со старым контрактом (warm_n, warm_pct,
+#         # warm_examples, weeks) = warmth(rows) — main.compute_all распаковывает
+#         # именно так.
+#         return iter((self.warm_n, self.warm_pct, self.warm_examples, self.weeks))
+#
+#
+# def warmth(
+#     rows: list[dict], confirmed_ambiguous: set[tuple[str, str]] | None = None,
+# ) -> WarmthResult:
+#     """Считает тёплые сообщения. Два прохода при неоднозначных словах похвалы
+#     («молодец»/«умница» и т.п. — см. AMBIGUOUS_PRAISE_WORDS в config.py):
+#
+#     1) warmth(rows) — confirmed_ambiguous не передан. Неоднозначные слова НЕ
+#        засчитываются, зато собираются в result.ambiguous_candidates.
+#     2) Если ambiguous_candidates непусты — main.py прогоняет их тексты через
+#        llm.classify_ambiguous_praise (батч, один вызов LLM на контакт) и
+#        строит set подтверждённых (direction, text).
+#     3) warmth(rows, confirmed_ambiguous=тот_set) — финальный, авторитетный
+#        результат: подтверждённые неоднозначные фразы теперь считаются тёплыми.
+#
+#     Если ambiguous_candidates после шага 1 пуст — шаг 3 не нужен, результат
+#     шага 1 уже финальный (экономит LLM-вызов на подавляющем большинстве
+#     контактов, где таких слов вообще не было).
+#
+#     % (warm_pct) — как раньше читается main.py напрямую для «лучшая
+#     совместимость» между контактами, в текст карточки НЕ идёт (доля от всей
+#     переписки занижает результат — см. compute_all)."""
+#     msgs = [r for r in rows if r.get("text")]
+#     total = len(msgs)
+#     if total == 0:
+#         return WarmthResult(warm_n=0, warm_pct=0.0, warm_examples=[], weeks=1.0)
+#
+#     occurrences: dict[str, Counter] = {"out": Counter(), "in": Counter()}
+#     ambiguous_candidates: list[tuple[str, str, str]] = []
+#     warm_n = 0
+#
+#     for r in msgs:
+#         text = r["text"]
+#         direction = r["direction"]
+#         stem_hits, has_emoji, ambiguous_stem = _classify_warm(text)
+#
+#         for stem, count in stem_hits.items():
+#             occurrences[direction][_CANON_BY_STEM[stem]] += count
+#
+#         is_warm = bool(stem_hits) or has_emoji
+#         if not is_warm and ambiguous_stem:
+#             if confirmed_ambiguous is not None:
+#                 is_warm = (direction, text) in confirmed_ambiguous
+#             else:
+#                 ambiguous_candidates.append(
+#                     (direction, text, _CANON_BY_STEM[ambiguous_stem])
+#                 )
+#
+#         if is_warm:
+#             warm_n += 1
+#
+#     warm_examples = _collect_warm_examples(rows, confirmed_ambiguous)
+#     weeks = _weeks_span(rows)
+#     return WarmthResult(
+#         warm_n=warm_n, warm_pct=warm_n / total, warm_examples=warm_examples,
+#         weeks=weeks, occurrences=occurrences, ambiguous_candidates=ambiguous_candidates,
+#     )
+#
 
 
 # ── 6. Циркадное совпадение ──────────────────────────────────────────────────
@@ -494,38 +558,70 @@ def _ru_count_word(n: int, one: str, few: str, many: str) -> str:
     return many
 
 
-def _fmt_times_per_week(rate: float) -> str:
-    """«5 раз в неделю» / «1.5 раза в неделю» — целое склоняется по числу,
-    дробное всегда «раза» (стандартная русская норма для нецелых)."""
-    if abs(rate - round(rate)) < 0.05:
-        n = round(rate)
-        word = _ru_count_word(n, "раз", "раза", "раз")
-        return f"{n} {word} в неделю"
-    return f"{rate:.1f} раза в неделю"
+def _fmt_ratio_times(ratio: float) -> str:
+    """«в 3 раза» / «в 5 раз» / «в 2.7 раза» — целое склоняется по числу,
+    дробное всегда «раза» (та же норма, что была у _fmt_times_per_week)."""
+    if abs(ratio - round(ratio)) < 0.05:
+        n = round(ratio)
+        return f"в {n} {_ru_count_word(n, 'раз', 'раза', 'раз')}"
+    return f"в {ratio:.1f} раза"
 
 
-def _fmt_weeks_span(weeks: float) -> str:
-    """«идёт {фраза}» — accusative для длительности: «идёт неделю» / «идёт
-    3 недели» / «идёт 25 недель»."""
-    if weeks < 1.5:
-        return "меньше недели"
-    n = round(weeks)
-    word = _ru_count_word(n, "неделю", "недели", "недель")
-    return f"{n} {word}"
+def _questions_fact(
+    a_q: int, c_q: int, a_total: int, c_total: int, a_share: float, c_share: float,
+) -> str:
+    """Одно предложение в стиле остальных осей: кто спрашивает чаще и
+    насколько. Сравниваем ДОЛИ, а не абсолютные числа — при разном объёме
+    сообщений абсолют вводит в заблуждение (120 вопросов на 2000 сообщений
+    реже, чем 60 на 300)."""
+    author_own = f"{a_q} из {a_total} твоих сообщений ({a_share:.0%})"
+    contact_own = f"{c_q} из {c_total} сообщений собеседника ({c_share:.0%})"
+    author_leads = a_share >= c_share
+
+    hi, lo = max(a_share, c_share), min(a_share, c_share)
+    if lo == 0:
+        if author_leads:
+            return f"Вопросы задаёшь только ты: {author_own}, у собеседника — ни одного."
+        return f"Вопросы задаёт только собеседник: {contact_own}, у тебя — ни одного."
+
+    if hi / lo < _QUESTION_PARITY_RATIO:
+        return f"Вопросы задаёте примерно поровну: {author_own}, {contact_own}."
+
+    times = _fmt_ratio_times(hi / lo)
+    if author_leads:
+        return f"Вопросы чаще задаёшь ты: {author_own} против {contact_own} — {times} чаще."
+    return f"Вопросы чаще задаёт собеседник: {contact_own} против {author_own} — {times} чаще."
 
 
-def compute_all(
-    rows: list[dict], confirmed_ambiguous: set[tuple[str, str]] | None = None,
-) -> dict[str, dict]:
+# _fmt_times_per_week / _fmt_weeks_span обслуживали ТОЛЬКО текст убранной
+# секции «Тепло» («N тёплых сообщений, в среднем X раз в неделю, переписка
+# идёт Y недель») — вместе с ней стали не нужны. Оставлены закомментированными
+# на случай, если понадобится формат «частота в неделю» другой метрике.
+# def _fmt_times_per_week(rate: float) -> str:
+#     """«5 раз в неделю» / «1.5 раза в неделю» — целое склоняется по числу,
+#     дробное всегда «раза» (стандартная русская норма для нецелых)."""
+#     if abs(rate - round(rate)) < 0.05:
+#         n = round(rate)
+#         word = _ru_count_word(n, "раз", "раза", "раз")
+#         return f"{n} {word} в неделю"
+#     return f"{rate:.1f} раза в неделю"
+#
+#
+# def _fmt_weeks_span(weeks: float) -> str:
+#     """«идёт {фраза}» — accusative для длительности: «идёт неделю» / «идёт
+#     3 недели» / «идёт 25 недель»."""
+#     if weeks < 1.5:
+#         return "меньше недели"
+#     n = round(weeks)
+#     word = _ru_count_word(n, "неделю", "недели", "недель")
+#     return f"{n} {word}"
+
+
+def compute_all(rows: list[dict]) -> dict[str, dict]:
     """Считает все метрики и сразу форматирует (short, fact) для каждой —
     возвращает {key: {"label", "short", "fact"}}, тот же контракт, что
     ждут main.py/llm.py, но числа внутри fact теперь и абсолютные, и %,
-    посчитанные из типизированных функций выше, не строками напрямую.
-
-    confirmed_ambiguous — прокидывается в warmth() как есть (LLM-подтверждённые
-    неоднозначные похвалы, см. warmth() докстринг); None на первом,
-    «разведочном» проходе — main.py вызывает compute_all дважды только если
-    у warmth() нашлись ambiguous_candidates."""
+    посчитанные из типизированных функций выше, не строками напрямую."""
     out: dict[str, dict] = {}
 
     n_author, n_contact, ratio = balance(rows)
@@ -582,36 +678,24 @@ def compute_all(
         ),
     }
 
-    warmth_result = warmth(rows, confirmed_ambiguous=confirmed_ambiguous)
-    warm_n, warm_pct = warmth_result.warm_n, warmth_result.warm_pct
-    warm_examples, weeks = warmth_result.warm_examples, warmth_result.weeks
-    out["warmth_conflict"] = {
-        "label": "Тепло",
-        "short": f"💚{warm_n}",
-        # % оставлен как ЧИСЛО в словаре (не в тексте fact ниже) — main.py
-        # читает warmth_pct напрямую для «лучшая совместимость» в «Анализ
-        # своего стиля» (сравнение между контактами), а не парсит регуляркой
-        # готовый текст. В САМ fact доля от объёма больше не идёт: доля от
-        # ВСЕЙ переписки (включая бытовую) занижает результат — 132 тёплых
-        # сообщения могут дать 2%, хотя абсолютно это много (см. warmth()).
-        "warmth_pct": warm_pct,
-        "fact": (
-            f"Тёплых сообщений — {warm_n}, в среднем {_fmt_times_per_week(warm_n / weeks)} "
-            f"(переписка идёт {_fmt_weeks_span(weeks)}). Частота тут не мера качества "
-            "отношений: в новых или бурных парах обычно больше тёплых слов, а в давних "
-            "стабильных тепло часто проявляется делами, а не текстом."
-        ),
-        # Реальные цитаты — main.py дописывает их отдельной строкой поверх
-        # fact/interpretation (см. _warmth_examples_suffix), в LLM-промпт
-        # интерпретации НЕ идут (там участвует только fact).
-        "warm_examples": warm_examples,
-        # occurrence-подсчёт по словам (не по сообщениям) — для топ-слов,
-        # естественного места в карточке пока нет, просто отдаём числом.
-        "warm_occurrences": {
-            "out": dict(warmth_result.occurrences["out"]),
-            "in": dict(warmth_result.occurrences["in"]),
-        },
-    }
+    a_q, c_q, a_total, c_total, q_examples = question_balance(rows)
+    a_share = a_q / a_total if a_total else 0.0
+    c_share = c_q / c_total if c_total else 0.0
+    if not a_q and not c_q:
+        out["questions"] = {
+            "label": "Кто чаще задаёт вопросы", "short": "—",
+            "fact": "Вопросов в переписке нет ни с одной стороны.",
+        }
+    else:
+        out["questions"] = {
+            "label": "Кто чаще задаёт вопросы",
+            "short": f"{c_share:.0%}/{a_share:.0%} собеседник/ты",
+            "fact": _questions_fact(a_q, c_q, a_total, c_total, a_share, c_share),
+            # Реальные цитаты — main.py дописывает их отдельной строкой поверх
+            # fact/interpretation (см. _quote_examples_suffix), в LLM-промпт
+            # интерпретации НЕ идут (там участвует только fact).
+            "examples": q_examples,
+        }
 
     my_peak, ct_peak, overlap_label = circadian_overlap(rows)
     if my_peak is None:

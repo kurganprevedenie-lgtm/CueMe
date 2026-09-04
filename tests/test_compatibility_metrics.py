@@ -1,6 +1,11 @@
+"""Тесты секции «Кто чаще задаёт вопросы» (compatibility_metrics.question_balance).
+
+Заменила секцию «Тепло» — её тесты удалены вместе с метрикой (словарный метод
+не видел контекст, см. комментарий в compatibility_metrics, блок «5»).
+"""
 from datetime import datetime, timedelta
 
-from compatibility_metrics import _classify_warm, compute_all, warmth
+from compatibility_metrics import compute_all, question_balance
 
 _BASE = datetime(2026, 1, 1)
 
@@ -13,167 +18,134 @@ def _row(offset_minutes, direction, text):
     }
 
 
-def test_direct_lexicon_words_count_without_llm():
-    rows = [_row(0, "in", "ты моя зая"), _row(1, "in", "я тебя очень люблю")]
-    result = warmth(rows)
-    assert result.warm_n == 2
-    assert result.ambiguous_candidates == []
-
-
-def test_ambiguous_praise_not_counted_without_confirmation():
-    # "молодец"/"умница" — неоднозначная похвала, БЕЗ confirmed_ambiguous не
-    # засчитывается тёплой, но попадает в кандидатов на LLM-проверку.
-    rows = [_row(0, "in", "ты молодец, все супер"), _row(1, "in", "умница моя")]
-    result = warmth(rows)
-    assert result.warm_n == 0
-    assert len(result.ambiguous_candidates) == 2
-    assert {c[2] for c in result.ambiguous_candidates} == {"молодец", "умница"}
-
-
-def test_ambiguous_praise_counted_when_confirmed():
-    rows = [_row(0, "in", "ты молодец, все супер"), _row(1, "in", "умница моя")]
-    confirmed = {("in", "ты молодец, все супер")}  # только первое LLM подтвердила
-    result = warmth(rows, confirmed_ambiguous=confirmed)
-    assert result.warm_n == 1
-    texts = [t for _, t in result.warm_examples]
-    assert "ты молодец, все супер" in texts
-    assert "умница моя" not in texts
-
-
-def test_warm_emoji_counts_as_warm():
-    rows = [_row(0, "in", "жду встречи ❤️"), _row(1, "in", "обычное сообщение без слов")]
-    result = warmth(rows)
-    assert result.warm_n == 1
-    assert result.warm_examples[0][1] == "жду встречи ❤️"
-
-
-def test_word_boundary_matching_no_substring_false_positive():
-    # Реальные примеры прошлого бага: административный/новостной текст без
-    # единого тёплого слова/стема не должен матчиться вообще.
+def test_counts_questions_per_side():
     rows = [
-        _row(0, "in", "Напоминание для студентов, обучающихся по договору, "
-                      "об оплате за следующий семестр."),
-        _row(1, "in", "Всеобщие выборы в Великобритании назначены на четверг."),
+        _row(0, "out", "привет"),
+        _row(1, "out", "как ты?"),
+        _row(2, "in", "норм"),
+        _row(3, "in", "а ты где?"),
+        _row(4, "in", "когда увидимся?"),
     ]
-    result = warmth(rows)
-    assert result.warm_n == 0
-    assert result.warm_examples == []
-    assert result.ambiguous_candidates == []
+    a_q, c_q, a_total, c_total, _ = question_balance(rows)
+    assert (a_q, a_total) == (1, 2)
+    assert (c_q, c_total) == (2, 3)
 
 
-def test_word_boundary_left_side_only_matches_inflected_forms():
-    # "любим" — стем, должен матчить "любимая"/"любимый" (словоформа), но
-    # НЕ ловить "полюблю" (стем не в начале слова — по+люблю).
+def test_question_not_only_at_the_end():
+    # «а ты как? я норм» — вопрос, хотя «?» в середине сообщения.
+    rows = [_row(0, "out", "а ты как? я норм")]
+    a_q, *_ = question_balance(rows)
+    assert a_q == 1
+
+
+def test_repeated_question_marks_are_one_question():
+    # Считаем ПО СООБЩЕНИЯМ, поэтому «ты где???» — один вопрос, а не три.
+    rows = [_row(0, "out", "ты где???"), _row(1, "out", "ага")]
+    a_q, _, a_total, *_ = question_balance(rows)
+    assert (a_q, a_total) == (1, 2)
+
+
+def test_fact_compares_shares_not_absolute_numbers():
+    # У автора вопросов больше в абсолюте (3 против 2), но доля ниже
+    # (3/10 = 30% против 2/4 = 50%) — вывод должен быть про собеседника.
+    rows = (
+        [_row(i, "out", "вопрос?" if i < 3 else "текст") for i in range(10)]
+        + [_row(100 + i, "in", "вопрос?" if i < 2 else "текст") for i in range(4)]
+    )
+    fact = compute_all(rows)["questions"]["fact"]
+    assert fact.startswith("Вопросы чаще задаёт собеседник")
+    assert "30%" in fact and "50%" in fact
+
+
+def test_fact_reports_parity_when_shares_are_close():
+    rows = (
+        [_row(i, "out", "вопрос?" if i < 5 else "текст") for i in range(10)]
+        + [_row(100 + i, "in", "вопрос?" if i < 5 else "текст") for i in range(10)]
+    )
+    fact = compute_all(rows)["questions"]["fact"]
+    assert "примерно поровну" in fact
+
+
+def test_fact_when_one_side_never_asks():
+    rows = [_row(0, "out", "как дела?"), _row(1, "in", "норм"), _row(2, "in", "ок")]
+    fact = compute_all(rows)["questions"]["fact"]
+    assert fact.startswith("Вопросы задаёшь только ты")
+    assert "ни одного" in fact
+
+
+def test_no_questions_at_all():
+    rows = [_row(0, "out", "привет"), _row(1, "in", "здарова")]
+    metrics = compute_all(rows)["questions"]
+    assert metrics["short"] == "—"
+    assert "нет ни с одной стороны" in metrics["fact"]
+    assert "examples" not in metrics
+
+
+def test_examples_come_from_the_leader_and_are_real_questions():
+    rows = (
+        [_row(i, "out", "текст") for i in range(10)]
+        + [_row(100, "in", "ты сегодня свободна?")]
+        + [_row(101, "in", "во сколько встречаемся?")]
+    )
+    *_, examples = question_balance(rows)
+    assert len(examples) == 2
+    assert all(direction == "in" for direction, _ in examples)
+    assert all("?" in text for _, text in examples)
+    # Свежие первыми
+    assert examples[0][1] == "во сколько встречаемся?"
+
+
+def test_examples_one_from_each_side_when_shares_are_close():
+    rows = (
+        [_row(i, "out", "твой вопрос?" if i < 5 else "текст") for i in range(10)]
+        + [_row(100 + i, "in", "мой вопрос?" if i < 5 else "текст") for i in range(10)]
+    )
+    *_, examples = question_balance(rows)
+    assert {direction for direction, _ in examples} == {"out", "in"}
+
+
+def test_junky_questions_are_not_quoted():
+    # Голый «?», «???» и ссылка со знаком вопроса — не цитаты (_looks_junky).
     rows = [
-        _row(0, "in", "моя любимая, привет"),
-        _row(1, "in", "я тебя полюблю ещё сильнее"),
+        _row(0, "in", "?"),
+        _row(1, "in", "???"),
+        _row(2, "in", "https://example.com/?a=1"),
+        _row(3, "in", "ты придёшь завтра?"),
     ]
-    result = warmth(rows)
-    assert result.warm_n == 1
-    assert result.warm_examples[0][1] == "моя любимая, привет"
+    *_, examples = question_balance(rows)
+    assert examples == [("in", "ты придёшь завтра?")]
 
 
-def test_examples_are_from_the_same_message_that_matched():
-    # Регрессия ровно на прошлый баг: если бы примеры брались из другого
-    # списка/сообщения, чем то, где найдено совпадение, эта проверка бы упала.
+def test_same_question_is_not_quoted_twice():
+    # «как дела?» человек задаёт регулярно — два одинаковых примера выглядели
+    # бы недоработкой, берём следующий по свежести отличающийся вопрос.
     rows = [
-        _row(0, "in", "просто нейтральное сообщение"),
-        _row(1, "in", "я тебя люблю"),
-        _row(2, "in", "ты моя зая"),
+        _row(0, "in", "ты придёшь?"),
+        _row(1, "in", "как дела?"),
+        _row(2, "in", "Как дела?"),
+        _row(3, "out", "норм"),
     ]
-    result = warmth(rows)
-    assert result.warm_n == 2
-    for direction, text in result.warm_examples:
-        stem_hits, has_emoji, _ = _classify_warm(text)
-        assert stem_hits or has_emoji
+    *_, examples = question_balance(rows)
+    texts = [t for _, t in examples]
+    assert len(texts) == len(set(t.lower() for t in texts))
 
 
-def test_examples_filtered_junk_and_freshest_first():
-    rows = [
-        _row(0, "in", "http://example.com"),  # ссылка — мусор-контроль
-        _row(1, "in", "я тебя люблю"),
-        _row(2, "in", "ты моя зая"),
-    ]
-    result = warmth(rows)
-    assert result.warm_n == 2
-    assert result.warm_examples[0] == ("in", "ты моя зая")  # свежее — первое
+def test_long_question_is_truncated_in_card_suffix():
+    import main
+
+    long_q = "а вот скажи мне пожалуйста " * 5 + "что ты думаешь?"
+    suffix = main._quote_examples_suffix({"examples": [("in", long_q)]})
+    assert "…" in suffix
+    assert len(suffix) < len(long_q) + 40
 
 
-def test_occurrence_count_separate_from_message_flag():
-    # "люблю тебя люблю тебя люблю тебя" — ОДНО тёплое сообщение (флаг), но
-    # 3 occurrence (у каждого вхождения "тебя" рядом — направленность на
-    # собеседника подтверждена без LLM).
-    rows = [_row(0, "out", "люблю тебя люблю тебя люблю тебя")]
-    result = warmth(rows)
-    assert result.warm_n == 1
-    assert result.occurrences["out"]["люблю"] == 3
-
-
-def test_fact_text_shows_absolute_count_not_percent():
-    rows = [_row(i, "in", f"люблю тебя {i}") for i in range(5)]
+def test_card_section_replaces_warmth():
+    rows = [_row(0, "out", "как ты?"), _row(1, "in", "норм")]
     metrics = compute_all(rows)
-    fact = metrics["warmth_conflict"]["fact"]
-    assert "%" not in fact
-    assert "Тёплых сообщений — 5" in fact
-    assert "раз" in fact  # частота в неделю
-    assert metrics["warmth_conflict"]["label"] == "Тепло"
-    assert metrics["warmth_conflict"]["warm_occurrences"]["in"]["люблю"] == 5
-
-
-def test_no_conflict_fields_left():
-    rows = [_row(0, "in", "бесит это все")]  # раньше матчило конфликт — теперь просто нейтральный текст
-    metrics = compute_all(rows)
-    wc = metrics["warmth_conflict"]
-    assert "conflict_examples" not in wc
-    assert wc["short"] == "💚0"
-
-
-def test_feeling_verb_with_second_person_counts_without_llm():
-    rows = [_row(0, "in", "скучаю по тебе очень"), _row(1, "in", "я тебя обожаю")]
-    result = warmth(rows)
-    assert result.warm_n == 2
-    assert result.ambiguous_candidates == []
-
-
-def test_feeling_verb_toward_object_not_counted_and_not_sent_to_llm():
-    # Реальный кейс из бага: "обожаю" направлено на фильм — не на собеседника.
-    # Явно посторонний объект рядом (фильм) — исключается сразу, LLM не зовём.
-    rows = [_row(0, "out", "бля как же я обожаю этот фильм")]
-    result = warmth(rows)
-    assert result.warm_n == 0
-    assert result.ambiguous_candidates == []
-    assert result.warm_examples == []
-
-
-def test_feeling_verb_toward_third_person_not_counted_and_not_sent_to_llm():
-    # Реальный кейс из бага: "я обожаю её" — третье лицо, не собеседник.
-    rows = [_row(0, "out", "я обожаю её")]
-    result = warmth(rows)
-    assert result.warm_n == 0
-    assert result.ambiguous_candidates == []
-
-
-def test_feeling_verb_undirected_goes_to_llm_candidates():
-    # Глагол есть, но ни "тебя", ни явно постороннего объекта рядом нет —
-    # неопределённость, кандидат на ту же LLM-проверку, что и AMBIGUOUS_PRAISE_WORDS.
-    rows = [_row(0, "in", "обожаю просто")]
-    result = warmth(rows)
-    assert result.warm_n == 0
-    assert len(result.ambiguous_candidates) == 1
-    assert result.ambiguous_candidates[0][2] == "обожаю"
-
-
-def test_feeling_verb_confirmed_by_llm_counts():
-    rows = [_row(0, "in", "обожаю просто")]
-    confirmed = {("in", "обожаю просто")}
-    result = warmth(rows, confirmed_ambiguous=confirmed)
-    assert result.warm_n == 1
-
-
-def test_compute_all_accepts_confirmed_ambiguous():
-    rows = [_row(0, "in", "ты молодец, все супер")]
-    metrics_plain = compute_all(rows)
-    assert metrics_plain["warmth_conflict"]["short"] == "💚0"
-
-    metrics_confirmed = compute_all(rows, confirmed_ambiguous={("in", "ты молодец, все супер")})
-    assert metrics_confirmed["warmth_conflict"]["short"] == "💚1"
+    assert "warmth_conflict" not in metrics
+    assert metrics["questions"]["label"] == "Кто чаще задаёт вопросы"
+    # Порядок секций: новая стоит там же, где стояло «Тепло» —
+    # между «Долгие паузы» и «Совпадение по времени».
+    keys = [k for k in metrics if not k.startswith("_")]
+    assert keys.index("questions") == keys.index("long_pauses") + 1
+    assert keys.index("circadian") == keys.index("questions") + 1

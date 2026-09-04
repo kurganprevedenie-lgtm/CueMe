@@ -77,7 +77,6 @@ from llm import (
     build_my_style_for_contact,
     build_overall_style,
     build_style_card,
-    classify_ambiguous_praise,
     extract_chat_from_image,
     analyze_reply_dynamics,
     get_forced_provider,
@@ -90,7 +89,7 @@ from llm import (
     suggest_reply_variants,
     transcribe_audio,
 )
-from compatibility_metrics import compute_all as compute_compat_metrics, warmth as compute_warmth
+from compatibility_metrics import compute_all as compute_compat_metrics
 from tg_parser import parse_chat
 from tools.export import extract_conversation, to_html, to_text
 from storage import (
@@ -1793,30 +1792,12 @@ async def _gen_deep_analysis(contact_id: int, owner_user_id: str) -> dict | None
     if cached and total_count - cached["last_rebuild_count"] < REBUILD_THRESHOLD:
         return cached
 
-    # Неоднозначные слова похвалы («молодец»/«умница» — AMBIGUOUS_PRAISE_WORDS
-    # в config.py) требуют LLM-подтверждения, что это тёплое обращение к
-    # партнёру, а не нейтральная похвала за дело. Разведочный проход БЕЗ
-    # confirmed_ambiguous ничего не досчитывает лишнего, только собирает
-    # кандидатов — если их нет (подавляющее большинство контактов), второй
-    # проход не нужен вообще, LLM не зовём зря.
-    provisional_warmth = compute_warmth(rows)
-    confirmed_ambiguous: set[tuple[str, str]] = set()
-    if provisional_warmth.ambiguous_candidates:
-        try:
-            texts = [c[1] for c in provisional_warmth.ambiguous_candidates]
-            verdicts = await classify_ambiguous_praise(texts)
-            confirmed_ambiguous = {
-                (c[0], c[1])
-                for c, ok in zip(provisional_warmth.ambiguous_candidates, verdicts)
-                if ok
-            }
-        except Exception:
-            logging.exception(
-                "deep_analysis: не удалось LLM-проверить неоднозначные похвалы — "
-                "считаем их все нейтральными",
-            )
-
-    metrics = compute_compat_metrics(rows, confirmed_ambiguous=confirmed_ambiguous)
+    # Разведочный LLM-проход для секции «Тепло» (проверка неоднозначных похвал)
+    # убран вместе с самой секцией — все метрики карточки снова считаются
+    # детерминированно, один вызов compute_all без предварительных обращений
+    # к LLM (сам разбор метрик ниже — build_compatibility_interpretation — на
+    # месте, он интерпретирует уже посчитанные числа).
+    metrics = compute_compat_metrics(rows)
     volume_trend = metrics.pop("_volume_trend")
     interpretations, dynamics_text, synthesis, advice = await build_compatibility_interpretation(
         metrics, volume_trend, user_gender=get_gender(owner_user_id),
@@ -1913,7 +1894,7 @@ _METRIC_EMOJI = {
     "response_speed": "⏱️",
     "initiation": "🙋",
     "long_pauses": "⏸️",
-    "warmth_conflict": "🌡️",
+    "questions": "❓",
     "circadian": "🕒",
 }
 
@@ -1921,16 +1902,17 @@ def _direction_label(direction: str) -> str:
     return "ты" if direction == "out" else "собеседник"
 
 
-def _warmth_examples_suffix(m: dict) -> str:
-    """Доп. строка с реальными цитатами ТОЛЬКО для секции «Тепло»
-    (warm_examples — см. compatibility_metrics.warmth) — остальные метрики
-    этого поля не имеют, суффикс для них пустой. Цитаты обрезаются до 80
-    символов, тот же паттерн, что у initiative_axis в features.py.
-    Добавляется ПОСЛЕ interpretation/fact, а не встраивается в промпт
-    интерпретации — LLM переписывает только смысл факта и не видит сырые
-    цитаты, значит не может их исказить/потерять."""
-    warm = m.get("warm_examples") or []
-    if not warm:
+def _quote_examples_suffix(m: dict) -> str:
+    """Доп. строка с реальными цитатами для любой метрики, у которой они есть
+    (поле "examples" — сейчас его отдаёт «Кто чаще задаёт вопросы», см.
+    compatibility_metrics.question_balance). У метрик без цитат поля нет и
+    суффикс пустой, поэтому вызывать можно на всех подряд, без частных
+    условий по ключу. Цитаты обрезаются до 80 символов — тот же паттерн, что
+    у initiative_axis в features.py. Добавляется ПОСЛЕ interpretation/fact, а
+    не встраивается в промпт интерпретации: LLM переписывает только смысл
+    факта и не видит сырые цитаты, значит не может их исказить/потерять."""
+    examples = m.get("examples") or []
+    if not examples:
         return ""
 
     def _quote(text: str) -> str:
@@ -1938,7 +1920,7 @@ def _warmth_examples_suffix(m: dict) -> str:
 
     parts = [
         f"«{_quote(text)}» ({_direction_label(direction)})"
-        for direction, text in warm
+        for direction, text in examples
     ]
     return " Например, " + "; ".join(parts) + "."
 
@@ -1991,8 +1973,7 @@ def _build_rich_analysis_html(name: str, metrics: dict, dynamics_text: str, synt
         if key.startswith("_"):
             continue
         text = m.get("interpretation") or m["fact"]
-        if key == "warmth_conflict":
-            text += _warmth_examples_suffix(m)
+        text += _quote_examples_suffix(m)  # пусто у метрик без цитат
         heading = f"{_METRIC_EMOJI.get(key, '')} {m['label']}".strip()
         metric_block_parts.append(
             f"{_rich_heading(heading)}\n<blockquote>{esc(text)}</blockquote>"
@@ -2051,8 +2032,7 @@ def _format_deep_analysis_text(name: str, metrics: dict, dynamics_text: str, syn
         if key.startswith("_"):
             continue
         text = m.get("interpretation") or m["fact"]
-        if key == "warmth_conflict":
-            text += _warmth_examples_suffix(m)
+        text += _quote_examples_suffix(m)  # пусто у метрик без цитат
         metric_part_list.append(
             f"<b>{_METRIC_EMOJI.get(key, '')} {html.escape(m['label'])}</b>\n{html.escape(text)}"
         )
