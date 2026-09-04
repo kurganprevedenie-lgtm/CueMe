@@ -4803,6 +4803,22 @@ def _format_remaining(delta: timedelta) -> str:
     return "меньше часа"
 
 
+_RU_MONTHS_GEN = {
+    1: "января", 2: "февраля", 3: "марта", 4: "апреля", 5: "мая", 6: "июня",
+    7: "июля", 8: "августа", 9: "сентября", 10: "октября", 11: "ноября", 12: "декабря",
+}
+
+
+def _format_until(dt: datetime) -> str:
+    """«25 августа 2026, 18:29 UTC» — конкретная дата и время окончания, а не
+    только относительный остаток (по прямой просьбе — юзер прислал скриншот
+    официальной Telegram-квитанции с таким форматом, «будет действовать до
+    25 Aug 2026 18:29:34 UTC», и попросил такую же конкретику у нас; месяц —
+    по-русски, без английских сокращений, секунды опущены как лишняя точность
+    для UI)."""
+    return f"{dt.day} {_RU_MONTHS_GEN[dt.month]} {dt.year}, {dt.strftime('%H:%M')} UTC"
+
+
 def _premium_expiry_line(telegram_id: str) -> str:
     """Строка «сколько осталось + способ оплаты» для активного Premium, или
     "" если срок неизвестен (Tribute — см. ниже). Порядок проверки — тот же
@@ -4814,22 +4830,31 @@ def _premium_expiry_line(telegram_id: str) -> str:
 
     until = get_deep_analysis_free_until(telegram_id)
     if until and until > now:
-        return f"🎁 Реферальная награда — осталось {_format_remaining(until - now)}."
+        return (
+            f"🎁 Реферальная награда — действует до {_format_until(until)} "
+            f"(осталось {_format_remaining(until - now)})."
+        )
 
     until = get_promo_channel_premium_until(telegram_id)
     if until and until > now:
-        return f"📢 Награда за подписку на канал — осталось {_format_remaining(until - now)}."
+        return (
+            f"📢 Награда за подписку на канал — действует до {_format_until(until)} "
+            f"(осталось {_format_remaining(until - now)})."
+        )
 
     until = get_stars_premium_until(telegram_id)
     if until and until > now:
         payment = get_latest_star_payment(telegram_id)
         if payment and payment["is_subscription"]:
             return (
-                f"⭐ Stars-подписка (автопродление) — следующее списание через "
-                f"{_format_remaining(until - now)}. Отменить — в Telegram: "
-                "Настройки → Мои подписки."
+                f"⭐ Stars-подписка (автопродление) — следующее списание "
+                f"{_format_until(until)} (через {_format_remaining(until - now)}). "
+                "Отменить — в Telegram: Настройки → Мои подписки."
             )
-        return f"⭐ Оплачено Stars — осталось {_format_remaining(until - now)}."
+        return (
+            f"⭐ Оплачено Stars — действует до {_format_until(until)} "
+            f"(осталось {_format_remaining(until - now)})."
+        )
 
     # Ни одного источника с известной датой — по приоритету _is_premium
     # остаётся только членство в приватном канале Tribute. САМОГО срока
