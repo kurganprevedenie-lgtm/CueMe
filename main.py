@@ -3212,11 +3212,21 @@ async def _collect_users_data(bot: Bot) -> tuple[list[dict], dict]:
     return rows, totals
 
 
-def _build_users_report(rows: list[dict], totals: dict) -> list[str]:
+def _build_users_report(rows: list[dict], totals: dict, hidden_count: int = 0) -> list[str]:
     """Возвращает список блоков (шапка, по одному на юзера, сводка) — НЕ
     склеенную строку, чтобы cmd_users мог резать на чанки по границам
-    блоков, а не посреди HTML-тега."""
+    блоков, а не посреди HTML-тега.
+
+    rows — сюда передаются ТОЛЬКО активные (см. cmd_users: фильтр по
+    _status_line == "✅ Активен") — заблокировавших бота, отключивших
+    Автоматизацию и застойных юзеров в сообщение не выводим, они есть
+    только в CSV. hidden_count — сколько строк скрыто, для пометки в шапке."""
     blocks = ["👥 <b>Пользователи CueMe</b>"]
+    if hidden_count:
+        blocks.append(
+            f"Показаны только активные — {hidden_count} неактивных/заблокировавших/"
+            "отключивших Автоматизацию скрыты из сообщения, они есть в CSV-файле ниже."
+        )
 
     for r in rows:
         blocks.append(
@@ -3285,7 +3295,11 @@ async def cmd_users(message: Message, bot: Bot) -> None:
     if not _is_admin(message.from_user.id):
         return
     rows, totals = await _collect_users_data(bot)
-    blocks = _build_users_report(rows, totals)
+    # В сообщении — только активные (не заблокировали бота, не отключали
+    # Автоматизацию, не застойные >_INACTIVE_AFTER_DAYS дн.) — остальных
+    # показываем только в CSV-файле, не хотим захламлять сообщение.
+    active_rows = [r for r in rows if r["_status_line"] == "✅ Активен"]
+    blocks = _build_users_report(active_rows, totals, hidden_count=len(rows) - len(active_rows))
     # Телеграм режет на 4096 символов — рубим ПО ГРАНИЦАМ блоков (не
     # посимвольно), иначе легко разрезать HTML-тег пополам и получить
     # ошибку парсинга у Telegram вместо отчёта.
