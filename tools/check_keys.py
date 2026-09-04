@@ -2,7 +2,17 @@
 Mistral, GitHub Models, OpenRouter) без ротации — каждый ключ бьётся отдельным
 запросом, чтобы увидеть его реальный статус.
 
-Запуск на сервере: py -3.13 tools/check_keys.py
+Название модели для каждого провайдера читается ИЗ llm.py (Provider._MODEL),
+а не дублируется здесь строкой — раньше было дублирование, и правка модели в
+llm.py (например миграция на новую модель после того, как старую сняли с
+обслуживания) молча не долетала до этого скрипта: он продолжал проверять
+старую, уже мёртвую модель, и диагностика врала. Актуально только для
+провайдеров, у которых MODEL — не переменная запроса, а фиксированный
+атрибут класса (Cloudflare/Cerebras/Mistral/GitHub Models/OpenRouter) —
+Gemini/Groq модель тоже читают из своих провайдеров ниже, для единообразия.
+
+Запуск на сервере: python3.13 -m tools.check_keys (или ./venv/bin/python -m
+tools.check_keys, если зависимости стоят в venv, см. cueme-bot.service)
 """
 import asyncio
 
@@ -19,6 +29,15 @@ from config import (
     MISTRAL_API_KEY,
     OPENROUTER_API_KEY,
 )
+from llm import (
+    CerebrasProvider,
+    CloudflareProvider,
+    GeminiProvider,
+    GitHubModelsProvider,
+    GroqProvider,
+    MistralProvider,
+    OpenRouterProvider,
+)
 
 
 def _mask(key: str) -> str:
@@ -28,7 +47,7 @@ def _mask(key: str) -> str:
 async def check_gemini(key: str) -> tuple[bool, str]:
     url = (
         "https://generativelanguage.googleapis.com/v1beta/models/"
-        f"gemini-flash-latest:generateContent?key={key}"
+        f"{GeminiProvider._MODEL}:generateContent?key={key}"
     )
     payload = {
         "contents": [{"role": "user", "parts": [{"text": "Ответь одним словом: тест пройден?"}]}],
@@ -53,9 +72,9 @@ async def check_gemini(key: str) -> tuple[bool, str]:
 
 
 async def check_groq(key: str) -> tuple[bool, str]:
-    url = "https://api.groq.com/openai/v1/chat/completions"
+    url = GroqProvider._URL
     payload = {
-        "model": "openai/gpt-oss-120b",
+        "model": GroqProvider._MODEL,
         "messages": [{"role": "user", "content": "Ответь одним словом: тест пройден?"}],
         "max_tokens": 200,  # gpt-oss тратит часть max_tokens на reasoning до финального content
     }
@@ -68,11 +87,11 @@ async def check_groq(key: str) -> tuple[bool, str]:
 
 
 async def check_cerebras(key: str) -> tuple[bool, str]:
-    url = "https://api.cerebras.ai/v1/chat/completions"
+    url = CerebrasProvider._URL
     payload = {
-        "model": "llama-3.3-70b",
+        "model": CerebrasProvider._MODEL,
         "messages": [{"role": "user", "content": "Ответь одним словом: тест пройден?"}],
-        "max_tokens": 20,
+        "max_tokens": 200,  # gpt-oss тратит часть max_tokens на reasoning до финального content
     }
     async with httpx.AsyncClient(timeout=30.0, trust_env=False) as client:
         resp = await client.post(url, headers={"Authorization": f"Bearer {key}"}, json=payload)
@@ -83,9 +102,9 @@ async def check_cerebras(key: str) -> tuple[bool, str]:
 
 
 async def check_mistral(key: str) -> tuple[bool, str]:
-    url = "https://api.mistral.ai/v1/chat/completions"
+    url = MistralProvider._URL
     payload = {
-        "model": "mistral-small-latest",
+        "model": MistralProvider._MODEL,
         "messages": [{"role": "user", "content": "Ответь одним словом: тест пройден?"}],
         "max_tokens": 20,
     }
@@ -100,7 +119,7 @@ async def check_mistral(key: str) -> tuple[bool, str]:
 async def check_cloudflare(account_id: str, token: str) -> tuple[bool, str]:
     url = f"https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1/chat/completions"
     payload = {
-        "model": "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+        "model": CloudflareProvider._MODEL,
         "messages": [{"role": "user", "content": "Ответь одним словом: тест пройден?"}],
         "max_tokens": 20,
     }
@@ -113,9 +132,9 @@ async def check_cloudflare(account_id: str, token: str) -> tuple[bool, str]:
 
 
 async def check_github_models(token: str) -> tuple[bool, str]:
-    url = "https://models.github.ai/inference/chat/completions"
+    url = GitHubModelsProvider._URL
     payload = {
-        "model": "openai/gpt-4o-mini",
+        "model": GitHubModelsProvider._MODEL,
         "messages": [{"role": "user", "content": "Ответь одним словом: тест пройден?"}],
         "max_tokens": 20,
     }
@@ -132,9 +151,9 @@ async def check_github_models(token: str) -> tuple[bool, str]:
 
 
 async def check_openrouter(key: str) -> tuple[bool, str]:
-    url = "https://openrouter.ai/api/v1/chat/completions"
+    url = OpenRouterProvider._URL
     payload = {
-        "model": "openai/gpt-oss-20b:free",
+        "model": OpenRouterProvider._MODEL,
         "messages": [{"role": "user", "content": "Ответь одним словом: тест пройден?"}],
         "max_tokens": 200,  # тоже reasoning-модель, см. комментарий в check_groq
     }

@@ -8,7 +8,7 @@ llm.py — обёртки над LLM-провайдерами с каскадн�
                   для новых ключей, см. миграцию 2026-08 ниже)
   2. Groq        (openai/gpt-oss-120b, см. миграцию 2026-08)  — fallback 1
   3. Cloudflare  (llama-3.3-70b, бесплатный тир, ~1300 запросов/день) — fallback 2
-  4. Cerebras    (llama-3.3-70b, бесплатный тир)          — fallback 3
+  4. Cerebras    (gpt-oss-120b, см. миграцию 2026-09 ниже) — fallback 3
   5. Mistral     (mistral-small-latest, бесплатный тир)   — fallback 4
   6. GitHub Models (gpt-4o-mini, бесплатный тир)          — fallback 5
   7. OpenRouter  (openrouter/free, см. миграцию 2026-09 ниже) — fallback 6
@@ -22,7 +22,10 @@ llm.py — обёртки над LLM-провайдерами с каскадн�
 тира (третий раз за историю проекта, что конкретную модель убирают из-под
 :free) — заменён на "openrouter/free", их официальный self-updating роутер
 по всем текущим бесплатным моделям сразу, чтобы больше не гоняться за
-очередной переименованной/убранной моделью вручную.
+очередной переименованной/убранной моделью вручную. В ТОТ ЖЕ день —
+живая проверка (tools/check_keys.py) на проде показала, что Cerebras тоже
+снял llama-3.3-70b с каталога моделей (404 "Model does not exist") —
+заменена на gpt-oss-120b (документирована как публично доступная).
 
 Cloudflare/Cerebras/Mistral/GitHub Models пропускаются автоматически, если
 их ключ(и) не заданы в .env (см. .env.example) — остальной каскад работает
@@ -517,7 +520,15 @@ class CloudflareProvider(LLMProvider):
 class CerebrasProvider(LLMProvider):
     name = "Cerebras"
     _URL   = "https://api.cerebras.ai/v1/chat/completions"
-    _MODEL = "llama-3.3-70b"
+    # llama-3.3-70b снята Cerebras с каталога (живая проверка на проде вернула
+    # 404 "Model does not exist", 2026-09) — gpt-oss-120b сейчас единственная
+    # модель, документированная как публично доступная (inference-docs.
+    # cerebras.ai/api-reference/models/public-models). НЕ проверено вживую на
+    # реальном ключе — прогнать tools/check_keys.py после деплоя.
+    _MODEL = "gpt-oss-120b"
+    # gpt-oss — та же reasoning-модель, что у Groq (см. _REASONING_BUFFER
+    # там): часть max_tokens уходит на рассуждения до финального content.
+    _REASONING_BUFFER = 900
 
     async def ask(self, prompt: str, max_tokens: int) -> str:
         if not CEREBRAS_API_KEY:
@@ -530,7 +541,7 @@ class CerebrasProvider(LLMProvider):
                 json={
                     "model": self._MODEL,
                     "messages": [{"role": "user", "content": prompt}],
-                    "max_tokens": max_tokens,
+                    "max_tokens": max_tokens + self._REASONING_BUFFER,
                 },
             )
 
