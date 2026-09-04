@@ -122,6 +122,7 @@ from storage import (
     get_ideal_date,
     get_last_event_time,
     get_last_incoming_message_time,
+    get_latest_star_payment,
     get_llm_cache,
     get_interaction_card,
     get_imported_messages,
@@ -4777,9 +4778,73 @@ async def cmd_help(message: Message) -> None:
 
 # ── /premium — статус подписки ────────────────────────────────────────────────
 
+def _ru_days_word(n: int) -> str:
+    if n % 10 == 1 and n % 100 != 11:
+        return "день"
+    if 2 <= n % 10 <= 4 and not (12 <= n % 100 <= 14):
+        return "дня"
+    return "дней"
+
+
+def _format_remaining(delta: timedelta) -> str:
+    """«3 дня» / «18 часов» / «меньше часа» — дни, если остались хотя бы
+    сутки, иначе часы (по условию задачи: дни и часы, если осталось меньше
+    суток — часов одних достаточно, до минут не мельчим)."""
+    total_seconds = int(delta.total_seconds())
+    if total_seconds <= 0:
+        return "меньше минуты"
+    days = total_seconds // 86400
+    if days >= 1:
+        return f"{days} {_ru_days_word(days)}"
+    hours = total_seconds // 3600
+    if hours >= 1:
+        hour_word = "час" if hours == 1 else ("часа" if 2 <= hours <= 4 else "часов")
+        return f"{hours} {hour_word}"
+    return "меньше часа"
+
+
+def _premium_expiry_line(telegram_id: str) -> str:
+    """Строка «сколько осталось + способ оплаты» для активного Premium, или
+    "" если срок неизвестен (Tribute — см. ниже). Порядок проверки — тот же
+    приоритет, что уже использует _is_premium (реферал → промо-канал →
+    Stars → членство в канале Tribute), поэтому если ни один источник с
+    известной датой не сработал, а _is_premium всё равно True — остаётся
+    только Tribute."""
+    now = datetime.now(timezone.utc)
+
+    until = get_deep_analysis_free_until(telegram_id)
+    if until and until > now:
+        return f"🎁 Реферальная награда — осталось {_format_remaining(until - now)}."
+
+    until = get_promo_channel_premium_until(telegram_id)
+    if until and until > now:
+        return f"📢 Награда за подписку на канал — осталось {_format_remaining(until - now)}."
+
+    until = get_stars_premium_until(telegram_id)
+    if until and until > now:
+        payment = get_latest_star_payment(telegram_id)
+        if payment and payment["is_subscription"]:
+            return (
+                f"⭐ Stars-подписка (автопродление) — следующее списание через "
+                f"{_format_remaining(until - now)}. Отменить — в Telegram: "
+                "Настройки → Мои подписки."
+            )
+        return f"⭐ Оплачено Stars — осталось {_format_remaining(until - now)}."
+
+    # Ни одного источника с известной датой — по приоритету _is_premium
+    # остаётся только членство в приватном канале Tribute. САМОГО срока
+    # окончания бот не знает: Tribute продлевает/отменяет подписку на своей
+    # стороне, боту доступен только текущий факт членства (get_chat_member).
+    return (
+        "💎 Подписка оформлена через Tribute — продление и отмена на их "
+        "стороне, точную дату окончания бот не знает."
+    )
+
+
 async def _premium_status_text(bot: Bot, telegram_id: str) -> str:
     if await _is_premium(bot, telegram_id):
-        return "👑 Подписка:\n\n✅ Активна — весь функционал CueMe без ограничений."
+        expiry_line = _premium_expiry_line(telegram_id)
+        return f"👑 Подписка:\n\n✅ Активна — весь функционал CueMe без ограничений.\n\n{expiry_line}"
 
     used = get_trial_used(telegram_id)
     left = max(0, FREE_TRIAL_REQUESTS - used)

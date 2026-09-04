@@ -1198,6 +1198,23 @@ def record_star_payment(
     return True
 
 
+def get_latest_star_payment(telegram_id: str) -> sqlite3.Row | None:
+    """Последний по времени Stars-платёж юзера (по created_at) — нужен, чтобы
+    понять, откуда взялось ТЕКУЩЕЕ окно stars_premium_until: тариф 'month' —
+    нативная Stars-подписка с автопродлением (is_subscription=1), 'day'/'week' —
+    разовая покупка. None, если платежей не было вовсе."""
+    with _conn() as conn:
+        return conn.execute(
+            """
+            SELECT * FROM star_payments
+            WHERE telegram_id = ?
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            (telegram_id,),
+        ).fetchone()
+
+
 def count_successful_referrals(telegram_id: str) -> int:
     """Сколько друзей реально начали пользоваться ботом (credited=1) — для /myref."""
     with _conn() as conn:
