@@ -11,12 +11,18 @@ llm.py — обёртки над LLM-провайдерами с каскадн�
   4. Cerebras    (llama-3.3-70b, бесплатный тир)          — fallback 3
   5. Mistral     (mistral-small-latest, бесплатный тир)   — fallback 4
   6. GitHub Models (gpt-4o-mini, бесплатный тир)          — fallback 5
-  7. OpenRouter  (openai/gpt-oss-20b:free, см. миграцию 2026-08) — fallback 6
+  7. OpenRouter  (openrouter/free, см. миграцию 2026-09 ниже) — fallback 6
 
 Миграция 2026-08: llama-3.3-70b-versatile отключён на Groq, gemini-2.5-flash
 отключён для новых ключей на Gemini, meta-llama/llama-3.3-70b-instruct:free
 снят с бесплатного тира OpenRouter — проверено вживую через /models на
 живых ключах, модели выше подтверждены реальным запросом (см. tools/check_keys.py).
+
+Миграция 2026-09: openai/gpt-oss-20b:free тоже снят OpenRouter с бесплатного
+тира (третий раз за историю проекта, что конкретную модель убирают из-под
+:free) — заменён на "openrouter/free", их официальный self-updating роутер
+по всем текущим бесплатным моделям сразу, чтобы больше не гоняться за
+очередной переименованной/убранной моделью вручную.
 
 Cloudflare/Cerebras/Mistral/GitHub Models пропускаются автоматически, если
 их ключ(и) не заданы в .env (см. .env.example) — остальной каскад работает
@@ -619,11 +625,17 @@ class GitHubModelsProvider(LLMProvider):
 class OpenRouterProvider(LLMProvider):
     name = "OpenRouter"
     _URL   = "https://openrouter.ai/api/v1/chat/completions"
-    # llama-3.1-8b-instruct:free, затем llama-3.3-70b-instruct:free OpenRouter
-    # по очереди убрал из бесплатного тира (404 "unavailable for free") —
-    # свободные модели там меняются часто, см. openrouter.ai/models перед
-    # следующей миграцией. gpt-oss-20b:free проверен вживую на 2026-08.
-    _MODEL = "openai/gpt-oss-20b:free"
+    # llama-3.1-8b-instruct:free, затем llama-3.3-70b-instruct:free, затем
+    # gpt-oss-20b:free — OpenRouter каждый раз убирал конкретную модель из
+    # бесплатного тира (404 "unavailable for free"), это повторялось минимум
+    # трижды за историю проекта. Вместо очередной жёстко зашитой модели —
+    # "openrouter/free", их официальный self-updating роутер по ВСЕМ (~24 на
+    # 2026-09) бесплатным моделям сразу (openrouter.ai/openrouter/free) —
+    # автоматически подстраивается под то, что реально бесплатно ПРЯМО
+    # СЕЙЧАС, конкретная модель внутри роутера может каждый запрос быть
+    # разной. НЕ проверено вживую на реальном ключе (см. tools/check_keys.py
+    # — прогнать перед тем, как полагаться на это в проде).
+    _MODEL = "openrouter/free"
     # Тоже reasoning-модель (см. _REASONING_BUFFER у GroqProvider) — та же
     # просадка на низком max_tokens подтверждена вживую (20 → пусто, 300 → ок).
     _REASONING_BUFFER = 900
