@@ -9,7 +9,7 @@ llm.py — обёртки над LLM-провайдерами с каскадн�
   2. Groq        (openai/gpt-oss-120b, см. миграцию 2026-08)  — fallback 1
   3. Cloudflare  (llama-3.3-70b, бесплатный тир, ~1300 запросов/день) — fallback 2
   4. Cerebras    (gpt-oss-120b, см. миграцию 2026-09 ниже) — fallback 3
-  5. Mistral     (mistral-small-latest, бесплатный тир)   — fallback 4
+  5. Mistral     (mistral-small-2603, см. миграцию 2026-09 ниже) — fallback 4
   6. GitHub Models (gpt-4o-mini, бесплатный тир)          — fallback 5
   7. OpenRouter  (openrouter/free, см. миграцию 2026-09 ниже) — fallback 6
 
@@ -25,7 +25,12 @@ llm.py — обёртки над LLM-провайдерами с каскадн�
 очередной переименованной/убранной моделью вручную. В ТОТ ЖЕ день —
 живая проверка (tools/check_keys.py) на проде показала, что Cerebras тоже
 снял llama-3.3-70b с каталога моделей (404 "Model does not exist") —
-заменена на gpt-oss-120b (документирована как публично доступная).
+заменена на gpt-oss-120b (документирована как публично доступная). Mistral
+тоже перешёл на датированные названия моделей — mistral-small-latest на
+живом ключе давал 429 на первом же запросе при активном плане и целой
+месячной квоте (алиас, похоже, не резолвится нормально) — заменена на
+mistral-small-2603 (подтверждено вживую как существующая модель в лимитах
+аккаунта на organization limits, console.mistral.ai).
 
 Cloudflare/Cerebras/Mistral/GitHub Models пропускаются автоматически, если
 их ключ(и) не заданы в .env (см. .env.example) — остальной каскад работает
@@ -563,7 +568,13 @@ class CerebrasProvider(LLMProvider):
 class MistralProvider(LLMProvider):
     name = "Mistral"
     _URL   = "https://api.mistral.ai/v1/chat/completions"
-    _MODEL = "mistral-small-latest"
+    # "mistral-small-latest" — живая проверка на проде (2026-09) вернула 429
+    # на первом же запросе при активном плане и не исчерпанной месячной
+    # квоте: алиас, похоже, не резолвится нормально после перехода Mistral
+    # на датированные названия моделей (organization limits в консоли
+    # показывают mistral-small-2603, а не mistral-small-latest вообще).
+    # Датированное имя подтверждено как присутствующее в лимитах аккаунта.
+    _MODEL = "mistral-small-2603"
 
     async def ask(self, prompt: str, max_tokens: int) -> str:
         if not MISTRAL_API_KEY:
