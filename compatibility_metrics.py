@@ -13,10 +13,11 @@ date, direction. БЕЗ реакций, БЕЗ длительности голо
 Модуль целиком БЕЗ LLM: каждая метрика считается по тексту детерминированно.
 Раньше исключением была секция «Тепло» (словарь тёплых слов + LLM-проверка
 неоднозначных кандидатов) — убрана целиком, см. блок «5. Тепло» ниже."""
+import calendar
 import re
 from collections import Counter
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from features import _looks_junky
 
@@ -33,6 +34,14 @@ def _parse_dt(iso: str) -> datetime | None:
         return datetime.fromisoformat(iso)
     except (ValueError, TypeError):
         return None
+
+
+def _as_utc(dt: datetime) -> datetime:
+    """Даты в rows бывают и с tz, и без (см. business_messages.date) — для
+    сравнения с datetime.now(timezone.utc) (см. volume_trend: определение
+    незавершённого периода) наивные считаем уже UTC, тот же принцип, что и
+    в main._relative_label."""
+    return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
 
 
 # ── 1. Баланс ──────────────────────────────────────────────────────────────
@@ -471,10 +480,32 @@ class Period:
     label: str
     n_author: int
     n_contact: int
+    # Незавершённый период (месяц/неделя/день, который на момент подсчёта ещё
+    # идёт в реальном календаре — см. volume_trend) занижает total чисто
+    # механически: в нём физически не могло накопиться столько же сообщений,
+    # сколько в уже закрытом периоде, даже без изменения темпа общения.
+    # is_complete=True для всех периодов, кроме, возможно, самого последнего.
+    is_complete: bool = True
+    # Сколько дней ФАКТИЧЕСКИ отражено в total: для завершённого периода —
+    # календарная длина периода целиком; для незавершённого — от начала
+    # периода до даты ПОСЛЕДНЕГО сообщения в нём (не «до сегодня» — иначе
+    # метрика зависела бы от момента запуска подсчёта, а не только от rows,
+    # см. докстринг модуля). Основа для daily_avg ниже.
+    days_elapsed: int = 1
+    # Календарная длина периода целиком (30 для сентября, 7 для недели) —
+    # для подписи «N дней из M, ещё не завершён» под таблицей; не влияет на
+    # daily_avg, только на отображение.
+    calendar_days: int = 1
 
     @property
     def total(self) -> int:
         return self.n_author + self.n_contact
+
+    @property
+    def daily_avg(self) -> float:
+        """Среднее сообщений в день — то, что реально сравнимо между
+        завершённым и незавершённым периодом (в отличие от total)."""
+        return self.total / self.days_elapsed if self.days_elapsed else 0.0
 
 
 @dataclass
@@ -506,9 +537,36 @@ def _period_key(dt: datetime, granularity: str) -> tuple[str, str]:
     return dt.strftime("%Y-%m-%d"), dt.strftime("%d.%m")
 
 
+def _period_bounds(dt: datetime, granularity: str) -> tuple[datetime, datetime]:
+    """(начало периода, конец периода) — оба началом/концом суток, тот же
+    tzinfo, что у dt. Конец — последняя секунда последнего календарного дня
+    периода (для месяца — реальное число дней в конкретном месяце, через
+    calendar.monthrange, не «30 дней всегда»)."""
+    if granularity == "month":
+        start = dt.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        last_day = calendar.monthrange(dt.year, dt.month)[1]
+        end = dt.replace(day=last_day, hour=23, minute=59, second=59, microsecond=999999)
+    elif granularity == "week":
+        start = (dt - timedelta(days=dt.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
+        end = (start + timedelta(days=6)).replace(hour=23, minute=59, second=59, microsecond=999999)
+    else:
+        start = dt.replace(hour=0, minute=0, second=0, microsecond=0)
+        end = dt.replace(hour=23, minute=59, second=59, microsecond=999999)
+    return start, end
+
+
 def volume_trend(rows: list[dict]) -> VolumeTrend:
     """Динамика объёма по периодам (адаптивная группировка) + отдельно пиковый
-    и последний период — для сравнения «было/стало» в тексте вывода."""
+    и последний период — для сравнения «было/стало» в тексте вывода.
+
+    Незавершённость определяется ТОЛЬКО у последнего периода (он один может
+    ещё идти на момент подсчёта карточки) — сравнивается календарный конец
+    периода с datetime.now(): если период кончится в будущем — он физически
+    не мог накопить столько же сообщений, сколько уже закрытые периоды
+    (см. Period.is_complete/days_elapsed/daily_avg выше). Единственное место
+    в модуле, где участвует datetime.now(), а не только rows — иначе саму
+    незавершённость (по определению зависящую от «сейчас ли ещё идёт
+    календарный месяц») в принципе не определить."""
     msgs = _sorted_texted(rows)
     if len(msgs) < 4:
         return VolumeTrend(granularity="day")
@@ -519,6 +577,8 @@ def volume_trend(rows: list[dict]) -> VolumeTrend:
 
     buckets: dict[str, Period] = {}
     order: list[str] = []
+    bucket_bounds: dict[str, tuple[datetime, datetime]] = {}
+    bucket_last_dt: dict[str, datetime] = {}
     for r in msgs:
         dt = _parse_dt(r["date"])
         if not dt:
@@ -527,10 +587,27 @@ def volume_trend(rows: list[dict]) -> VolumeTrend:
         if key not in buckets:
             buckets[key] = Period(label=label, n_author=0, n_contact=0)
             order.append(key)
+            bucket_bounds[key] = _period_bounds(dt, granularity)
         if r["direction"] == "out":
             buckets[key].n_author += 1
         else:
             buckets[key].n_contact += 1
+        prev_last = bucket_last_dt.get(key)
+        if prev_last is None or dt > prev_last:
+            bucket_last_dt[key] = dt
+
+    now = datetime.now(timezone.utc)
+    for key in order:
+        p = buckets[key]
+        period_start, period_end = bucket_bounds[key]
+        p.calendar_days = (period_end.date() - period_start.date()).days + 1
+        if _as_utc(period_end) < now:
+            p.is_complete = True
+            p.days_elapsed = p.calendar_days
+        else:
+            p.is_complete = False
+            last_with_data = bucket_last_dt[key]
+            p.days_elapsed = max(1, (last_with_data.date() - period_start.date()).days + 1)
 
     periods = [buckets[k] for k in order]
     peak = max(periods, key=lambda p: p.total) if periods else None

@@ -1764,9 +1764,18 @@ def _deep_stats_summary(rows: list[dict]) -> str:
 
 def _volume_trend_to_dict(vt) -> dict:
     """VolumeTrend (compatibility_metrics.py) → JSON-совместимый dict —
-    dataclass с dataclass-полями напрямую не сериализуется в json.dumps."""
+    dataclass с dataclass-полями напрямую не сериализуется в json.dumps.
+    is_complete/days_elapsed/calendar_days — нужны _trend_table_rows, чтобы
+    пометить в таблице период, который на момент подсчёта ещё не завершён
+    (см. compatibility_metrics.Period)."""
     def _period(p):
-        return None if p is None else {"label": p.label, "n_author": p.n_author, "n_contact": p.n_contact}
+        if p is None:
+            return None
+        return {
+            "label": p.label, "n_author": p.n_author, "n_contact": p.n_contact,
+            "is_complete": p.is_complete, "days_elapsed": p.days_elapsed,
+            "calendar_days": p.calendar_days,
+        }
     return {
         "granularity": vt.granularity,
         "periods": [_period(p) for p in vt.periods],
@@ -1937,6 +1946,16 @@ def _trend_table_rows(vt: dict) -> list[dict]:
     return periods[-_MAX_TREND_ROWS:]
 
 
+def _trend_row_label(p: dict) -> str:
+    """Подпись периода для таблицы — с явной пометкой, если период ещё не
+    завершён («09.2026 (5 дней из 30, ещё не завершён)»), чтобы читатель не
+    принял сырую сумму незавершённого периода за законченный показатель
+    (сама сумма в таблице не меняется — только подпись)."""
+    if p.get("is_complete", True):
+        return p["label"]
+    return f"{p['label']} ({p['days_elapsed']} дней из {p['calendar_days']}, ещё не завершён)"
+
+
 def _rich_heading(text: str) -> str:
     """Жирный заголовок внутри Rich Message: <p><b>...</b></p>, НЕ
     <h2>/<h3> (heading-блок, RichBlockSectionHeading в Bot API 10.1+).
@@ -1984,7 +2003,7 @@ def _build_rich_analysis_html(name: str, metrics: dict, dynamics_text: str, synt
     trend_rows = _trend_table_rows(vt)
     if trend_rows:
         table_lines = "\n".join(
-            f'<tr><td align="left">{esc(p["label"])}</td>'
+            f'<tr><td align="left">{esc(_trend_row_label(p))}</td>'
             f'<td align="center">{p["n_author"]}</td>'
             f'<td align="center">{p["n_contact"]}</td>'
             f'<td align="center">{p["n_author"] + p["n_contact"]}</td></tr>'
@@ -2041,7 +2060,7 @@ def _format_deep_analysis_text(name: str, metrics: dict, dynamics_text: str, syn
 
     trend_rows = _trend_table_rows(vt)
     if trend_rows:
-        lines = [f"{p['label']}: ты {p['n_author']}, собеседник {p['n_contact']}, всего {p['n_author'] + p['n_contact']}" for p in trend_rows]
+        lines = [f"{_trend_row_label(p)}: ты {p['n_author']}, собеседник {p['n_contact']}, всего {p['n_author'] + p['n_contact']}" for p in trend_rows]
         trend_table = "<pre>" + html.escape("\n".join(lines)) + "</pre>\n"
     else:
         trend_table = ""
