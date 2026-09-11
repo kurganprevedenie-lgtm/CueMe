@@ -249,6 +249,8 @@ BTN_DATE          = "💐 Идеальное свидание"
 # оставлена закомментированной ниже — на случай отката.
 # BTN_MORE          = "⚙️ Ещё"
 BTN_SUBSCRIPTION  = "👑 Подписка"
+# BTN_HELP («❓ Помощь») убрана из главного меню (упрощение до 4 кнопок) —
+# сама функция и /help не тронуты, просто больше не кнопка меню.
 BTN_HELP          = "❓ Помощь"
 # BTN_ME («👤 Мой стиль») убрана вместе с командой /me — дублировала
 # «Анализ своего стиля» (и была бесплатной лазейкой мимо подписки на неё;
@@ -409,13 +411,17 @@ def paywall_kb() -> InlineKeyboardMarkup:
 def premium_menu_kb() -> InlineKeyboardMarkup:
     """Клавиатура под карточкой «👑 Подписка»: оформить (Tribute) + оплата
     Stars прямо в Telegram + два бесплатных пути (реферальная награда и
-    подписка на промо-канал)."""
+    подписка на промо-канал) + «⬅️ Назад» в главное меню. Кнопка
+    «🎁 Пригласи друга» переименована в «👥 Реферальная система» — тот же
+    callback_data="show_invite", просто название под новую иерархию экранов
+    (Подписка → Реферальная система)."""
     b = InlineKeyboardBuilder()
     if PREMIUM_SUBSCRIBE_URL:
         b.button(text="💎 Оформить подписку", url=PREMIUM_SUBSCRIBE_URL)
     b.button(text="⭐ Оплатить Stars", callback_data="stars_menu")
-    b.button(text="🎁 Пригласи друга", callback_data="show_invite")
+    b.button(text="👥 Реферальная система", callback_data="show_invite")
     b.button(text="📢 Подписаться на канал", callback_data="promo:offer")
+    b.button(text="⬅️ Назад", callback_data="sub:to_menu")
     b.adjust(1)
     return b.as_markup()
 
@@ -701,7 +707,7 @@ _STARS_TIERS = {
 @dp.callback_query(F.data == "stars_menu")
 async def cb_stars_menu(call: CallbackQuery) -> None:
     await call.answer()
-    await call.message.answer(
+    await call.message.edit_text(
         "⭐ Оплата Telegram Stars — прямо в Telegram, без сторонних сайтов. "
         "Выбери тариф:",
         reply_markup=stars_tariff_kb(),
@@ -711,7 +717,7 @@ async def cb_stars_menu(call: CallbackQuery) -> None:
 @dp.callback_query(F.data == "stars_back")
 async def cb_stars_back(call: CallbackQuery, bot: Bot) -> None:
     await call.answer()
-    await _show_premium_screen(call.message, bot, str(call.from_user.id))
+    await _show_premium_screen(call.message, bot, str(call.from_user.id), edit=True)
 
 
 @dp.callback_query(F.data.startswith("stars_buy:"))
@@ -849,9 +855,21 @@ def _invite_text(telegram_id: str) -> str:
     )
 
 
-async def _show_invite(message: Message, bot: Bot, telegram_id: str | None = None) -> None:
+def invite_kb() -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    b.button(text="⬅️ Назад", callback_data="show_premium")
+    return b.as_markup()
+
+
+async def _show_invite(
+    message: Message, bot: Bot, telegram_id: str | None = None, edit: bool = False,
+) -> None:
     telegram_id = telegram_id or str(message.from_user.id)
-    await message.answer(_invite_text(telegram_id), parse_mode="HTML")
+    text = _invite_text(telegram_id)
+    if edit:
+        await message.edit_text(text, reply_markup=invite_kb(), parse_mode="HTML")
+    else:
+        await message.answer(text, reply_markup=invite_kb(), parse_mode="HTML")
 
 
 @dp.message(Command("invite"))
@@ -1003,8 +1021,55 @@ def main_kb() -> ReplyKeyboardMarkup:
     # b.row(KeyboardButton(text=BTN_LIVE))
     b.row(KeyboardButton(text=BTN_UNIFIED))
     b.row(KeyboardButton(text=BTN_DEEP), KeyboardButton(text=BTN_DATE))
-    b.row(KeyboardButton(text=BTN_SUBSCRIPTION), KeyboardButton(text=BTN_HELP))
+    b.row(KeyboardButton(text=BTN_SUBSCRIPTION))
     return b.as_markup(resize_keyboard=True)
+
+
+_MAIN_MENU_TEXT = (
+    "👋 Вот что я умею:\n\n"
+    "💬 Ответ с CueMe — подскажу, что написать в моменте\n"
+    "🔬 Анализ собеседника — разберу вашу переписку по фактам\n"
+    "💐 Идеальное свидание — накидаю идеи для свидания"
+)
+
+
+async def _send_main_menu(target: Message, edit: bool = False) -> None:
+    """Экран главного меню — общий для /menu, кнопки «⬅️ Вернуться в меню»
+    под результатами генерации и возврата «⬅️ Назад» из «👑 Подписка».
+    edit=True (Назад из Подписки) — редактирует ТО ЖЕ сообщение, снимая
+    inline-клавиатуру (reply_markup=None): main_kb() — обычная (reply)
+    клавиатура, она уже активна с более раннего шага и не привязана к
+    конкретному сообщению, так что edit_message_text её не трогает.
+    edit=False (по умолчанию) — новое сообщение с main_kb()."""
+    if edit:
+        await target.edit_text(_MAIN_MENU_TEXT, reply_markup=None)
+    else:
+        await target.answer(_MAIN_MENU_TEXT, reply_markup=main_kb())
+
+
+@dp.message(Command("menu"))
+async def cmd_menu(message: Message) -> None:
+    await _send_main_menu(message)
+
+
+_BACK_TO_MENU_BUTTON = InlineKeyboardButton(text="⬅️ Вернуться в меню", callback_data="back_to_menu")
+
+
+def _with_back_to_menu(markup: InlineKeyboardMarkup) -> InlineKeyboardMarkup:
+    """Добавляет строку «⬅️ Вернуться в меню» под уже собранной клавиатурой
+    результата генерации (Ответ с CueMe / Анализ собеседника / Идеальное
+    свидание) — не трогает остальные кнопки той клавиатуры."""
+    markup.inline_keyboard.append([_BACK_TO_MENU_BUTTON])
+    return markup
+
+
+@dp.callback_query(F.data == "back_to_menu")
+async def cb_back_to_menu(call: CallbackQuery) -> None:
+    """Не редактирует сообщение с результатом (его контент остаётся в
+    истории чата нетронутым) — присылает главное меню НОВЫМ сообщением,
+    тем же способом, что /menu."""
+    await call.answer()
+    await _send_main_menu(call.message)
 
 
 # more_menu_kb убрана вместе с BTN_MORE — «Идеальное свидание» стало кнопкой
@@ -1983,7 +2048,7 @@ async def _gen_deep_analysis(contact_id: int, owner_user_id: str) -> dict | None
 def deep_analysis_result_kb(contact_id: int) -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     b.button(text="🔄 Обновить анализ", callback_data=f"deepan_refresh:{contact_id}")
-    return b.as_markup()
+    return _with_back_to_menu(b.as_markup())
 
 
 # async def _run_deep_analysis(
@@ -2399,7 +2464,7 @@ def _format_ideal_date(name: str, data: dict) -> str:
 def ideal_date_result_kb(contact_id: int) -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     b.button(text="🔄 Другая идея", callback_data=f"idealdate_refresh:{contact_id}")
-    return b.as_markup()
+    return _with_back_to_menu(b.as_markup())
 
 
 async def _run_ideal_date(
@@ -2885,11 +2950,7 @@ async def handle_photo(message: Message) -> None:
 
 async def _send_start_menu(message: Message, telegram_id: str) -> None:
     if list_contacts(telegram_id):
-        await message.answer(
-            "С возвращением!\n\n"
-            "Жми «💬 Ответ с CueMe» или «🔬 Анализ собеседника» 👇",
-            reply_markup=main_kb(),
-        )
+        await _send_main_menu(message)
         return
 
     me = await message.bot.get_me()
@@ -4185,7 +4246,7 @@ _VARIANT_KINDS = ("reply", "screenshot")
 def variants_result_kb(action_id: str) -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     b.button(text="🔄 Другие варианты", callback_data=f"varregen:{action_id}")
-    return b.as_markup()
+    return _with_back_to_menu(b.as_markup())
 
 
 async def _run_variants_generation(
@@ -4369,7 +4430,7 @@ def _running_notes_preview(notes_text: str, n: int = 2) -> str:
 def live_variants_kb(action_id: str) -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     b.button(text="🔄 Другие варианты", callback_data=f"liveregen:{action_id}")
-    return b.as_markup()
+    return _with_back_to_menu(b.as_markup())
 
 
 # ── Готовые фразы (статичные скрипты, без LLM и без квоты) ────────────────────
@@ -5154,21 +5215,33 @@ async def cmd_premium(message: Message, bot: Bot) -> None:
     await message.answer(text, reply_markup=paywall_kb())
 
 
-async def _show_premium_screen(target: Message, bot: Bot, telegram_id: str) -> None:
+async def _show_premium_screen(target: Message, bot: Bot, telegram_id: str, edit: bool = False) -> None:
     text = await _premium_status_text(bot, telegram_id)
-    await target.answer(text, reply_markup=premium_menu_kb())
+    if edit:
+        await target.edit_text(text, reply_markup=premium_menu_kb())
+    else:
+        await target.answer(text, reply_markup=premium_menu_kb())
 
 
 @dp.callback_query(F.data == "show_premium")
 async def cb_show_premium(call: CallbackQuery, bot: Bot) -> None:
+    """Тоже служит «⬅️ Назад» из «👥 Реферальная система» в «👑 Подписка» —
+    редактирует то же сообщение (invite_kb() ведёт сюда же)."""
     await call.answer()
-    await _show_premium_screen(call.message, bot, str(call.from_user.id))
+    await _show_premium_screen(call.message, bot, str(call.from_user.id), edit=True)
 
 
 @dp.callback_query(F.data == "show_invite")
 async def cb_show_invite(call: CallbackQuery, bot: Bot) -> None:
     await call.answer()
-    await _show_invite(call.message, bot, str(call.from_user.id))
+    await _show_invite(call.message, bot, str(call.from_user.id), edit=True)
+
+
+@dp.callback_query(F.data == "sub:to_menu")
+async def cb_sub_to_main_menu(call: CallbackQuery) -> None:
+    """«⬅️ Назад» с экрана «👑 Подписка» — в главное меню, тем же сообщением."""
+    await call.answer()
+    await _send_main_menu(call.message, edit=True)
 
 
 # ── /delete — удалить данные (152-ФЗ) ────────────────────────────────────────
