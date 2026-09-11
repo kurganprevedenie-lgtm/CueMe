@@ -928,18 +928,40 @@ _GENDER_LABELS = {"male": "парень", "female": "девушка"}
 _GENDER_PROMPT_TEXT = "Кстати — как к тебе обращаться?"
 
 
-async def _maybe_prompt_gender(bot: Bot, telegram_id: str) -> None:
+async def _maybe_prompt_gender(
+    bot: Bot,
+    telegram_id: str,
+    *,
+    edit_chat_id: int | None = None,
+    edit_message_id: int | None = None,
+) -> bool:
     """Спрашивает пол один раз, сразу после реального завершения онбординга
     (первый контакт создан — демо/JSON/Business). Идемпотентно — no-op, если
-    уже спрашивали/выбрали."""
+    уже спрашивали/выбрали. Если передан edit_chat_id/edit_message_id
+    (Business-цепочка — см. cb_source_select) — редактирует ЭТО сообщение
+    вместо отправки нового, чтобы вся цепочка онбординг-вопросов оставалась
+    одним сообщением. Возвращает True, если вопрос реально показан (отправлен
+    или отредактирован) — вызывающий код (cb_source_select) использует это,
+    чтобы понять, нужно ли сразу переходить к следующему шагу цепочки."""
     if get_gender(telegram_id) is not None:
-        return
+        return False
     try:
-        await bot.send_message(int(telegram_id), _GENDER_PROMPT_TEXT, reply_markup=gender_kb())
+        if edit_chat_id is not None and edit_message_id is not None:
+            await bot.edit_message_text(
+                _GENDER_PROMPT_TEXT,
+                chat_id=edit_chat_id,
+                message_id=edit_message_id,
+                reply_markup=gender_kb(),
+            )
+        else:
+            await bot.send_message(int(telegram_id), _GENDER_PROMPT_TEXT, reply_markup=gender_kb())
     except TelegramForbiddenError:
         mark_bot_blocked(telegram_id)
+        return False
     except Exception:
         logging.warning("gender prompt failed: telegram_id=%s", telegram_id)
+        return False
+    return True
 
 
 # ── Источник привлечения ──────────────────────────────────────────────────────
@@ -961,16 +983,22 @@ def source_kb() -> InlineKeyboardMarkup:
     ])
 
 
-async def _maybe_prompt_source(bot: Bot, telegram_id: str) -> None:
-    """Спрашивает источник один раз, идемпотентно — no-op если уже отвечал."""
+async def _maybe_prompt_source(bot: Bot, telegram_id: str) -> Message | None:
+    """Спрашивает источник один раз, идемпотентно — no-op если уже отвечал.
+    Отправляется отдельным (новым) сообщением — это начало editable-цепочки
+    Business-онбординга (см. cb_source_select/cb_gender_select дальше),
+    поэтому возвращает отправленное Message, чтобы вызывающий код (пока
+    никто не использует возврат явно, но message_id уже есть на клиенте
+    через call.message в следующих шагах цепочки) мог бы его использовать."""
     if get_acquisition_source(telegram_id) is not None:
-        return
+        return None
     try:
-        await bot.send_message(int(telegram_id), _SOURCE_PROMPT_TEXT, reply_markup=source_kb())
+        return await bot.send_message(int(telegram_id), _SOURCE_PROMPT_TEXT, reply_markup=source_kb())
     except TelegramForbiddenError:
         mark_bot_blocked(telegram_id)
     except Exception:
         logging.warning("source prompt failed: telegram_id=%s", telegram_id)
+    return None
 
 
 @dp.callback_query(F.data.startswith("src:"))
@@ -979,13 +1007,25 @@ async def cb_source_select(call: CallbackQuery, bot: Bot) -> None:
     source = call.data.split(":", 1)[1]
     set_acquisition_source(telegram_id, source)
     await call.answer()
-    try:
-        await call.message.delete()
-    except Exception:
-        pass
     # Пол спрашиваем только теперь — после того как юзер реально ответил на
-    # вопрос про источник, а не одновременно с ним.
-    await _maybe_prompt_gender(bot, telegram_id)
+    # вопрос про источник, а не одновременно с ним. Editим ЭТО ЖЕ сообщение
+    # (было: delete + отдельное новое сообщение) — вся цепочка онбординг-
+    # вопросов остаётся одним редактируемым сообщением.
+    shown = await _maybe_prompt_gender(
+        bot, telegram_id,
+        edit_chat_id=call.message.chat.id,
+        edit_message_id=call.message.message_id,
+    )
+    if not shown:
+        # Пол уже известен (редкий кейс) — вопрос про пол пропускаем и сразу
+        # переходим к финальному шагу цепочки.
+        if list_contacts(telegram_id):
+            try:
+                await call.message.delete()
+            except Exception:
+                pass
+        else:
+            await _finish_onboarding_chain(bot, call.message.chat.id, call.message.message_id)
 
 
 def _contact_words(user_gender: str | None) -> tuple[str, str]:
@@ -2343,9 +2383,18 @@ async def handle_business_connection(event: BusinessConnection, bot: Bot) -> Non
         # до ответа останется невидим в /users.
         upsert_user(owner_id, f"user{owner_id}")
         try:
+            # reply_markup=main_kb() — это единственное место, где reply-
+            # клавиатура доходит до юзера на чистом Business-пути (JSON/демо
+            # получают её в своих сообщениях дальше по потоку). Раньше её
+            # слали отдельным сообщением с текстом "·"-заглушкой перед
+            # вопросом про источник — теперь просто вешаем на это, реальное
+            # по смыслу сообщение, а вопросы про источник/пол дальше editят
+            # ОДНО следующее сообщение (см. _maybe_prompt_source/
+            # cb_source_select/cb_gender_select/_finish_onboarding_chain).
             await bot.send_message(
                 event.user.id,
                 "✅ Готово, бот подключён! CueMe готов помогать тебе в переписках )",
+                reply_markup=main_kb(),
             )
         except TelegramForbiddenError:
             mark_bot_blocked(owner_id)
@@ -2537,29 +2586,43 @@ async def _send_no_contacts_hint(message: Message) -> None:
     )
 
 
-async def _send_no_dialogs_hint(message: Message) -> None:
-    """Показывается, когда у юзера ещё нет ни одного контакта (диалога) —
-    сразу конкретный вопрос с двумя вариантами следующего шага (без
-    свободного выбора среди всех кнопок главного меню — на живых тестерах
-    общий текст с полной клавиатурой не работал, терялись)."""
-    # main_kb (reply-клавиатура) — единственное место, где она доходит до
-    # юзера на чистом Business-пути (до первого сообщения ещё не было
-    # повода её прислать). Шлём ПЕРВЫМ сообщением (до inline-вопроса ниже) —
-    # два разных типа клавиатур (reply + inline) подряд в некоторых клиентах
-    # ведут себя надёжнее в этом порядке. Раньше здесь стоял zero-width
-    # space (U+200B) — не исключено, что Telegram Bot API его не всегда
-    # принимает как валидный text; "·" — заведомо обычный непустой символ.
-    # Обёрнуто в try/except с логированием — раньше сбой (если он был) тут
-    # проходил тихо, и без journalctl-следа причину было не установить.
-    try:
-        await message.answer("·", reply_markup=main_kb())
-    except Exception:
-        logging.exception("_send_no_dialogs_hint: не удалось отправить main_kb")
+# _send_no_dialogs_hint — заменена на _finish_onboarding_chain (edit-in-place
+# всей Business-цепочки онбординга, задача «объединить цепочку сообщений»).
+# Раньше слала ДВА новых сообщения: сначала "·"-заглушку (единственная цель —
+# доставить reply-клавиатуру main_kb, которую нельзя повесить на сообщение с
+# inline-кнопками вопроса) + сам вопрос отдельным сообщением. main_kb теперь
+# уезжает юзеру раньше, вместе с первым сообщением о подключении
+# (handle_business_connection), так что заглушка не нужна — оставлено здесь
+# закомментированным на случай отката.
+# async def _send_no_dialogs_hint(message: Message) -> None:
+#     try:
+#         await message.answer("·", reply_markup=main_kb())
+#     except Exception:
+#         logging.exception("_send_no_dialogs_hint: не удалось отправить main_kb")
+#     await message.answer(
+#         "Готово, бот подключён! Есть кто-то конкретный, с кем сейчас переписываешься?",
+#         reply_markup=_quickstart_kb(),
+#     )
 
-    await message.answer(
-        "Готово, бот подключён! Есть кто-то конкретный, с кем сейчас переписываешься?",
-        reply_markup=_quickstart_kb(),
-    )
+
+_QUICKSTART_PROMPT_TEXT = "Готово, бот подключён! Есть кто-то конкретный, с кем сейчас переписываешься?"
+
+
+async def _finish_onboarding_chain(bot: Bot, chat_id: int, message_id: int) -> None:
+    """Финальный шаг Business-цепочки онбординга (источник → пол → это) —
+    редактирует то же самое сообщение вместо отправки нового."""
+    try:
+        await bot.edit_message_text(
+            _QUICKSTART_PROMPT_TEXT,
+            chat_id=chat_id,
+            message_id=message_id,
+            reply_markup=_quickstart_kb(),
+        )
+    except Exception:
+        logging.warning(
+            "_finish_onboarding_chain: не удалось отредактировать chat_id=%s message_id=%s",
+            chat_id, message_id,
+        )
 
 
 @dp.callback_query(F.data == "qs:yes")
@@ -2652,10 +2715,35 @@ def business_connect_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Подключить", url="tg://settings/edit")],
         [InlineKeyboardButton(text="👀 Видео-инструкция", url="https://t.me/CueMee")],
-        [InlineKeyboardButton(text="👑 Подписка", callback_data="show_premium")],
+        # "👑 Подписка" убрана с этого экрана (задача: стартовый экран не
+        # должен вести на подписку) — доступ к ней остаётся через кнопку
+        # "👑 Подписка" в main_kb() и команду /premium.
         [InlineKeyboardButton(text="✨ Возможности бота", url="https://t.me/CueMee")],
-        [InlineKeyboardButton(text="🆘 Поддержка", url="https://t.me/furdokw")],
+        [InlineKeyboardButton(text="🆘 Поддержка", url="https://t.me/CueMeSupport")],
     ])
+
+
+async def _send_business_connect_prompt(target: Message, text: str) -> None:
+    """Инструкция по подключению Автоматизации чатов — со скриншотом, куда
+    именно нажимать в настройках Telegram, если задан ONBOARDING_PHOTO_PATH/
+    ONBOARDING_PHOTO_FILE_ID (.env), иначе просто текст. Тот же приоритет
+    файл-на-диске → file_id → голый текст, что и в _send_start_menu — общий
+    хелпер, чтобы cb_onboarding_business и cmd_connect не дублировали его."""
+    photo_path = Path(ONBOARDING_PHOTO_PATH) if ONBOARDING_PHOTO_PATH else None
+    if photo_path and photo_path.is_file():
+        await target.answer_photo(
+            photo=FSInputFile(photo_path),
+            caption=text,
+            reply_markup=business_connect_kb(),
+        )
+    elif ONBOARDING_PHOTO_FILE_ID:
+        await target.answer_photo(
+            photo=ONBOARDING_PHOTO_FILE_ID,
+            caption=text,
+            reply_markup=business_connect_kb(),
+        )
+    else:
+        await target.answer(text, reply_markup=business_connect_kb())
 
 
 # ── Захват file_id фото-инструкции (только для админа) ───────────────────────
@@ -2749,29 +2837,30 @@ async def cmd_start(message: Message, state: FSMContext, bot: Bot) -> None:
 
 
 @dp.callback_query(F.data.in_({"gender:male", "gender:female"}))
-async def cb_gender_select(call: CallbackQuery, state: FSMContext) -> None:
+async def cb_gender_select(call: CallbackQuery, state: FSMContext, bot: Bot) -> None:
     gender = call.data.split(":", 1)[1]
     telegram_id = str(call.from_user.id)
     set_gender(telegram_id, gender)
     # Подтверждение — всплывающим тостом, не отдельным сообщением в чате.
     await call.answer(f"Обращаюсь как к «{_GENDER_LABELS[gender]}»")
-    try:
-        await call.message.delete()
-    except Exception:
-        pass
     await state.clear()
 
     if list_contacts(telegram_id):
         # Уже есть хотя бы один контакт (демо/JSON/Business) — вопрос про пол
         # всегда задаётся СРАЗУ после того, как онбординг только что показал
-        # меню и инструкции; повторно слать "С возвращением!" тут не нужно.
-        pass
+        # меню и инструкции; повторно слать "С возвращением!" тут не нужно —
+        # само сообщение с вопросом про пол больше не нужно, убираем его.
+        try:
+            await call.message.delete()
+        except Exception:
+            pass
     else:
         # Пол спросили сразу после подключения Автоматизации чатов, ещё до
         # первого реального сообщения — контакта пока нет. Полный экран
-        # приветствия тут ни к чему, это уже пройденный шаг — просто
-        # показываем подсказку начать диалог (несёт и меню-клавиатуру).
-        await _send_no_dialogs_hint(call.message)
+        # приветствия тут ни к чему, это уже пройденный шаг — редактируем ЭТО
+        # ЖЕ сообщение на финальный вопрос цепочки (было: delete + 2 новых
+        # сообщения через _send_no_dialogs_hint).
+        await _finish_onboarding_chain(bot, call.message.chat.id, call.message.message_id)
 
 
 @dp.message(Command("gender"))
@@ -2785,10 +2874,7 @@ async def cb_onboarding_business(call: CallbackQuery, state: FSMContext, bot: Bo
     await call.answer()
     telegram_id = str(call.from_user.id)
     upsert_user(telegram_id, f"user{call.from_user.id}")
-    await call.message.answer(
-        await _business_connect_text(bot),
-        reply_markup=business_connect_kb(),
-    )
+    await _send_business_connect_prompt(call.message, await _business_connect_text(bot))
 
 
 @dp.callback_query(F.data == "onb:json")
@@ -2966,10 +3052,7 @@ async def cb_setup_contact(call: CallbackQuery, state: FSMContext) -> None:
 
 @dp.message(Command("connect"))
 async def cmd_connect(message: Message, bot: Bot) -> None:
-    await message.answer(
-        await _business_connect_text(bot),
-        reply_markup=business_connect_kb(),
-    )
+    await _send_business_connect_prompt(message, await _business_connect_text(bot))
 
 
 # ── /users — список всех пользователей + сводка (только для админа) ─────────
