@@ -598,7 +598,7 @@ async def cb_promo_check(call: CallbackQuery, bot: Bot) -> None:
 
 
 @dp.chat_member()
-async def on_promo_channel_membership_change(event: ChatMemberUpdated) -> None:
+async def on_promo_channel_membership_change(event: ChatMemberUpdated, bot: Bot) -> None:
     """Живое отслеживание отписки/подписки на промо-канал (PROMO_CHANNEL_USERNAME)
     для юзеров с активным окном промо-Premium. Требует прав администратора
     бота в этом канале — иначе chat_member-апдейты по нему не приходят.
@@ -625,12 +625,30 @@ async def on_promo_channel_membership_change(event: ChatMemberUpdated) -> None:
         remaining = (until - datetime.now(timezone.utc)).total_seconds()
         if remaining > 0:
             pause_promo_channel_premium(telegram_id, int(remaining))
+            await _notify_promo_premium_paused(bot, telegram_id)
         return
 
     remaining_seconds, _ = get_promo_channel_pause(telegram_id)
     if remaining_seconds:
         until = datetime.now(timezone.utc) + timedelta(seconds=remaining_seconds)
         resume_promo_channel_premium(telegram_id, until)
+
+
+_PROMO_PAUSED_TEXT = (
+    "Очень жаль, что вы отписались от нашего канала 😔 К сожалению, мы "
+    "приостановили ваш пробный Premium-период. Чтобы возобновить его — "
+    "подпишитесь обратно, и оставшееся время вернётся."
+)
+
+
+async def _notify_promo_premium_paused(bot: Bot, telegram_id: str) -> None:
+    """Уведомляет юзера о приостановке промо-Premium из-за отписки от канала.
+    Молча глотает ошибку отправки (юзер мог заблокировать бота) — постановка
+    на паузу уже применена и не зависит от того, дошло ли уведомление."""
+    try:
+        await bot.send_message(int(telegram_id), _PROMO_PAUSED_TEXT)
+    except Exception:
+        logging.warning("promo premium pause notify failed: telegram_id=%s", telegram_id)
 
 
 async def _reconcile_promo_channel_premium(bot: Bot) -> None:
@@ -657,6 +675,7 @@ async def _reconcile_promo_channel_premium(bot: Bot) -> None:
                 remaining = (until - datetime.now(timezone.utc)).total_seconds()
                 if remaining > 0:
                     pause_promo_channel_premium(telegram_id, int(remaining))
+                    await _notify_promo_premium_paused(bot, telegram_id)
         except Exception:
             logging.exception("promo channel reconciliation pass failed")
 
@@ -1070,16 +1089,33 @@ def source_kb() -> InlineKeyboardMarkup:
     ])
 
 
-async def _maybe_prompt_source(bot: Bot, telegram_id: str) -> Message | None:
+async def _maybe_prompt_source(
+    bot: Bot,
+    telegram_id: str,
+    *,
+    edit_chat_id: int | None = None,
+    edit_message_id: int | None = None,
+) -> Message | None:
     """Спрашивает источник один раз, идемпотентно — no-op если уже отвечал.
-    Отправляется отдельным (новым) сообщением — это начало editable-цепочки
-    Business-онбординга (см. cb_source_select/cb_gender_select дальше),
-    поэтому возвращает отправленное Message, чтобы вызывающий код (пока
-    никто не использует возврат явно, но message_id уже есть на клиенте
-    через call.message в следующих шагах цепочки) мог бы его использовать."""
+    Если передан edit_chat_id/edit_message_id (сообщение "✅ Готово, бот
+    подключён!" из handle_business_connection) — редактирует ЭТО сообщение
+    вместо отправки нового, чтобы вся Business-цепочка онбординга (подключён
+    → источник → пол → квикстарт) оставалась ОДНИМ сообщением от самого
+    первого шага. reply_markup=main_kb() (reply-клавиатура), которым это
+    сообщение было отправлено изначально, при этом не трогается — это
+    отдельная от inline-кнопок сущность на уровне чата, edit_message_text
+    меняет только текст и inline-клавиатуру."""
     if get_acquisition_source(telegram_id) is not None:
         return None
     try:
+        if edit_chat_id is not None and edit_message_id is not None:
+            await bot.edit_message_text(
+                _SOURCE_PROMPT_TEXT,
+                chat_id=edit_chat_id,
+                message_id=edit_message_id,
+                reply_markup=source_kb(),
+            )
+            return None
         return await bot.send_message(int(telegram_id), _SOURCE_PROMPT_TEXT, reply_markup=source_kb())
     except TelegramForbiddenError:
         mark_bot_blocked(telegram_id)
@@ -2469,16 +2505,21 @@ async def handle_business_connection(event: BusinessConnection, bot: Bot) -> Non
         # UPDATE по несуществующей строке (молчаливый no-op), а сам юзер
         # до ответа останется невидим в /users.
         upsert_user(owner_id, f"user{owner_id}")
+        sent: Message | None = None
         try:
             # reply_markup=main_kb() — это единственное место, где reply-
             # клавиатура доходит до юзера на чистом Business-пути (JSON/демо
-            # получают её в своих сообщениях дальше по потоку). Раньше её
-            # слали отдельным сообщением с текстом "·"-заглушкой перед
-            # вопросом про источник — теперь просто вешаем на это, реальное
-            # по смыслу сообщение, а вопросы про источник/пол дальше editят
-            # ОДНО следующее сообщение (см. _maybe_prompt_source/
-            # cb_source_select/cb_gender_select/_finish_onboarding_chain).
-            await bot.send_message(
+            # получают её в своих сообщениях дальше по потоку). Раньше
+            # доставка main_kb требовала отдельного сообщения с текстом
+            # "·"-заглушкой — теперь main_kb едет прямо с этим сообщением
+            # (reply-клавиатура — сущность уровня чата, не привязана к
+            # конкретному сообщению, так что дальнейшие edit_message_text
+            # ниже её не затрагивают), а САМО это сообщение — начало и
+            # первый шаг editable-цепочки: следующие шаги (источник → пол →
+            # квикстарт) редактируют именно его, а не шлют новые (см.
+            # _maybe_prompt_source/cb_source_select/cb_gender_select/
+            # _finish_onboarding_chain).
+            sent = await bot.send_message(
                 event.user.id,
                 "✅ Готово, бот подключён! CueMe готов помогать тебе в переписках )",
                 reply_markup=main_kb(),
@@ -2491,7 +2532,14 @@ async def handle_business_connection(event: BusinessConnection, bot: Bot) -> Non
         await asyncio.sleep(3)
         # Пол спрашиваем не сразу, а из cb_source_select — ПОСЛЕ того как юзер
         # реально ответит на вопрос про источник (последовательно, не хором).
-        await _maybe_prompt_source(bot, owner_id)
+        if sent is not None:
+            await _maybe_prompt_source(
+                bot, owner_id,
+                edit_chat_id=sent.chat.id,
+                edit_message_id=sent.message_id,
+            )
+        else:
+            await _maybe_prompt_source(bot, owner_id)
 
 
 # ── Использование подсказок CueMe в реальной переписке ────────────────────────
@@ -2737,7 +2785,10 @@ def _quickstart_gender_kb() -> InlineKeyboardMarkup:
 @dp.callback_query(F.data == "qs:no")
 async def cb_quickstart_no(call: CallbackQuery) -> None:
     await call.answer()
-    await call.message.answer("Кому бы написал(-а)?", reply_markup=_quickstart_gender_kb())
+    # edit, не answer — остаёмся тем же сообщением цепочки; новое сообщение
+    # начинается только когда бот реально присылает готовую фразу
+    # (cb_quickstart_gender ниже).
+    await call.message.edit_text("Кому бы написал(-а)?", reply_markup=_quickstart_gender_kb())
 
 
 def _quickstart_phrase_next_kb(target: str) -> InlineKeyboardMarkup:
