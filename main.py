@@ -1089,33 +1089,18 @@ def source_kb() -> InlineKeyboardMarkup:
     ])
 
 
-async def _maybe_prompt_source(
-    bot: Bot,
-    telegram_id: str,
-    *,
-    edit_chat_id: int | None = None,
-    edit_message_id: int | None = None,
-) -> Message | None:
+async def _maybe_prompt_source(bot: Bot, telegram_id: str) -> Message | None:
     """Спрашивает источник один раз, идемпотентно — no-op если уже отвечал.
-    Если передан edit_chat_id/edit_message_id (сообщение "✅ Готово, бот
-    подключён!" из handle_business_connection) — редактирует ЭТО сообщение
-    вместо отправки нового, чтобы вся Business-цепочка онбординга (подключён
-    → источник → пол → квикстарт) оставалась ОДНИМ сообщением от самого
-    первого шага. reply_markup=main_kb() (reply-клавиатура), которым это
-    сообщение было отправлено изначально, при этом не трогается — это
-    отдельная от inline-кнопок сущность на уровне чата, edit_message_text
-    меняет только текст и inline-клавиатуру."""
+    Отдельное (новое) сообщение — попытка editить сюда же сообщение "✅
+    Готово, бот подключён!" (отправленное с main_kb(), reply-клавиатурой)
+    не сработала на живом тесте: Telegram не даёт добавить inline-кнопки
+    через edit_message_text сообщению, изначально отправленному с обычной
+    (reply) клавиатурой. Это НАЧАЛО editable-цепочки — дальше (источник →
+    пол → квикстарт) редактируется именно это сообщение, см.
+    cb_source_select/cb_gender_select/_finish_onboarding_chain."""
     if get_acquisition_source(telegram_id) is not None:
         return None
     try:
-        if edit_chat_id is not None and edit_message_id is not None:
-            await bot.edit_message_text(
-                _SOURCE_PROMPT_TEXT,
-                chat_id=edit_chat_id,
-                message_id=edit_message_id,
-                reply_markup=source_kb(),
-            )
-            return None
         return await bot.send_message(int(telegram_id), _SOURCE_PROMPT_TEXT, reply_markup=source_kb())
     except TelegramForbiddenError:
         mark_bot_blocked(telegram_id)
@@ -2505,21 +2490,22 @@ async def handle_business_connection(event: BusinessConnection, bot: Bot) -> Non
         # UPDATE по несуществующей строке (молчаливый no-op), а сам юзер
         # до ответа останется невидим в /users.
         upsert_user(owner_id, f"user{owner_id}")
-        sent: Message | None = None
         try:
             # reply_markup=main_kb() — это единственное место, где reply-
             # клавиатура доходит до юзера на чистом Business-пути (JSON/демо
-            # получают её в своих сообщениях дальше по потоку). Раньше
-            # доставка main_kb требовала отдельного сообщения с текстом
-            # "·"-заглушкой — теперь main_kb едет прямо с этим сообщением
-            # (reply-клавиатура — сущность уровня чата, не привязана к
-            # конкретному сообщению, так что дальнейшие edit_message_text
-            # ниже её не затрагивают), а САМО это сообщение — начало и
-            # первый шаг editable-цепочки: следующие шаги (источник → пол →
-            # квикстарт) редактируют именно его, а не шлют новые (см.
-            # _maybe_prompt_source/cb_source_select/cb_gender_select/
-            # _finish_onboarding_chain).
-            sent = await bot.send_message(
+            # получают её в своих сообщениях дальше по потоку). Раньше её
+            # доставка требовала отдельного сообщения с текстом "·"-заглушкой
+            # — теперь просто едет с этим, реальным по смыслу, сообщением.
+            #
+            # ПОПЫТКА (откатена): editить именно ЭТО сообщение дальше в
+            # вопрос про источник — не сработало на практике (проверено
+            # живым тестом), похоже Telegram не даёt добавить inline-кнопки
+            # через edit_message_text сообщению, изначально отправленному с
+            # обычной (reply) клавиатурой. Поэтому вопрос про источник всё
+            # ещё уходит ОТДЕЛЬНЫМ сообщением (_maybe_prompt_source ниже) —
+            # а вот всё ПОСЛЕ него (источник → пол → квикстарт → «кому бы
+            # написал») остаётся правками одного и того же сообщения.
+            await bot.send_message(
                 event.user.id,
                 "✅ Готово, бот подключён! CueMe готов помогать тебе в переписках )",
                 reply_markup=main_kb(),
@@ -2532,14 +2518,7 @@ async def handle_business_connection(event: BusinessConnection, bot: Bot) -> Non
         await asyncio.sleep(3)
         # Пол спрашиваем не сразу, а из cb_source_select — ПОСЛЕ того как юзер
         # реально ответит на вопрос про источник (последовательно, не хором).
-        if sent is not None:
-            await _maybe_prompt_source(
-                bot, owner_id,
-                edit_chat_id=sent.chat.id,
-                edit_message_id=sent.message_id,
-            )
-        else:
-            await _maybe_prompt_source(bot, owner_id)
+        await _maybe_prompt_source(bot, owner_id)
 
 
 # ── Использование подсказок CueMe в реальной переписке ────────────────────────
