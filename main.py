@@ -27,7 +27,7 @@ from aiogram.types import (
     BotCommand,
     BufferedInputFile,
     BusinessConnection,
-    CallbackQuery, Document, ErrorEvent, FSInputFile, InputRichMessage, Message,
+    CallbackQuery, ChatMemberUpdated, Document, ErrorEvent, FSInputFile, InputRichMessage, Message,
     InlineKeyboardButton, InlineKeyboardMarkup,
     LabeledPrice, PreCheckoutQuery,
     ReplyKeyboardMarkup, KeyboardButton,
@@ -119,6 +119,10 @@ from storage import (
     get_deep_analysis_free_until,
     get_gender,
     get_promo_channel_premium_until,
+    get_promo_channel_pause,
+    get_users_with_active_promo_premium,
+    pause_promo_channel_premium,
+    resume_promo_channel_premium,
     get_ideal_date,
     get_last_event_time,
     get_last_incoming_message_time,
@@ -552,10 +556,17 @@ async def cb_promo_offer(call: CallbackQuery) -> None:
 
 @dp.callback_query(F.data == "promo:check")
 async def cb_promo_check(call: CallbackQuery, bot: Bot) -> None:
+    """Ручная проверка кнопкой «Я подписался». Реально проверяет членство
+    через bot.get_chat_member (anti-abuse) и разруливает три случая:
+    1) юзер на паузе (был Premium, отписался, теперь снова подписан) —
+       возобновляем с сохранённого остатка, НЕ начисляя новую награду;
+    2) награда уже выдавалась когда-либо (claimed=True, паузы нет) — второй
+       раз не даём (has_claimed_promo_reward — разовый anti-abuse флаг);
+    3) первая выдача — начисляем PROMO_CHANNEL_REWARD_DAYS и ставим claimed.
+    Это ручной путь-дублёр к live-отслеживанию через chat_member
+    (on_promo_channel_membership_change) — нужен на случай, если то событие
+    почему-то не пришло."""
     telegram_id = str(call.from_user.id)
-    if has_claimed_promo_reward(telegram_id):
-        await call.answer("Уже получено раньше", show_alert=True)
-        return
 
     try:
         member = await bot.get_chat_member(PROMO_CHANNEL_USERNAME, int(telegram_id))
@@ -568,10 +579,86 @@ async def cb_promo_check(call: CallbackQuery, bot: Bot) -> None:
         await call.answer("Не вижу подписки — проверь и попробуй снова", show_alert=True)
         return
 
+    remaining_seconds, _ = get_promo_channel_pause(telegram_id)
+    if remaining_seconds:
+        until = datetime.now(timezone.utc) + timedelta(seconds=remaining_seconds)
+        resume_promo_channel_premium(telegram_id, until)
+        await call.answer()
+        await call.message.answer("🎉 С возвращением! Оставшееся время Premium возобновлено.")
+        return
+
+    if has_claimed_promo_reward(telegram_id):
+        await call.answer("Уже получено раньше", show_alert=True)
+        return
+
     until = datetime.now(timezone.utc) + timedelta(days=PROMO_CHANNEL_REWARD_DAYS)
     set_promo_channel_reward(telegram_id, until)
     await call.answer()
     await call.message.answer(f"🎉 Готово! {PROMO_CHANNEL_REWARD_DAYS} дня Premium активны.")
+
+
+@dp.chat_member()
+async def on_promo_channel_membership_change(event: ChatMemberUpdated) -> None:
+    """Живое отслеживание отписки/подписки на промо-канал (PROMO_CHANNEL_USERNAME)
+    для юзеров с активным окном промо-Premium. Требует прав администратора
+    бота в этом канале — иначе chat_member-апдейты по нему не приходят.
+    Отписка сразу ставит Premium на паузу (сохраняя остаток, см.
+    pause_promo_channel_premium), повторная подписка возобновляет с
+    сохранённого остатка (resume_promo_channel_premium) — БЕЗ новой выдачи
+    награды, has_claimed_promo_reward её больше не даёт. Подстраховка на
+    случай пропущенного апдейта — суточная сверка,
+    см. _reconcile_promo_channel_premium."""
+    channel_username = PROMO_CHANNEL_USERNAME.lstrip("@").lower()
+    if (event.chat.username or "").lower() != channel_username:
+        return
+
+    telegram_id = str(event.new_chat_member.user.id)
+    was_member = event.old_chat_member.status in ("member", "administrator", "creator")
+    is_member = event.new_chat_member.status in ("member", "administrator", "creator")
+    if was_member == is_member:
+        return
+
+    if not is_member:
+        until = get_promo_channel_premium_until(telegram_id)
+        if not until:
+            return
+        remaining = (until - datetime.now(timezone.utc)).total_seconds()
+        if remaining > 0:
+            pause_promo_channel_premium(telegram_id, int(remaining))
+        return
+
+    remaining_seconds, _ = get_promo_channel_pause(telegram_id)
+    if remaining_seconds:
+        until = datetime.now(timezone.utc) + timedelta(seconds=remaining_seconds)
+        resume_promo_channel_premium(telegram_id, until)
+
+
+async def _reconcile_promo_channel_premium(bot: Bot) -> None:
+    """Суточная подстраховка на случай пропущенного chat_member-события
+    (например, бот был офлайн): проходит по всем юзерам с активным окном
+    промо-Premium, явно перепроверяет членство через bot.get_chat_member и
+    ставит на паузу тех, кто уже не подписан, а событие поймать не удалось.
+    Отдельного планировщика (cron/APScheduler) в проекте нет — это обычный
+    фоновый asyncio-таск, запускается один раз из main()."""
+    while True:
+        await asyncio.sleep(24 * 60 * 60)
+        try:
+            for telegram_id in get_users_with_active_promo_premium():
+                until = get_promo_channel_premium_until(telegram_id)
+                if not until or until <= datetime.now(timezone.utc):
+                    continue
+                try:
+                    member = await bot.get_chat_member(PROMO_CHANNEL_USERNAME, int(telegram_id))
+                    subscribed = member.status in ("member", "administrator", "creator")
+                except Exception:
+                    continue
+                if subscribed:
+                    continue
+                remaining = (until - datetime.now(timezone.utc)).total_seconds()
+                if remaining > 0:
+                    pause_promo_channel_premium(telegram_id, int(remaining))
+        except Exception:
+            logging.exception("promo channel reconciliation pass failed")
 
 
 # ── Stars-подписка (Telegram Stars, XTR) ──────────────────────────────────────
@@ -5306,6 +5393,7 @@ async def main() -> None:
         BotCommand(command="delete",      description="Удалить свои данные"),
         BotCommand(command="rebuild",     description="Пересобрать все карточки"),
     ])
+    asyncio.create_task(_reconcile_promo_channel_premium(bot))
     await dp.start_polling(
         bot,
         allowed_updates=[
@@ -5316,6 +5404,7 @@ async def main() -> None:
             "edited_business_message",
             "deleted_business_messages",
             "pre_checkout_query",
+            "chat_member",
         ],
     )
 

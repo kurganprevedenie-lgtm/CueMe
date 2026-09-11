@@ -235,6 +235,15 @@ def init_db() -> None:
         # заново повторную награду не даёт (anti-abuse).
         _add_column_if_missing(conn, "users", "promo_channel_premium_until", "TEXT")
         _add_column_if_missing(conn, "users", "promo_channel_reward_claimed", "INTEGER NOT NULL DEFAULT 0")
+        # Пауза промо-Premium при отписке от канала (см. main.py:
+        # on_promo_channel_membership_change): remaining_seconds — сколько
+        # оставалось на момент отписки, paused_at — когда поставлено на паузу.
+        # Оба NULL, если пауза не активна. Возобновление (повторная подписка)
+        # переносит remaining_seconds обратно в promo_channel_premium_until и
+        # чистит оба поля — claimed-флаг выше НЕ трогается, новая награда не
+        # начисляется, просто досчитывается уже выданная.
+        _add_column_if_missing(conn, "users", "promo_channel_remaining_seconds", "INTEGER")
+        _add_column_if_missing(conn, "users", "promo_channel_paused_at", "TEXT")
         # Личный реферальный код — друг вводит его вручную через /redeem.
         _add_column_if_missing(conn, "users", "referral_code", "TEXT")
         _create_index_if_missing(conn, "idx_users_referral_code", "users", "referral_code", unique=True)
@@ -1139,6 +1148,74 @@ def get_promo_channel_premium_until(telegram_id: str) -> datetime | None:
         return datetime.fromisoformat(row["promo_channel_premium_until"])
     except ValueError:
         return None
+
+
+def pause_promo_channel_premium(telegram_id: str, remaining_seconds: int) -> None:
+    """Ставит промо-Premium на паузу при отписке от канала: сохраняет остаток
+    времени и снимает активное окно (promo_channel_premium_until = NULL), так
+    что _has_promo_channel_premium сразу перестаёт считать Premium активным.
+    Остаток восстанавливается resume_promo_channel_premium при повторной
+    подписке — см. main.py: on_promo_channel_membership_change /
+    _reconcile_promo_channel_premium."""
+    with _conn() as conn:
+        conn.execute(
+            """
+            UPDATE users
+            SET promo_channel_premium_until = NULL,
+                promo_channel_remaining_seconds = ?,
+                promo_channel_paused_at = ?
+            WHERE telegram_id = ?
+            """,
+            (remaining_seconds, _now(), telegram_id),
+        )
+
+
+def get_promo_channel_pause(telegram_id: str) -> tuple[int | None, datetime | None]:
+    """(остаток в секундах, момент постановки на паузу) или (None, None),
+    если промо-Premium сейчас не на паузе."""
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT promo_channel_remaining_seconds, promo_channel_paused_at "
+            "FROM users WHERE telegram_id = ?",
+            (telegram_id,),
+        ).fetchone()
+    if not row or row["promo_channel_remaining_seconds"] is None:
+        return None, None
+    paused_at = None
+    if row["promo_channel_paused_at"]:
+        try:
+            paused_at = datetime.fromisoformat(row["promo_channel_paused_at"])
+        except ValueError:
+            paused_at = None
+    return row["promo_channel_remaining_seconds"], paused_at
+
+
+def resume_promo_channel_premium(telegram_id: str, until: datetime) -> None:
+    """Возобновляет промо-Premium с сохранённого остатка (until = сейчас +
+    remaining_seconds, считает вызывающий код) и чистит поля паузы."""
+    with _conn() as conn:
+        conn.execute(
+            """
+            UPDATE users
+            SET promo_channel_premium_until = ?,
+                promo_channel_remaining_seconds = NULL,
+                promo_channel_paused_at = NULL
+            WHERE telegram_id = ?
+            """,
+            (until.isoformat(), telegram_id),
+        )
+
+
+def get_users_with_active_promo_premium() -> list[str]:
+    """telegram_id всех юзеров с активным (не на паузе) окном промо-Premium —
+    вход для суточной сверки членства в канале
+    (main._reconcile_promo_channel_premium), подстраховка на случай
+    пропущенного chat_member-события."""
+    with _conn() as conn:
+        rows = conn.execute(
+            "SELECT telegram_id FROM users WHERE promo_channel_premium_until IS NOT NULL",
+        ).fetchall()
+    return [row["telegram_id"] for row in rows]
 
 
 # ── Stars-подписка (Telegram Stars, независимо от канала-пропуска Tribute) ────
