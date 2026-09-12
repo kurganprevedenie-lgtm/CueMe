@@ -50,15 +50,8 @@ def test_style_cache_key_deterministic_and_sensitive():
     )
 
 
-# ── _last_incoming_line ───────────────────────────────────────────────────────
-
-def test_last_incoming_line():
-    assert main._last_incoming_line("Она: привет\nЯ: норм\nОна: а ты куда?") == "Она: а ты куда?"
-    assert main._last_incoming_line("Собеседник: привет\nЯ: норм\nЯ: ага") == "Собеседник: привет"
-    assert main._last_incoming_line("Я: норм\nСобеседник: а ты куда?\nЯ: потом скажу") == "Собеседник: а ты куда?"
-    assert main._last_incoming_line("одна строка") == "одна строка"
-    assert main._last_incoming_line("текст\n\n   \n") == "текст"
-    assert main._last_incoming_line("") == ""
+# _last_incoming_line удалена вместе с функцией «скриншот переписки → ответ»
+# (main.py — секция «Ответить по скриншоту», закомментирована целиком).
 
 
 # _auto_style_for_ctx удалена вместе со старой style_pick_kb-инфраструктурой

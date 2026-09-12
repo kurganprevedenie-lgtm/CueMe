@@ -68,7 +68,10 @@ from config import (
 )
 from features import detect_reply_situation, extract_features, stage_hint, totals_from_summary, winning_messages
 from llm import (
-    ILLEGIBLE_MARKER,
+    # ILLEGIBLE_MARKER, extract_chat_from_image, screenshot_variants — были
+    # нужны только функции «скриншот переписки → ответ», убранной целиком
+    # (см. пометки у Screenshot/handle_unified_input/секции «Ответить по
+    # скриншоту» ниже) — сами функции остались в llm.py на случай отката.
     PROVIDER_NAMES,
     RateLimitError,
     build_compatibility_interpretation,
@@ -77,14 +80,12 @@ from llm import (
     build_my_style_for_contact,
     build_overall_style,
     build_style_card,
-    extract_chat_from_image,
     analyze_reply_dynamics,
     get_forced_provider,
     get_provider_stats,
     live_coach_step,
     make_features_summary,
     sample_texts,
-    screenshot_variants,
     set_forced_provider,
     suggest_reply_variants,
     transcribe_audio,
@@ -1332,18 +1333,24 @@ class Setup(StatesGroup):
 class ReplyHelp(StatesGroup):
     waiting_for_incoming = State()
 
-class Screenshot(StatesGroup):
-    waiting_for_image = State()
+# Screenshot (FSM для отдельной команды /screenshot) убрана вместе со всей
+# функцией «скриншот переписки → ответ» — см. пометку у секции «Ответить по
+# скриншоту» ниже. Класс оставлен закомментированным — некоторые функции по
+# соседству (_run_variants_generation) раньше ссылались на него.
+# class Screenshot(StatesGroup):
+#     waiting_for_image = State()
 
 class LiveDialogue(StatesGroup):
     waiting_for_name     = State()
     waiting_for_incoming = State()
 
 class UnifiedReply(StatesGroup):
-    """«💬 Ответ с CueMe» — единая точка входа вместо БТН_SCREENSHOT/
-    BTN_REPLY/BTN_LIVE: фото/текст/форвард → определение контакта →
-    приводит к одному из существующих пайплайнов (ReplyHelp для
-    существующего контакта, LiveDialogue для нового)."""
+    """«💬 Ответ с CueMe» — единая точка входа вместо БТН_REPLY/BTN_LIVE
+    (BTN_SCREENSHOT была третьей — фото-вход в эту же точку убран вместе с
+    функцией «скриншот переписки → ответ», см. handle_unified_input): текст/
+    форвард → определение контакта → приводит к одному из существующих
+    пайплайнов (ReplyHelp для существующего контакта, LiveDialogue для
+    нового)."""
     waiting_for_input = State()
     waiting_for_name  = State()
 
@@ -2764,8 +2771,7 @@ async def _send_no_contacts_hint(message: Message) -> None:
     существующий единый флоу, который как раз и создаёт контакт на лету."""
     await message.answer(
         "Пока нет ни одного диалога для этого — начни с «💬 Ответ с CueMe», "
-        "перешли туда любое сообщение или скриншот переписки, и я заведу "
-        "первый контакт.",
+        "перешли туда любое сообщение, и я заведу первый контакт.",
         reply_markup=_no_contacts_kb(),
     )
 
@@ -4013,12 +4019,14 @@ async def cb_reply_contact(call: CallbackQuery, state: FSMContext) -> None:
 
 
 # ── 💬 Ответ с CueMe (единая точка входа вместо Скриншот/Ответить/Новый диалог) ──
-# Фото/текст/форвард → определение контакта → существующий пайплайн:
-# ReplyHelp для выбранного контакта, LiveDialogue для нового.
+# Текст/форвард → определение контакта → существующий пайплайн: ReplyHelp
+# для выбранного контакта, LiveDialogue для нового. Фото (скриншот
+# переписки) как вход убран вместе с функцией «скриншот → ответ» — см.
+# пометку у handle_unified_input и у секции «Ответить по скриншоту» ниже.
 
 async def _start_unified_reply(message: Message, state: FSMContext) -> None:
     await state.set_state(UnifiedReply.waiting_for_input)
-    await message.answer("Пришли скриншот переписки, перешли сообщение или просто вставь текст")
+    await message.answer("Перешли сообщение или просто вставь текст переписки")
 
 
 def unified_contacts_kb(contacts: list) -> InlineKeyboardMarkup:
@@ -4032,23 +4040,18 @@ def unified_contacts_kb(contacts: list) -> InlineKeyboardMarkup:
 
 @dp.message(UnifiedReply.waiting_for_input, _not_command)
 async def handle_unified_input(message: Message, state: FSMContext, bot: Bot) -> None:
+    # Функция «скриншот переписки → ответ» убрана целиком (по запросу) —
+    # фото в этом состоянии больше не читаем через Vision, просто просим
+    # текст. Раньше здесь был branch на message.photo → extract_chat_from_image.
     if message.photo:
-        await message.answer("Читаю скриншот...")
-        try:
-            buf = await bot.download(message.photo[-1])
-            incoming = await extract_chat_from_image(buf.read())
-        except Exception:
-            logging.exception("unified: не удалось скачать/распознать скриншот")
-            incoming = ""
-        if not incoming or incoming.strip() == ILLEGIBLE_MARKER:
-            await message.answer("Не смог прочитать скриншот — пришли текст переписки сообщением.")
-            return  # остаёмся в UnifiedReply.waiting_for_input
-    else:
-        txt, _ = await _message_text(bot, message)
-        incoming = (txt or "").strip()
-        if not incoming:
-            await message.answer("Пришли скриншот, перешли сообщение или вставь текст.")
-            return
+        await message.answer("Скриншоты сейчас не поддерживаются — перешли сообщение или вставь текст.")
+        return
+
+    txt, _ = await _message_text(bot, message)
+    incoming = (txt or "").strip()
+    if not incoming:
+        await message.answer("Перешли сообщение или вставь текст.")
+        return
 
     telegram_id = str(message.from_user.id)
     contacts = list_contacts(telegram_id)
@@ -4149,23 +4152,27 @@ def _format_blocks(blocks: list[dict]) -> str:
     )
 
 
-def _last_incoming_line(chat_text: str) -> str:
-    """Последняя непустая строка распознанной переписки — приближение последней
-    реплики собеседника для ситуативной эвристики (скриншот/OCR). Если OCR
-    сохранил роли, пропускаем строки автора («Я: ...») и берём последнюю чужую."""
-    lines = [line.strip() for line in (chat_text or "").splitlines() if line.strip()]
-    if not lines:
-        return ""
-    self_re = re.compile(r"^(я|me|you)\s*[:：-]", re.IGNORECASE)
-    other_re = re.compile(r"^(собеседник|он|она|они|контакт|не я)\s*[:：-]", re.IGNORECASE)
-
-    for s in reversed(lines):
-        if other_re.match(s):
-            return s
-    for s in reversed(lines):
-        if not self_re.match(s):
-            return s
-    return lines[-1]
+# _last_incoming_line — использовалась только функцией «скриншот переписки →
+# ответ» (распознанный OCR-текст скриншота, приближение последней реплики
+# собеседника). Убрана вместе с ней, оставлена закомментированной на случай
+# отката (см. секцию «Ответить по скриншоту» выше).
+# def _last_incoming_line(chat_text: str) -> str:
+#     """Последняя непустая строка распознанной переписки — приближение последней
+#     реплики собеседника для ситуативной эвристики (скриншот/OCR). Если OCR
+#     сохранил роли, пропускаем строки автора («Я: ...») и берём последнюю чужую."""
+#     lines = [line.strip() for line in (chat_text or "").splitlines() if line.strip()]
+#     if not lines:
+#         return ""
+#     self_re = re.compile(r"^(я|me|you)\s*[:：-]", re.IGNORECASE)
+#     other_re = re.compile(r"^(собеседник|он|она|они|контакт|не я)\s*[:：-]", re.IGNORECASE)
+#
+#     for s in reversed(lines):
+#         if other_re.match(s):
+#             return s
+#     for s in reversed(lines):
+#         if not self_re.match(s):
+#             return s
+#     return lines[-1]
 
 
 def _reply_data_signals(samples: dict | None, last_incoming: str) -> str | None:
@@ -4263,7 +4270,9 @@ def _save_shown_suggestions(
 # _VARIANT_KINDS — какие ctx["kind"] поддерживают вариантную генерацию.
 # «🎯 Другой тон» (точечный выбор одного стиля) убран — оставлена только
 # перегенерация; вместе с ней ушла и старая style_pick_kb-инфраструктура.
-_VARIANT_KINDS = ("reply", "screenshot")
+# "screenshot" убран вместе с функцией «скриншот переписки → ответ» (см.
+# закомментированную секцию «Ответить по скриншоту» выше).
+_VARIANT_KINDS = ("reply",)
 
 
 def variants_result_kb(action_id: str) -> InlineKeyboardMarkup:
@@ -4276,10 +4285,10 @@ async def _run_variants_generation(
     target: Message, ctx: dict, telegram_id: int, bot: Bot, action_id: str,
     state: FSMContext | None = None, force_fresh: bool = False,
 ) -> None:
-    """Общий шаг генерации нескольких именованных вариантов ОДНИМ вызовом LLM —
-    для «Ответить за меня» / «По скриншоту». Диспетчер по ctx["kind"] зовёт
-    нужную из *_variants функций. Гейт и списание триала — один раз за вызов
-    (не за каждый вариант), т.к. это один вызов LLM."""
+    """Общий шаг генерации нескольких именованных вариантов ОДНИМ вызовом LLM
+    для «Ответ с CueMe» (kind всегда "reply" — kind="screenshot" убран вместе
+    с функцией «скриншот переписки → ответ»). Гейт и списание триала — один
+    раз за вызов (не за каждый вариант), т.к. это один вызов LLM."""
     kind = ctx.get("kind")
     text = ctx.get("text") if kind == "reply" else ctx.get("chat_text")
     if text is None:
@@ -4308,18 +4317,14 @@ async def _run_variants_generation(
             return
         prev = ctx.get("variants") if force_fresh else None
         try:
-            if kind == "reply":
-                variants = await suggest_reply_variants(
-                    text, style_card, interaction_card,
-                    data_signals=signals, previous_variants=prev, winning_examples=winning,
-                    user_gender=gender,
-                )
-            else:  # screenshot
-                variants = await screenshot_variants(
-                    text, style_card, interaction_card,
-                    previous_variants=prev, data_signals=signals, winning_examples=winning,
-                    user_gender=gender,
-                )
+            # kind всегда "reply" — "screenshot" убран вместе с функцией
+            # «скриншот переписки → ответ» (screenshot_variants в llm.py
+            # остался нетронутым, просто больше никем не вызывается).
+            variants = await suggest_reply_variants(
+                text, style_card, interaction_card,
+                data_signals=signals, previous_variants=prev, winning_examples=winning,
+                user_gender=gender,
+            )
         except RateLimitError:
             await target.answer("Лимит исчерпан, попробуй позже.")
             return
@@ -4352,12 +4357,6 @@ async def _run_variants_generation(
             "Пришли следующее сообщение собеседника, чтобы ответить и на него. "
             "Чтобы выйти из режима — нажми любую кнопку меню."
         )
-    elif kind == "screenshot" and state is not None:
-        await state.set_state(Screenshot.waiting_for_image)
-        await target.answer(
-            "Пришли следующий скриншот (или текст переписки), чтобы продолжить. "
-            "Чтобы выйти из режима — нажми любую кнопку меню."
-        )
 
 
 @dp.callback_query(F.data.startswith("varregen:"))
@@ -4377,7 +4376,7 @@ async def _process_reply_incoming(
     """Общий хвост «Ответить за меня»: сборка ctx и генерация вариантов.
     user_id — ОТДЕЛЬНЫМ параметром (не message.from_user.id) — при вызове
     из callback-контекста message может быть call.message, чей .from_user
-    это бот, не юзер (стандартная ловушка aiogram, см. _prompt_screenshot_style)."""
+    это бот, не юзер (стандартная ловушка aiogram)."""
     telegram_id = str(user_id)
     data = await state.get_data()
     # Состояние НЕ сбрасываем — иначе следующее сообщение улетит в общий
@@ -4785,172 +4784,177 @@ async def cb_live_regen(call: CallbackQuery) -> None:
     await _run_live_coach_step(call.message, ctx, call.from_user.id, call.bot, action_id, force_fresh=True)
 
 
-# ── 📸 Ответить по скриншоту ──────────────────────────────────────────────────
+# ── 📸 Ответить по скриншоту — УБРАНА ЦЕЛИКОМ по запросу пользователя ────────
+# Отдельная команда /screenshot (в дополнение к общей точке входа «💬 Ответ
+# с CueMe», которая тоже больше не принимает фото — см. handle_unified_input
+# выше). Закомментирована целиком, не удалена физически — на случай отката.
+# Использовала kind="screenshot" в _run_variants_generation (screenshot_variants
+# в llm.py) — та ветка тоже закомментирована ниже, вместе с Screenshot(FSM).
 
-async def _start_screenshot(message: Message, state: FSMContext) -> None:
-    telegram_id = str(message.from_user.id)
-    if not list_contacts(telegram_id):
-        await _send_no_contacts_hint(message)
-        return
-    await state.set_state(Screenshot.waiting_for_image)
-    await message.answer("Пришли скриншот переписки (или вставь текст диалога), на который нужно ответить:")
-
-
-@dp.message(Command("screenshot"))
-async def cmd_screenshot(message: Message, state: FSMContext) -> None:
-    await _start_screenshot(message, state)
-
-
-@dp.message(Screenshot.waiting_for_image, F.photo)
-async def handle_screenshot_photo(message: Message, state: FSMContext, bot: Bot) -> None:
-    await message.answer("Читаю скриншот...")
-    try:
-        buf = await bot.download(message.photo[-1])
-        chat_text = await extract_chat_from_image(buf.read())
-    except Exception:
-        logging.exception("screenshot: не удалось скачать/распознать")
-        chat_text = ""
-
-    if not chat_text or chat_text.strip() == ILLEGIBLE_MARKER:
-        await message.answer("Не смог прочитать скриншот — пришли текст переписки сообщением.")
-        return  # остаёмся в Screenshot.waiting_for_image
-
-    await _proceed_screenshot_style_pick(message, state, chat_text)
-
-
-@dp.message(Screenshot.waiting_for_image, F.text)
-async def handle_screenshot_text(message: Message, state: FSMContext) -> None:
-    chat_text = (message.text or "").strip()
-    if not chat_text:
-        await message.answer("Пришли скриншот или текст переписки.")
-        return
-    await _proceed_screenshot_style_pick(message, state, chat_text)
-
-
-def screenshot_contact_pick_kb(contacts: list, action_id: str) -> InlineKeyboardMarkup:
-    """Как contacts_kb, но с кнопкой для человека, которого ещё нет в базе —
-    для него используется общий (агрегатный) стиль, без interaction_card."""
-    b = InlineKeyboardBuilder()
-    for c in contacts:
-        b.button(text=_contact_name(c), callback_data=f"shotcontact:{c['id']}:{action_id}")
-    b.button(text="🆕 Новый человек (нет в базе)", callback_data=f"shotcontact:new:{action_id}")
-    b.adjust(1)
-    return b.as_markup()
-
-
-async def _proceed_screenshot_style_pick(message: Message, state: FSMContext, chat_text: str) -> None:
-    await state.clear()
-    telegram_id = str(message.from_user.id)
-    contacts = list_contacts(telegram_id)
-
-    action_id = _new_action(message.from_user.id, {"kind": "screenshot_pending", "chat_text": chat_text})
-    await message.answer("Чья это переписка?", reply_markup=screenshot_contact_pick_kb(contacts, action_id))
-
-
-@dp.callback_query(F.data.startswith("shotcontact:"))
-async def cb_screenshot_contact(call: CallbackQuery, bot: Bot, state: FSMContext) -> None:
-    parts = call.data.split(":")
-    if len(parts) != 3:
-        await call.answer("Контекст устарел — начни заново через «📸 По скриншоту».", show_alert=True)
-        return
-    _, raw_id, action_id = parts
-    telegram_id = str(call.from_user.id)
-
-    ctx = _get_action(call.from_user.id, action_id)
-    if not ctx or ctx.get("kind") != "screenshot_pending":
-        await call.answer("Контекст устарел — начни заново через «📸 По скриншоту».", show_alert=True)
-        return
-
-    if raw_id == "new":
-        await call.answer()
-        await _prompt_screenshot_style_no_contact(bot, call.message, call.from_user.id, telegram_id, ctx["chat_text"], state, edit=True)
-        return
-
-    contact_id = int(raw_id)
-    contact = get_contact_by_id(contact_id)
-    if not contact:
-        await call.answer("Контакт не найден.")
-        return
-
-    await call.answer()
-    await _prompt_screenshot_style(bot, call.message, call.from_user.id, telegram_id, contact_id, ctx["chat_text"], state, edit=True)
-
-
-async def _prompt_screenshot_style(
-    bot: Bot, target: Message, user_id: int, telegram_id: str, contact_id: int, chat_text: str,
-    state: FSMContext, edit: bool = False,
-) -> None:
-    # ВАЖНО: user_id передаётся отдельным параметром, а не берётся из
-    # target.from_user — при edit=True target это call.message, чей
-    # .from_user это БОТ, а не пользователь (стандартная ловушка aiogram).
-    if not await _quota_gate(bot, target, telegram_id):
-        return
-    # Генерация карточек ходит в LLM — без обработки ошибок сбой (лимит/провайдер
-    # недоступен) тихо убивал кнопку: спиннер гас, а сообщение не менялось.
-    try:
-        style_card = await _style_for_rewrite(telegram_id, contact_id)
-        interaction_card = (await _gen_interaction_card(contact_id, telegram_id) or "") if style_card else ""
-    except RateLimitError:
-        await (target.edit_text if edit else target.answer)("Лимит запросов исчерпан — попробуй через пару минут.")
-        return
-    except Exception:
-        logging.exception("screenshot: не удалось сгенерировать карточки")
-        await (target.edit_text if edit else target.answer)("Сервис сейчас перегружен — попробуй чуть позже.")
-        return
-    if not style_card:
-        text = "Не удалось получить твой стиль — сначала загрузи JSON чата или дай накопить сообщений."
-        await (target.edit_text(text) if edit else target.answer(text))
-        return
-
-    samples = get_message_samples(contact_id)
-    ctx = {
-        "kind": "screenshot", "chat_text": chat_text, "result": None, "style": None,
-        "contact_id": contact_id,
-        "style_card": style_card, "interaction_card": interaction_card,
-        "data_signals": _reply_data_signals(samples, _last_incoming_line(chat_text)),
-        "winning": _winning_for_contact(telegram_id, contact_id),
-    }
-    action_id = _new_action(user_id, ctx)
-    if edit:
-        await target.edit_text("Генерирую варианты...")
-    else:
-        await target.answer("Генерирую варианты...")
-    await _run_variants_generation(target, ctx, user_id, bot, action_id, state)
-
-
-async def _prompt_screenshot_style_no_contact(
-    bot: Bot, target: Message, user_id: int, telegram_id: str, chat_text: str,
-    state: FSMContext, edit: bool = False,
-) -> None:
-    """Для человека, которого ещё нет в базе — общий (агрегатный) стиль автора,
-    без per-contact interaction_card (промпт сам подставит нейтральный фолбэк)."""
-    if not await _quota_gate(bot, target, telegram_id):
-        return
-    try:
-        style_card = await _gen_style_card(telegram_id)
-    except RateLimitError:
-        await (target.edit_text if edit else target.answer)("Лимит запросов исчерпан — попробуй через пару минут.")
-        return
-    except Exception:
-        logging.exception("screenshot(new): не удалось сгенерировать стиль")
-        await (target.edit_text if edit else target.answer)("Сервис сейчас перегружен — попробуй чуть позже.")
-        return
-    if not style_card:
-        text = "Не удалось получить твой стиль — сначала загрузи JSON чата или дай накопить сообщений."
-        await (target.edit_text(text) if edit else target.answer(text))
-        return
-
-    ctx = {
-        "kind": "screenshot", "chat_text": chat_text, "result": None, "style": None,
-        "style_card": style_card, "interaction_card": "",
-        "data_signals": _reply_data_signals(None, _last_incoming_line(chat_text)),
-    }
-    action_id = _new_action(user_id, ctx)
-    if edit:
-        await target.edit_text("Генерирую варианты...")
-    else:
-        await target.answer("Генерирую варианты...")
-    await _run_variants_generation(target, ctx, user_id, bot, action_id, state)
+# async def _start_screenshot(message: Message, state: FSMContext) -> None:
+#     telegram_id = str(message.from_user.id)
+#     if not list_contacts(telegram_id):
+#         await _send_no_contacts_hint(message)
+#         return
+#     await state.set_state(Screenshot.waiting_for_image)
+#     await message.answer("Пришли скриншот переписки (или вставь текст диалога), на который нужно ответить:")
+#
+#
+# @dp.message(Command("screenshot"))
+# async def cmd_screenshot(message: Message, state: FSMContext) -> None:
+#     await _start_screenshot(message, state)
+#
+#
+# @dp.message(Screenshot.waiting_for_image, F.photo)
+# async def handle_screenshot_photo(message: Message, state: FSMContext, bot: Bot) -> None:
+#     await message.answer("Читаю скриншот...")
+#     try:
+#         buf = await bot.download(message.photo[-1])
+#         chat_text = await extract_chat_from_image(buf.read())
+#     except Exception:
+#         logging.exception("screenshot: не удалось скачать/распознать")
+#         chat_text = ""
+#
+#     if not chat_text or chat_text.strip() == ILLEGIBLE_MARKER:
+#         await message.answer("Не смог прочитать скриншот — пришли текст переписки сообщением.")
+#         return  # остаёмся в Screenshot.waiting_for_image
+#
+#     await _proceed_screenshot_style_pick(message, state, chat_text)
+#
+#
+# @dp.message(Screenshot.waiting_for_image, F.text)
+# async def handle_screenshot_text(message: Message, state: FSMContext) -> None:
+#     chat_text = (message.text or "").strip()
+#     if not chat_text:
+#         await message.answer("Пришли скриншот или текст переписки.")
+#         return
+#     await _proceed_screenshot_style_pick(message, state, chat_text)
+#
+#
+# def screenshot_contact_pick_kb(contacts: list, action_id: str) -> InlineKeyboardMarkup:
+#     """Как contacts_kb, но с кнопкой для человека, которого ещё нет в базе —
+#     для него используется общий (агрегатный) стиль, без interaction_card."""
+#     b = InlineKeyboardBuilder()
+#     for c in contacts:
+#         b.button(text=_contact_name(c), callback_data=f"shotcontact:{c['id']}:{action_id}")
+#     b.button(text="🆕 Новый человек (нет в базе)", callback_data=f"shotcontact:new:{action_id}")
+#     b.adjust(1)
+#     return b.as_markup()
+#
+#
+# async def _proceed_screenshot_style_pick(message: Message, state: FSMContext, chat_text: str) -> None:
+#     await state.clear()
+#     telegram_id = str(message.from_user.id)
+#     contacts = list_contacts(telegram_id)
+#
+#     action_id = _new_action(message.from_user.id, {"kind": "screenshot_pending", "chat_text": chat_text})
+#     await message.answer("Чья это переписка?", reply_markup=screenshot_contact_pick_kb(contacts, action_id))
+#
+#
+# @dp.callback_query(F.data.startswith("shotcontact:"))
+# async def cb_screenshot_contact(call: CallbackQuery, bot: Bot, state: FSMContext) -> None:
+#     parts = call.data.split(":")
+#     if len(parts) != 3:
+#         await call.answer("Контекст устарел — начни заново через «📸 По скриншоту».", show_alert=True)
+#         return
+#     _, raw_id, action_id = parts
+#     telegram_id = str(call.from_user.id)
+#
+#     ctx = _get_action(call.from_user.id, action_id)
+#     if not ctx or ctx.get("kind") != "screenshot_pending":
+#         await call.answer("Контекст устарел — начни заново через «📸 По скриншоту».", show_alert=True)
+#         return
+#
+#     if raw_id == "new":
+#         await call.answer()
+#         await _prompt_screenshot_style_no_contact(bot, call.message, call.from_user.id, telegram_id, ctx["chat_text"], state, edit=True)
+#         return
+#
+#     contact_id = int(raw_id)
+#     contact = get_contact_by_id(contact_id)
+#     if not contact:
+#         await call.answer("Контакт не найден.")
+#         return
+#
+#     await call.answer()
+#     await _prompt_screenshot_style(bot, call.message, call.from_user.id, telegram_id, contact_id, ctx["chat_text"], state, edit=True)
+#
+#
+# async def _prompt_screenshot_style(
+#     bot: Bot, target: Message, user_id: int, telegram_id: str, contact_id: int, chat_text: str,
+#     state: FSMContext, edit: bool = False,
+# ) -> None:
+#     # ВАЖНО: user_id передаётся отдельным параметром, а не берётся из
+#     # target.from_user — при edit=True target это call.message, чей
+#     # .from_user это БОТ, а не пользователь (стандартная ловушка aiogram).
+#     if not await _quota_gate(bot, target, telegram_id):
+#         return
+#     # Генерация карточек ходит в LLM — без обработки ошибок сбой (лимит/провайдер
+#     # недоступен) тихо убивал кнопку: спиннер гас, а сообщение не менялось.
+#     try:
+#         style_card = await _style_for_rewrite(telegram_id, contact_id)
+#         interaction_card = (await _gen_interaction_card(contact_id, telegram_id) or "") if style_card else ""
+#     except RateLimitError:
+#         await (target.edit_text if edit else target.answer)("Лимит запросов исчерпан — попробуй через пару минут.")
+#         return
+#     except Exception:
+#         logging.exception("screenshot: не удалось сгенерировать карточки")
+#         await (target.edit_text if edit else target.answer)("Сервис сейчас перегружен — попробуй чуть позже.")
+#         return
+#     if not style_card:
+#         text = "Не удалось получить твой стиль — сначала загрузи JSON чата или дай накопить сообщений."
+#         await (target.edit_text(text) if edit else target.answer(text))
+#         return
+#
+#     samples = get_message_samples(contact_id)
+#     ctx = {
+#         "kind": "screenshot", "chat_text": chat_text, "result": None, "style": None,
+#         "contact_id": contact_id,
+#         "style_card": style_card, "interaction_card": interaction_card,
+#         "data_signals": _reply_data_signals(samples, _last_incoming_line(chat_text)),
+#         "winning": _winning_for_contact(telegram_id, contact_id),
+#     }
+#     action_id = _new_action(user_id, ctx)
+#     if edit:
+#         await target.edit_text("Генерирую варианты...")
+#     else:
+#         await target.answer("Генерирую варианты...")
+#     await _run_variants_generation(target, ctx, user_id, bot, action_id, state)
+#
+#
+# async def _prompt_screenshot_style_no_contact(
+#     bot: Bot, target: Message, user_id: int, telegram_id: str, chat_text: str,
+#     state: FSMContext, edit: bool = False,
+# ) -> None:
+#     """Для человека, которого ещё нет в базе — общий (агрегатный) стиль автора,
+#     без per-contact interaction_card (промпт сам подставит нейтральный фолбэк)."""
+#     if not await _quota_gate(bot, target, telegram_id):
+#         return
+#     try:
+#         style_card = await _gen_style_card(telegram_id)
+#     except RateLimitError:
+#         await (target.edit_text if edit else target.answer)("Лимит запросов исчерпан — попробуй через пару минут.")
+#         return
+#     except Exception:
+#         logging.exception("screenshot(new): не удалось сгенерировать стиль")
+#         await (target.edit_text if edit else target.answer)("Сервис сейчас перегружен — попробуй чуть позже.")
+#         return
+#     if not style_card:
+#         text = "Не удалось получить твой стиль — сначала загрузи JSON чата или дай накопить сообщений."
+#         await (target.edit_text(text) if edit else target.answer(text))
+#         return
+#
+#     ctx = {
+#         "kind": "screenshot", "chat_text": chat_text, "result": None, "style": None,
+#         "style_card": style_card, "interaction_card": "",
+#         "data_signals": _reply_data_signals(None, _last_incoming_line(chat_text)),
+#     }
+#     action_id = _new_action(user_id, ctx)
+#     if edit:
+#         await target.edit_text("Генерирую варианты...")
+#     else:
+#         await target.answer("Генерирую варианты...")
+#     await _run_variants_generation(target, ctx, user_id, bot, action_id, state)
 
 
 # ── /rebuild — принудительная пересборка всех карточек ───────────────────────
@@ -5057,13 +5061,10 @@ async def _show_help(message: Message) -> None:
     await message.answer(
         "Вот что я умею. На главном экране — кнопка «💬 Ответ с CueMe» плюс "
         "«🔬 Анализ собеседника», «💐 Идеальное свидание» и «👑 Подписка»:\n\n"
-        "💬 Ответ с CueMe — пришли скриншот переписки, перешли сообщение или "
-        "вставь текст: если контакт уже есть — несколько вариантов ответа "
-        "(Флирт/Дружески/Уверенно и т.п.); если нет — заведём новый диалог "
-        "(живой коучинг с нуля)\n"
-        "/reply — ответить на его сообщение\n"
-        "/screenshot — ответить по скриншоту переписки (можно слать скриншоты "
-        "один за другим)\n\n"
+        "💬 Ответ с CueMe — перешли сообщение или вставь текст: если контакт "
+        "уже есть — несколько вариантов ответа (Флирт/Дружески/Уверенно и "
+        "т.п.); если нет — заведём новый диалог (живой коучинг с нуля)\n"
+        "/reply — ответить на его сообщение\n\n"
         "<b>🔬 Анализ собеседника</b> (кнопка в меню)\n"
         "/deep_analysis — совместимость, как писать этому человеку, стиль и "
         "флаги, готовое сообщение\n\n"
@@ -5083,7 +5084,7 @@ async def _show_help(message: Message) -> None:
         "<b>🎬 Остальное</b>\n"
         "/start — начало работы\n"
         "/help — это сообщение\n\n"
-        f"💎 {FREE_TRIAL_REQUESTS} бесплатных попыток на ответ/скриншот, "
+        f"💎 {FREE_TRIAL_REQUESTS} бесплатных попыток на ответ, "
         "дальше и остальные функции — по подписке. Статус — /premium.",
         parse_mode="HTML",
     )
@@ -5494,7 +5495,7 @@ def _validate_startup_config() -> None:
         )
     if not GROQ_API_KEY:
         logging.warning(
-            "GROQ_API_KEY не задан — распознавание голоса/скриншотов пойдёт только "
+            "GROQ_API_KEY не задан — распознавание голоса пойдёт только "
             "через Gemini-fallback."
         )
     logging.info("Конфиг проверен. Доступные LLM-ключи: %s", ", ".join(present))
@@ -5510,7 +5511,8 @@ async def main() -> None:
         BotCommand(command="help",        description="Список команд"),
         BotCommand(command="connect",     description="Подключить Автоматизацию чатов"),
         BotCommand(command="me",          description="Мой стиль общения"),
-        BotCommand(command="screenshot",  description="Ответить по скриншоту"),
+        # BotCommand("screenshot", ...) убрана вместе с функцией «скриншот
+        # переписки → ответ» — команда /screenshot закомментирована в коде.
         BotCommand(command="reply",       description="Помочь ответить собеседнику"),
         BotCommand(command="contacts",    description="Загруженные чаты"),
         BotCommand(command="progress",    description="Прогресс накопления по контактам"),
