@@ -1150,10 +1150,10 @@ async def cmd_menu(message: Message) -> None:
 
 @dp.callback_query(F.data.startswith("mm:"))
 async def cb_main_menu_action(call: CallbackQuery, state: FSMContext, bot: Bot) -> None:
-    """Пункты главного меню, которые НЕ являются вложенными edit-экранами
-    (в отличие от «👑 Подписка», см. main_menu_kb) — каждый запускает своё
-    действие обычным способом (новое сообщение/FSM-флоу), не трогая само
-    сообщение главного меню, которое остаётся на месте со своими кнопками."""
+    """«unified»/«deep»/«date» — одноразовые действия (новое сообщение/
+    FSM-флоу), само сообщение главного меню не трогают. «support» — как
+    «👑 Подписка» (см. main_menu_kb): вложенный edit-экран, «⬅️ Назад»
+    (help_kb → callback_data="sub:to_menu") редактирует обратно в меню."""
     action = call.data.split(":", 1)[1]
     await call.answer()
     await state.clear()
@@ -1165,7 +1165,7 @@ async def cb_main_menu_action(call: CallbackQuery, state: FSMContext, bot: Bot) 
     elif action == "date":
         await _show_ideal_date(call.message, bot, telegram_id)
     elif action == "support":
-        await _show_help(call.message)
+        await _show_help(call.message, edit=True)
 
 
 _BACK_TO_MENU_BUTTON = InlineKeyboardButton(text="⬅️ Вернуться в меню", callback_data="back_to_menu")
@@ -3190,6 +3190,18 @@ async def cb_onboarding_json(call: CallbackQuery, state: FSMContext, bot: Bot) -
 def support_kb() -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     b.button(text="🆘 Написать в поддержку", url="https://t.me/CueMeSupport")
+    return b.as_markup()
+
+
+def help_kb() -> InlineKeyboardMarkup:
+    """Как support_kb(), плюс «⬅️ Назад» — для _show_help(edit=True) из
+    главного меню (callback_data="sub:to_menu" — тот же таргет, что и
+    «Назад» из «Подписка», см. cb_sub_to_main_menu, работает для любого
+    сообщения, не только для экрана Подписки)."""
+    b = InlineKeyboardBuilder()
+    b.button(text="🆘 Написать в поддержку", url="https://t.me/CueMeSupport")
+    b.button(text="⬅️ Назад", callback_data="sub:to_menu")
+    b.adjust(1)
     return b.as_markup()
 
 
@@ -5262,8 +5274,12 @@ async def cmd_progress(message: Message) -> None:
 
 # ── /help ────────────────────────────────────────────────────────────────────
 
-async def _show_help(message: Message) -> None:
-    await message.answer(
+async def _show_help(message: Message, edit: bool = False) -> None:
+    """edit=True (из главного меню, BTN_SUPPORT/mm:support) — редактирует ТО
+    ЖЕ сообщение (как «Подписка»), с «⬅️ Назад» в меню (help_kb). edit=False
+    (/help, BTN_HELP по тексту со старой клавиатуры) — новое сообщение, без
+    Назад (нет экрана, в который возвращаться) — только ссылка на поддержку."""
+    text = (
         "Вот что я умею. На главном экране — кнопка «💬 Ответ с CueMe» плюс "
         "«🔬 Анализ собеседника», «💐 Идеальное свидание» и «👑 Подписка»:\n\n"
         "💬 Ответ с CueMe — перешли сообщение или вставь текст: если контакт "
@@ -5290,10 +5306,12 @@ async def _show_help(message: Message) -> None:
         "/start — начало работы\n"
         "/help — это сообщение\n\n"
         f"💎 {FREE_TRIAL_REQUESTS} бесплатных попыток на ответ, "
-        "дальше и остальные функции — по подписке. Статус — /premium.",
-        parse_mode="HTML",
-        reply_markup=support_kb(),
+        "дальше и остальные функции — по подписке. Статус — /premium."
     )
+    if edit:
+        await message.edit_text(text, parse_mode="HTML", reply_markup=help_kb())
+    else:
+        await message.answer(text, parse_mode="HTML", reply_markup=support_kb())
 
 
 @dp.message(Command("help"))
