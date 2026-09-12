@@ -551,11 +551,12 @@ def _has_stars_premium(telegram_id: str) -> bool:
 # PREMIUM_CHANNEL_ID (приватный канал-пропуск Tribute, платный, отдельная
 # механика в _is_premium). Награда — ОДИН раз за всё время: has_claimed_promo_reward
 # навсегда true после первого начисления, отписка-подписка заново не даёт дубль.
-# Подписка проверяется ТОЛЬКО автоматически — через chat_member-апдейты
+# Подписка проверяется автоматически — через chat_member-апдейты
 # (on_promo_channel_membership_change) + суточную сверку на случай пропущенного
-# апдейта (_reconcile_promo_channel_premium). Кнопки "Я подписался" нет —
-# результат приходит отдельным (асинхронным) сообщением, когда бот реально
-# это увидит, а не по факту нажатия кнопки.
+# апдейта (_reconcile_promo_channel_premium) — плюс ручная кнопка «✅ Я
+# подписался» (cb_promo_check) как подстраховка на случай, если Telegram не
+# прислал chat_member-апдейт (бот был офлайн и т.п.) — единственный путь,
+# которым тогда можно было бы получить награду.
 
 def _promo_back_kb() -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
@@ -566,6 +567,7 @@ def _promo_back_kb() -> InlineKeyboardMarkup:
 def _promo_offer_kb() -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     b.button(text="📢 Открыть канал", url=f"https://t.me/{PROMO_CHANNEL_USERNAME.lstrip('@')}")
+    b.button(text="✅ Я подписался", callback_data="promo:check")
     b.button(text="⬅️ Назад", callback_data="show_premium")
     b.adjust(1)
     return b.as_markup()
@@ -577,28 +579,76 @@ async def cb_promo_offer(call: CallbackQuery) -> None:
     остальные переходы в этом разделе, см. _show_premium_screen/_show_invite),
     не шлёт отдельное. Подписка проверяется автоматически
     (on_promo_channel_membership_change) — награда и подтверждение придут
-    отдельным сообщением, когда бот это увидит, см. там же."""
+    отдельным сообщением, когда бот это увидит; «✅ Я подписался»
+    (cb_promo_check) — подстраховка, если это событие почему-то не пришло."""
     await call.answer()
     if has_claimed_promo_reward(str(call.from_user.id)):
         await call.message.edit_text("Ты уже получал эту награду раньше 🙂", reply_markup=_promo_back_kb())
         return
     await call.message.edit_text(
         f"Подпишись на {PROMO_CHANNEL_USERNAME} и получи "
-        f"{PROMO_CHANNEL_REWARD_DAYS} дня Premium бесплатно. Подписка проверяется "
-        "автоматически — как только бот это увидит, придёт отдельное сообщение "
-        "с подтверждением.",
+        f"{PROMO_CHANNEL_REWARD_DAYS} дня Premium бесплатно. Проверяем автоматически, "
+        "но если через пару минут ничего не пришло — жми «✅ Я подписался».",
         reply_markup=_promo_offer_kb(),
+    )
+
+
+@dp.callback_query(F.data == "promo:check")
+async def cb_promo_check(call: CallbackQuery, bot: Bot) -> None:
+    """Ручная проверка — подстраховка на случай, если Telegram не прислал
+    chat_member-апдейт (on_promo_channel_membership_change) вовремя. Реально
+    проверяет членство через bot.get_chat_member (anti-abuse), не просто
+    верит нажатию. Редактирует ЭТОТ ЖЕ экран «Подписка» (как остальные
+    переходы в разделе), не шлёт новое сообщение — в отличие от
+    on_promo_channel_membership_change, у которой юзер асинхронно мог уже
+    уйти в другой раздел меню, тут это тот же самый клик, тот же экран."""
+    telegram_id = str(call.from_user.id)
+
+    try:
+        member = await bot.get_chat_member(PROMO_CHANNEL_USERNAME, int(telegram_id))
+        subscribed = member.status in ("member", "administrator", "creator")
+    except Exception:
+        logging.exception("promo channel check failed for %s", telegram_id)
+        subscribed = False
+
+    if not subscribed:
+        await call.answer("Не вижу подписки — проверь и попробуй снова", show_alert=True)
+        return
+
+    remaining_seconds, _ = get_promo_channel_pause(telegram_id)
+    if remaining_seconds:
+        until = datetime.now(timezone.utc) + timedelta(seconds=remaining_seconds)
+        resume_promo_channel_premium(telegram_id, until)
+        await call.answer()
+        await call.message.edit_text(
+            f"🎉 С возвращением! Оставшееся время Premium возобновлено — до {_format_until(until)}.",
+            reply_markup=_promo_back_kb(),
+        )
+        return
+
+    if has_claimed_promo_reward(telegram_id):
+        await call.answer("Уже получено раньше", show_alert=True)
+        return
+
+    until = datetime.now(timezone.utc) + timedelta(days=PROMO_CHANNEL_REWARD_DAYS)
+    set_promo_channel_reward(telegram_id, until)
+    await call.answer()
+    await call.message.edit_text(
+        f"✅ Готово! Ты подписан(а), Premium активен на {PROMO_CHANNEL_REWARD_DAYS} "
+        f"дня (до {_format_until(until)}).",
+        reply_markup=_promo_back_kb(),
     )
 
 
 @dp.chat_member()
 async def on_promo_channel_membership_change(event: ChatMemberUpdated, bot: Bot) -> None:
-    """Единственная проверка подписки на промо-канал (PROMO_CHANNEL_USERNAME) —
-    кнопки "Я подписался" нет, всё решается тут + суточной сверкой
-    (_reconcile_promo_channel_premium на случай пропущенного апдейта, но она
-    только приостанавливает — новую награду не выдаёт). Требует прав
-    администратора бота в этом канале — иначе chat_member-апдейты по нему не
-    приходят. При is_member=True — три случая:
+    """Автоматическая проверка подписки на промо-канал (PROMO_CHANNEL_USERNAME) —
+    основной путь, плюс суточная сверка на случай пропущенного апдейта
+    (_reconcile_promo_channel_premium, но она только приостанавливает —
+    новую награду не выдаёт) и ручная кнопка «✅ Я подписался» (cb_promo_check)
+    как подстраховка. Требует прав администратора бота в этом канале —
+    иначе chat_member-апдейты по нему не приходят. При is_member=True —
+    три случая:
     1) юзер на паузе (был Premium, отписался, теперь снова подписан) —
        возобновляем с сохранённого остатка, БЕЗ новой выдачи награды;
     2) награда уже выдавалась когда-либо (claimed=True, паузы нет) — второй
