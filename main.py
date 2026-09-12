@@ -250,9 +250,14 @@ BTN_DATE          = "💐 Идеальное свидание"
 # оставлена закомментированной ниже — на случай отката.
 # BTN_MORE          = "⚙️ Ещё"
 BTN_SUBSCRIPTION  = "👑 Подписка"
-# BTN_HELP («❓ Помощь») убрана из главного меню (упрощение до 4 кнопок) —
-# сама функция и /help не тронуты, просто больше не кнопка меню.
+# BTN_HELP («❓ Помощь», /help — полный список команд) НЕ на главном меню —
+# сама функция и /help не тронуты, просто не кнопка меню. Не путать с
+# BTN_SUPPORT ниже — другая функция, случайно похожее название.
 BTN_HELP          = "❓ Помощь"
+# BTN_SUPPORT — переименована из «🆘 Поддержка» (раньше только инлайн-кнопка
+# на экране /connect, business_connect_kb) — та же ссылка на @CueMeSupport,
+# теперь ещё и кнопка главного меню, пятая по счёту.
+BTN_SUPPORT       = "🆘 Помощь"
 # BTN_ME («👤 Мой стиль») убрана вместе с командой /me — дублировала
 # «Анализ своего стиля» (и была бесплатной лазейкой мимо подписки на неё;
 # сам «Анализ своего стиля» тоже убран совсем, см. пометку у BTN_DEEP выше).
@@ -264,7 +269,7 @@ BTN_HELP          = "❓ Помощь"
 # BTN_REWRITE («📝 Переписать») и /auto удалены совсем — их сценарий (черновик
 # без привязки к входящему) теперь полностью закрывает «💫 Новый диалог».
 _ALL_BTNS = {
-    BTN_UNIFIED, BTN_DEEP, BTN_DATE, BTN_SUBSCRIPTION, BTN_HELP,
+    BTN_UNIFIED, BTN_DEEP, BTN_DATE, BTN_SUBSCRIPTION, BTN_HELP, BTN_SUPPORT,
 }
 
 # Защита от параллельных пересборок одного контакта
@@ -352,14 +357,19 @@ async def _answer_long(
         await message.answer(chunk, reply_markup=reply_markup if last else None, parse_mode=parse_mode)
 
 
-async def _edit_or_answer_long(message: Message, text: str) -> None:
+async def _edit_or_answer_long(
+    message: Message, text: str, reply_markup: InlineKeyboardMarkup | None = None,
+    parse_mode: str | None = None,
+) -> None:
     """Как call.message.edit_text(), но при переполнении лимита Telegram первый
     кусок идёт в edit, а остальные — отдельными сообщениями (edit не может
-    «раздвоиться» на несколько сообщений)."""
+    «раздвоиться» на несколько сообщений). reply_markup — с ПОСЛЕДНИМ куском,
+    как в _answer_long."""
     chunks = _split_long_text(text)
-    await message.edit_text(chunks[0])
-    for chunk in chunks[1:]:
-        await message.answer(chunk)
+    last = len(chunks) - 1
+    await message.edit_text(chunks[0], reply_markup=reply_markup if last == 0 else None, parse_mode=parse_mode)
+    for i, chunk in enumerate(chunks[1:], start=1):
+        await message.answer(chunk, reply_markup=reply_markup if i == last else None, parse_mode=parse_mode)
 
 
 # ── Подписка (Tribute) ──────────────────────────────────────────────────────
@@ -1023,6 +1033,7 @@ def main_kb() -> ReplyKeyboardMarkup:
     b.row(KeyboardButton(text=BTN_UNIFIED))
     b.row(KeyboardButton(text=BTN_DEEP), KeyboardButton(text=BTN_DATE))
     b.row(KeyboardButton(text=BTN_SUBSCRIPTION))
+    b.row(KeyboardButton(text=BTN_SUPPORT))
     return b.as_markup(resize_keyboard=True)
 
 
@@ -3079,6 +3090,22 @@ async def cb_onboarding_json(call: CallbackQuery, state: FSMContext, bot: Bot) -
     )
 
 
+def support_kb() -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    b.button(text="🆘 Написать в поддержку", url="https://t.me/CueMeSupport")
+    return b.as_markup()
+
+
+async def _show_support(message: Message) -> None:
+    """BTN_SUPPORT («🆘 Помощь», кнопка главного меню) — та же ссылка на
+    @CueMeSupport, что и «Поддержка» в business_connect_kb (/connect).
+    Reply-кнопка не может сама быть url — шлём сообщение с инлайн-ссылкой."""
+    await message.answer(
+        "Если что-то не работает или есть вопрос — пиши сюда:",
+        reply_markup=support_kb(),
+    )
+
+
 # ── Кнопки главного меню ──────────────────────────────────────────────────────
 
 @dp.message(F.text.in_(_ALL_BTNS))
@@ -3100,6 +3127,8 @@ async def handle_menu_button(message: Message, state: FSMContext, bot: Bot) -> N
         await _show_premium_screen(message, bot, str(message.from_user.id))
     elif message.text == BTN_HELP:
         await _show_help(message)
+    elif message.text == BTN_SUPPORT:
+        await _show_support(message)
 
 
 @dp.callback_query(F.data.startswith("menu:"))
@@ -4023,10 +4052,21 @@ async def cb_reply_contact(call: CallbackQuery, state: FSMContext) -> None:
 # для выбранного контакта, LiveDialogue для нового. Фото (скриншот
 # переписки) как вход убран вместе с функцией «скриншот → ответ» — см.
 # пометку у handle_unified_input и у секции «Ответить по скриншоту» ниже.
+#
+# Вся фаза настройки (запрос текста → выбор/имя контакта → статус
+# генерации) — ОДНО редактируемое сообщение, а не серия новых: message_id
+# первого сообщения сохраняется в FSM (setup_chat_id/setup_message_id) и
+# переиспользуется через bot.edit_message_text в handle_unified_input/
+# handle_unified_name (это обычные message-хендлеры, не callback — своего
+# "call.message" для edit у них нет). cb_unified_contact — callback на этом
+# же сообщении, там подходит обычный call.message.edit_text. Итоговое
+# сообщение с вариантами ответа (после настройки) — НОВОЕ, самостоятельное,
+# см. _run_variants_generation/_run_live_coach_step.
 
 async def _start_unified_reply(message: Message, state: FSMContext) -> None:
     await state.set_state(UnifiedReply.waiting_for_input)
-    await message.answer("Перешли сообщение или просто вставь текст переписки")
+    sent = await message.answer("Перешли сообщение или просто вставь текст переписки")
+    await state.update_data(setup_chat_id=sent.chat.id, setup_message_id=sent.message_id)
 
 
 def unified_contacts_kb(contacts: list) -> InlineKeyboardMarkup:
@@ -4038,19 +4078,35 @@ def unified_contacts_kb(contacts: list) -> InlineKeyboardMarkup:
     return b.as_markup()
 
 
+async def _edit_setup_message(
+    state: FSMContext, bot: Bot, text: str, reply_markup: InlineKeyboardMarkup | None = None,
+) -> None:
+    """Редактирует сообщение фазы настройки «Ответ с CueMe» (setup_chat_id/
+    setup_message_id из FSM, см. _start_unified_reply) — общий хелпер для
+    handle_unified_input/handle_unified_name, которые получают обычное
+    message-событие (не callback), так что своего call.message для edit нет."""
+    data = await state.get_data()
+    chat_id, message_id = data.get("setup_chat_id"), data.get("setup_message_id")
+    if chat_id is None or message_id is None:
+        return  # не должно происходить — на всякий случай не роняем хендлер
+    await bot.edit_message_text(text, chat_id=chat_id, message_id=message_id, reply_markup=reply_markup)
+
+
 @dp.message(UnifiedReply.waiting_for_input, _not_command)
 async def handle_unified_input(message: Message, state: FSMContext, bot: Bot) -> None:
     # Функция «скриншот переписки → ответ» убрана целиком (по запросу) —
     # фото в этом состоянии больше не читаем через Vision, просто просим
     # текст. Раньше здесь был branch на message.photo → extract_chat_from_image.
     if message.photo:
-        await message.answer("Скриншоты сейчас не поддерживаются — перешли сообщение или вставь текст.")
+        await _edit_setup_message(
+            state, bot, "Скриншоты сейчас не поддерживаются — перешли сообщение или вставь текст.",
+        )
         return
 
     txt, _ = await _message_text(bot, message)
     incoming = (txt or "").strip()
     if not incoming:
-        await message.answer("Перешли сообщение или вставь текст.")
+        await _edit_setup_message(state, bot, "Перешли сообщение или вставь текст.")
         return
 
     telegram_id = str(message.from_user.id)
@@ -4059,25 +4115,26 @@ async def handle_unified_input(message: Message, state: FSMContext, bot: Bot) ->
 
     if not contacts:
         await state.set_state(UnifiedReply.waiting_for_name)
-        await message.answer(
-            "Как назвать этот диалог? Просто имя или метка, чтобы потом узнать среди контактов."
+        await _edit_setup_message(
+            state, bot,
+            "Как назвать этот диалог? Просто имя или метка, чтобы потом узнать среди контактов.",
         )
         return
 
-    await message.answer("Кому отвечаем?", reply_markup=unified_contacts_kb(contacts))
+    await _edit_setup_message(state, bot, "Кому отвечаем?", reply_markup=unified_contacts_kb(contacts))
 
 
 @dp.message(UnifiedReply.waiting_for_name)
 async def handle_unified_name(message: Message, state: FSMContext, bot: Bot) -> None:
     name = (message.text or "").strip()
     if not name:
-        await message.answer("Пришли имя текстом.")
+        await _edit_setup_message(state, bot, "Пришли имя текстом.")
         return
 
     data = await state.get_data()
     pending_text = data.get("pending_text")
     if not pending_text:
-        await message.answer("Контекст устарел — начни заново через «💬 Ответ с CueMe».")
+        await _edit_setup_message(state, bot, "Контекст устарел — начни заново через «💬 Ответ с CueMe».")
         await state.clear()
         return
 
@@ -4087,7 +4144,10 @@ async def handle_unified_name(message: Message, state: FSMContext, bot: Bot) -> 
 
     await state.set_state(LiveDialogue.waiting_for_incoming)
     await state.update_data(contact_id=contact_id, dialogue_history=[])
-    await message.answer(f"Готово — «{name}».")
+    # "Готово — «name»." — часть той же редактируемой фазы настройки, не
+    # отдельное сообщение (см. _start_unified_reply). Итог с вариантами
+    # ответа дальше в _process_live_incoming — уже НОВОЕ сообщение.
+    await _edit_setup_message(state, bot, f"Готово — «{name}». Генерирую варианты...")
     try:
         await _process_live_incoming(message, state, bot, pending_text, message.from_user.id)
     except Exception:
@@ -4242,7 +4302,10 @@ _VARIANT_LETTERS = "АБВГДЕЁЖЗИ"
 
 def _format_variants(variants: list[tuple[str, str]]) -> str:
     """HTML: текст каждого варианта в <code> — в Telegram такой блок копируется
-    по одному тапу, без отдельной кнопки «Скопировать» на каждый вариант."""
+    по одному тапу, без отдельной кнопки «Скопировать» на каждый вариант.
+    Вступительная строка «Вот несколько вариантов...» убрана по запросу —
+    варианты идут сразу; инсайт/инструкция про продолжение сессии теперь
+    отдельным блоком снизу, см. _variants_footer."""
     blocks = []
     for i, (name, text) in enumerate(variants):
         letter = _VARIANT_LETTERS[i] if i < len(_VARIANT_LETTERS) else str(i + 1)
@@ -4250,7 +4313,20 @@ def _format_variants(variants: list[tuple[str, str]]) -> str:
             f"<b>Вариант {letter}: {html.escape(name)}</b>\n"
             f"<code>{html.escape(text)}</code>"
         )
-    return "Вот несколько вариантов — выбирай или комбинируй.\n\n" + "\n\n".join(blocks)
+    return "\n\n".join(blocks)
+
+
+def _variants_footer(insight: str | None, continuation: str) -> str:
+    """Цитата (blockquote) внизу сообщения с вариантами — инсайт про
+    собеседника (если есть — только у «живого» диалога, см. _run_live_coach_step)
+    и инструкция про продолжение сессии. Строится ОДИН раз при первой
+    генерации и сохраняется в ctx["footer_html"] — «Другие варианты»
+    (force_fresh) переиспользует её как есть, меняются только сами варианты."""
+    parts = []
+    if insight:
+        parts.append(html.escape(insight))
+    parts.append(html.escape(continuation))
+    return "<blockquote>" + "\n\n".join(parts) + "</blockquote>"
 
 
 def _save_shown_suggestions(
@@ -4348,14 +4424,30 @@ async def _run_variants_generation(
 
     _save_shown_suggestions(str(telegram_id), ctx.get("contact_id"), kind, variants)
     ctx["variants"] = variants
-    await _answer_long(
-        target, _format_variants(variants), reply_markup=variants_result_kb(action_id), parse_mode="HTML",
-    )
 
-    if kind == "reply":
-        await target.answer(
-            "Пришли следующее сообщение собеседника, чтобы ответить и на него. "
+    # footer_html строится ОДИН раз (при первой генерации) и живёт в ctx —
+    # «Другие варианты» (force_fresh) переиспользует его как есть, см.
+    # _variants_footer. Результат — самостоятельное сообщение (не edit фазы
+    # настройки, см. _start_unified_reply): первый раз answer (новое),
+    # «Другие варианты» — edit того же результата.
+    footer = ctx.get("footer_html")
+    if footer is None:
+        contact_gen, _ = _contact_words(gender)
+        continuation = (
+            f"Пришли следующее сообщение {contact_gen}, чтобы ответить и на него. "
             "Чтобы выйти из режима — нажми любую кнопку меню."
+        )
+        footer = _variants_footer(None, continuation)
+        ctx["footer_html"] = footer
+
+    text_out = f"{_format_variants(variants)}\n\n{footer}"
+    if force_fresh:
+        await _edit_or_answer_long(
+            target, text_out, reply_markup=variants_result_kb(action_id), parse_mode="HTML",
+        )
+    else:
+        await _answer_long(
+            target, text_out, reply_markup=variants_result_kb(action_id), parse_mode="HTML",
         )
 
 
@@ -4679,8 +4771,6 @@ async def _run_live_coach_step(
 
     if force_fresh:
         if not await _quota_gate(bot, target, str(telegram_id)):
-
-             
             return
         try:
             variants = await suggest_reply_variants(
@@ -4704,8 +4794,15 @@ async def _run_live_coach_step(
             return
         _save_shown_suggestions(str(telegram_id), contact_id, "live", variants)
         ctx["variants"] = variants
-        await _answer_long(
-            target, _format_variants(variants), reply_markup=live_variants_kb(action_id), parse_mode="HTML",
+        # footer_html уже посчитан при первой генерации (см. конец функции) и
+        # хранится в ctx — «Другие варианты» его не пересчитывает, инсайт и
+        # инструкция остаются как были, меняются только сами варианты. Editим
+        # ЭТО ЖЕ сообщение (target = call.message из cb_live_regen), а не
+        # шлём новое.
+        footer = ctx.get("footer_html", "")
+        await _edit_or_answer_long(
+            target, f"{_format_variants(variants)}\n\n{footer}",
+            reply_markup=live_variants_kb(action_id), parse_mode="HTML",
         )
         return
 
@@ -4756,20 +4853,31 @@ async def _run_live_coach_step(
     _save_shown_suggestions(str(telegram_id), contact_id, "live", variants)
     ctx["variants"] = variants
     ctx["running_notes"] = updated_notes
-    await _answer_long(
-        target, _format_variants(variants), reply_markup=live_variants_kb(action_id), parse_mode="HTML",
-    )
 
+    # Инсайт («Что я уже понял») и инструкция про продолжение сессии — ОДНОЙ
+    # цитатой внизу итогового сообщения (не отдельными message), см.
+    # _variants_footer. footer_html сохраняется в ctx — «Другие варианты»
+    # (force_fresh, ветка выше) переиспользует его без изменений.
     message_count = ctx.get("message_count", 0)
+    insight = None
     if updated_notes and (message_count == 1 or message_count % LIVE_NOTES_SUMMARY_EVERY == 0):
         preview = _running_notes_preview(updated_notes)
         if preview:
-            await target.answer(f"Что я уже понял:\n{preview}")
+            insight = f"Что я уже понял:\n{preview}"
 
     contact_gen, _ = _contact_words(gender)
-    await target.answer(
+    continuation = (
         f"Пришли следующее сообщение {contact_gen} — отвечу и на него. "
         "Чтобы выйти из режима — нажми любую кнопку меню."
+    )
+    footer = _variants_footer(insight, continuation)
+    ctx["footer_html"] = footer
+
+    # Итог — САМОСТОЯТЕЛЬНОЕ сообщение (не edit фазы настройки, см.
+    # _start_unified_reply/_edit_setup_message): answer шлёт НОВОЕ.
+    await _answer_long(
+        target, f"{_format_variants(variants)}\n\n{footer}",
+        reply_markup=live_variants_kb(action_id), parse_mode="HTML",
     )
 
 
