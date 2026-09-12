@@ -2993,9 +2993,8 @@ def _quickstart_phrase_next_kb(target: str) -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     b.button(text="🔄 Другой вариант", callback_data=f"qsphr_next:{target}")
     b.button(text="💘 Дайвинчик", url="https://t.me/leomatchbot")
-    b.button(text="⚡ FastLove", url="https://t.me/fastlovetg_bot")
     b.adjust(1)
-    return b.as_markup()
+    return _with_back_to_menu(b.as_markup())
 
 
 async def _send_quickstart_phrases(msg: Message, state: FSMContext, target: str) -> None:
