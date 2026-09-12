@@ -30,7 +30,7 @@ from aiogram.types import (
     CallbackQuery, ChatMemberUpdated, Document, ErrorEvent, FSInputFile, InputRichMessage, Message,
     InlineKeyboardButton, InlineKeyboardMarkup,
     LabeledPrice, PreCheckoutQuery,
-    ReplyKeyboardMarkup, KeyboardButton,
+    ReplyKeyboardMarkup, ReplyKeyboardRemove, KeyboardButton,
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
 
@@ -551,80 +551,61 @@ def _has_stars_premium(telegram_id: str) -> bool:
 # PREMIUM_CHANNEL_ID (приватный канал-пропуск Tribute, платный, отдельная
 # механика в _is_premium). Награда — ОДИН раз за всё время: has_claimed_promo_reward
 # навсегда true после первого начисления, отписка-подписка заново не даёт дубль.
+# Подписка проверяется ТОЛЬКО автоматически — через chat_member-апдейты
+# (on_promo_channel_membership_change) + суточную сверку на случай пропущенного
+# апдейта (_reconcile_promo_channel_premium). Кнопки "Я подписался" нет —
+# результат приходит отдельным (асинхронным) сообщением, когда бот реально
+# это увидит, а не по факту нажатия кнопки.
+
+def _promo_back_kb() -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    b.button(text="⬅️ Назад", callback_data="show_premium")
+    return b.as_markup()
+
+
+def _promo_offer_kb() -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    b.button(text="📢 Открыть канал", url=f"https://t.me/{PROMO_CHANNEL_USERNAME.lstrip('@')}")
+    b.button(text="⬅️ Назад", callback_data="show_premium")
+    b.adjust(1)
+    return b.as_markup()
+
 
 @dp.callback_query(F.data == "promo:offer")
 async def cb_promo_offer(call: CallbackQuery) -> None:
+    """Экран внутри «👑 Подписка» — редактирует ТО ЖЕ сообщение (как и
+    остальные переходы в этом разделе, см. _show_premium_screen/_show_invite),
+    не шлёт отдельное. Подписка проверяется автоматически
+    (on_promo_channel_membership_change) — награда и подтверждение придут
+    отдельным сообщением, когда бот это увидит, см. там же."""
     await call.answer()
     if has_claimed_promo_reward(str(call.from_user.id)):
-        await call.message.answer("Ты уже получал эту награду раньше 🙂")
+        await call.message.edit_text("Ты уже получал эту награду раньше 🙂", reply_markup=_promo_back_kb())
         return
-    await call.message.answer(
+    await call.message.edit_text(
         f"Подпишись на {PROMO_CHANNEL_USERNAME} и получи "
-        f"{PROMO_CHANNEL_REWARD_DAYS} дня Premium бесплатно:",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(
-                text="📢 Открыть канал",
-                url=f"https://t.me/{PROMO_CHANNEL_USERNAME.lstrip('@')}",
-            )],
-            [InlineKeyboardButton(text="✅ Я подписался", callback_data="promo:check")],
-        ]),
+        f"{PROMO_CHANNEL_REWARD_DAYS} дня Premium бесплатно. Подписка проверяется "
+        "автоматически — как только бот это увидит, придёт отдельное сообщение "
+        "с подтверждением.",
+        reply_markup=_promo_offer_kb(),
     )
-
-
-@dp.callback_query(F.data == "promo:check")
-async def cb_promo_check(call: CallbackQuery, bot: Bot) -> None:
-    """Ручная проверка кнопкой «Я подписался». Реально проверяет членство
-    через bot.get_chat_member (anti-abuse) и разруливает три случая:
-    1) юзер на паузе (был Premium, отписался, теперь снова подписан) —
-       возобновляем с сохранённого остатка, НЕ начисляя новую награду;
-    2) награда уже выдавалась когда-либо (claimed=True, паузы нет) — второй
-       раз не даём (has_claimed_promo_reward — разовый anti-abuse флаг);
-    3) первая выдача — начисляем PROMO_CHANNEL_REWARD_DAYS и ставим claimed.
-    Это ручной путь-дублёр к live-отслеживанию через chat_member
-    (on_promo_channel_membership_change) — нужен на случай, если то событие
-    почему-то не пришло."""
-    telegram_id = str(call.from_user.id)
-
-    try:
-        member = await bot.get_chat_member(PROMO_CHANNEL_USERNAME, int(telegram_id))
-        subscribed = member.status in ("member", "administrator", "creator")
-    except Exception:
-        logging.exception("promo channel check failed for %s", telegram_id)
-        subscribed = False
-
-    if not subscribed:
-        await call.answer("Не вижу подписки — проверь и попробуй снова", show_alert=True)
-        return
-
-    remaining_seconds, _ = get_promo_channel_pause(telegram_id)
-    if remaining_seconds:
-        until = datetime.now(timezone.utc) + timedelta(seconds=remaining_seconds)
-        resume_promo_channel_premium(telegram_id, until)
-        await call.answer()
-        await call.message.answer("🎉 С возвращением! Оставшееся время Premium возобновлено.")
-        return
-
-    if has_claimed_promo_reward(telegram_id):
-        await call.answer("Уже получено раньше", show_alert=True)
-        return
-
-    until = datetime.now(timezone.utc) + timedelta(days=PROMO_CHANNEL_REWARD_DAYS)
-    set_promo_channel_reward(telegram_id, until)
-    await call.answer()
-    await call.message.answer(f"🎉 Готово! {PROMO_CHANNEL_REWARD_DAYS} дня Premium активны.")
 
 
 @dp.chat_member()
 async def on_promo_channel_membership_change(event: ChatMemberUpdated, bot: Bot) -> None:
-    """Живое отслеживание отписки/подписки на промо-канал (PROMO_CHANNEL_USERNAME)
-    для юзеров с активным окном промо-Premium. Требует прав администратора
-    бота в этом канале — иначе chat_member-апдейты по нему не приходят.
-    Отписка сразу ставит Premium на паузу (сохраняя остаток, см.
-    pause_promo_channel_premium), повторная подписка возобновляет с
-    сохранённого остатка (resume_promo_channel_premium) — БЕЗ новой выдачи
-    награды, has_claimed_promo_reward её больше не даёт. Подстраховка на
-    случай пропущенного апдейта — суточная сверка,
-    см. _reconcile_promo_channel_premium."""
+    """Единственная проверка подписки на промо-канал (PROMO_CHANNEL_USERNAME) —
+    кнопки "Я подписался" нет, всё решается тут + суточной сверкой
+    (_reconcile_promo_channel_premium на случай пропущенного апдейта, но она
+    только приостанавливает — новую награду не выдаёт). Требует прав
+    администратора бота в этом канале — иначе chat_member-апдейты по нему не
+    приходят. При is_member=True — три случая:
+    1) юзер на паузе (был Premium, отписался, теперь снова подписан) —
+       возобновляем с сохранённого остатка, БЕЗ новой выдачи награды;
+    2) награда уже выдавалась когда-либо (claimed=True, паузы нет) — второй
+       раз не даём (has_claimed_promo_reward — разовый anti-abuse флаг), тихо;
+    3) первая выдача — начисляем PROMO_CHANNEL_REWARD_DAYS, ставим claimed,
+       уведомляем НОВЫМ сообщением (не правкой экрана «Подписка» — юзер к
+       этому моменту мог уйти в другой раздел меню)."""
     channel_username = PROMO_CHANNEL_USERNAME.lstrip("@").lower()
     if (event.chat.username or "").lower() != channel_username:
         return
@@ -649,6 +630,15 @@ async def on_promo_channel_membership_change(event: ChatMemberUpdated, bot: Bot)
     if remaining_seconds:
         until = datetime.now(timezone.utc) + timedelta(seconds=remaining_seconds)
         resume_promo_channel_premium(telegram_id, until)
+        await _notify_promo_premium_resumed(bot, telegram_id, until)
+        return
+
+    if has_claimed_promo_reward(telegram_id):
+        return
+
+    until = datetime.now(timezone.utc) + timedelta(days=PROMO_CHANNEL_REWARD_DAYS)
+    set_promo_channel_reward(telegram_id, until)
+    await _notify_promo_reward_granted(bot, telegram_id, until)
 
 
 _PROMO_PAUSED_TEXT = (
@@ -666,6 +656,32 @@ async def _notify_promo_premium_paused(bot: Bot, telegram_id: str) -> None:
         await bot.send_message(int(telegram_id), _PROMO_PAUSED_TEXT)
     except Exception:
         logging.warning("promo premium pause notify failed: telegram_id=%s", telegram_id)
+
+
+async def _notify_promo_reward_granted(bot: Bot, telegram_id: str, until: datetime) -> None:
+    """Уведомляет о ПЕРВОЙ выдаче промо-Premium после автоматически
+    подтверждённой подписки — отдельным НОВЫМ сообщением (не правкой экрана
+    «Подписка»: асинхронное событие, юзер мог уже уйти в другой раздел
+    меню). Молча глотает ошибку отправки — награда уже начислена
+    независимо от того, дошло ли уведомление."""
+    text = (
+        f"✅ Готово! Ты подписан(а), Premium активен на {PROMO_CHANNEL_REWARD_DAYS} "
+        f"дня (до {_format_until(until)})."
+    )
+    try:
+        await bot.send_message(int(telegram_id), text)
+    except Exception:
+        logging.warning("promo reward grant notify failed: telegram_id=%s", telegram_id)
+
+
+async def _notify_promo_premium_resumed(bot: Bot, telegram_id: str, until: datetime) -> None:
+    """Уведомляет о возобновлении промо-Premium после повторной подписки
+    (юзер был на паузе) — тоже отдельное новое сообщение."""
+    text = f"🎉 С возвращением! Оставшееся время Premium возобновлено — до {_format_until(until)}."
+    try:
+        await bot.send_message(int(telegram_id), text)
+    except Exception:
+        logging.warning("promo premium resume notify failed: telegram_id=%s", telegram_id)
 
 
 async def _reconcile_promo_channel_premium(bot: Bot) -> None:
@@ -1026,15 +1042,20 @@ async def cmd_myref(message: Message) -> None:
     await message.answer("\n".join(lines))
 
 
-def main_kb() -> ReplyKeyboardMarkup:
-    b = ReplyKeyboardBuilder()
-    # b.row(KeyboardButton(text=BTN_SCREENSHOT), KeyboardButton(text=BTN_REPLY))
-    # b.row(KeyboardButton(text=BTN_LIVE))
-    b.row(KeyboardButton(text=BTN_UNIFIED))
-    b.row(KeyboardButton(text=BTN_DEEP), KeyboardButton(text=BTN_DATE))
-    b.row(KeyboardButton(text=BTN_SUBSCRIPTION))
-    b.row(KeyboardButton(text=BTN_SUPPORT))
-    return b.as_markup(resize_keyboard=True)
+# main_kb() (persistent reply-клавиатура) убрана совсем по запросу — главное
+# меню теперь то же самое, что «Подписка»: одно сообщение с inline-кнопками,
+# которое редактируется при переходах, а не нижняя панель. Не удалена
+# физически — на случай отката (но ReplyKeyboardRemove в местах, которые
+# раньше её отправляли, теперь активно снимает эту клавиатуру у тех, у кого
+# она ещё видна с более ранней версии бота — см. handle_business_connection/
+# handle_document ниже).
+# def main_kb() -> ReplyKeyboardMarkup:
+#     b = ReplyKeyboardBuilder()
+#     b.row(KeyboardButton(text=BTN_UNIFIED))
+#     b.row(KeyboardButton(text=BTN_DEEP), KeyboardButton(text=BTN_DATE))
+#     b.row(KeyboardButton(text=BTN_SUBSCRIPTION))
+#     b.row(KeyboardButton(text=BTN_SUPPORT))
+#     return b.as_markup(resize_keyboard=True)
 
 
 _MAIN_MENU_TEXT = (
@@ -1045,23 +1066,58 @@ _MAIN_MENU_TEXT = (
 )
 
 
+def main_menu_kb() -> InlineKeyboardMarkup:
+    """Главное меню — 5 пунктов, той же вёрстки/механики, что «Подписка»
+    (premium_menu_kb): inline-кнопки на одном сообщении, редактируемом при
+    переходах. «👑 Подписка» ведёт в уже существующую edit-in-place иерархию
+    (callback_data="show_premium" — тот же, что и «⬅️ Назад» из Реферальной
+    системы, см. cb_show_premium). Остальные — одноразовые действия
+    (мультишаговые FSM-флоу/результаты своим сообщением), не вложенные
+    экраны — см. cb_main_menu_action."""
+    b = InlineKeyboardBuilder()
+    b.button(text=BTN_UNIFIED, callback_data="mm:unified")
+    b.button(text=BTN_DEEP, callback_data="mm:deep")
+    b.button(text=BTN_DATE, callback_data="mm:date")
+    b.button(text=BTN_SUBSCRIPTION, callback_data="show_premium")
+    b.button(text=BTN_SUPPORT, callback_data="mm:support")
+    b.adjust(1)
+    return b.as_markup()
+
+
 async def _send_main_menu(target: Message, edit: bool = False) -> None:
     """Экран главного меню — общий для /menu, кнопки «⬅️ Вернуться в меню»
     под результатами генерации и возврата «⬅️ Назад» из «👑 Подписка».
-    edit=True (Назад из Подписки) — редактирует ТО ЖЕ сообщение, снимая
-    inline-клавиатуру (reply_markup=None): main_kb() — обычная (reply)
-    клавиатура, она уже активна с более раннего шага и не привязана к
-    конкретному сообщению, так что edit_message_text её не трогает.
-    edit=False (по умолчанию) — новое сообщение с main_kb()."""
+    edit=True (Назад из Подписки) — редактирует ТО ЖЕ сообщение (та же
+    механика, что и у самой Подписки). edit=False — новое сообщение."""
     if edit:
-        await target.edit_text(_MAIN_MENU_TEXT, reply_markup=None)
+        await target.edit_text(_MAIN_MENU_TEXT, reply_markup=main_menu_kb())
     else:
-        await target.answer(_MAIN_MENU_TEXT, reply_markup=main_kb())
+        await target.answer(_MAIN_MENU_TEXT, reply_markup=main_menu_kb())
 
 
 @dp.message(Command("menu"))
 async def cmd_menu(message: Message) -> None:
     await _send_main_menu(message)
+
+
+@dp.callback_query(F.data.startswith("mm:"))
+async def cb_main_menu_action(call: CallbackQuery, state: FSMContext, bot: Bot) -> None:
+    """Пункты главного меню, которые НЕ являются вложенными edit-экранами
+    (в отличие от «👑 Подписка», см. main_menu_kb) — каждый запускает своё
+    действие обычным способом (новое сообщение/FSM-флоу), не трогая само
+    сообщение главного меню, которое остаётся на месте со своими кнопками."""
+    action = call.data.split(":", 1)[1]
+    await call.answer()
+    await state.clear()
+    telegram_id = str(call.from_user.id)
+    if action == "unified":
+        await _start_unified_reply(call.message, state)
+    elif action == "deep":
+        await _show_deep_analysis(call.message, bot, telegram_id)
+    elif action == "date":
+        await _show_ideal_date(call.message, bot, telegram_id)
+    elif action == "support":
+        await _show_support(call.message)
 
 
 _BACK_TO_MENU_BUTTON = InlineKeyboardButton(text="⬅️ Вернуться в меню", callback_data="back_to_menu")
@@ -2574,24 +2630,17 @@ async def handle_business_connection(event: BusinessConnection, bot: Bot) -> Non
         # до ответа останется невидим в /users.
         upsert_user(owner_id, f"user{owner_id}")
         try:
-            # reply_markup=main_kb() — это единственное место, где reply-
-            # клавиатура доходит до юзера на чистом Business-пути (JSON/демо
-            # получают её в своих сообщениях дальше по потоку). Раньше её
-            # доставка требовала отдельного сообщения с текстом "·"-заглушкой
-            # — теперь просто едет с этим, реальным по смыслу, сообщением.
-            #
-            # ПОПЫТКА (откатена): editить именно ЭТО сообщение дальше в
-            # вопрос про источник — не сработало на практике (проверено
-            # живым тестом), похоже Telegram не даёt добавить inline-кнопки
-            # через edit_message_text сообщению, изначально отправленному с
-            # обычной (reply) клавиатурой. Поэтому вопрос про источник всё
-            # ещё уходит ОТДЕЛЬНЫМ сообщением (_maybe_prompt_source ниже) —
-            # а вот всё ПОСЛЕ него (источник → пол → квикстарт → «кому бы
-            # написал») остаётся правками одного и того же сообщения.
+            # reply_markup=ReplyKeyboardRemove() — main_kb() (persistent
+            # reply-клавиатура) убрана совсем, эта отправка на всякий случай
+            # снимает её, если у юзера она ещё видна с более ранней версии
+            # бота. Дальше вопрос про источник уходит ОТДЕЛЬНЫМ сообщением
+            # (_maybe_prompt_source ниже) — а вот всё ПОСЛЕ него (источник →
+            # пол → квикстарт → «кому бы написал») остаётся правками одного
+            # и того же сообщения.
             await bot.send_message(
                 event.user.id,
                 "✅ Готово, бот подключён! CueMe готов помогать тебе в переписках )",
-                reply_markup=main_kb(),
+                reply_markup=ReplyKeyboardRemove(),
             )
         except TelegramForbiddenError:
             mark_bot_blocked(owner_id)
@@ -2921,7 +2970,7 @@ def business_connect_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="👀 Видео-инструкция", url="https://t.me/CueMee")],
         # "👑 Подписка" убрана с этого экрана (задача: стартовый экран не
         # должен вести на подписку) — доступ к ней остаётся через кнопку
-        # "👑 Подписка" в main_kb() и команду /premium.
+        # "👑 Подписка" в главном меню (main_menu_kb) и команду /premium.
         [InlineKeyboardButton(text="✨ Возможности бота", url="https://t.me/CueMee")],
         [InlineKeyboardButton(text="🆘 Поддержка", url="https://t.me/CueMeSupport")],
     ])
@@ -3212,13 +3261,13 @@ async def handle_document(message: Message, bot: Bot, state: FSMContext) -> None
             if style_card and interaction_card:
                 await message.answer(
                     f"Готово! Данные по {name} загружены.\n"
-                    "Жми «💬 Ответ с CueMe» — подскажу что ответить.",
-                    reply_markup=main_kb(),
+                    "Открой /menu — там «💬 Ответ с CueMe» подскажет что ответить.",
+                    reply_markup=ReplyKeyboardRemove(),
                 )
             else:
                 await message.answer(
-                    "Файл загружен. Используй кнопки меню для работы.",
-                    reply_markup=main_kb(),
+                    "Файл загружен. Открой /menu для работы.",
+                    reply_markup=ReplyKeyboardRemove(),
                 )
         else:
             await state.set_state(Setup.waiting_for_contact)
@@ -3229,8 +3278,8 @@ async def handle_document(message: Message, bot: Bot, state: FSMContext) -> None
     else:
         await message.answer(
             f"Загружено — {name} ({chat.meta.total_messages} сообщений).\n"
-            "Нажми «🔬 Анализ собеседника» для разбора.",
-            reply_markup=main_kb(),
+            "Открой /menu → «🔬 Анализ собеседника» для разбора.",
+            reply_markup=ReplyKeyboardRemove(),
         )
 
 
@@ -3257,13 +3306,11 @@ async def cb_setup_contact(call: CallbackQuery, state: FSMContext) -> None:
         await state.clear()
         await call.message.edit_text(
             f"Готово! Данные по {name} загружены.\n"
-            "Жми «💬 Ответ с CueMe» — подскажу что ответить."
+            "Открой /menu — там «💬 Ответ с CueMe» подскажет что ответить."
         )
-        await call.message.answer("Готово к работе 👇", reply_markup=main_kb())
     else:
         await state.clear()
-        await call.message.edit_text("Файл загружен. Используй кнопки меню.")
-        await call.message.answer("Меню:", reply_markup=main_kb())
+        await call.message.edit_text("Файл загружен. Открой /menu для работы.")
 
 
 # ── /connect ─────────────────────────────────────────────────────────────────
@@ -5615,6 +5662,7 @@ async def main() -> None:
     bot = Bot(token=BOT_TOKEN)
     await bot.set_my_commands([
         BotCommand(command="start",       description="Начало работы"),
+        BotCommand(command="menu",        description="Главное меню"),
         BotCommand(command="gender",      description="Сменить пол"),
         BotCommand(command="help",        description="Список команд"),
         BotCommand(command="connect",     description="Подключить Автоматизацию чатов"),
