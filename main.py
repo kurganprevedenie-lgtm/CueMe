@@ -491,15 +491,27 @@ async def _require_premium(bot: Bot, target: Message, telegram_id: str) -> bool:
 
 
 # ── Реферальная программа ─────────────────────────────────────────────────────
-# Пригласивший получает REFERRAL_REWARD_DAYS дней полной Premium-подписки,
-# когда друг реально начинает пользоваться ботом (создан первый контакт).
-# Друг вводит персональный код пригласившего командой /redeem — см.
-# cmd_redeem ниже для анти-абуз проверок.
+# Пригласивший получает REFERRAL_REWARD_DAYS дней полной Premium-подписки за
+# КАЖДОГО друга. Два независимых пути привести друга:
+# 1) реферальная ССЫЛКА (/start ref<CODE>, см. cmd_start) — засчитывается и
+#    начисляется МГНОВЕННО при первом /start приглашённого, без требования
+#    Premium или подключения Автоматизации чатов — только сам факт /start.
+# 2) персональный КОД, который друг вводит вручную командой /redeem — тут
+#    начисление специально отложено до реального использования бота (первый
+#    контакт, см. _credit_referral_if_pending) — слабее сигнал вовлечённости,
+#    чем клик по настоящей ссылке, так что anti-abuse тут строже.
+# Оба пути пишут в одну и ту же таблицу referrals (save_referral_pending,
+# PRIMARY KEY referred_telegram_id — один друг не может быть засчитан дважды
+# ни при каком сочетании путей).
 
 
 async def _credit_referral_if_pending(bot: Bot, referred_id: str) -> None:
-    """Друг реально начал пользоваться (создан первый контакт) → начисляем
-    рефереру Premium-награду и уведомляем. Каждый новый друг НАКАПЛИВАЕТ
+    """Начисляет рефереру Premium-награду за referred_id, если по нему есть
+    незачтённая (credited=0) запись — идемпотентно, повторный вызов для уже
+    зачтённого друга просто no-op (get_pending_referral вернёт None). Вызывается
+    из двух мест: сразу из cmd_start (реферальная ссылка — мгновенно) и из
+    business-connect/JSON-import (страховка для /redeem-кода — там начисление
+    ждёт реального первого контакта). Каждый новый друг НАКАПЛИВАЕТ
     награду — REFERRAL_REWARD_DAYS прибавляются к уже активному окну (если
     оно ещё не истекло), а не перезаписывают его с текущего момента.
     Идемпотентно: credited-флаг + PRIMARY KEY(referred_id) не дают начислить
@@ -906,11 +918,20 @@ async def process_stars_successful_payment(message: Message, bot: Bot) -> None:
     await message.answer(f"🎉 Готово! Premium активен до {until_label}.{extra}")
 
 
-def _invite_text(telegram_id: str) -> str:
+async def _referral_link(bot: Bot, code: str) -> str:
+    """t.me/<реальный username бота>?start=ref<CODE> — читает username живьём
+    через bot.get_me(), никогда не хардкодит (раньше в ссылке был чужой
+    username — этот баг был именно тут)."""
+    me = await bot.get_me()
+    return f"https://t.me/{me.username}?start=ref{code}"
+
+
+async def _invite_text(bot: Bot, telegram_id: str) -> str:
     """Тело приглашения — общее для /invite и рассылки-напоминания
     (cmd_broadcast_invite), чтобы формулировка гарантированно не разъезжалась."""
     code = get_or_create_referral_code(telegram_id)
     count = count_successful_referrals(telegram_id)
+    link = await _referral_link(bot, code)
 
     if _has_referral_premium(telegram_id):
         until = get_deep_analysis_free_until(telegram_id)
@@ -922,11 +943,13 @@ def _invite_text(telegram_id: str) -> str:
         "🎁 Пригласи друга\n\n"
         f"👥 Приведено друзей: {count}\n"
         f"{reward_line}\n"
-        "Скинь другу этот код — пусть введёт его командой /redeem в этом боте.\n"
-        "Как только он реально начнёт пользоваться CueMe — тебе дадутся "
-        f"{REFERRAL_REWARD_DAYS} дня Premium подписки:\n\n"
-        f"<code>/redeem {html.escape(code)}</code>\n\n"
-        "(тапни по коду, чтобы скопировать)"
+        f"Пригласи друга по ссылке — получи {REFERRAL_REWARD_DAYS} дня Premium "
+        "сразу, как только он запустит бота. Без ограничений по количеству друзей:\n\n"
+        f"{link}\n\n"
+        "Ссылка не открывается? Дай ему свой код — введёт его командой "
+        f"/redeem (в этом случае награда придёт чуть позже, когда он реально "
+        "начнёт пользоваться CueMe):\n"
+        f"<code>{html.escape(code)}</code>"
     )
 
 
@@ -940,7 +963,7 @@ async def _show_invite(
     message: Message, bot: Bot, telegram_id: str | None = None, edit: bool = False,
 ) -> None:
     telegram_id = telegram_id or str(message.from_user.id)
-    text = _invite_text(telegram_id)
+    text = await _invite_text(bot, telegram_id)
     if edit:
         await message.edit_text(text, reply_markup=invite_kb(), parse_mode="HTML")
     else:
@@ -978,7 +1001,7 @@ async def _run_broadcast_invite(bot: Bot, requester_id: int) -> None:
     for u in users:
         telegram_id = u["telegram_id"]
         try:
-            text = "💡 Кстати, забыл сказать —\n\n" + _invite_text(telegram_id)
+            text = "💡 Кстати, забыл сказать —\n\n" + await _invite_text(bot, telegram_id)
             await bot.send_message(int(telegram_id), text, parse_mode="HTML")
             sent += 1
         except TelegramForbiddenError:
@@ -3122,6 +3145,22 @@ async def cmd_start(message: Message, state: FSMContext, bot: Bot) -> None:
         record_event(telegram_id, "start")  # для "последнее действие" в /users
     except Exception:
         logging.exception("cmd_start: не удалось записать событие")
+
+    # Реферальная ссылка (/start ref<CODE>) — засчитываем и начисляем СРАЗУ,
+    # только для реально НОВОГО юзера (is_new — до этого момента его не было
+    # в users вообще), без требования Premium или подключения Автоматизации
+    # чатов, см. коммент у _credit_referral_if_pending. Повторный /start (уже
+    # не is_new) с тем же параметром — no-op, защита от повторного начисления.
+    if is_new:
+        parts = (message.text or "").split(maxsplit=1)
+        payload = parts[1].strip() if len(parts) == 2 else ""
+        if payload.startswith("ref") and len(payload) > 3:
+            code = payload[3:].strip().upper()
+            referrer_id = get_referrer_by_code(code)
+            if referrer_id and referrer_id != telegram_id:
+                save_referral_pending(referrer_id, telegram_id)
+                await _credit_referral_if_pending(bot, telegram_id)
+
     await _send_start_menu(message, telegram_id)
     username = message.from_user.username
     is_test_account = bool(username) and username.lower() in TEST_ACCOUNT_USERNAMES
