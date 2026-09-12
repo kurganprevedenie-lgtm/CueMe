@@ -3743,25 +3743,25 @@ async def cb_export_user(call: CallbackQuery, bot: Bot) -> None:
             safe_name = re.sub(r"[^\w\-]+", "_", export["contact_name"] or f"contact{c['id']}")
 
             # Фото (с подписью или без) — скачиваем реальные байты (раз на
-            # file_id, а не на сообщение) и кладём рядом в архив, чтобы .html
-            # мог их встроить обычным <img src="...">. Сбой скачивания ОДНОГО
-            # фото не должен рушить весь экспорт — просто останется плейсхолдер
-            # «📷 Фото» в .html для этого сообщения.
-            photo_paths: dict[str, str] = {}
+            # file_id, а не на сообщение) и встраиваем прямо в .html base64
+            # (to_html), а не отдельными файлами рядом — так .html остаётся
+            # самостоятельным файлом, который не потеряет фото, если его
+            # скопировать/переслать отдельно от остального архива. Сбой
+            # скачивания ОДНОГО фото не должен рушить весь экспорт — просто
+            # останется плейсхолдер «📷 Фото» в .html для этого сообщения.
+            photo_data: dict[str, bytes] = {}
             file_ids = {m["photo_file_id"] for m in export["messages"] if m.get("photo_file_id")}
-            for i, file_id in enumerate(file_ids):
+            for file_id in file_ids:
                 try:
                     photo_buf = await bot.download(file_id)
                 except Exception:
                     logging.warning("export: не удалось скачать фото file_id=%s", file_id)
                     continue
-                photo_path = f"{safe_name}_photos/{i}.jpg"
-                zf.writestr(photo_path, photo_buf.read())
-                photo_paths[file_id] = photo_path
+                photo_data[file_id] = photo_buf.read()
 
             zf.writestr(f"{safe_name}.json", json.dumps(export, ensure_ascii=False, indent=2))
             zf.writestr(f"{safe_name}.txt", to_text(export))
-            zf.writestr(f"{safe_name}.html", to_html(export, photo_paths))
+            zf.writestr(f"{safe_name}.html", to_html(export, photo_data))
             added += 1
 
     if added == 0:

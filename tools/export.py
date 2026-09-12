@@ -15,6 +15,7 @@
     python -m tools.export --contact 3 --out chat.html
 """
 import argparse
+import base64
 import html
 import json
 import sys
@@ -106,20 +107,21 @@ def _fmt_day(dt: datetime) -> str:
     return label
 
 
-def to_html(export: dict, photo_paths: dict[str, str] | None = None) -> str:
-    """Визуальный HTML-экспорт — самостоятельный файл (инлайновый <style>, без
-    внешних зависимостей), открывается локально в браузере без интернета.
-    Сообщения автора (from_id == my_id) — пузырём справа, собеседника — слева,
-    с разделителем даты между днями, в духе типичного чат-интерфейса.
+def to_html(export: dict, photo_data: dict[str, bytes] | None = None) -> str:
+    """Визуальный HTML-экспорт — самостоятельный файл (инлайновый <style>,
+    инлайновые фото, без внешних зависимостей и внешних файлов), открывается
+    локально в браузере без интернета и не зависит от того, лежит ли рядом
+    что-то ещё — можно переслать/скопировать один .html и фото не потеряются.
 
-    photo_paths — {file_id: относительный путь внутри zip-архива} для фото,
-    уже скачанных через bot.download (см. main.cb_export_user — там же и
-    заполняется). Без него (CLI-запуск tools/export.py без живого бота,
-    file_id скачать нечем) фото показываются плейсхолдером «📷 Фото» —
-    подпись к фото, если была, показывается в любом случае."""
+    photo_data — {file_id: сырые байты} для фото, уже скачанных через
+    bot.download (см. main.cb_export_user — там же и заполняется), кодируются
+    прямо тут в data:-URI (base64), без отдельных файлов рядом. Без него
+    (CLI-запуск tools/export.py без живого бота, file_id скачать нечем) фото
+    показываются плейсхолдером «📷 Фото» — подпись к фото, если была,
+    показывается в любом случае."""
     name = export.get("contact_name") or "собеседник"
     my_id = export.get("my_id")
-    photo_paths = photo_paths or {}
+    photo_data = photo_data or {}
 
     rows_html: list[str] = []
     last_day: str | None = None
@@ -138,9 +140,10 @@ def to_html(export: dict, photo_paths: dict[str, str] | None = None) -> str:
         photo_file_id = m.get("photo_file_id")
         photo_html = ""
         if photo_file_id:
-            photo_path = photo_paths.get(photo_file_id)
-            if photo_path:
-                photo_html = f'<img class="bubble-photo" src="{html.escape(photo_path)}">'
+            raw = photo_data.get(photo_file_id)
+            if raw:
+                b64 = base64.b64encode(raw).decode("ascii")
+                photo_html = f'<img class="bubble-photo" src="data:image/jpeg;base64,{b64}">'
             else:
                 photo_html = '<div class="bubble-photo-placeholder">📷 Фото</div>'
         body = html.escape(text).replace("\n", "<br>") if text else ""
