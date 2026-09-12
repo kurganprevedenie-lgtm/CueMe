@@ -251,12 +251,10 @@ BTN_DATE          = "💐 Идеальное свидание"
 # BTN_MORE          = "⚙️ Ещё"
 BTN_SUBSCRIPTION  = "👑 Подписка"
 # BTN_HELP («❓ Помощь», /help — полный список команд) НЕ на главном меню —
-# сама функция и /help не тронуты, просто не кнопка меню. Не путать с
-# BTN_SUPPORT ниже — другая функция, случайно похожее название.
+# доступна только командой /help. BTN_SUPPORT ниже — пятая кнопка главного
+# меню (тоже «Помощь», разные эмодзи) — ведёт туда же (_show_help), с
+# кнопкой на @CueMeSupport внизу того же сообщения (support_kb).
 BTN_HELP          = "❓ Помощь"
-# BTN_SUPPORT — переименована из «🆘 Поддержка» (раньше только инлайн-кнопка
-# на экране /connect, business_connect_kb) — та же ссылка на @CueMeSupport,
-# теперь ещё и кнопка главного меню, пятая по счёту.
 BTN_SUPPORT       = "🆘 Помощь"
 # BTN_ME («👤 Мой стиль») убрана вместе с командой /me — дублировала
 # «Анализ своего стиля» (и была бесплатной лазейкой мимо подписки на неё;
@@ -1167,7 +1165,7 @@ async def cb_main_menu_action(call: CallbackQuery, state: FSMContext, bot: Bot) 
     elif action == "date":
         await _show_ideal_date(call.message, bot, telegram_id)
     elif action == "support":
-        await _show_support(call.message)
+        await _show_help(call.message)
 
 
 _BACK_TO_MENU_BUTTON = InlineKeyboardButton(text="⬅️ Вернуться в меню", callback_data="back_to_menu")
@@ -3195,14 +3193,16 @@ def support_kb() -> InlineKeyboardMarkup:
     return b.as_markup()
 
 
-async def _show_support(message: Message) -> None:
-    """BTN_SUPPORT («🆘 Помощь», кнопка главного меню) — та же ссылка на
-    @CueMeSupport, что и «Поддержка» в business_connect_kb (/connect).
-    Reply-кнопка не может сама быть url — шлём сообщение с инлайн-ссылкой."""
-    await message.answer(
-        "Если что-то не работает или есть вопрос — пиши сюда:",
-        reply_markup=support_kb(),
-    )
+# _show_support — раньше показывала только ссылку на @CueMeSupport по тапу
+# «🆘 Помощь» в главном меню. По запросу «в кнопке помощь должен быть список
+# команд» — BTN_SUPPORT теперь ведёт на _show_help (тот же список, что и
+# BTN_HELP//help), с кнопкой на поддержку внизу (support_kb в _show_help).
+# Не удалена физически — на случай отката.
+# async def _show_support(message: Message) -> None:
+#     await message.answer(
+#         "Если что-то не работает или есть вопрос — пиши сюда:",
+#         reply_markup=support_kb(),
+#     )
 
 
 # ── Кнопки главного меню ──────────────────────────────────────────────────────
@@ -3227,7 +3227,7 @@ async def handle_menu_button(message: Message, state: FSMContext, bot: Bot) -> N
     elif message.text == BTN_HELP:
         await _show_help(message)
     elif message.text == BTN_SUPPORT:
-        await _show_support(message)
+        await _show_help(message)
 
 
 @dp.callback_query(F.data.startswith("menu:"))
@@ -5292,6 +5292,7 @@ async def _show_help(message: Message) -> None:
         f"💎 {FREE_TRIAL_REQUESTS} бесплатных попыток на ответ, "
         "дальше и остальные функции — по подписке. Статус — /premium.",
         parse_mode="HTML",
+        reply_markup=support_kb(),
     )
 
 
