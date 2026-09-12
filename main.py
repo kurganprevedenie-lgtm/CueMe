@@ -449,8 +449,15 @@ def stars_tariff_kb() -> InlineKeyboardMarkup:
     return b.as_markup()
 
 
-async def _send_paywall(target: Message, text: str) -> None:
-    await target.answer(text, reply_markup=premium_menu_kb())
+async def _send_paywall(target: Message, text: str, edit: bool = False) -> None:
+    """edit=True — редактирует ТО ЖЕ сообщение (например, главное меню или
+    экран с контактом), а не шлёт отдельное новое — вызывающий код передаёт
+    edit только когда точно знает, что target это сообщение БОТА (иначе
+    edit_text упадёт на чужом/юзерском сообщении)."""
+    if edit:
+        await target.edit_text(text, reply_markup=premium_menu_kb())
+    else:
+        await target.answer(text, reply_markup=premium_menu_kb())
 
 
 async def _has_quota(bot: Bot, telegram_id: str) -> bool:
@@ -460,7 +467,7 @@ async def _has_quota(bot: Bot, telegram_id: str) -> bool:
     return get_trial_used(telegram_id) < FREE_TRIAL_REQUESTS
 
 
-async def _quota_gate(bot: Bot, target: Message, telegram_id: str) -> bool:
+async def _quota_gate(bot: Bot, target: Message, telegram_id: str, edit: bool = False) -> bool:
     """Проверка доступа БЕЗ списания. Если попытки кончились — показывает пейволл.
     Списание делает _charge_trial_if_needed уже ПОСЛЕ успешной генерации."""
     if await _has_quota(bot, telegram_id):
@@ -468,7 +475,8 @@ async def _quota_gate(bot: Bot, target: Message, telegram_id: str) -> bool:
     await _send_paywall(
         target,
         "Бесплатные попытки закончились — но, похоже, тебе заходит 😏 Дальше — "
-        "по подписке: весь функционал плюс полный разбор собеседника с подарками."
+        "по подписке: весь функционал плюс полный разбор собеседника с подарками.",
+        edit=edit,
     )
     return False
 
@@ -481,13 +489,13 @@ async def _charge_trial_if_needed(bot: Bot, telegram_id: str) -> None:
     increment_trial_used(telegram_id)
 
 
-async def _require_premium(bot: Bot, target: Message, telegram_id: str) -> bool:
+async def _require_premium(bot: Bot, target: Message, telegram_id: str, edit: bool = False) -> bool:
     """Гейт для функций без бесплатного триала (анализ собеседника, стиль
     собеседника и т.п.) — доступ только по активной подписке."""
     if await _is_premium(bot, telegram_id):
         return True
 
-    await _send_paywall(target, "Эта функция доступна только по подписке CueMe Premium.")
+    await _send_paywall(target, "Эта функция доступна только по подписке CueMe Premium.", edit=edit)
     return False
 
 
@@ -1196,9 +1204,9 @@ async def cb_main_menu_action(call: CallbackQuery, state: FSMContext, bot: Bot) 
     if action == "unified":
         await _start_unified_reply(call.message, state)
     elif action == "deep":
-        await _show_deep_analysis(call.message, bot, telegram_id)
+        await _show_deep_analysis(call.message, bot, telegram_id, edit=True)
     elif action == "date":
-        await _show_ideal_date(call.message, bot, telegram_id)
+        await _show_ideal_date(call.message, bot, telegram_id, edit=True)
     elif action == "support":
         await _show_help(call.message, edit=True)
 
@@ -2448,7 +2456,7 @@ async def _run_deep_analysis(
 ) -> None:
     # Реферальная награда теперь даёт полный Premium (учтено внутри _is_premium,
     # которую вызывает _require_premium) — отдельной проверки тут больше не нужно.
-    if not await _require_premium(bot, target, telegram_id):
+    if not await _require_premium(bot, target, telegram_id, edit=edit):
         return
     contact = get_contact_by_id(contact_id)
     if not contact:
@@ -2506,10 +2514,15 @@ async def _run_deep_analysis(
         )
 
 
-async def _show_deep_analysis(message: Message, bot: Bot, telegram_id: str | None = None) -> None:
-    # telegram_id передаётся явно из cb_submenu (call.from_user), т.к. message
-    # там — это сообщение БОТА с инлайн-клавиатурой, а не сообщение юзера, и
-    # message.from_user в этом случае был бы ботом, а не человеком.
+async def _show_deep_analysis(
+    message: Message, bot: Bot, telegram_id: str | None = None, edit: bool = False,
+) -> None:
+    # telegram_id передаётся явно из cb_submenu/cb_main_menu_action
+    # (call.from_user), т.к. message там — это сообщение БОТА с инлайн-
+    # клавиатурой, а не сообщение юзера, и message.from_user в этом случае
+    # был бы ботом, а не человеком. edit=True — оттуда же (главное меню):
+    # пейволл/статус редактируют то же сообщение, а не шлют новое (финальный
+    # результат — всегда отдельное новое сообщение, см. _run_deep_analysis).
     telegram_id = telegram_id or str(message.from_user.id)
     contacts = list_contacts(telegram_id)
     if not contacts:
@@ -2517,10 +2530,13 @@ async def _show_deep_analysis(message: Message, bot: Bot, telegram_id: str | Non
         return
 
     if len(contacts) == 1:
-        await _run_deep_analysis(bot, message, telegram_id, contacts[0]["id"])
+        await _run_deep_analysis(bot, message, telegram_id, contacts[0]["id"], edit=edit)
         return
 
-    await message.answer("Для кого сделать анализ собеседника?", reply_markup=contacts_kb(contacts, "deepan"))
+    if edit:
+        await message.edit_text("Для кого сделать анализ собеседника?", reply_markup=contacts_kb(contacts, "deepan"))
+    else:
+        await message.answer("Для кого сделать анализ собеседника?", reply_markup=contacts_kb(contacts, "deepan"))
 
 
 @dp.message(Command("deep_analysis"))
@@ -2628,7 +2644,7 @@ async def _run_ideal_date(
     bot: Bot, target: Message, telegram_id: str, contact_id: int,
     edit: bool = False, fresh: bool = False,
 ) -> None:
-    if not await _require_premium(bot, target, telegram_id):
+    if not await _require_premium(bot, target, telegram_id, edit=edit):
         return
     contact = get_contact_by_id(contact_id)
     if not contact:
@@ -2661,7 +2677,9 @@ async def _run_ideal_date(
     await _answer_long(target, _format_ideal_date(name, data), reply_markup=ideal_date_result_kb(contact_id))
 
 
-async def _show_ideal_date(message: Message, bot: Bot, telegram_id: str | None = None) -> None:
+async def _show_ideal_date(
+    message: Message, bot: Bot, telegram_id: str | None = None, edit: bool = False,
+) -> None:
     telegram_id = telegram_id or str(message.from_user.id)
     contacts = list_contacts(telegram_id)
     if not contacts:
@@ -2669,10 +2687,13 @@ async def _show_ideal_date(message: Message, bot: Bot, telegram_id: str | None =
         return
 
     if len(contacts) == 1:
-        await _run_ideal_date(bot, message, telegram_id, contacts[0]["id"])
+        await _run_ideal_date(bot, message, telegram_id, contacts[0]["id"], edit=edit)
         return
 
-    await message.answer("С кем свидание?", reply_markup=contacts_kb(contacts, "idealdate"))
+    if edit:
+        await message.edit_text("С кем свидание?", reply_markup=contacts_kb(contacts, "idealdate"))
+    else:
+        await message.answer("С кем свидание?", reply_markup=contacts_kb(contacts, "idealdate"))
 
 
 @dp.callback_query(F.data.startswith("idealdate_refresh:"))
@@ -4356,7 +4377,7 @@ async def cb_unified_contact(call: CallbackQuery, state: FSMContext, bot: Bot) -
     name = _contact_name(contact)
     await call.message.edit_text(f"Обрабатываю сообщение от {name}...")
     try:
-        await _process_reply_incoming(call.message, state, bot, pending_text, call.from_user.id)
+        await _process_reply_incoming(call.message, state, bot, pending_text, call.from_user.id, edit=True)
     except Exception:
         logging.exception("cb_unified_contact: сбой автообработки первого сообщения")
         await call.message.answer(
@@ -4623,11 +4644,17 @@ async def cb_variants_regen(call: CallbackQuery, state: FSMContext) -> None:
 
 async def _process_reply_incoming(
     message: Message, state: FSMContext, bot: Bot, incoming: str, user_id: int,
+    edit: bool = False,
 ) -> None:
     """Общий хвост «Ответить за меня»: сборка ctx и генерация вариантов.
     user_id — ОТДЕЛЬНЫМ параметром (не message.from_user.id) — при вызове
     из callback-контекста message может быть call.message, чей .from_user
-    это бот, не юзер (стандартная ловушка aiogram)."""
+    это бот, не юзер (стандартная ловушка aiogram). edit=True — только из
+    cb_unified_contact (message это call.message, только что отредактированное
+    "Обрабатываю сообщение от {name}..." — сообщение БОТА): если триал уже
+    исчерпан, пейволл редактирует его же, а не шлёт новое. edit=False (из
+    handle_incoming, по умолчанию) — message это реальное пересланное
+    сообщение от юзера, редактировать его нельзя."""
     telegram_id = str(user_id)
     data = await state.get_data()
     # Состояние НЕ сбрасываем — иначе следующее сообщение улетит в общий
@@ -4635,7 +4662,7 @@ async def _process_reply_incoming(
     # Выйти из режима — любая кнопка меню (handle_menu_button сбрасывает state).
 
     contact_id = data.get("contact_id")
-    if not await _quota_gate(bot, message, telegram_id):
+    if not await _quota_gate(bot, message, telegram_id, edit=edit):
         return
 
     # «Разбор переписки» (_send_reply_analysis) здесь отключён намеренно:
