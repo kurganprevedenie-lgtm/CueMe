@@ -27,7 +27,8 @@ from aiogram.types import (
     BotCommand,
     BufferedInputFile,
     BusinessConnection,
-    CallbackQuery, ChatMemberUpdated, Document, ErrorEvent, FSInputFile, InputRichMessage, Message,
+    CallbackQuery, ChatMemberUpdated, CopyTextButton, Document, ErrorEvent, FSInputFile,
+    InputRichMessage, LinkPreviewOptions, Message,
     InlineKeyboardButton, InlineKeyboardMarkup,
     LabeledPrice, PreCheckoutQuery,
     ReplyKeyboardMarkup, ReplyKeyboardRemove, KeyboardButton,
@@ -926,9 +927,11 @@ async def _referral_link(bot: Bot, code: str) -> str:
     return f"https://t.me/{me.username}?start=ref{code}"
 
 
-async def _invite_text(bot: Bot, telegram_id: str) -> str:
+async def _invite_text(bot: Bot, telegram_id: str) -> tuple[str, str]:
     """Тело приглашения — общее для /invite и рассылки-напоминания
-    (cmd_broadcast_invite), чтобы формулировка гарантированно не разъезжалась."""
+    (cmd_broadcast_invite), чтобы формулировка гарантированно не разъезжалась.
+    Возвращает (текст, ссылка) — ссылка нужна отдельно для кнопки
+    «📋 Скопировать ссылку» (copy_text, см. invite_kb)."""
     code = get_or_create_referral_code(telegram_id)
     count = count_successful_referrals(telegram_id)
     link = await _referral_link(bot, code)
@@ -939,23 +942,22 @@ async def _invite_text(bot: Bot, telegram_id: str) -> str:
     else:
         reward_line = ""
 
-    return (
+    text = (
         "🎁 Пригласи друга\n\n"
         f"👥 Приведено друзей: {count}\n"
         f"{reward_line}\n"
         f"Пригласи друга по ссылке — получи {REFERRAL_REWARD_DAYS} дня Premium "
         "сразу, как только он запустит бота. Без ограничений по количеству друзей:\n\n"
-        f"{link}\n\n"
-        "Ссылка не открывается? Дай ему свой код — введёт его командой "
-        f"/redeem (в этом случае награда придёт чуть позже, когда он реально "
-        "начнёт пользоваться CueMe):\n"
-        f"<code>{html.escape(code)}</code>"
+        f"{link}"
     )
+    return text, link
 
 
-def invite_kb() -> InlineKeyboardMarkup:
+def invite_kb(link: str) -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
+    b.button(text="📋 Скопировать ссылку", copy_text=CopyTextButton(text=link))
     b.button(text="⬅️ Назад", callback_data="show_premium")
+    b.adjust(1)
     return b.as_markup()
 
 
@@ -963,11 +965,16 @@ async def _show_invite(
     message: Message, bot: Bot, telegram_id: str | None = None, edit: bool = False,
 ) -> None:
     telegram_id = telegram_id or str(message.from_user.id)
-    text = await _invite_text(bot, telegram_id)
+    text, link = await _invite_text(bot, telegram_id)
+    # Ссылка сама по себе не разворачивается в превью (Telegram
+    # показывал большую карточку бота под текстом) — она уже видна как
+    # текст и копируется кнопкой, лишняя карточка тут не нужна.
+    preview = LinkPreviewOptions(is_disabled=True)
+    kb = invite_kb(link)
     if edit:
-        await message.edit_text(text, reply_markup=invite_kb(), parse_mode="HTML")
+        await message.edit_text(text, reply_markup=kb, parse_mode="HTML", link_preview_options=preview)
     else:
-        await message.answer(text, reply_markup=invite_kb(), parse_mode="HTML")
+        await message.answer(text, reply_markup=kb, parse_mode="HTML", link_preview_options=preview)
 
 
 @dp.message(Command("invite"))
@@ -1001,8 +1008,13 @@ async def _run_broadcast_invite(bot: Bot, requester_id: int) -> None:
     for u in users:
         telegram_id = u["telegram_id"]
         try:
-            text = "💡 Кстати, забыл сказать —\n\n" + await _invite_text(bot, telegram_id)
-            await bot.send_message(int(telegram_id), text, parse_mode="HTML")
+            body, link = await _invite_text(bot, telegram_id)
+            text = "💡 Кстати, забыл сказать —\n\n" + body
+            await bot.send_message(
+                int(telegram_id), text, parse_mode="HTML",
+                reply_markup=invite_kb(link),
+                link_preview_options=LinkPreviewOptions(is_disabled=True),
+            )
             sent += 1
         except TelegramForbiddenError:
             # Юзер заблокировал бота — ожидаемо на любой массовой рассылке,
