@@ -338,6 +338,13 @@ def init_db() -> None:
         # приватном канале Tribute (это отдельный, параллельный способ оплаты,
         # тот же паттерн *_until, что у реферальной и промо-наград выше).
         _add_column_if_missing(conn, "users", "stars_premium_until", "TEXT")
+        # Фото из Business-переписки (только они несут реальный Telegram
+        # file_id, который бот может скачать — фото из JSON-экспорта на
+        # диске пользователя, не у нас, поэтому imported_messages не трогаем).
+        # text у такого сообщения обычно NULL (нет подписи к фото) — само
+        # сообщение уже сохранялось и раньше, просто file_id нигде не
+        # оседал и был потерян навсегда.
+        _add_column_if_missing(conn, "business_messages", "photo_file_id", "TEXT")
 
         # Индексы под горячие выборки (пересборка карточек, чтение истории)
         _create_index_if_missing(
@@ -1552,6 +1559,52 @@ def get_all_dated_messages(owner_user_id: str, contact_id: int) -> list[dict]:
     return out
 
 
+def get_all_dated_messages_for_export(owner_user_id: str, contact_id: int) -> list[dict]:
+    """Как get_all_dated_messages, но ТАКЖЕ включает business-сообщения без
+    текста, у которых есть photo_file_id (чистое фото без подписи) — иначе
+    отфильтровываются наравне с пустыми. Только для /export (tools/export.py):
+    анализ/карточки (get_all_dated_messages) фото не должны видеть — там
+    нечего скармливать LLM без подписи. imported_messages фото не несут
+    (JSON-экспорт Telegram Desktop хранит фото файлами на диске юзера, у
+    бота нет к ним доступа и Telegram file_id для них)."""
+    with _conn() as conn:
+        biz_rows = conn.execute(
+            """
+            SELECT bm.date, bm.direction, bm.text, bm.photo_file_id
+            FROM business_messages bm
+            JOIN business_chat_refs bcr
+                ON bm.chat_ref = bcr.chat_ref
+               AND bm.owner_user_id = bcr.owner_user_id
+            WHERE bcr.contact_id = ?
+              AND bm.owner_user_id = ?
+              AND ((bm.text IS NOT NULL AND bm.text != '') OR bm.photo_file_id IS NOT NULL)
+            """,
+            (contact_id, owner_user_id),
+        ).fetchall()
+        imp_rows = conn.execute(
+            """
+            SELECT date, direction, text
+            FROM imported_messages
+            WHERE contact_id = ? AND text IS NOT NULL AND text != ''
+            """,
+            (contact_id,),
+        ).fetchall()
+
+    seen: set[tuple[str, str, str | None]] = set()
+    out: list[dict] = []
+    for row in list(biz_rows) + list(imp_rows):
+        photo_file_id = row["photo_file_id"] if "photo_file_id" in row.keys() else None
+        key = (row["date"], row["direction"], row["text"] or photo_file_id)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append({
+            "date": row["date"], "direction": row["direction"],
+            "text": row["text"], "photo_file_id": photo_file_id,
+        })
+    return out
+
+
 def count_biz_messages_for_contact(owner_user_id: str, contact_id: int) -> int:
     """Всего сообщений (в обе стороны) для контакта через маппинг."""
     with _conn() as conn:
@@ -1661,18 +1714,21 @@ def save_business_message(
     date: str,
     tg_message_id: int | None,
     raw_meta: dict,
+    photo_file_id: str | None = None,
 ) -> int | None:
     """Сохраняет business-сообщение. Возвращает id вставленного ряда, или None,
     если это дубль (повторная доставка того же connection_id+chat_ref+tg_message_id) —
     id нужен вызывающему коду, чтобы привязать к сообщению результат сопоставления
-    с подсказкой (см. suggestion_matches/mark_suggestion_matched)."""
+    с подсказкой (см. suggestion_matches/mark_suggestion_matched).
+    photo_file_id — Telegram file_id самой большой версии фото (если сообщение
+    фото, с подписью или без), для просмотра в /export (см. tools/export.py)."""
     with _conn() as conn:
         cur = conn.execute(
             """
             INSERT OR IGNORE INTO business_messages
                 (connection_id, owner_user_id, chat_ref, direction,
-                 text, date, tg_message_id, raw_meta)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                 text, date, tg_message_id, raw_meta, photo_file_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 connection_id,
@@ -1683,6 +1739,7 @@ def save_business_message(
                 date,
                 tg_message_id,
                 json.dumps(raw_meta, ensure_ascii=False),
+                photo_file_id,
             ),
         )
         return cur.lastrowid if cur.rowcount > 0 else None

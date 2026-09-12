@@ -2639,6 +2639,7 @@ def _persist_business_message(
     text: str | None, is_voice: bool, date: str, tg_message_id: int,
     contact_tg_id: str, chat_first_name: str | None, chat_last_name: str | None,
     chat_username: str | None, sender_username: str | None,
+    photo_file_id: str | None = None,
 ) -> int | None:
     """Синхронная DB-часть обработки business-сообщения: сохранение + резолв контакта
     + троттлинг refresh + сопоставление с подсказками CueMe (для исходящих).
@@ -2647,7 +2648,7 @@ def _persist_business_message(
     message_id = save_business_message(
         connection_id=conn_id, owner_user_id=owner_id, chat_ref=chat_ref,
         direction=direction, text=text, date=date, tg_message_id=tg_message_id,
-        raw_meta=_msg_meta(text, is_voice),
+        raw_meta=_msg_meta(text, is_voice), photo_file_id=photo_file_id,
     )
     if message_id is None:
         # Повторная доставка того же сообщения — не триггерим пересборку.
@@ -2713,6 +2714,9 @@ async def handle_business_message(event: Message, bot: Bot) -> None:
     chat_ref  = _chat_ref(event.chat.id)
     text, is_voice = await _message_text(bot, event)  # голосовое → текст через Whisper
     date      = event.date.isoformat()
+    # Самое большое разрешение — для просмотра в /export (см. tools/export.py).
+    # event.caption уже попал в text через _message_text выше, если было.
+    photo_file_id = event.photo[-1].file_id if event.photo else None
 
     # Синхронную DB-часть уводим в поток, чтобы не блокировать event loop.
     contact_id_for_rebuild = await asyncio.to_thread(
@@ -2723,6 +2727,7 @@ async def handle_business_message(event: Message, bot: Bot) -> None:
         chat_first_name=event.chat.first_name, chat_last_name=event.chat.last_name,
         chat_username=getattr(event.chat, "username", None),
         sender_username=event.from_user.username if event.from_user else None,
+        photo_file_id=photo_file_id,
     )
 
     if contact_id_for_rebuild:
@@ -3736,9 +3741,27 @@ async def cb_export_user(call: CallbackQuery, bot: Bot) -> None:
             if not export["messages"]:
                 continue
             safe_name = re.sub(r"[^\w\-]+", "_", export["contact_name"] or f"contact{c['id']}")
+
+            # Фото (с подписью или без) — скачиваем реальные байты (раз на
+            # file_id, а не на сообщение) и кладём рядом в архив, чтобы .html
+            # мог их встроить обычным <img src="...">. Сбой скачивания ОДНОГО
+            # фото не должен рушить весь экспорт — просто останется плейсхолдер
+            # «📷 Фото» в .html для этого сообщения.
+            photo_paths: dict[str, str] = {}
+            file_ids = {m["photo_file_id"] for m in export["messages"] if m.get("photo_file_id")}
+            for i, file_id in enumerate(file_ids):
+                try:
+                    photo_buf = await bot.download(file_id)
+                except Exception:
+                    logging.warning("export: не удалось скачать фото file_id=%s", file_id)
+                    continue
+                photo_path = f"{safe_name}_photos/{i}.jpg"
+                zf.writestr(photo_path, photo_buf.read())
+                photo_paths[file_id] = photo_path
+
             zf.writestr(f"{safe_name}.json", json.dumps(export, ensure_ascii=False, indent=2))
             zf.writestr(f"{safe_name}.txt", to_text(export))
-            zf.writestr(f"{safe_name}.html", to_html(export))
+            zf.writestr(f"{safe_name}.html", to_html(export, photo_paths))
             added += 1
 
     if added == 0:

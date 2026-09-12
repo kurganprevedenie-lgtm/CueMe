@@ -27,7 +27,11 @@ import storage
 def extract_conversation(contact_id: int) -> dict:
     """Собирает переписку контакта в формате Telegram-экспорта (result.json),
     который понимают tg_parser.parse_chat и eval --export.
-    Ключи my_id/contact_name — служебные (parse_chat читает только messages)."""
+    Ключи my_id/contact_name — служебные (parse_chat читает только messages).
+    Фото без подписи (photo_file_id есть, text пуст) тоже попадают сюда —
+    get_all_dated_messages_for_export не фильтрует их, в отличие от
+    get_all_dated_messages (тот отдаёт данные для LLM-анализа, фото без
+    текста туда скармливать нечего)."""
     contact = storage.get_contact_by_id(contact_id)
     if not contact:
         raise ValueError(f"контакт id={contact_id} не найден в bot.db")
@@ -37,7 +41,7 @@ def extract_conversation(contact_id: int) -> dict:
     contact_fid = contact["original_from_id"] or f"contact{contact_id}"
     name = contact["display_name"] or contact_fid
 
-    rows = storage.get_all_dated_messages(owner, contact_id)
+    rows = storage.get_all_dated_messages_for_export(owner, contact_id)
     rows.sort(key=lambda r: r["date"])
     # (date, text) исходящего business-сообщения → результат сопоставления с
     # подсказкой CueMe (main._match_outgoing_to_suggestion) — тот же
@@ -50,9 +54,11 @@ def extract_conversation(contact_id: int) -> dict:
             "type": "message",
             "from_id": my_id if r["direction"] == "out" else contact_fid,
             "from": "Я" if r["direction"] == "out" else name,
-            "text": r["text"],
+            "text": r["text"] or "",
             "date": r["date"],
         }
+        if r.get("photo_file_id"):
+            m["photo_file_id"] = r["photo_file_id"]
         if r["direction"] == "out":
             match = matches.get((r["date"], r["text"]))
             if match:
@@ -74,10 +80,12 @@ def _cueme_badge(match: dict | None) -> str:
 def to_text(export: dict) -> str:
     """Человекочитаемая выгрузка: «[дата] Кто: текст» — плюс короткая приписка
     «🤖 CueMe (N%)» / «🤖 CueMe (с правками)» в конце строки, если исходящее
-    сообщение засчитано как использование подсказки (см. cueme_match)."""
+    сообщение засчитано как использование подсказки (см. cueme_match). Фото
+    без подписи — «📷 Фото»; сам файл в .txt не встроить, смотреть в .html."""
     lines = []
     for m in export["messages"]:
-        line = f"[{m['date']}] {m['from']}: {m['text']}"
+        body = m["text"] or ("📷 Фото" if m.get("photo_file_id") else "")
+        line = f"[{m['date']}] {m['from']}: {body}"
         badge = _cueme_badge(m.get("cueme_match"))
         if badge:
             line += f"  {badge}"
@@ -98,21 +106,20 @@ def _fmt_day(dt: datetime) -> str:
     return label
 
 
-def to_html(export: dict) -> str:
+def to_html(export: dict, photo_paths: dict[str, str] | None = None) -> str:
     """Визуальный HTML-экспорт — самостоятельный файл (инлайновый <style>, без
     внешних зависимостей), открывается локально в браузере без интернета.
     Сообщения автора (from_id == my_id) — пузырём справа, собеседника — слева,
     с разделителем даты между днями, в духе типичного чат-интерфейса.
 
-    Медиа-плейсхолдер (фото/голосовое без текста) — ЧИСТО подстраховка на
-    случай пустого text: storage.get_all_dated_messages уже фильтрует такие
-    сообщения на уровне SQL (WHERE text IS NOT NULL AND text != ''), поэтому
-    extract_conversation физически не отдаёт медиа-only сообщения — to_text()
-    по той же причине их никак не обрабатывает, этот код в реальности не
-    срабатывает, пока структура данных (messages: from_id/from/text/date) не
-    начнёт нести отдельный признак типа сообщения."""
+    photo_paths — {file_id: относительный путь внутри zip-архива} для фото,
+    уже скачанных через bot.download (см. main.cb_export_user — там же и
+    заполняется). Без него (CLI-запуск tools/export.py без живого бота,
+    file_id скачать нечем) фото показываются плейсхолдером «📷 Фото» —
+    подпись к фото, если была, показывается в любом случае."""
     name = export.get("contact_name") or "собеседник"
     my_id = export.get("my_id")
+    photo_paths = photo_paths or {}
 
     rows_html: list[str] = []
     last_day: str | None = None
@@ -128,18 +135,24 @@ def to_html(export: dict) -> str:
             last_day = day_key
 
         text = (m.get("text") or "").strip()
-        if text:
-            body = html.escape(text).replace("\n", "<br>")
-        else:
-            body = "📷 Без текста"  # медиа-плейсхолдер, см. докстринг выше
+        photo_file_id = m.get("photo_file_id")
+        photo_html = ""
+        if photo_file_id:
+            photo_path = photo_paths.get(photo_file_id)
+            if photo_path:
+                photo_html = f'<img class="bubble-photo" src="{html.escape(photo_path)}">'
+            else:
+                photo_html = '<div class="bubble-photo-placeholder">📷 Фото</div>'
+        body = html.escape(text).replace("\n", "<br>") if text else ""
 
         time_label = dt.strftime("%H:%M") if dt is not None else ""
         side = "out" if m.get("from_id") == my_id else "in"
         badge = _cueme_badge(m.get("cueme_match"))
         badge_html = f'<div class="cueme-badge">{html.escape(badge)}</div>' if badge else ""
+        text_html = f'<div class="bubble-text">{body}</div>' if body else ""
         rows_html.append(
             f'<div class="row {side}"><div class="bubble">'
-            f'<div class="bubble-text">{body}</div>'
+            f"{photo_html}{text_html}"
             f"{badge_html}"
             f'<div class="bubble-time">{time_label}</div>'
             f'</div></div>'
@@ -214,6 +227,18 @@ def to_html(export: dict) -> str:
     line-height: 1.35;
     white-space: pre-wrap;
     word-wrap: break-word;
+  }}
+  .bubble-photo {{
+    display: block;
+    max-width: 260px;
+    max-height: 260px;
+    border-radius: 6px;
+    margin-bottom: 4px;
+  }}
+  .bubble-photo-placeholder {{
+    font-size: 14.5px;
+    color: var(--meta);
+    margin-bottom: 4px;
   }}
   .bubble-time {{
     font-size: 11px;
