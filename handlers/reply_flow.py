@@ -56,7 +56,7 @@ from llm import (
     live_coach_step,
     suggest_reply_variants,
 )
-from services.cards import _gen_interaction_card, _gen_my_style_per_contact, _gen_style_card
+from services.cards import _gen_interaction_card, _gen_style_card
 from storage import (
     get_all_dated_messages,
     get_contact_by_id,

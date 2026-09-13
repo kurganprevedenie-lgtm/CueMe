@@ -4,7 +4,6 @@
 Код перенесён из main.py без изменений (структурный рефакторинг), кроме
 регистрации на собственном Router вместо глобального Dispatcher.
 """
-import html
 import logging
 from datetime import datetime, timedelta, timezone
 

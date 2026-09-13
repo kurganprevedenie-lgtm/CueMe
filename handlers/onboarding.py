@@ -9,8 +9,6 @@ JSON-экспорта переписки.
 import html
 import logging
 import tempfile
-import uuid
-from datetime import datetime, timezone
 from pathlib import Path
 
 from aiogram import Bot, F, Router

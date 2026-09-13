@@ -33,11 +33,7 @@ from aiogram.types import (
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-from config import (
-    ADMIN_GROUP_CHAT_ID,
-    FREE_TRIAL_REQUESTS,
-    REBUILD_THRESHOLD,
-)
+from config import ADMIN_GROUP_CHAT_ID
 from handlers.common import (
     _GENDER_LABELS,
     _contact_name,

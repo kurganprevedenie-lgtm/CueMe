@@ -20,7 +20,6 @@ from aiogram.filters import Command
 from aiogram.types import (
     CallbackQuery,
     ChatMemberUpdated,
-    InlineKeyboardButton,
     InlineKeyboardMarkup,
     LabeledPrice,
     Message,
@@ -42,7 +41,6 @@ from handlers.common import (
     _format_until,
     _is_premium,
     _premium_expiry_info,
-    _ru_days_word,
     _send_main_menu,
     paywall_kb,
     premium_menu_kb,
