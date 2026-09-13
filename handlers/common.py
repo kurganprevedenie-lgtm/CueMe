@@ -615,6 +615,8 @@ def _premium_expiry_info(telegram_id: str) -> tuple[str, datetime | None, bool]:
         payment = get_latest_star_payment(telegram_id)
         return "stars", until, bool(payment and payment["is_subscription"])
 
+    return "tribute", None, False
+
 # ── Экран главного меню ──────────────────────────────────────────────────────
 # Живёт в общем слое, а не в handlers/main_menu.py, потому что на него
 # ссылаются в обе стороны: main_menu показывает его, а «⬅️ Назад» из
