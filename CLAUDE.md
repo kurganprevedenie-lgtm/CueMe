@@ -54,7 +54,7 @@ CueMe — AI-ассистент для дейтинга и отношений в
 > «Скриншот → ответ» (кнопка «📸 По скриншоту», Vision читает скриншот
 > переписки) убрана из бота совсем — как отдельная команда `/screenshot`,
 > так и приём фото внутри «💬 Ответ с CueMe» (там теперь только текст/форвард).
-> Код закомментирован в main.py, не удалён физически.
+> Код закомментирован в `handlers/reply_flow.py`, не удалён физически.
 
 > «Анализ своего стиля» (кнопка «🪞», Большая пятёрка + лингвистический
 > разбор + блок «лучшая совместимость») убран из бота совсем — остаётся
@@ -119,9 +119,9 @@ LLM вызывается лениво — только при запросе п�
 users(telegram_id PK, my_id, created_at, auto_mode, auto_contact_id,
       last_style_rebuild_count, trial_used, gender)
       -- gender: 'male' | 'female' | NULL, спрашивается в самом начале
-      -- (GenderGateMiddleware в main.py блокирует всё взаимодействие, пока не
-      -- выбран); нужен для согласования рода в промптах (llm.py: _gender_note)
-      -- и обращения к пользователю. Меняется командой /gender.
+      -- (GenderGateMiddleware в handlers/common.py блокирует всё взаимодействие,
+      -- пока не выбран); нужен для согласования рода в промптах (llm.py:
+      -- _gender_note) и обращения к пользователю. Меняется командой /gender.
 contacts(id PK, user_telegram_id, contact_alias UUID,
          original_from_id, display_name)
 style_cards(user_telegram_id PK, card_text, updated_at)
@@ -147,21 +147,64 @@ events(id PK AUTO, ts, user_telegram_id, event_type, meta)  -- продукто�
 
 ## Файлы проекта
 
-- `main.py` — aiogram-хендлеры, FSM, вся логика бота
-- `storage.py` — SQLite, все таблицы и функции работы с БД
-- `llm.py` — вызовы Groq через httpx (trust_env=False)
-- `features.py` — локальные признаки переписки без LLM
-- `tg_parser.py` — парсер JSON-экспорта Telegram Desktop
-- `config.py` — константы из .env, APP_NAME = "CueMe"
-- `PROMPTS.md` — все промпты бота (документация)
+Раньше вся логика бота лежала в одном `main.py` (5843 строки) — разложена
+по модулям структурным рефакторингом (поведение не менялось).
+
+```
+main.py                  — точка входа: Bot/Dispatcher, обработчик ошибок,
+                           GenderGateMiddleware, include_router, polling
+config.py                — константы из .env, APP_NAME = "CueMe"
+handlers/                — хендлеры по функциональным областям, каждый со своим Router
+  common.py              — ОБЩИЙ слой: константы кнопок, FSM-состояния, доступ
+                           (_is_premium/_quota_gate/_require_premium/_send_paywall +
+                           клавиатуры пейволла), экран главного меню
+                           (_send_main_menu/main_menu_kb), gender-гейт, мелкие
+                           хелперы (_answer_long/_contact_name/_message_text/...)
+  onboarding.py          — /start (+реф-ссылка), источник и пол, квикстарт-цепочка,
+                           /connect, импорт JSON-экспорта
+  business.py            — Telegram Business API: подключение и приём живого потока
+  main_menu.py           — /menu, тапы mm:*, «Вернуться в меню», текстовый фолбэк
+  subscription.py        — экран «Подписка», промо-канал, Telegram Stars,
+                           payments_router (pre_checkout/successful_payment)
+  referral.py            — реферальная ссылка, /redeem, /myref, начисление награды
+  reply_flow.py          — «Ответ с CueMe»: ответ контакту, живой диалог, фразы
+  analysis.py            — «Анализ собеседника»: метрики, интерпретация, рендер
+  date_ideas.py          — «Идеальное свидание»
+  support.py             — /help и ссылка на поддержку
+  admin.py               — /users, /sources, /suggestion_stats, /export, /provider,
+                           /inspect, /wipe, /broadcast_invite, захват file_id фото
+  account.py             — /contacts, /rebuild, /progress, /delete, «мой стиль с ним»
+services/
+  cards.py               — генерация и авто-пересборка карточек стиля (без хендлеров)
+storage.py               — SQLite, все таблицы и функции работы с БД
+llm.py                   — каскад LLM-провайдеров через httpx (trust_env=False)
+features.py              — локальные признаки переписки без LLM
+compatibility_metrics.py — детерминированные метрики совместимости
+tg_parser.py             — парсер JSON-экспорта Telegram Desktop
+tools/export.py          — выгрузка переписки в JSON/TXT/HTML (CLI + /export)
+PROMPTS.md               — все промпты бота (документация)
+```
+
+**Порядок include_router в `main.py` — часть поведения, не стиль.** aiogram
+резолвит апдейт по порядку регистрации: первый подошедший хендлер забирает
+его. Значимые пересечения (подробный комментарий — в самом `main.py`):
+платежи подключаются первыми; `referral` — до остальных (состояние ввода
+кода ловит любое сообщение); `main_menu`/`admin`/`onboarding` — до
+`reply_flow` (кнопка меню выходит из режима, фото/документ перехватываются);
+`account`/`support`/`subscription` — после `reply_flow`. Перед перестановкой
+роутеров проверь, не пересекаются ли фильтры.
 
 ## Главное меню бота
 
+Одно сообщение с inline-клавиатурой (не reply-панель), редактируется при
+переходах — как и раздел «Подписка»:
+
 ```
-[📝 Переписать]      [👤 Мой стиль]
-[🔍 Стиль собеседника] [🔄 Авто-режим]
-[📸 По скриншоту]   [🔬 Глубокий анализ]
-[🎯 Мой стиль с ним] [📋 Контакты]
+[💬 Ответ с CueMe]
+[🔬 Анализ собеседника]
+[💐 Идеальное свидание]
+[👑 Подписка]
+[🆘 Помощь]
 ```
 
 ## Business API
@@ -211,8 +254,8 @@ Tribute (10% комиссия, без вебхука на нашей сторо�
   локальный и без LLM, но включение фичи всё равно платное.
 - Все остальные функции (анализ собеседника, анализ своего стиля, стиль
   собеседника, /rebuild_all) — только по активной подписке, без триала.
-- Гейты: `_consume_trial_or_paywall()` (триал) и `_require_premium()` (жёсткий),
-  обе в main.py, обёрнуты вокруг `_is_premium()`.
+- Гейты: `_quota_gate()` (триал) и `_require_premium()` (жёсткий), обе в
+  `handlers/common.py`, обёрнуты вокруг `_is_premium()`.
 
 ## Соглашения по коду
 
