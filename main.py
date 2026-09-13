@@ -28,7 +28,7 @@ from aiogram.types import (
     BufferedInputFile,
     BusinessConnection,
     CallbackQuery, ChatMemberUpdated, CopyTextButton, Document, ErrorEvent, FSInputFile,
-    InputRichMessage, LinkPreviewOptions, Message,
+    InputMediaDocument, InputRichMessage, LinkPreviewOptions, Message,
     InlineKeyboardButton, InlineKeyboardMarkup,
     LabeledPrice, PreCheckoutQuery,
     ReplyKeyboardMarkup, ReplyKeyboardRemove, KeyboardButton,
@@ -3707,53 +3707,58 @@ async def _collect_users_data(bot: Bot) -> tuple[list[dict], dict]:
     return rows, totals
 
 
-def _build_users_report(rows: list[dict], totals: dict, hidden_count: int = 0) -> list[str]:
-    """Возвращает список блоков (шапка, по одному на юзера, сводка) — НЕ
-    склеенную строку, чтобы cmd_users мог резать на чанки по границам
-    блоков, а не посреди HTML-тега.
-
-    rows — сюда передаются ТОЛЬКО активные (см. cmd_users: фильтр по
-    _status_line == "✅ Активен") — заблокировавших бота, отключивших
-    Автоматизацию и застойных юзеров в сообщение не выводим, они есть
-    только в CSV. hidden_count — сколько строк скрыто, для пометки в шапке."""
-    blocks = ["👥 <b>Пользователи CueMe</b>"]
-    if hidden_count:
-        blocks.append(
-            f"Показаны только активные — {hidden_count} неактивных/заблокировавших/"
-            "отключивших Автоматизацию скрыты из сообщения, они есть в CSV-файле ниже."
-        )
-
-    for r in rows:
-        blocks.append(
-            f"👤 <b>{html.escape(r['username'])}</b>\n"
-            f"    Пол: {r['gender']} · Триал: {r['trial_used']}\n"
-            f"    Источник: {r['source']}\n"
-            f"    Контактов: {r['contacts_count']} · Сообщений: {r['messages_count']}\n"
-            f"    Последнее действие: {r['_last_action_label']} · "
-            f"Последнее сообщение от собеседника: {r['_last_incoming_label']}\n"
-            f"    Статус: {r['_status_line']}{r['_premium_line']}"
-        )
-
-    blocks.append(
-        f"📊 <b>Сводка</b>\n"
-        f"Всего: {totals['total']}\n"
-        f"С полом: {totals['with_gender']}\n"
-        f"С контактом: {totals['with_contact']}\n"
-        f"С активной реферальной Premium: {totals['with_ref_premium']}\n"
-        f"Заблокировали бота: {totals['blocked']}\n"
-        f"Отключили Автоматизацию чатов: {totals['automation_off']}\n"
-        f"Неактивных (&gt;{_INACTIVE_AFTER_DAYS} дн.): {totals['inactive']}"
-    )
-    blocks.append(
-        f"🧩 <b>Пользуются функциями</b>\n"
-        f"Ответить за меня: {totals['used_reply']}\n"
-        f"По скриншоту: {totals['used_screenshot']}\n"
-        f"Ответить с CueMe (live): {totals['used_live']}\n"
-        f"Анализ собеседника: {totals['used_deep_analysis']}\n"
-        f"Активны за 7 дней: {totals['active_7d']}\n"
-        f"Premium сейчас: {totals['premium_now']}"
-    )
-    return blocks
+# _build_users_report — раньше рендерила /users как кучу текстовых сообщений
+# (шапка + блок на каждого активного юзера + сводка), которые Telegram резал
+# на чанки по 3500 символов. По прямому запросу — больше не шлём: только два
+# файла (HTML + CSV, см. _build_users_html/_build_users_csv и cmd_users
+# ниже). Не удалена физически — на случай отката.
+# def _build_users_report(rows: list[dict], totals: dict, hidden_count: int = 0) -> list[str]:
+#     """Возвращает список блоков (шапка, по одному на юзера, сводка) — НЕ
+#     склеенную строку, чтобы cmd_users мог резать на чанки по границам
+#     блоков, а не посреди HTML-тега.
+#
+#     rows — сюда передаются ТОЛЬКО активные (см. cmd_users: фильтр по
+#     _status_line == "✅ Активен") — заблокировавших бота, отключивших
+#     Автоматизацию и застойных юзеров в сообщение не выводим, они есть
+#     только в CSV. hidden_count — сколько строк скрыто, для пометки в шапке."""
+#     blocks = ["👥 <b>Пользователи CueMe</b>"]
+#     if hidden_count:
+#         blocks.append(
+#             f"Показаны только активные — {hidden_count} неактивных/заблокировавших/"
+#             "отключивших Автоматизацию скрыты из сообщения, они есть в CSV-файле ниже."
+#         )
+#
+#     for r in rows:
+#         blocks.append(
+#             f"👤 <b>{html.escape(r['username'])}</b>\n"
+#             f"    Пол: {r['gender']} · Триал: {r['trial_used']}\n"
+#             f"    Источник: {r['source']}\n"
+#             f"    Контактов: {r['contacts_count']} · Сообщений: {r['messages_count']}\n"
+#             f"    Последнее действие: {r['_last_action_label']} · "
+#             f"Последнее сообщение от собеседника: {r['_last_incoming_label']}\n"
+#             f"    Статус: {r['_status_line']}{r['_premium_line']}"
+#         )
+#
+#     blocks.append(
+#         f"📊 <b>Сводка</b>\n"
+#         f"Всего: {totals['total']}\n"
+#         f"С полом: {totals['with_gender']}\n"
+#         f"С контактом: {totals['with_contact']}\n"
+#         f"С активной реферальной Premium: {totals['with_ref_premium']}\n"
+#         f"Заблокировали бота: {totals['blocked']}\n"
+#         f"Отключили Автоматизацию чатов: {totals['automation_off']}\n"
+#         f"Неактивных (&gt;{_INACTIVE_AFTER_DAYS} дн.): {totals['inactive']}"
+#     )
+#     blocks.append(
+#         f"🧩 <b>Пользуются функциями</b>\n"
+#         f"Ответить за меня: {totals['used_reply']}\n"
+#         f"По скриншоту: {totals['used_screenshot']}\n"
+#         f"Ответить с CueMe (live): {totals['used_live']}\n"
+#         f"Анализ собеседника: {totals['used_deep_analysis']}\n"
+#         f"Активны за 7 дней: {totals['active_7d']}\n"
+#         f"Premium сейчас: {totals['premium_now']}"
+#     )
+#     return blocks
 
 
 # Порядок столбцов CSV. Значения берутся из строк _collect_users_data по этим
@@ -3768,6 +3773,227 @@ _USERS_CSV_COLUMNS = [
     "is_premium_now", "premium_source", "premium_until", "premium_remaining",
     "premium_auto_renew", "trial_used", "referrals_made",
 ]
+
+
+def _fmt_ru_date(value: str) -> str:
+    """"2026-09-13" → "13.09.2026", "2026-09-13 14:30" → "13.09.2026 14:30".
+    premium_until хранится в rows отдельно от остальных дат — не через
+    _csv_dt, а как datetime.isoformat() (с "T" и смещением таймзоны, см.
+    _collect_users_data) — тоже разбираем, через fromisoformat.
+    Пусто/нераспарсенное — "—" (в CSV те же поля остаются пустой ячейкой,
+    здесь так нагляднее в таблице)."""
+    if not value:
+        return "—"
+    try:
+        if len(value) > 10:
+            try:
+                dt = datetime.strptime(value, "%Y-%m-%d %H:%M")
+            except ValueError:
+                dt = datetime.fromisoformat(value)
+            return dt.strftime("%d.%m.%Y %H:%M")
+        dt = datetime.strptime(value, "%Y-%m-%d")
+        return dt.strftime("%d.%m.%Y")
+    except ValueError:
+        return value
+
+
+_USERS_HTML_YES = '<span class="b-yes">✅</span>'
+_USERS_HTML_NO = '<span class="b-no">❌</span>'
+
+# Колонки HTML-отчёта: (заголовок, ключ в rows). Тот же набор пользователей
+# и полей, что в CSV (_USERS_CSV_COLUMNS) — просто читаемое представление,
+# а не сырые да/нет и таймстампы.
+_USERS_HTML_COLUMNS = [
+    ("Пользователь", "username"),
+    ("Telegram ID", "telegram_id"),
+    ("Пол", "gender"),
+    ("Источник", "source"),
+    ("Регистрация", "signup_date"),
+    ("Дней с рег.", "days_since_signup"),
+    ("Контактов", "contacts_count"),
+    ("Сообщений", "messages_count"),
+    ("Последнее действие", "last_action_at"),
+    ("Собеседник писал", "last_incoming_at"),
+    ("Активен (7 дн.)", "active_last_7d"),
+    ("Заблокировал бота", "blocked"),
+    ("Автоматизация выкл.", "automation_off"),
+    ("«Ответить за меня»", "uses_reply"),
+    ("«По скриншоту»", "uses_screenshot"),
+    ("Live-диалог", "uses_live"),
+    ("Анализ собеседника", "used_deep_analysis"),
+    ("Карточка стиля", "has_style_card"),
+    ("Premium", "is_premium_now"),
+    ("Источник Premium", "premium_source"),
+    ("Premium до", "premium_until"),
+    ("Осталось Premium", "premium_remaining"),
+    ("Автопродление", "premium_auto_renew"),
+    ("Триал использован", "trial_used"),
+    ("Рефералов", "referrals_made"),
+]
+
+_USERS_HTML_DATE_KEYS = {"signup_date", "last_action_at", "last_incoming_at", "premium_until"}
+_USERS_HTML_BOOL_KEYS = {
+    "active_last_7d", "blocked", "automation_off",
+    "used_deep_analysis", "has_style_card", "is_premium_now",
+}
+_USERS_HTML_NUM_KEYS = {
+    "telegram_id", "days_since_signup", "contacts_count", "messages_count",
+    "uses_reply", "uses_screenshot", "uses_live", "trial_used", "referrals_made",
+}
+
+
+def _users_html_cell(key: str, value) -> tuple[str, str]:
+    """(отображаемый HTML, СЫРОЕ значение для сортировки — экранирование под
+    HTML-атрибут делает вызывающий код одним местом, см. _build_users_html,
+    чтобы не экранировать дважды). Числовые колонки решает JS сам (см.
+    <script> в _build_users_html) — если ВСЕ data-sort в колонке парсятся
+    как число, сортирует численно, иначе как строку. Даты уже хранятся в
+    rows как "ГГГГ-ММ-ДД[ ЧЧ:ММ]" (см. _csv_dt) — это само по себе
+    хронологический порядок при строковой сортировке, отдельного числового
+    представления не нужно."""
+    if key in _USERS_HTML_DATE_KEYS:
+        return _fmt_ru_date(value), (value or "")
+    if key in _USERS_HTML_BOOL_KEYS:
+        return (_USERS_HTML_YES if value else _USERS_HTML_NO), ("1" if value else "0")
+    if key == "premium_auto_renew":
+        if value == "":  # не Premium сейчас — вопрос об автопродлении не применим
+            return "—", "-1"
+        return (_USERS_HTML_YES if value else _USERS_HTML_NO), ("1" if value else "0")
+    if key in _USERS_HTML_NUM_KEYS:
+        return str(value), str(value)
+    if key == "premium_remaining":
+        text = html.escape(value) if value else "—"
+        return text, (value or "")
+    text = html.escape(str(value)) if value not in (None, "") else "—"
+    return text, (str(value).lower() if value else "")
+
+
+def _build_users_html(rows: list[dict], totals: dict) -> bytes:
+    """Самостоятельный HTML-файл (инлайн <style>/<script>, без внешних
+    зависимостей — открывается локально без интернета): та же выборка
+    пользователей, что в CSV, но читаемая — иконки вместо да/нет, даты
+    ДД.ММ.ГГГГ, Premium-строки подсвечены цветом фона, любая колонка
+    пересортировывается кликом по заголовку (простой vanilla JS).
+
+    По умолчанию — сортировка по дате регистрации, сначала новые (сортируем
+    здесь же, в Python, JS дальше просто переставляет уже отрисованные
+    строки при клике)."""
+    ordered = sorted(rows, key=lambda r: r["signup_date"] or "", reverse=True)
+
+    head_html = "".join(f"<th>{html.escape(label)}</th>" for label, _ in _USERS_HTML_COLUMNS)
+
+    body_rows = []
+    for r in ordered:
+        cells = []
+        for _, key in _USERS_HTML_COLUMNS:
+            display, sort_val = _users_html_cell(key, r[key])
+            cells.append(f'<td data-sort="{html.escape(sort_val, quote=True)}">{display}</td>')
+        row_class = ' class="row-premium"' if r["is_premium_now"] else ""
+        body_rows.append(f"<tr{row_class}>{''.join(cells)}</tr>")
+
+    generated_at = datetime.now(timezone.utc).strftime("%d.%m.%Y %H:%M UTC")
+    doc = f"""<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>Пользователи CueMe</title>
+<style>
+  :root {{ color-scheme: light; }}
+  * {{ box-sizing: border-box; }}
+  body {{
+    margin: 0; padding: 20px;
+    font-family: -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+    background: #f4f5f7; color: #1b1f24;
+  }}
+  h1 {{ font-size: 18px; margin: 0 0 4px; }}
+  .meta {{ color: #666; font-size: 13px; margin-bottom: 14px; }}
+  .summary {{
+    display: flex; flex-wrap: wrap; gap: 8px 18px;
+    background: #fff; border: 1px solid #e1e4e8; border-radius: 8px;
+    padding: 10px 14px; margin-bottom: 16px; font-size: 13px;
+  }}
+  .summary b {{ color: #111; }}
+  .table-wrap {{
+    overflow-x: auto; background: #fff; border: 1px solid #e1e4e8;
+    border-radius: 8px;
+  }}
+  table {{ border-collapse: collapse; width: 100%; font-size: 13px; white-space: nowrap; }}
+  th, td {{ padding: 7px 10px; text-align: left; border-bottom: 1px solid #eee; }}
+  th {{
+    position: sticky; top: 0; background: #fafbfc; cursor: pointer;
+    user-select: none; border-bottom: 2px solid #d7dbe0; white-space: nowrap;
+  }}
+  th:hover {{ background: #f0f2f4; }}
+  th.sort-asc::after {{ content: " ▲"; color: #888; }}
+  th.sort-desc::after {{ content: " ▼"; color: #888; }}
+  tbody tr:hover {{ background: #f6f8fa; }}
+  tr.row-premium {{ background: #fff6d8; }}
+  tr.row-premium:hover {{ background: #fdedb0; }}
+  .b-yes {{ color: #1a7f37; }}
+  .b-no {{ color: #cf222e; }}
+</style>
+</head>
+<body>
+<h1>👥 Пользователи CueMe</h1>
+<div class="meta">Сформировано {generated_at} · всего {totals['total']} ·
+клик по заголовку колонки — сортировка · строки с активной Premium выделены</div>
+<div class="summary">
+  <span>С полом: <b>{totals['with_gender']}</b></span>
+  <span>С контактом: <b>{totals['with_contact']}</b></span>
+  <span>Premium сейчас: <b>{totals['premium_now']}</b></span>
+  <span>Реферальный Premium: <b>{totals['with_ref_premium']}</b></span>
+  <span>Заблокировали бота: <b>{totals['blocked']}</b></span>
+  <span>Отключили Автоматизацию: <b>{totals['automation_off']}</b></span>
+  <span>Неактивных: <b>{totals['inactive']}</b></span>
+  <span>Активны за 7 дней: <b>{totals['active_7d']}</b></span>
+</div>
+<div class="table-wrap">
+<table>
+<thead><tr>{head_html}</tr></thead>
+<tbody>
+{"".join(body_rows)}
+</tbody>
+</table>
+</div>
+<script>
+document.querySelectorAll("th").forEach(function (th, idx) {{
+  th.addEventListener("click", function () {{
+    var table = th.closest("table");
+    var tbody = table.querySelector("tbody");
+    var rows = Array.prototype.slice.call(tbody.querySelectorAll("tr"));
+    var asc = th.dataset.sortDir !== "asc";
+    table.querySelectorAll("th").forEach(function (h) {{
+      delete h.dataset.sortDir;
+      h.classList.remove("sort-asc", "sort-desc");
+    }});
+    th.dataset.sortDir = asc ? "asc" : "desc";
+    th.classList.add(asc ? "sort-asc" : "sort-desc");
+
+    function val(tr) {{
+      var cell = tr.children[idx];
+      return cell.dataset.sort !== undefined ? cell.dataset.sort : cell.textContent;
+    }}
+    var allNumeric = rows.every(function (tr) {{
+      var v = val(tr);
+      return v === "" || !isNaN(parseFloat(v));
+    }});
+    rows.sort(function (a, b) {{
+      var va = val(a), vb = val(b);
+      if (allNumeric) {{
+        va = parseFloat(va); if (isNaN(va)) va = -Infinity;
+        vb = parseFloat(vb); if (isNaN(vb)) vb = -Infinity;
+        return asc ? va - vb : vb - va;
+      }}
+      return asc ? va.localeCompare(vb) : vb.localeCompare(va);
+    }});
+    rows.forEach(function (tr) {{ tbody.appendChild(tr); }});
+  }});
+}});
+</script>
+</body>
+</html>
+"""
+    return doc.encode("utf-8")
 
 
 def _build_users_csv(rows: list[dict]) -> bytes:
@@ -3788,49 +4014,45 @@ def _build_users_csv(rows: list[dict]) -> bytes:
 
 @dp.message(Command("users"))
 async def cmd_users(message: Message, bot: Bot) -> None:
+    """Раньше слал ещё и текстовую сводку кучей отдельных сообщений (по
+    юзеру + шапка/сводка, порезанные на чанки по 3500 символов) — убрано по
+    прямому запросу, теперь только два файла: читаемая HTML-таблица и
+    подробный CSV, см. _build_users_html/_build_users_csv."""
     if not _is_admin(message.from_user.id):
         return
     rows, totals = await _collect_users_data(bot)
-    # В сообщении — только активные (не заблокировали бота, не отключали
-    # Автоматизацию, не застойные >_INACTIVE_AFTER_DAYS дн.) — остальных
-    # показываем только в CSV-файле, не хотим захламлять сообщение.
-    active_rows = [r for r in rows if r["_status_line"] == "✅ Активен"]
-    blocks = _build_users_report(active_rows, totals, hidden_count=len(rows) - len(active_rows))
-    # Телеграм режет на 4096 символов — рубим ПО ГРАНИЦАМ блоков (не
-    # посимвольно), иначе легко разрезать HTML-тег пополам и получить
-    # ошибку парсинга у Telegram вместо отчёта.
-    chunks: list[str] = []
-    current = ""
-    for block in blocks:
-        candidate = f"{current}\n\n{block}" if current else block
-        if len(candidate) > 3500:
-            if current:
-                chunks.append(current)
-            current = block
-        else:
-            current = candidate
-    if current:
-        chunks.append(current)
-
-    target_chat = int(ADMIN_GROUP_CHAT_ID) if ADMIN_GROUP_CHAT_ID else message.chat.id
-    for chunk in chunks:
-        try:
-            await bot.send_message(target_chat, chunk, parse_mode="HTML")
-        except Exception:
-            logging.warning("cmd_users: send failed to %s", target_chat)
-            await message.answer(chunk, parse_mode="HTML")
-
-    # Тем же проходом — CSV со всеми метриками (в сообщениях выше только
-    # обзор, в файле — полная таблица для Excel/Sheets).
     if not rows:
         return
-    filename = f"cueme_users_{datetime.now(timezone.utc).strftime('%Y%m%d')}.csv"
-    document = BufferedInputFile(_build_users_csv(rows), filename=filename)
+
+    target_chat = int(ADMIN_GROUP_CHAT_ID) if ADMIN_GROUP_CHAT_ID else message.chat.id
+    # Оба файла — ВСЕ пользователи (не только активные, как раньше в тексте):
+    # send_media_group шлёт их одним альбомом, одним ответом, а не двумя
+    # отдельными сообщениями.
+    date_tag = datetime.now(timezone.utc).strftime("%Y%m%d")
+    html_name = f"cueme_users_{date_tag}.html"
+    csv_name = f"cueme_users_{date_tag}.csv"
+    html_bytes = _build_users_html(rows, totals)
+    csv_bytes = _build_users_csv(rows)
     try:
-        await bot.send_document(target_chat, document)
+        await bot.send_media_group(target_chat, [
+            InputMediaDocument(
+                media=BufferedInputFile(html_bytes, filename=html_name),
+                caption="👥 Читаемая таблица (открыть в браузере) + подробный CSV",
+            ),
+            InputMediaDocument(media=BufferedInputFile(csv_bytes, filename=csv_name)),
+        ])
     except Exception:
-        logging.warning("cmd_users: csv send failed to %s", target_chat)
-        await message.answer_document(document)
+        logging.warning("cmd_users: media group send failed to %s, retrying separately", target_chat)
+        try:
+            await bot.send_document(
+                target_chat, BufferedInputFile(html_bytes, filename=html_name),
+                caption="👥 Читаемая таблица (открыть в браузере)",
+            )
+            await bot.send_document(target_chat, BufferedInputFile(csv_bytes, filename=csv_name))
+        except Exception:
+            logging.warning("cmd_users: files send failed to %s", target_chat)
+            await message.answer_document(BufferedInputFile(html_bytes, filename=html_name))
+            await message.answer_document(BufferedInputFile(csv_bytes, filename=csv_name))
 
 
 # ── /sources — статистика по источникам привлечения (только для админа) ────
