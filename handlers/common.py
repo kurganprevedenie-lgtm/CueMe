@@ -614,3 +614,46 @@ def _premium_expiry_info(telegram_id: str) -> tuple[str, datetime | None, bool]:
     if until and until > now:
         payment = get_latest_star_payment(telegram_id)
         return "stars", until, bool(payment and payment["is_subscription"])
+
+# ── Экран главного меню ──────────────────────────────────────────────────────
+# Живёт в общем слое, а не в handlers/main_menu.py, потому что на него
+# ссылаются в обе стороны: main_menu показывает его, а «⬅️ Назад» из
+# «Подписки» (handlers/subscription.py) и _send_start_menu (onboarding)
+# редактируют/шлют его же — держать здесь дешевле, чем разруливать цикл
+# импортов между модулями хендлеров.
+
+_MAIN_MENU_TEXT = (
+    "👋 Вот что я умею:\n\n"
+    "💬 Ответ с CueMe — подскажу, что написать в моменте\n"
+    "🔬 Анализ собеседника — разберу вашу переписку по фактам\n"
+    "💐 Идеальное свидание — накидаю идеи для свидания"
+)
+
+
+def main_menu_kb() -> InlineKeyboardMarkup:
+    """Главное меню — 5 пунктов, той же вёрстки/механики, что «Подписка»
+    (premium_menu_kb): inline-кнопки на одном сообщении, редактируемом при
+    переходах. «👑 Подписка» ведёт в уже существующую edit-in-place иерархию
+    (callback_data="show_premium" — тот же, что и «⬅️ Назад» из Реферальной
+    системы, см. cb_show_premium). Остальные — одноразовые действия
+    (мультишаговые FSM-флоу/результаты своим сообщением), не вложенные
+    экраны — см. cb_main_menu_action."""
+    b = InlineKeyboardBuilder()
+    b.button(text=BTN_UNIFIED, callback_data="mm:unified")
+    b.button(text=BTN_DEEP, callback_data="mm:deep")
+    b.button(text=BTN_DATE, callback_data="mm:date")
+    b.button(text=BTN_SUBSCRIPTION, callback_data="show_premium")
+    b.button(text=BTN_SUPPORT, callback_data="mm:support")
+    b.adjust(1)
+    return b.as_markup()
+
+
+async def _send_main_menu(target: Message, edit: bool = False) -> None:
+    """Экран главного меню — общий для /menu, кнопки «⬅️ Вернуться в меню»
+    под результатами генерации и возврата «⬅️ Назад» из «👑 Подписка».
+    edit=True (Назад из Подписки) — редактирует ТО ЖЕ сообщение (та же
+    механика, что и у самой Подписки). edit=False — новое сообщение."""
+    if edit:
+        await target.edit_text(_MAIN_MENU_TEXT, reply_markup=main_menu_kb())
+    else:
+        await target.answer(_MAIN_MENU_TEXT, reply_markup=main_menu_kb())

@@ -8,6 +8,7 @@
 import html
 import json
 import logging
+import re
 from datetime import datetime, timezone
 
 from aiogram import Bot, F, Router
@@ -16,6 +17,7 @@ from aiogram.filters import Command
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from compatibility_metrics import compute_all as compute_compat_metrics
+from config import REBUILD_THRESHOLD
 from handlers.common import (
     _answer_long,
     _contact_name,
@@ -26,6 +28,8 @@ from handlers.common import (
 )
 from llm import RateLimitError, build_compatibility_interpretation
 from storage import (
+    count_biz_messages_for_contact,
+    count_imported_messages,
     delete_deep_analysis,
     get_all_dated_messages,
     get_contact_by_id,
