@@ -1,6 +1,7 @@
 """Тесты чистых хелперов main.py (без сети/aiogram-раннера).
 Импорт main поднимает Bot/Dispatcher, но без соединения — этого достаточно."""
 import main
+from handlers import common, reply_flow
 
 
 # ── _contact_name ─────────────────────────────────────────────────────────────
@@ -65,7 +66,7 @@ def test_reply_data_signals_stage_from_totals_plus_situation():
         "features_summary": "Пользователь: 200 сообщ., длина 40. Собеседник: 190 сообщ., длина 30.",
         "my_sample": ["a"], "contact_sample": ["b"],   # длины малы, но тоталы из сводки главнее
     }
-    sig = main._reply_data_signals(samples, "ок")
+    sig = reply_flow._reply_data_signals(samples, "ок")
     assert sig is not None
     assert "давняя переписка" in sig          # стадия по реальным тоталам (390)
     assert "сух" in sig                        # сухая реплика «ок»
@@ -73,11 +74,11 @@ def test_reply_data_signals_stage_from_totals_plus_situation():
 
 def test_reply_data_signals_none_when_nothing():
     # нет семплов и обычная реплика → сигналов нет
-    assert main._reply_data_signals(None, "расскажи как прошёл день?") is None
+    assert reply_flow._reply_data_signals(None, "расскажи как прошёл день?") is None
 
 
 # ── _format_blocks ────────────────────────────────────────────────────────────
 
 def test_format_blocks():
-    out = main._format_blocks([{"observation": "наб", "mechanism": "мех", "action": "дей"}])
+    out = reply_flow._format_blocks([{"observation": "наб", "mechanism": "мех", "action": "дей"}])
     assert "🔍 наб" in out and "⚙️ мех" in out and "🎯 дей" in out
