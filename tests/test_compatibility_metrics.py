@@ -131,10 +131,10 @@ def test_same_question_is_not_quoted_twice():
 
 
 def test_long_question_is_truncated_in_card_suffix():
-    import main
+    from handlers import analysis
 
     long_q = "а вот скажи мне пожалуйста " * 5 + "что ты думаешь?"
-    suffix = main._quote_examples_suffix({"examples": [("in", long_q)]})
+    suffix = analysis._quote_examples_suffix({"examples": [("in", long_q)]})
     assert "…" in suffix
     assert len(suffix) < len(long_q) + 40
 
