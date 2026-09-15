@@ -248,6 +248,13 @@ def init_db() -> None:
         _add_column_if_missing(conn, "users", "referral_code", "TEXT")
         _create_index_if_missing(conn, "idx_users_referral_code", "users", "referral_code", unique=True)
         _add_column_if_missing(conn, "contacts", "username", "TEXT")
+        # Ручной диалог («💬 Ответ с CueMe», юзер прислал username вместо
+        # простого имени) автослит с реальным Business-контактом того же
+        # username, см. main.py: find_unlinked_manual_contact_by_username +
+        # merge_manual_contact_into. archived_into_contact_id != NULL — эта
+        # запись «архивная» (данные перенесены туда), не удалена физически;
+        # list_contacts её больше не отдаёт.
+        _add_column_if_missing(conn, "contacts", "archived_into_contact_id", "INTEGER")
         _add_column_if_missing(conn, "message_samples", "contact_label", "TEXT")
         # user_features_summary — подмножество features_summary, убираем дубль
         ms_cols = [r[1] for r in conn.execute("PRAGMA table_info(message_samples)").fetchall()]
@@ -512,9 +519,13 @@ def get_or_create_contact(
 
 
 def list_contacts(user_telegram_id: str) -> list[sqlite3.Row]:
+    # archived_into_contact_id IS NULL — заархивированные автослиянием
+    # ручные диалоги (см. merge_manual_contact_into) больше не показываем,
+    # их данные уже перенесены на реальный контакт.
     with _conn() as conn:
         return conn.execute(
-            "SELECT * FROM contacts WHERE user_telegram_id = ?", (user_telegram_id,)
+            "SELECT * FROM contacts WHERE user_telegram_id = ? AND archived_into_contact_id IS NULL",
+            (user_telegram_id,),
         ).fetchall()
 
 
@@ -530,6 +541,59 @@ def update_contact_username(contact_id: int, username: str) -> None:
         conn.execute(
             "UPDATE contacts SET username = ? WHERE id = ?",
             (username, contact_id),
+        )
+
+
+def find_unlinked_manual_contact_by_username(user_telegram_id: str, username: str) -> sqlite3.Row | None:
+    """Ручной диалог этого юзера бота («💬 Ответ с CueMe» → LiveDialogue,
+    original_from_id = "live_<uuid>", т.е. БЕЗ привязки к реальному
+    telegram_id) с сохранённым username, совпадающим (без учёта регистра и
+    "@") с указанным. Уже заархивированные (см. merge_manual_contact_into)
+    не возвращаются. Для автослияния с реальным Business-контактом того же
+    username, см. main._persist_business_message."""
+    norm = username.lstrip("@").lower()
+    with _conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT * FROM contacts
+            WHERE user_telegram_id = ?
+              AND username IS NOT NULL AND LOWER(username) = ?
+              AND archived_into_contact_id IS NULL
+            """,
+            (user_telegram_id, norm),
+        ).fetchall()
+    for row in rows:
+        if row["original_from_id"].startswith("live_"):
+            return row
+    return None
+
+
+# Таблицы, где contact_id — PRIMARY KEY (максимум одна строка на контакт) —
+# для них перенос при слиянии безопасен без риска конфликта PK ТОЛЬКО если
+# у контакта-приёмника такой строки ещё нет (гарантировано в
+# merge_manual_contact_into: реальный контакт там всегда только что создан).
+_MERGE_TABLES_SINGLE_ROW = (
+    "interaction_cards", "message_samples", "my_style_per_contact",
+    "deep_analysis", "ideal_date", "running_notes",
+)
+# Таблицы, где на контакт может быть много строк — переносим их все.
+_MERGE_TABLES_MULTI_ROW = ("imported_messages", "suggestions")
+
+
+def merge_manual_contact_into(manual_contact_id: int, real_contact_id: int) -> None:
+    """Переносит все накопленные по ручному диалогу данные (сообщения,
+    карточки стиля/собеседника, заметки живого коучинга, готовые разборы) на
+    настоящий Business-контакт и архивирует исходную запись (не удаляет —
+    archived_into_contact_id, см. list_contacts/find_unlinked_manual_contact_by_username)."""
+    with _conn() as conn:
+        for table in _MERGE_TABLES_SINGLE_ROW + _MERGE_TABLES_MULTI_ROW:
+            conn.execute(
+                f"UPDATE {table} SET contact_id = ? WHERE contact_id = ?",
+                (real_contact_id, manual_contact_id),
+            )
+        conn.execute(
+            "UPDATE contacts SET archived_into_contact_id = ? WHERE id = ?",
+            (real_contact_id, manual_contact_id),
         )
 
 

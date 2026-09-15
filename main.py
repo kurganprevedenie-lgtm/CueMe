@@ -105,6 +105,7 @@ from storage import (
     delete_style_card,
     event_counts_by_user,
     find_contact_by_original_id,
+    find_unlinked_manual_contact_by_username,
     get_all_dated_messages,
     get_all_dated_my_messages,
     get_all_per_contact_style_cards,
@@ -143,6 +144,7 @@ from storage import (
     mark_bot_blocked,
     mark_bot_unblocked,
     mark_referral_credited,
+    merge_manual_contact_into,
     save_imported_messages,
     get_my_style_last_rebuild_count,
     get_my_style_per_contact,
@@ -2811,11 +2813,14 @@ def _persist_business_message(
     contact_tg_id: str, chat_first_name: str | None, chat_last_name: str | None,
     chat_username: str | None, sender_username: str | None,
     photo_file_id: str | None = None,
-) -> int | None:
+) -> tuple[int | None, tuple[str, str] | None]:
     """Синхронная DB-часть обработки business-сообщения: сохранение + резолв контакта
     + троттлинг refresh + сопоставление с подсказками CueMe (для исходящих).
-    Возвращает contact_id для пересборки (или None). Выполняется в
-    asyncio.to_thread, чтобы не блокировать event loop на живом потоке."""
+    Возвращает (contact_id для пересборки, merge_notice) — merge_notice это
+    (название ручного диалога, username), если этот контакт только что
+    автоматически слился с ранее созданным вручную диалогом (см.
+    merge_manual_contact_into), иначе None. Выполняется в asyncio.to_thread,
+    чтобы не блокировать event loop на живом потоке."""
     message_id = save_business_message(
         connection_id=conn_id, owner_user_id=owner_id, chat_ref=chat_ref,
         direction=direction, text=text, date=date, tg_message_id=tg_message_id,
@@ -2827,7 +2832,7 @@ def _persist_business_message(
             "business_message дубль пропущен: conn=%s chat_ref=%s msg_id=%s",
             conn_id, chat_ref, tg_message_id,
         )
-        return None
+        return None, None
     logging.info(
         "business_message saved: conn=%s chat_ref=%s direction=%s",
         conn_id, chat_ref, direction,
@@ -2836,10 +2841,11 @@ def _persist_business_message(
 
     # Для приватного чата contact_tg_id всегда равен ID собеседника
     if contact_tg_id == owner_id:
-        return None  # edge-case: не создаём контакт «сам с собой»
+        return None, None  # edge-case: не создаём контакт «сам с собой»
     original_id = f"user{contact_tg_id}"
 
     contact_row = find_contact_by_original_id(owner_id, original_id)
+    merge_notice: tuple[str, str] | None = None
     if not contact_row:
         # Контакт ещё не создан — создаём автоматически из данных чата
         display_name = " ".join(
@@ -2848,6 +2854,21 @@ def _persist_business_message(
         cid = get_or_create_contact(owner_id, original_id, display_name)
         if chat_username:
             update_contact_username(cid, chat_username)
+            # Ручной диалог («💬 Ответ с CueMe») с тем же username, ещё без
+            # реального telegram_id — автослияние: переносим накопленные
+            # данные на этот только что созданный реальный контакт и
+            # архивируем исходную запись (main._persist_business_message
+            # вызывается один раз на новый контакт — при первом сообщении
+            # именно от него, так что повторной проверки на дальнейших
+            # сообщениях не нужно).
+            manual = find_unlinked_manual_contact_by_username(owner_id, chat_username)
+            if manual and manual["id"] != cid:
+                merge_manual_contact_into(manual["id"], cid)
+                merge_notice = (manual["display_name"] or "без названия", chat_username.lstrip("@"))
+                logging.info(
+                    "manual contact auto-merged: manual_id=%s → real_id=%s username=%s",
+                    manual["id"], cid, chat_username,
+                )
         upsert_chat_ref_mapping(owner_id, chat_ref, cid)
         logging.info("auto-created contact: id=%s name=%s", cid, display_name)
     else:
@@ -2862,7 +2883,7 @@ def _persist_business_message(
     # Освежаем message_samples (без LLM, дёшево), но не чаще раза в N сообщений
     if _should_refresh_samples(cid):
         _refresh_samples(owner_id, cid)
-    return cid
+    return cid, merge_notice
 
 
 @dp.business_message()
@@ -2890,7 +2911,7 @@ async def handle_business_message(event: Message, bot: Bot) -> None:
     photo_file_id = event.photo[-1].file_id if event.photo else None
 
     # Синхронную DB-часть уводим в поток, чтобы не блокировать event loop.
-    contact_id_for_rebuild = await asyncio.to_thread(
+    contact_id_for_rebuild, merge_notice = await asyncio.to_thread(
         _persist_business_message,
         conn_id=conn_id, owner_id=owner_id, chat_ref=chat_ref, direction=direction,
         text=text, is_voice=is_voice, date=date, tg_message_id=event.message_id,
@@ -2908,6 +2929,17 @@ async def handle_business_message(event: Message, bot: Bot) -> None:
         await _credit_referral_if_pending(bot, owner_id)
         await _maybe_prompt_gender(bot, owner_id)
         asyncio.create_task(_maybe_rebuild(owner_id, contact_id_for_rebuild, bot))
+
+    if merge_notice:
+        manual_name, username = merge_notice
+        try:
+            await bot.send_message(
+                owner_id,
+                f"Заметил совпадение — объединил диалог «{manual_name}» с контактом "
+                f"@{username}, вся история теперь в одном месте.",
+            )
+        except Exception:
+            logging.exception("не удалось отправить уведомление об автослиянии контакта")
 
 
 # ── /start ────────────────────────────────────────────────────────────────────
@@ -4465,6 +4497,27 @@ async def cb_reply_contact(call: CallbackQuery, state: FSMContext) -> None:
 # сообщение с вариантами ответа (после настройки) — НОВОЕ, самостоятельное,
 # см. _run_variants_generation/_run_live_coach_step.
 
+# Ручной диалог («➕ Другой человек» / первый диалог без контактов) — просим
+# username вместо простого имени, чтобы потом можно было автоматически
+# слить эту запись с реальным Business-контактом того же человека (см.
+# _persist_business_message → find_unlinked_manual_contact_by_username /
+# merge_manual_contact_into в storage.py). Если юзернейма нет — ведём себя
+# как раньше, просто сохраняем как название без привязки к username
+# (см. handle_unified_name → _looks_like_username).
+_UNIFIED_NAME_PROMPT = (
+    "Знаешь юзернейм собеседника? Пришли его (с @ или без) — тогда я смогу сам "
+    "связать этот диалог с реальным контактом, если он потом подключится через "
+    "автоматизацию. Если юзернейма нет — просто напиши любое имя, как раньше."
+)
+
+_USERNAME_RE = re.compile(r"^@?[a-zA-Z][a-zA-Z0-9_]{4,31}$")
+
+
+def _looks_like_username(text: str) -> bool:
+    """Похоже ли на валидный формат Telegram username (с @ или без)."""
+    return bool(_USERNAME_RE.match(text.strip()))
+
+
 async def _start_unified_reply(message: Message, state: FSMContext) -> None:
     await state.set_state(UnifiedReply.waiting_for_input)
     sent = await message.answer("Перешли сообщение или просто вставь текст переписки")
@@ -4517,10 +4570,7 @@ async def handle_unified_input(message: Message, state: FSMContext, bot: Bot) ->
 
     if not contacts:
         await state.set_state(UnifiedReply.waiting_for_name)
-        await _edit_setup_message(
-            state, bot,
-            "Как назвать этот диалог? Просто имя или метка, чтобы потом узнать среди контактов.",
-        )
+        await _edit_setup_message(state, bot, _UNIFIED_NAME_PROMPT)
         return
 
     await _edit_setup_message(state, bot, "Кому отвечаем?", reply_markup=unified_contacts_kb(contacts))
@@ -4543,6 +4593,11 @@ async def handle_unified_name(message: Message, state: FSMContext, bot: Bot) -> 
     telegram_id = str(message.from_user.id)
     upsert_user(telegram_id, f"user{telegram_id}")
     contact_id = get_or_create_contact(telegram_id, f"live_{uuid.uuid4().hex}", name)
+    if _looks_like_username(name):
+        # Юзер прислал юзернейм, а не просто имя/метку — сохраняем отдельно
+        # для будущего автослияния (см. _UNIFIED_NAME_PROMPT), display_name
+        # при этом остаётся как есть (тот же текст, что юзер прислал).
+        update_contact_username(contact_id, name.lstrip("@").lower())
 
     await state.set_state(LiveDialogue.waiting_for_incoming)
     await state.update_data(contact_id=contact_id, dialogue_history=[])
@@ -4575,9 +4630,7 @@ async def cb_unified_contact(call: CallbackQuery, state: FSMContext, bot: Bot) -
 
     if raw_id == "new":
         await state.set_state(UnifiedReply.waiting_for_name)
-        await call.message.edit_text(
-            "Как назвать этот диалог? Просто имя или метка, чтобы потом узнать среди контактов."
-        )
+        await call.message.edit_text(_UNIFIED_NAME_PROMPT)
         return
 
     contact_id = int(raw_id)
