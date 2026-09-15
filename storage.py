@@ -345,6 +345,13 @@ def init_db() -> None:
         # приватном канале Tribute (это отдельный, параллельный способ оплаты,
         # тот же паттерн *_until, что у реферальной и промо-наград выше).
         _add_column_if_missing(conn, "users", "stars_premium_until", "TEXT")
+        # Одноразовый бесплатный пробник на «Анализ собеседника» и отдельно на
+        # «Идеальное свидание» — НЕ то же самое, что users.trial_used (это
+        # счётчик «Ответ с CueMe» из FREE_TRIAL_REQUESTS попыток). Каждая из
+        # этих двух фич даёт РОВНО ОДИН бесплатный успешный запуск без
+        # Premium, см. main.py: _require_premium_or_free_trial.
+        _add_column_if_missing(conn, "users", "analysis_trial_used", "INTEGER NOT NULL DEFAULT 0")
+        _add_column_if_missing(conn, "users", "date_trial_used", "INTEGER NOT NULL DEFAULT 0")
         # Фото из Business-переписки (только они несут реальный Telegram
         # file_id, который бот может скачать — фото из JSON-экспорта на
         # диске пользователя, не у нас, поэтому imported_messages не трогаем).
@@ -446,6 +453,39 @@ def increment_trial_used(telegram_id: str) -> None:
         conn.execute(
             "UPDATE users SET trial_used = trial_used + 1 WHERE telegram_id = ?",
             (telegram_id,),
+        )
+
+
+def get_analysis_trial_used(telegram_id: str) -> bool:
+    """Использован ли одноразовый бесплатный пробник «Анализ собеседника»
+    (отдельно от users.trial_used — счётчика «Ответ с CueMe»)."""
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT analysis_trial_used FROM users WHERE telegram_id = ?", (telegram_id,)
+        ).fetchone()
+    return bool(row["analysis_trial_used"]) if row else False
+
+
+def mark_analysis_trial_used(telegram_id: str) -> None:
+    with _conn() as conn:
+        conn.execute(
+            "UPDATE users SET analysis_trial_used = 1 WHERE telegram_id = ?", (telegram_id,)
+        )
+
+
+def get_date_trial_used(telegram_id: str) -> bool:
+    """Использован ли одноразовый бесплатный пробник «Идеальное свидание»."""
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT date_trial_used FROM users WHERE telegram_id = ?", (telegram_id,)
+        ).fetchone()
+    return bool(row["date_trial_used"]) if row else False
+
+
+def mark_date_trial_used(telegram_id: str) -> None:
+    with _conn() as conn:
+        conn.execute(
+            "UPDATE users SET date_trial_used = 1 WHERE telegram_id = ?", (telegram_id,)
         )
 
 

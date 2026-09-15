@@ -117,6 +117,8 @@ from storage import (
     get_recent_unmatched_suggestions,
     get_latest_business_connection,
     get_contact_by_id,
+    get_analysis_trial_used,
+    get_date_trial_used,
     get_deep_analysis,
     get_acquisition_source,
     get_deep_analysis_free_until,
@@ -141,8 +143,10 @@ from storage import (
     get_trial_used,
     get_user,
     increment_trial_used,
+    mark_analysis_trial_used,
     mark_bot_blocked,
     mark_bot_unblocked,
+    mark_date_trial_used,
     mark_referral_credited,
     merge_manual_contact_into,
     save_imported_messages,
@@ -499,6 +503,35 @@ async def _require_premium(bot: Bot, target: Message, telegram_id: str, edit: bo
 
     await _send_paywall(target, "Эта функция доступна только по подписке CueMe Premium.", edit=edit)
     return False
+
+
+async def _require_premium_or_free_trial(
+    bot: Bot, target: Message, telegram_id: str,
+    get_trial_used_fn, edit: bool = False,
+) -> bool:
+    """Гейт для функций с ОДНОЙ бесплатной попыткой на юзера («Анализ
+    собеседника» / «Идеальное свидание» — каждая фича считается отдельно
+    своим полем в users, НЕ переиспользует общий users.trial_used от «Ответ
+    с CueMe»). Premium активен — пропускает без ограничений. Иначе, если
+    пробник ещё не потрачен — пропускает (списание делает вызывающий код
+    ПОСЛЕ успешной генерации, см. _charge_feature_trial_if_needed). Пробник
+    уже потрачен — обычный пейволл, как раньше у _require_premium."""
+    if await _is_premium(bot, telegram_id):
+        return True
+    if not get_trial_used_fn(telegram_id):
+        return True
+
+    await _send_paywall(target, "Эта функция доступна только по подписке CueMe Premium.", edit=edit)
+    return False
+
+
+async def _charge_feature_trial_if_needed(bot: Bot, telegram_id: str, mark_trial_used_fn) -> None:
+    """Списывает одноразовый пробник «Анализ собеседника»/«Идеальное
+    свидание». Вызывать ТОЛЬКО после успешной генерации (недостаточно данных
+    не считается использованной попыткой). Premium ничего не списывает."""
+    if await _is_premium(bot, telegram_id):
+        return
+    mark_trial_used_fn(telegram_id)
 
 
 # ── Реферальная программа ─────────────────────────────────────────────────────
@@ -2457,8 +2490,12 @@ async def _run_deep_analysis(
     bot: Bot, target: Message, telegram_id: str, contact_id: int, edit: bool = False
 ) -> None:
     # Реферальная награда теперь даёт полный Premium (учтено внутри _is_premium,
-    # которую вызывает _require_premium) — отдельной проверки тут больше не нужно.
-    if not await _require_premium(bot, target, telegram_id, edit=edit):
+    # которую вызывает _require_premium_or_free_trial) — отдельной проверки
+    # тут больше не нужно. Плюс одноразовый бесплатный пробник на саму эту
+    # фичу (см. _require_premium_or_free_trial), отдельно от users.trial_used.
+    if not await _require_premium_or_free_trial(
+        bot, target, telegram_id, get_analysis_trial_used, edit=edit
+    ):
         return
     contact = get_contact_by_id(contact_id)
     if not contact:
@@ -2484,7 +2521,8 @@ async def _run_deep_analysis(
         await target.answer(
             f"Пока маловато данных по {name} для анализа собеседника — нужно минимум "
             f"{DEEP_ANALYSIS_MIN_MSGS} сообщений с обеих сторон (JSON-экспорт или "
-            "накопление через Автоматизацию чатов)."
+            "накопление через Автоматизацию чатов).",
+            reply_markup=_with_back_to_menu(InlineKeyboardMarkup(inline_keyboard=[])),
         )
         return
 
@@ -2514,6 +2552,8 @@ async def _run_deep_analysis(
             target, _format_deep_analysis_text(name, metrics, dynamics_text, synthesis, advice),
             reply_markup=deep_analysis_result_kb(contact_id), parse_mode="HTML",
         )
+
+    await _charge_feature_trial_if_needed(bot, telegram_id, mark_analysis_trial_used)
 
 
 async def _show_deep_analysis(
@@ -2646,7 +2686,11 @@ async def _run_ideal_date(
     bot: Bot, target: Message, telegram_id: str, contact_id: int,
     edit: bool = False, fresh: bool = False,
 ) -> None:
-    if not await _require_premium(bot, target, telegram_id, edit=edit):
+    # Одноразовый бесплатный пробник на эту фичу, отдельно от users.trial_used
+    # (см. _require_premium_or_free_trial).
+    if not await _require_premium_or_free_trial(
+        bot, target, telegram_id, get_date_trial_used, edit=edit
+    ):
         return
     contact = get_contact_by_id(contact_id)
     if not contact:
@@ -2677,6 +2721,7 @@ async def _run_ideal_date(
         return
 
     await _answer_long(target, _format_ideal_date(name, data), reply_markup=ideal_date_result_kb(contact_id))
+    await _charge_feature_trial_if_needed(bot, telegram_id, mark_date_trial_used)
 
 
 async def _show_ideal_date(
