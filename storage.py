@@ -315,6 +315,14 @@ def init_db() -> None:
             conn.execute("DELETE FROM deep_analysis")
         _add_column_if_missing(conn, "deep_analysis", "dynamics_text", "TEXT NOT NULL DEFAULT ''")
         _add_column_if_missing(conn, "deep_analysis", "synthesis_text", "TEXT NOT NULL DEFAULT ''")
+        # «Готовое сообщение» возвращено в карточку по фидбеку — колонка та же,
+        # что была до 6d58335 (выпилена там вместе с howto/flags как дубль
+        # «Ответить с CueMe»), переиспользуем имя. На этот раз рендерится НЕ
+        # отдельным tap-to-copy сообщением, а моноширинным блоком внизу той же
+        # карточки (см. main.py: _build_rich_analysis_html/_format_deep_analysis_text).
+        if "message_text" not in da_cols:
+            conn.execute("DELETE FROM deep_analysis")
+        _add_column_if_missing(conn, "deep_analysis", "message_text", "TEXT NOT NULL DEFAULT ''")
         # Секция «Тепло» заменена на «Кто чаще задаёт вопросы» — изменилась не
         # схема таблицы, а СОДЕРЖИМОЕ metrics_json (ключ warmth_conflict вместо
         # questions), а карточка рендерит ровно то, что лежит в JSON. Поэтому
@@ -1029,12 +1037,13 @@ def get_all_per_contact_style_cards(owner_user_id: str) -> list[dict]:
 
 def save_deep_analysis(
     contact_id: int, metrics_json: str, dynamics_text: str, synthesis_text: str,
-    advice_text: str, rebuild_count: int,
+    advice_text: str, message_text: str, rebuild_count: int,
 ) -> None:
     """metrics_json — сериализованный dict {key: {"label","short","fact","interpretation"}}
     (см. compatibility_metrics.py + build_compatibility_interpretation в llm.py).
     dynamics_text — интерпретация динамики переписки (адаптивная группировка
-    день/неделя/месяц), synthesis_text — ВЫВОД (синтез всех метрик разом).
+    день/неделя/месяц), synthesis_text — ВЫВОД (синтез всех метрик разом),
+    message_text — готовое сообщение (моноширинный блок внизу карточки).
     rebuild_count — общее число сообщений контакта на момент сохранения, для
     авто-инвалидации по REBUILD_THRESHOLD (тот же паттерн, что my_style_per_contact)."""
     with _conn() as conn:
@@ -1042,17 +1051,18 @@ def save_deep_analysis(
             """
             INSERT INTO deep_analysis
                 (contact_id, compatibility_text, metrics_json, dynamics_text,
-                 synthesis_text, advice_text, last_rebuild_count, updated_at)
-            VALUES (?, '', ?, ?, ?, ?, ?, ?)
+                 synthesis_text, advice_text, message_text, last_rebuild_count, updated_at)
+            VALUES (?, '', ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(contact_id) DO UPDATE SET
                 metrics_json       = excluded.metrics_json,
                 dynamics_text      = excluded.dynamics_text,
                 synthesis_text     = excluded.synthesis_text,
                 advice_text        = excluded.advice_text,
+                message_text       = excluded.message_text,
                 last_rebuild_count = excluded.last_rebuild_count,
                 updated_at         = excluded.updated_at
             """,
-            (contact_id, metrics_json, dynamics_text, synthesis_text, advice_text, rebuild_count, _now()),
+            (contact_id, metrics_json, dynamics_text, synthesis_text, advice_text, message_text, rebuild_count, _now()),
         )
 
 
@@ -1068,6 +1078,7 @@ def get_deep_analysis(contact_id: int) -> dict | None:
         "dynamics_text":      row["dynamics_text"],
         "synthesis_text":     row["synthesis_text"],
         "advice_text":        row["advice_text"],
+        "message_text":       row["message_text"],
         "last_rebuild_count": row["last_rebuild_count"],
     }
 

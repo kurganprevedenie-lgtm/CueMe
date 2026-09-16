@@ -2282,6 +2282,22 @@ def _volume_trend_to_dict(vt) -> dict:
     }
 
 
+def _recent_dialogue_lines(rows: list[dict], limit: int = 20) -> list[str]:
+    """Последние limit сообщений (дата+время+автор), хронологически — контекст
+    ТОЛЬКО для блока «Готовое сообщение» в build_compatibility_interpretation,
+    чтобы оно продолжало реальную последнюю тему, а не звучало общо. В
+    метриках (compatibility_metrics.py) не участвует — те считаются по всей
+    истории контакта отдельно."""
+    texted = [r for r in rows if r.get("text") and r.get("date")]
+    tail = sorted(texted, key=lambda r: r["date"])[-limit:]
+    lines = []
+    for r in tail:
+        who = "Я" if r["direction"] == "out" else "Собеседник"
+        when = r["date"][:16].replace("T", " ")
+        lines.append(f"{when} {who}: {r['text']}")
+    return lines
+
+
 async def _gen_deep_analysis(contact_id: int, owner_user_id: str) -> dict | None:
     """Ленивая генерация с кэшем в deep_analysis, инвалидация по REBUILD_THRESHOLD
     (тот же паттерн, что my_style_per_contact) — не пересчитываем на каждый
@@ -2307,8 +2323,9 @@ async def _gen_deep_analysis(contact_id: int, owner_user_id: str) -> dict | None
     # месте, он интерпретирует уже посчитанные числа).
     metrics = compute_compat_metrics(rows)
     volume_trend = metrics.pop("_volume_trend")
-    interpretations, dynamics_text, synthesis, advice = await build_compatibility_interpretation(
-        metrics, volume_trend, user_gender=get_gender(owner_user_id),
+    recent_lines = _recent_dialogue_lines(rows)
+    interpretations, dynamics_text, synthesis, advice, ready_message = await build_compatibility_interpretation(
+        metrics, volume_trend, recent_lines, user_gender=get_gender(owner_user_id),
     )
     for key, text in interpretations.items():
         metrics[key]["interpretation"] = text
@@ -2323,10 +2340,11 @@ async def _gen_deep_analysis(contact_id: int, owner_user_id: str) -> dict | None
     metrics["_volume_trend"] = _volume_trend_to_dict(volume_trend)
 
     metrics_json = json.dumps(metrics, ensure_ascii=False)
-    save_deep_analysis(contact_id, metrics_json, dynamics_text, synthesis, advice, total_count)
+    save_deep_analysis(contact_id, metrics_json, dynamics_text, synthesis, advice, ready_message, total_count)
     return {
         "metrics_json": metrics_json, "dynamics_text": dynamics_text,
-        "synthesis_text": synthesis, "advice_text": advice, "last_rebuild_count": total_count,
+        "synthesis_text": synthesis, "advice_text": advice,
+        "message_text": ready_message, "last_rebuild_count": total_count,
     }
 
 
@@ -2469,12 +2487,27 @@ def _rich_heading(text: str) -> str:
     return f"<p><b>{html.escape(text)}</b></p>"
 
 
-def _build_rich_analysis_html(name: str, metrics: dict, dynamics_text: str, synthesis: str, advice: str) -> str:
+def _ready_message_block_html(name: str, message_text: str) -> str:
+    """Моноширинный блок «Напиши сейчас, {name}!» внизу карточки анализа —
+    готовое сообщение, которое можно скопировать и отправить прямо сейчас
+    (build_compatibility_interpretation в llm.py). Возвращена по фидбеку:
+    была отдельным tap-to-copy сообщением до 6d58335, теперь — блок в конце
+    той же карточки. Пусто, если LLM не вернула текст (не выдумываем)."""
+    if not message_text.strip():
+        return ""
+    return (
+        f"{_rich_heading(f'✉️ Напиши сейчас, {name}!')}\n"
+        f"<pre>{html.escape(message_text.strip())}</pre>\n"
+    )
+
+
+def _build_rich_analysis_html(name: str, metrics: dict, dynamics_text: str, synthesis: str, advice: str, message_text: str) -> str:
     """HTML для sendRichMessage (Bot API 10.1+, aiogram InputRichMessage.html):
     жирный заголовок (см. _rich_heading — НЕ <h2>/<h3>) с эмодзи по смыслу
     метрики + <blockquote> под ним на каждую метрику, отдельная секция
     «Динамика переписки» с настоящей таблицей периодов, «Вывод» — синтез,
-    «Что дальше» — совет обычным текстом, без выделения."""
+    «Что дальше» — совет обычным текстом, без выделения, «Напиши сейчас» —
+    готовое сообщение моноширинным блоком (см. _ready_message_block_html)."""
     esc = html.escape
     meta = metrics.get("_meta") or {}
     vt = metrics.get("_volume_trend") or {}
@@ -2527,11 +2560,12 @@ def _build_rich_analysis_html(name: str, metrics: dict, dynamics_text: str, synt
         f"{_rich_heading('🧩 Вывод')}\n"
         f"<blockquote>{esc(synthesis)}</blockquote>\n"
         f"{_rich_heading('👉 Что дальше')}\n"
-        f"<p>{esc(advice)}</p>"
+        f"<p>{esc(advice)}</p>\n"
+        f"{_ready_message_block_html(name, message_text)}"
     )
 
 
-def _format_deep_analysis_text(name: str, metrics: dict, dynamics_text: str, synthesis: str, advice: str) -> str:
+def _format_deep_analysis_text(name: str, metrics: dict, dynamics_text: str, synthesis: str, advice: str, message_text: str) -> str:
     """Plain-text ФОЛБЭК для _run_deep_analysis, если Rich Message не
     отправился — та же структура, эмодзи-заголовки вместо heading, таблица
     периодов моноширинным блоком. HTML-спецсимволы в значениях (например
@@ -2563,11 +2597,19 @@ def _format_deep_analysis_text(name: str, metrics: dict, dynamics_text: str, syn
     else:
         trend_table = ""
 
+    ready_part = ""
+    if message_text.strip():
+        ready_part = (
+            f"\n\n✉️ <b>Напиши сейчас, {html.escape(name)}!</b>\n"
+            f"<pre>{html.escape(message_text.strip())}</pre>"
+        )
+
     return (
         f"{header}{metric_parts}\n\n"
         f"📈 <b>Динамика переписки</b>\n{trend_table}{html.escape(dynamics_text)}\n\n"
         f"🧩 <b>Вывод</b>\n{html.escape(synthesis)}\n\n"
         f"👉 <b>Что дальше</b>\n{html.escape(advice)}"
+        f"{ready_part}"
     )
 
 
@@ -2619,6 +2661,7 @@ async def _run_deep_analysis(
     dynamics_text = data["dynamics_text"]
     synthesis = data["synthesis_text"]
     advice = data["advice_text"]
+    message_text = data["message_text"]
 
     # Rich Message (заголовки + цитаты на метрику + таблица динамики) —
     # основной путь; ЛЮБОЙ сбой (отказ Bot API, нет капабилити у клиента и
@@ -2632,7 +2675,7 @@ async def _run_deep_analysis(
     # анимацию тем же edit_message_text, как и остальные два флоу.
     sent_rich = False
     try:
-        rich_html = _build_rich_analysis_html(name, metrics, dynamics_text, synthesis, advice)
+        rich_html = _build_rich_analysis_html(name, metrics, dynamics_text, synthesis, advice, message_text)
         await bot.send_rich_message(
             chat_id=progress_msg.chat.id,
             rich_message=InputRichMessage(html=rich_html),
@@ -2649,7 +2692,7 @@ async def _run_deep_analysis(
             pass  # не критично — прогресс-сообщение просто останется висеть над результатом
     else:
         await _edit_or_answer_long(
-            progress_msg, _format_deep_analysis_text(name, metrics, dynamics_text, synthesis, advice),
+            progress_msg, _format_deep_analysis_text(name, metrics, dynamics_text, synthesis, advice, message_text),
             reply_markup=deep_analysis_result_kb(contact_id), parse_mode="HTML",
         )
 
