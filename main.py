@@ -369,6 +369,18 @@ async def _answer_long(
 # _run_variants_generation для выбранного контакта и _run_live_coach_step для
 # холодного старта «Живого диалога»), «Анализ собеседника» (_run_deep_analysis),
 # «Идеальное свидание» (_run_ideal_date).
+#
+# «Ответ с CueMe» — единственный флоу с двумя РАЗНЫМИ режимами показа:
+# - первая генерация в диалоге (выбрал контакт / начал новый диалог) —
+#   прогресс-бар, но круче 5с (_REPLY_PROGRESS_CYCLE_SECONDS), не 10с —
+#   с пропорционально более быстрой анимацией (тот же _PROGRESS_FRAME_COUNT
+#   кадров укладывается в 5с вместо 10с, см. with_progress_animation).
+# - «Другие варианты» БЕЗ выхода из диалога — вообще БЕЗ прогресс-бара,
+#   результат сразу по готовности LLM, без ожидания цикла (см.
+#   _run_variants_generation/_run_live_coach_step: force_fresh ветка).
+# «Анализ собеседника»/«Идеальное свидание» такого различия не просили —
+# у них по-прежнему единый 10-секундный цикл на каждый вызов, включая
+# «Обновить»/«Другая идея».
 
 _PROGRESS_FRAMES = [
     "⏳ Генерирую ▓░░░░░░░░░",
@@ -382,13 +394,15 @@ _PROGRESS_FRAMES = [
     "⏳ Генерирую ░░░░░░▓▓▓░",
     "⏳ Генерирую ░░░░░░░▓▓▓",
 ]
-_PROGRESS_CYCLE_SECONDS = 10.0
-_PROGRESS_FRAME_COUNT = 10  # по кадру в секунду внутри одного 10-секундного круга
+_PROGRESS_CYCLE_SECONDS = 10.0  # Анализ собеседника, Идеальное свидание
+_REPLY_PROGRESS_CYCLE_SECONDS = 5.0  # Ответ с CueMe, первая генерация в диалоге
+_PROGRESS_FRAME_COUNT = 10  # кадров в одном круге — при 5с круге кадр идёт вдвое быстрее
 
 
-async def _run_progress_cycle(bot: Bot, chat_id: int, message_id: int) -> None:
-    """Один полный круг анимации ровно _PROGRESS_CYCLE_SECONDS секунд."""
-    frame_interval = _PROGRESS_CYCLE_SECONDS / _PROGRESS_FRAME_COUNT
+async def _run_progress_cycle(bot: Bot, chat_id: int, message_id: int, cycle_seconds: float) -> None:
+    """Один полный круг анимации ровно cycle_seconds секунд, _PROGRESS_FRAME_COUNT
+    кадров равномерно внутри него — короче круг, быстрее сменяются кадры."""
+    frame_interval = cycle_seconds / _PROGRESS_FRAME_COUNT
     for frame in _PROGRESS_FRAMES[:_PROGRESS_FRAME_COUNT]:
         try:
             await bot.edit_message_text(frame, chat_id=chat_id, message_id=message_id)
@@ -397,19 +411,20 @@ async def _run_progress_cycle(bot: Bot, chat_id: int, message_id: int) -> None:
         await asyncio.sleep(frame_interval)
 
 
-async def with_progress_animation(bot: Bot, chat_id: int, message_id: int, coro):
-    """Крутит анимацию на message_id ЦЕЛЫМИ 10-секундными кругами, пока
-    выполняется coro (реальный вызов LLM) — результат отдаётся ТОЛЬКО на
-    границе круга, никогда раньше. Если LLM ответила за 2 секунды — юзер всё
-    равно видит анимацию все 10 секунд текущего круга; если LLM не успела за
-    10 секунд — крутим ещё один круг целиком и снова проверяем на его
-    границе (14 секунд реальной генерации → результат ровно на 20-й секунде,
-    не раньше и не позже). Исключение из coro пробрасывается вызывающему
-    коду сразу по завершении того круга, на котором coro упала, — тот сам
-    решает, как отредактировать message_id в сообщение об ошибке."""
+async def with_progress_animation(
+    bot: Bot, chat_id: int, message_id: int, coro, cycle_seconds: float = _PROGRESS_CYCLE_SECONDS,
+):
+    """Крутит анимацию на message_id ЦЕЛЫМИ cycle_seconds-секундными кругами,
+    пока выполняется coro (реальный вызов LLM) — результат отдаётся ТОЛЬКО на
+    границе круга, никогда раньше. Если LLM ответила быстрее — юзер всё
+    равно видит анимацию весь текущий круг; если LLM не успела — крутим ещё
+    один круг целиком и снова проверяем на его границе. Исключение из coro
+    пробрасывается вызывающему коду сразу по завершении того круга, на
+    котором coro упала, — тот сам решает, как отредактировать message_id в
+    сообщение об ошибке."""
     task = asyncio.ensure_future(coro)
     while True:
-        await _run_progress_cycle(bot, chat_id, message_id)
+        await _run_progress_cycle(bot, chat_id, message_id, cycle_seconds)
         if task.done():
             return task.result()  # исключение из coro пробрасывается здесь же
 
@@ -427,6 +442,24 @@ async def _edit_or_answer_long(
     await message.edit_text(chunks[0], reply_markup=reply_markup if last == 0 else None, parse_mode=parse_mode)
     for i, chunk in enumerate(chunks[1:], start=1):
         await message.answer(chunk, reply_markup=reply_markup if i == last else None, parse_mode=parse_mode)
+
+
+async def _finish_generation_message(
+    progress_msg: Message | None, target: Message, force_fresh: bool, text: str,
+    reply_markup: InlineKeyboardMarkup | None = None, parse_mode: str | None = None,
+) -> None:
+    """Единая точка «куда девать результат/ошибку» для _run_variants_generation
+    и _run_live_coach_step («Ответ с CueMe»): progress_msg — крутилась
+    анимация, редактируем ЕЁ; иначе force_fresh — «Другие варианты» без
+    анимации, редактируем target (call.message с прошлыми вариантами) на
+    месте; иначе — кэш-хит первой генерации, новое сообщение (target тут
+    часто НЕ бот-владеемое — сообщение юзера, редактировать нельзя)."""
+    if progress_msg:
+        await _edit_or_answer_long(progress_msg, text, reply_markup=reply_markup, parse_mode=parse_mode)
+    elif force_fresh:
+        await _edit_or_answer_long(target, text, reply_markup=reply_markup, parse_mode=parse_mode)
+    else:
+        await _answer_long(target, text, reply_markup=reply_markup, parse_mode=parse_mode)
 
 
 # ── Подписка (Tribute) ──────────────────────────────────────────────────────
@@ -4957,40 +4990,45 @@ async def _run_variants_generation(
             except (ValueError, TypeError):
                 variants = None
 
-    # progress_msg — заведённое НАМИ сообщение-анимация на время реального
-    # вызова LLM; None, если варианты взялись из кэша (генерации не было, крутить
-    # нечего). force_fresh («Другие варианты») редактирует target (уже
-    # существующее сообщение с прошлыми вариантами) — сохраняет прежнее
-    # поведение edit-in-place, теперь с анимацией вместо мгновенной подмены.
-    # Первая генерация шлёт НОВОЕ сообщение — target тут иногда сообщение
-    # ПОЛЬЗОВАТЕЛЯ (см. handle_incoming), которое бот не может редактировать.
+    # progress_msg — заведённое НАМИ сообщение-анимация, ТОЛЬКО для первой
+    # генерации в диалоге (не force_fresh): фиксированный 5-секундный круг,
+    # см. with_progress_animation/_REPLY_PROGRESS_CYCLE_SECONDS. «Другие
+    # варианты» (force_fresh, юзер не выходит из диалога) — по явному
+    # запросу БЕЗ анимации и БЕЗ ожидания цикла, результат сразу по
+    # готовности LLM. None и при кэш-хите (генерации не было, крутить нечего).
     progress_msg: Message | None = None
     if variants is None:
         # Реальный вызов LLM — здесь и только здесь гейт + списание.
         if not await _quota_gate(bot, target, str(telegram_id)):
             return
         prev = ctx.get("variants") if force_fresh else None
-        progress_msg = await (
-            target.edit_text(_PROGRESS_FRAMES[0]) if force_fresh else target.answer(_PROGRESS_FRAMES[0])
+        # kind всегда "reply" — "screenshot" убран вместе с функцией
+        # «скриншот переписки → ответ» (screenshot_variants в llm.py
+        # остался нетронутым, просто больше никем не вызывается).
+        coro = suggest_reply_variants(
+            text, style_card, interaction_card,
+            data_signals=signals, previous_variants=prev, winning_examples=winning,
+            user_gender=gender,
         )
         try:
-            # kind всегда "reply" — "screenshot" убран вместе с функцией
-            # «скриншот переписки → ответ» (screenshot_variants в llm.py
-            # остался нетронутым, просто больше никем не вызывается).
-            variants = await with_progress_animation(
-                bot, progress_msg.chat.id, progress_msg.message_id,
-                suggest_reply_variants(
-                    text, style_card, interaction_card,
-                    data_signals=signals, previous_variants=prev, winning_examples=winning,
-                    user_gender=gender,
-                ),
-            )
+            if force_fresh:
+                variants = await coro
+            else:
+                progress_msg = await target.answer(_PROGRESS_FRAMES[0])
+                variants = await with_progress_animation(
+                    bot, progress_msg.chat.id, progress_msg.message_id, coro,
+                    cycle_seconds=_REPLY_PROGRESS_CYCLE_SECONDS,
+                )
         except RateLimitError:
-            await progress_msg.edit_text("Лимит исчерпан, попробуй позже.")
+            await _finish_generation_message(
+                progress_msg, target, force_fresh, "Лимит исчерпан, попробуй позже.",
+            )
             return
         except Exception:
             logging.exception("%s-variants: ошибка генерации", kind)
-            await progress_msg.edit_text("Не получилось сгенерировать варианты — попробуй ещё раз.")
+            await _finish_generation_message(
+                progress_msg, target, force_fresh, "Не получилось сгенерировать варианты — попробуй ещё раз.",
+            )
             return
 
         # Успех — списываем ОДНУ попытку (не за каждый вариант — это один вызов
@@ -5003,8 +5041,9 @@ async def _run_variants_generation(
             logging.exception("telemetry: не удалось записать событие генерации вариантов")
 
     if not variants:
-        text = "Не получилось сгенерировать варианты — попробуй ещё раз."
-        await (progress_msg.edit_text(text) if progress_msg else target.answer(text))
+        await _finish_generation_message(
+            progress_msg, target, force_fresh, "Не получилось сгенерировать варианты — попробуй ещё раз.",
+        )
         return
 
     _save_shown_suggestions(str(telegram_id), ctx.get("contact_id"), kind, variants)
@@ -5024,18 +5063,10 @@ async def _run_variants_generation(
         ctx["footer_html"] = footer
 
     text_out = f"{_format_variants(variants)}\n\n{footer}"
-    # progress_msg (когда была реальная генерация) — анимация превращается в
-    # результат ТЕМ ЖЕ edit_message_text. Кэш-хит без progress_msg — прежнее
-    # поведение: новое отдельное сообщение (target — не редактируем, могло
-    # быть сообщением пользователя).
-    if progress_msg:
-        await _edit_or_answer_long(
-            progress_msg, text_out, reply_markup=variants_result_kb(action_id), parse_mode="HTML",
-        )
-    else:
-        await _answer_long(
-            target, text_out, reply_markup=variants_result_kb(action_id), parse_mode="HTML",
-        )
+    await _finish_generation_message(
+        progress_msg, target, force_fresh, text_out,
+        reply_markup=variants_result_kb(action_id), parse_mode="HTML",
+    )
 
 
 @dp.callback_query(F.data.startswith("varregen:"))
@@ -5365,23 +5396,20 @@ async def _run_live_coach_step(
     if force_fresh:
         if not await _quota_gate(bot, target, str(telegram_id)):
             return
-        # Editим ЭТО ЖЕ сообщение (target = call.message из cb_live_regen) —
-        # сначала в анимацию, потом в новый результат, а не шлём новое.
-        progress_msg = await target.edit_text(_PROGRESS_FRAMES[0])
+        # «Другие варианты» без выхода из диалога — БЕЗ анимации, ответ
+        # показываем сразу по готовности LLM (по явному запросу), результат
+        # заменяет target (call.message из cb_live_regen) на месте.
         try:
-            variants = await with_progress_animation(
-                bot, progress_msg.chat.id, progress_msg.message_id,
-                suggest_reply_variants(
-                    text, style_card, running_notes, previous_variants=ctx.get("variants"),
-                    user_gender=gender,
-                ),
+            variants = await suggest_reply_variants(
+                text, style_card, running_notes, previous_variants=ctx.get("variants"),
+                user_gender=gender,
             )
         except RateLimitError:
-            await progress_msg.edit_text("Лимит исчерпан, попробуй позже.")
+            await target.edit_text("Лимит исчерпан, попробуй позже.")
             return
         except Exception:
             logging.exception("live-coach: ошибка регена вариантов")
-            await progress_msg.edit_text("Не получилось сгенерировать варианты — попробуй ещё раз.")
+            await target.edit_text("Не получилось сгенерировать варианты — попробуй ещё раз.")
             return
         await _charge_trial_if_needed(bot, str(telegram_id))
         try:
@@ -5389,7 +5417,7 @@ async def _run_live_coach_step(
         except Exception:
             logging.exception("telemetry: не удалось записать событие live-регена")
         if not variants:
-            await progress_msg.edit_text("Не получилось сгенерировать варианты — попробуй ещё раз.")
+            await target.edit_text("Не получилось сгенерировать варианты — попробуй ещё раз.")
             return
         _save_shown_suggestions(str(telegram_id), contact_id, "live", variants)
         ctx["variants"] = variants
@@ -5398,7 +5426,7 @@ async def _run_live_coach_step(
         # инструкция остаются как были, меняются только сами варианты.
         footer = ctx.get("footer_html", "")
         await _edit_or_answer_long(
-            progress_msg, f"{_format_variants(variants)}\n\n{footer}",
+            target, f"{_format_variants(variants)}\n\n{footer}",
             reply_markup=live_variants_kb(action_id), parse_mode="HTML",
         )
         return
@@ -5415,10 +5443,12 @@ async def _run_live_coach_step(
         except (ValueError, TypeError, KeyError):
             variants = updated_notes = None
 
-    # progress_msg — заведённое НАМИ сообщение-анимация на время реального
-    # вызова LLM; None при кэш-хите (генерации не было). target тут почти
-    # всегда сообщение ПОЛЬЗОВАТЕЛЯ (см. _process_live_incoming/
-    # handle_live_incoming), бот не может его редактировать — поэтому новое.
+    # progress_msg — заведённое НАМИ сообщение-анимация, фиксированный
+    # 5-секундный круг (первая генерация в новом диалоге, см.
+    # _REPLY_PROGRESS_CYCLE_SECONDS); None при кэш-хите (генерации не было).
+    # target тут почти всегда сообщение ПОЛЬЗОВАТЕЛЯ (см.
+    # _process_live_incoming/handle_live_incoming), бот не может его
+    # редактировать — поэтому новое сообщение, не edit.
     progress_msg: Message | None = None
     if variants is None:
         if not await _quota_gate(bot, target, str(telegram_id)):
@@ -5431,6 +5461,7 @@ async def _run_live_coach_step(
                     text, style_card, running_notes or None, ctx.get("dialogue_history"),
                     user_gender=gender,
                 ),
+                cycle_seconds=_REPLY_PROGRESS_CYCLE_SECONDS,
             )
         except RateLimitError:
             await progress_msg.edit_text("Лимит исчерпан, попробуй позже.")
@@ -5453,8 +5484,8 @@ async def _run_live_coach_step(
         ctx["message_count"] = new_count
 
     if not variants:
-        text = "Не получилось сгенерировать совет — попробуй ещё раз."
-        await (progress_msg.edit_text(text) if progress_msg else target.answer(text))
+        err_text = "Не получилось сгенерировать совет — попробуй ещё раз."
+        await (progress_msg.edit_text(err_text) if progress_msg else target.answer(err_text))
         return
 
     _save_shown_suggestions(str(telegram_id), contact_id, "live", variants)
