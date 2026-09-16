@@ -382,32 +382,36 @@ _PROGRESS_FRAMES = [
     "⏳ Генерирую ░░░░░░▓▓▓░",
     "⏳ Генерирую ░░░░░░░▓▓▓",
 ]
-_PROGRESS_FRAME_INTERVAL = 1.5  # сек — не упереться в лимиты Telegram на edit одного сообщения
+_PROGRESS_CYCLE_SECONDS = 10.0
+_PROGRESS_FRAME_COUNT = 10  # по кадру в секунду внутри одного 10-секундного круга
 
 
-async def _animate_progress(bot: Bot, chat_id: int, message_id: int) -> None:
-    i = 0
-    while True:
+async def _run_progress_cycle(bot: Bot, chat_id: int, message_id: int) -> None:
+    """Один полный круг анимации ровно _PROGRESS_CYCLE_SECONDS секунд."""
+    frame_interval = _PROGRESS_CYCLE_SECONDS / _PROGRESS_FRAME_COUNT
+    for frame in _PROGRESS_FRAMES[:_PROGRESS_FRAME_COUNT]:
         try:
-            await bot.edit_message_text(
-                _PROGRESS_FRAMES[i % len(_PROGRESS_FRAMES)], chat_id=chat_id, message_id=message_id,
-            )
+            await bot.edit_message_text(frame, chat_id=chat_id, message_id=message_id)
         except Exception:
             pass  # гонки/rate limit одного кадра — не роняем задачу анимации
-        i += 1
-        await asyncio.sleep(_PROGRESS_FRAME_INTERVAL)
+        await asyncio.sleep(frame_interval)
 
 
 async def with_progress_animation(bot: Bot, chat_id: int, message_id: int, coro):
-    """Крутит зацикленную анимацию прогресс-бара на message_id, пока выполняется
-    coro (реальный вызов LLM), затем отменяет анимацию и возвращает результат
-    coro (или пробрасывает её исключение — вызывающий код сам решает, как
-    отредактировать message_id в сообщение об ошибке)."""
-    task = asyncio.create_task(_animate_progress(bot, chat_id, message_id))
-    try:
-        return await coro
-    finally:
-        task.cancel()
+    """Крутит анимацию на message_id ЦЕЛЫМИ 10-секундными кругами, пока
+    выполняется coro (реальный вызов LLM) — результат отдаётся ТОЛЬКО на
+    границе круга, никогда раньше. Если LLM ответила за 2 секунды — юзер всё
+    равно видит анимацию все 10 секунд текущего круга; если LLM не успела за
+    10 секунд — крутим ещё один круг целиком и снова проверяем на его
+    границе (14 секунд реальной генерации → результат ровно на 20-й секунде,
+    не раньше и не позже). Исключение из coro пробрасывается вызывающему
+    коду сразу по завершении того круга, на котором coro упала, — тот сам
+    решает, как отредактировать message_id в сообщение об ошибке."""
+    task = asyncio.ensure_future(coro)
+    while True:
+        await _run_progress_cycle(bot, chat_id, message_id)
+        if task.done():
+            return task.result()  # исключение из coro пробрасывается здесь же
 
 
 async def _edit_or_answer_long(
