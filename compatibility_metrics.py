@@ -18,8 +18,11 @@ import re
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 from features import _looks_junky
+
+MOSCOW_TZ = ZoneInfo("Europe/Moscow")
 
 
 def _sorted_texted(rows: list[dict]) -> list[dict]:
@@ -42,6 +45,22 @@ def _as_utc(dt: datetime) -> datetime:
     незавершённого периода) наивные считаем уже UTC, тот же принцип, что и
     в main._relative_label."""
     return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
+
+
+def _to_moscow(dt: datetime) -> datetime:
+    """Переводит распарсенный timestamp сообщения в московское время —
+    ЕДИНАЯ точка конвертации перед тем, как из даты берут час/день/месяц для
+    статистики (пики активности в circadian_overlap, группировка периодов в
+    volume_trend, календарные даты долгих пауз в long_pauses). Business API
+    отдаёт date в UTC — без этой конвертации, например, час дня считался бы
+    из сырого UTC, и для юзера из Москвы переписка в 17:00 показывалась бы
+    как «пик в 14:00» (ровно смещение UTC→Europe/Moscow, +3ч). Наивные даты
+    (JSON-экспорт) сначала приводятся к UTC через _as_utc — тот же принцип,
+    что и в остальном модуле. НЕ используется там, где даты только
+    вычитаются друг из друга (response_speed_median, initiation_after_pause,
+    long_pauses — интервал между сообщениями) — разница между двумя aware-
+    datetime не зависит от часового пояса, конвертация там не нужна."""
+    return _as_utc(dt).astimezone(MOSCOW_TZ)
 
 
 # ── 1. Баланс ──────────────────────────────────────────────────────────────
@@ -125,7 +144,11 @@ def long_pauses(rows: list[dict], threshold_hours: int = 24) -> tuple[int, list[
         if not prev_dt or not cur_dt:
             continue
         if cur_dt - prev_dt >= timedelta(hours=threshold_hours):
-            dates.append(cur["date"][:10])
+            # Календарная дата — московская, не сырой срез UTC-ISO (тот же
+            # баг класса, что и в circadian_overlap/volume_trend: у сообщения
+            # поздним вечером по МСК, но уже следующим днём по UTC, старый
+            # срез "[:10]" показал бы вчерашнюю дату).
+            dates.append(_to_moscow(cur_dt).strftime("%Y-%m-%d"))
     return len(dates), dates
 
 
@@ -452,7 +475,7 @@ def circadian_overlap(rows: list[dict]) -> tuple[int | None, int | None, str]:
         dt = _parse_dt(r["date"])
         if not dt:
             continue
-        (my_hours if r["direction"] == "out" else ct_hours)[dt.hour] += 1
+        (my_hours if r["direction"] == "out" else ct_hours)[_to_moscow(dt).hour] += 1
 
     if not my_hours or not ct_hours:
         return None, None, "недостаточно данных"
@@ -583,6 +606,10 @@ def volume_trend(rows: list[dict]) -> VolumeTrend:
         dt = _parse_dt(r["date"])
         if not dt:
             continue
+        # Московское время — иначе сообщение поздним вечером по МСК, но уже
+        # следующим днём/месяцем по UTC, попало бы не в тот период (тот же
+        # баг класса, что чинили в circadian_overlap выше).
+        dt = _to_moscow(dt)
         key, label = _period_key(dt, granularity)
         if key not in buckets:
             buckets[key] = Period(label=label, n_author=0, n_contact=0)
@@ -784,8 +811,8 @@ def compute_all(rows: list[dict]) -> dict[str, dict]:
         out["circadian"] = {
             "label": "Совпадение по времени", "short": overlap_label,
             "fact": (
-                f"Твой пик активности — {my_peak}:00 ({_hour_label(my_peak)}), у "
-                f"собеседника — {ct_peak}:00 ({_hour_label(ct_peak)}), пики {overlap_label}."
+                f"Твой пик активности — {my_peak}:00 (МСК) ({_hour_label(my_peak)}), у "
+                f"собеседника — {ct_peak}:00 (МСК) ({_hour_label(ct_peak)}), пики {overlap_label}."
             ),
         }
 

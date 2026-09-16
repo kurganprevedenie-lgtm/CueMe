@@ -1,3 +1,4 @@
 aiogram>=3.31.0
 python-dotenv>=1.0
 httpx[socks]>=0.27
+tzdata>=2024.1
