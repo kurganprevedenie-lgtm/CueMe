@@ -4720,6 +4720,17 @@ async def _start_unified_reply(message: Message, state: FSMContext) -> None:
     await state.update_data(setup_chat_id=sent.chat.id, setup_message_id=sent.message_id)
 
 
+@dp.callback_query(F.data == "unified_reply_restart")
+async def cb_unified_reply_restart(call: CallbackQuery, state: FSMContext) -> None:
+    """«👥 Ответ для другого собеседника» на результате «Ответ с CueMe»
+    (variants_result_kb/live_variants_kb) — не редактирует сообщение с
+    вариантами (остаётся в истории чата нетронутым), запускает флоу заново
+    НОВЫМ сообщением, тот же способ входа, что и через главное меню (см.
+    _start_unified_reply)."""
+    await call.answer()
+    await _start_unified_reply(call.message, state)
+
+
 def unified_contacts_kb(contacts: list) -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     for c in contacts:
@@ -5081,6 +5092,8 @@ _VARIANT_KINDS = ("reply",)
 def variants_result_kb(action_id: str) -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     b.button(text="🔄 Другие варианты", callback_data=f"varregen:{action_id}")
+    b.button(text="👥 Ответ для другого собеседника", callback_data="unified_reply_restart")
+    b.adjust(1)
     return _with_back_to_menu(b.as_markup())
 
 
@@ -5292,6 +5305,8 @@ def _running_notes_preview(notes_text: str, n: int = 2) -> str:
 def live_variants_kb(action_id: str) -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     b.button(text="🔄 Другие варианты", callback_data=f"liveregen:{action_id}")
+    b.button(text="👥 Ответ для другого собеседника", callback_data="unified_reply_restart")
+    b.adjust(1)
     return _with_back_to_menu(b.as_markup())
 
 
