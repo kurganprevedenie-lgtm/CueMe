@@ -31,6 +31,7 @@ from aiogram.types import (
     InputMediaDocument, InputRichMessage, LinkPreviewOptions, Message,
     InlineKeyboardButton, InlineKeyboardMarkup,
     LabeledPrice, PreCheckoutQuery,
+    MessageOriginUser, MessageOriginHiddenUser, MessageOriginChat, MessageOriginChannel,
     ReplyKeyboardMarkup, ReplyKeyboardRemove, KeyboardButton,
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
@@ -4711,7 +4712,10 @@ def _looks_like_username(text: str) -> bool:
 
 async def _start_unified_reply(message: Message, state: FSMContext) -> None:
     await state.set_state(UnifiedReply.waiting_for_input)
-    sent = await message.answer("Перешли сообщение или просто вставь текст переписки")
+    sent = await message.answer(
+        "Перешли одно или несколько сообщений подряд или просто вставь текст "
+        "переписки — соберу всё вместе"
+    )
     await state.update_data(setup_chat_id=sent.chat.id, setup_message_id=sent.message_id)
 
 
@@ -4738,11 +4742,89 @@ async def _edit_setup_message(
     await bot.edit_message_text(text, chat_id=chat_id, message_id=message_id, reply_markup=reply_markup)
 
 
+# Дебаунс-буфер для пачки пересланных сообщений на этапе сбора контекста
+# (UnifiedReply.waiting_for_input): Telegram доставляет несколько подряд
+# пересланных ОБЫЧНЫХ текстовых сообщений (не альбом) отдельными апдейтами,
+# не одним пакетом — значит нельзя обрабатывать первое же сообщение, нужно
+# подождать тишины. In-memory, не в БД — временное состояние одной сессии
+# ввода, переживать перезапуск бота не обязано. Ключ — telegram user id (int).
+_unified_input_buffer: dict[int, list[tuple[str | None, str]]] = {}
+_unified_input_timers: dict[int, asyncio.Task] = {}
+_UNIFIED_INPUT_DEBOUNCE_SECONDS = 2.0
+
+
+def _forward_author_label(message: Message) -> str | None:
+    """Имя автора пересланного сообщения по forward_origin (Bot API 7.0+) —
+    None, если сообщение НЕ переслано (юзер напечатал сам, значит это его
+    собственная реплика, см. _combine_unified_input)."""
+    origin = message.forward_origin
+    if origin is None:
+        return None
+    if isinstance(origin, MessageOriginUser):
+        return origin.sender_user.full_name
+    if isinstance(origin, MessageOriginHiddenUser):
+        return origin.sender_user_name
+    if isinstance(origin, MessageOriginChat):
+        return origin.sender_chat.title or "Собеседник"
+    if isinstance(origin, MessageOriginChannel):
+        return origin.chat.title or "Канал"
+    return "Собеседник"
+
+
+def _combine_unified_input(buffer: list[tuple[str | None, str]]) -> str:
+    """Склеивает буфер пересланных/введённых сообщений в один контекст.
+    Одно сообщение без forward-метаданных (обычный случай — вставил текст
+    или переслал одно сообщение) — как раньше, голый текст без префикса, не
+    меняем формат самого частого пути. Несколько сообщений — каждое своей
+    строкой «Автор: текст» (автор — по forward_origin, см.
+    _forward_author_label), чтобы сохранить структуру диалога, а не
+    склеивать всё в сплошной блок; сообщения без forward-метаданных внутри
+    такой пачки — реплика от лица юзера бота («Я»)."""
+    if len(buffer) == 1 and buffer[0][0] is None:
+        return buffer[0][1]
+    return "\n".join(f"{author or 'Я'}: {text}" for author, text in buffer)
+
+
+async def _flush_unified_input(user_id: int, state: FSMContext, bot: Bot) -> None:
+    """Ждёт _UNIFIED_INPUT_DEBOUNCE_SECONDS тишины от этого юзера и только
+    потом обрабатывает весь накопленный буфер разом — пока не пришло новое
+    сообщение (которое отменит эту задачу и запустит новую, см.
+    handle_unified_input). Тело после sleep — старое тело
+    handle_unified_input, без изменений в логике выбора контакта."""
+    try:
+        await asyncio.sleep(_UNIFIED_INPUT_DEBOUNCE_SECONDS)
+    except asyncio.CancelledError:
+        return  # пришло новое сообщение раньше паузы — таймер уже перезапущен им
+
+    buffer = _unified_input_buffer.pop(user_id, None)
+    _unified_input_timers.pop(user_id, None)
+    if not buffer:
+        return
+
+    # Юзер мог за это время уйти из этого шага (команда меню и т.п.) —
+    # буфер тогда уже не актуален, применять его некуда.
+    if await state.get_state() != UnifiedReply.waiting_for_input.state:
+        return
+
+    incoming = _combine_unified_input(buffer)
+    telegram_id = str(user_id)
+    contacts = list_contacts(telegram_id)
+    await state.update_data(pending_text=incoming)
+
+    if not contacts:
+        await state.set_state(UnifiedReply.waiting_for_name)
+        await _edit_setup_message(state, bot, _UNIFIED_NAME_PROMPT)
+        return
+
+    await _edit_setup_message(state, bot, "Кому отвечаем?", reply_markup=unified_contacts_kb(contacts))
+
+
 @dp.message(UnifiedReply.waiting_for_input, _not_command)
 async def handle_unified_input(message: Message, state: FSMContext, bot: Bot) -> None:
     # Функция «скриншот переписки → ответ» убрана целиком (по запросу) —
     # фото в этом состоянии больше не читаем через Vision, просто просим
     # текст. Раньше здесь был branch на message.photo → extract_chat_from_image.
+    # Фото не буферизуется — отдельный, немедленный ответ, вне очереди.
     if message.photo:
         await _edit_setup_message(
             state, bot, "Скриншоты сейчас не поддерживаются — перешли сообщение или вставь текст.",
@@ -4755,16 +4837,14 @@ async def handle_unified_input(message: Message, state: FSMContext, bot: Bot) ->
         await _edit_setup_message(state, bot, "Перешли сообщение или вставь текст.")
         return
 
-    telegram_id = str(message.from_user.id)
-    contacts = list_contacts(telegram_id)
-    await state.update_data(pending_text=incoming)
+    user_id = message.from_user.id
+    author = _forward_author_label(message)
+    _unified_input_buffer.setdefault(user_id, []).append((author, incoming))
 
-    if not contacts:
-        await state.set_state(UnifiedReply.waiting_for_name)
-        await _edit_setup_message(state, bot, _UNIFIED_NAME_PROMPT)
-        return
-
-    await _edit_setup_message(state, bot, "Кому отвечаем?", reply_markup=unified_contacts_kb(contacts))
+    prev_timer = _unified_input_timers.get(user_id)
+    if prev_timer and not prev_timer.done():
+        prev_timer.cancel()
+    _unified_input_timers[user_id] = asyncio.create_task(_flush_unified_input(user_id, state, bot))
 
 
 @dp.message(UnifiedReply.waiting_for_name)
