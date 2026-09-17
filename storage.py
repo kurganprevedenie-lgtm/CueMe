@@ -225,6 +225,13 @@ def init_db() -> None:
         # известный статус", не гарантированно live.
         _add_column_if_missing(conn, "users", "blocked_bot", "INTEGER NOT NULL DEFAULT 0")
         _add_column_if_missing(conn, "users", "demo_trial_used", "INTEGER NOT NULL DEFAULT 0")
+        # Старая persistent reply-клавиатура (main_kb(), убрана из кода) у части
+        # юзеров ещё физически видна на устройстве — Telegram её не скрывает
+        # сам, нужен явный reply_markup=ReplyKeyboardRemove() в чат. 0 (default)
+        # = ещё не чистили, разово отправим при следующем визите в главное меню
+        # (см. main.py: _send_main_menu). Новым юзерам ставится сразу 1 при
+        # /start (cmd_start, is_new) — они эту клавиатуру никогда не видели.
+        _add_column_if_missing(conn, "users", "legacy_kb_cleared", "INTEGER NOT NULL DEFAULT 0")
         # Реферальная награда: до какого момента (UTC ISO) у пригласившего
         # активна полная Premium-подписка (имя колонки историческое — раньше
         # награда покрывала только «Анализ собеседника»). NULL = награды нет.
@@ -433,6 +440,23 @@ def mark_bot_unblocked(telegram_id: str) -> None:
     with _conn() as conn:
         conn.execute(
             "UPDATE users SET blocked_bot = 0 WHERE telegram_id = ?", (telegram_id,)
+        )
+
+
+def is_legacy_kb_cleared(telegram_id: str) -> bool:
+    """True — либо уже чистили старую reply-клавиатуру этому юзеру, либо он
+    новый и никогда её не видел (см. _add_column_if_missing выше)."""
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT legacy_kb_cleared FROM users WHERE telegram_id = ?", (telegram_id,)
+        ).fetchone()
+    return bool(row and row["legacy_kb_cleared"])
+
+
+def mark_legacy_kb_cleared(telegram_id: str) -> None:
+    with _conn() as conn:
+        conn.execute(
+            "UPDATE users SET legacy_kb_cleared = 1 WHERE telegram_id = ?", (telegram_id,)
         )
 
 

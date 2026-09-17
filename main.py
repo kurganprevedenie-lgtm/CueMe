@@ -147,6 +147,8 @@ from storage import (
     mark_analysis_trial_used,
     mark_bot_blocked,
     mark_bot_unblocked,
+    is_legacy_kb_cleared,
+    mark_legacy_kb_cleared,
     mark_date_trial_used,
     mark_referral_credited,
     merge_manual_contact_into,
@@ -1301,7 +1303,29 @@ async def _send_main_menu(target: Message, edit: bool = False) -> None:
     """Экран главного меню — общий для /menu, кнопки «⬅️ Вернуться в меню»
     под результатами генерации и возврата «⬅️ Назад» из «👑 Подписка».
     edit=True (Назад из Подписки) — редактирует ТО ЖЕ сообщение (та же
-    механика, что и у самой Подписки). edit=False — новое сообщение."""
+    механика, что и у самой Подписки). edit=False — новое сообщение.
+
+    target.chat.id — telegram_id юзера в обоих случаях (личный чат с ботом,
+    chat.id == user id даже когда target это call.message, чей from_user —
+    бот, не юзер)."""
+    telegram_id = str(target.chat.id)
+    if not is_legacy_kb_cleared(telegram_id):
+        # Старая persistent reply-клавиатура (main_kb(), убрана из кода) у
+        # части юзеров ещё физически видна на устройстве — inline-меню сверху
+        # её не перекрывает, нужен отдельный reply_markup=ReplyKeyboardRemove().
+        # Разово, маленьким отдельным сообщением перед самим меню (снять
+        # клавиатуру и отредактировать существующее сообщение одним вызовом
+        # нельзя — это разные типы reply_markup).
+        try:
+            await target.bot.send_message(
+                target.chat.id,
+                "Старые кнопки внизу экрана отключены — всё нужное теперь в меню ниже.",
+                reply_markup=ReplyKeyboardRemove(),
+            )
+        except Exception:
+            logging.warning("legacy kb clear failed: telegram_id=%s", telegram_id)
+        mark_legacy_kb_cleared(telegram_id)
+
     if edit:
         await target.edit_text(_MAIN_MENU_TEXT, reply_markup=main_menu_kb())
     else:
@@ -3398,6 +3422,8 @@ async def cmd_start(message: Message, state: FSMContext, bot: Bot) -> None:
     # оставался невидим в /users, если дальше ничего не сделал.
     upsert_user(telegram_id, f"user{telegram_id}")
     mark_bot_unblocked(telegram_id)  # живой /start — юзер точно не заблокировал бота
+    if is_new:
+        mark_legacy_kb_cleared(telegram_id)  # новый юзер старую reply-клавиатуру никогда не видел
     try:
         record_event(telegram_id, "start")  # для "последнее действие" в /users
     except Exception:
