@@ -92,7 +92,7 @@ from llm import (
     suggest_reply_variants,
     transcribe_audio,
 )
-from compatibility_metrics import compute_all as compute_compat_metrics
+from compatibility_metrics import compute_all as compute_compat_metrics, MOSCOW_TZ
 from tg_parser import parse_chat
 from tools.export import extract_conversation, to_html, to_text
 from storage import (
@@ -4057,6 +4057,33 @@ def _csv_dt(iso_str: str | None, fmt: str = "%Y-%m-%d %H:%M") -> str:
     return dt.strftime(fmt)
 
 
+def _fmt_msk(iso_str: str | None) -> str:
+    """Абсолютные дата+время в МСК с явной пометкой — для карточки /users
+    («когда последний раз писал собеседник»). В отличие от _relative_label
+    (относительное «N дней назад») и _csv_dt (остаётся в UTC, для CSV) — тут
+    именно абсолютный момент, переведённый в МСК. «—», если даты нет."""
+    if not iso_str:
+        return "—"
+    try:
+        dt = datetime.fromisoformat(iso_str)
+    except ValueError:
+        return "—"
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(MOSCOW_TZ).strftime("%d.%m.%Y %H:%M") + " (МСК)"
+
+
+async def _is_subscribed_to_promo_channel(bot: Bot, telegram_id: str) -> bool:
+    """Живой статус подписки на промо-канал (PROMO_CHANNEL_USERNAME) — для
+    карточки /users, отдельный запрос на юзера (тот же профиль стоимости,
+    что уже есть у _is_premium в этом же отчёте)."""
+    try:
+        member = await bot.get_chat_member(PROMO_CHANNEL_USERNAME, int(telegram_id))
+        return member.status in ("member", "administrator", "creator")
+    except Exception:
+        return False
+
+
 def _yn(value: bool) -> str:
     return "да" if value else "нет"
 
@@ -4088,7 +4115,7 @@ async def _collect_users_data(bot: Bot) -> tuple[list[dict], dict]:
         "total": len(users), "with_gender": 0, "with_contact": 0,
         "with_ref_premium": 0, "blocked": 0, "automation_off": 0, "inactive": 0,
         "premium_now": 0, "used_reply": 0, "used_screenshot": 0, "used_live": 0,
-        "used_deep_analysis": 0, "active_7d": 0,
+        "used_deep_analysis": 0, "active_7d": 0, "subscribed_channel": 0,
     }
 
     for u in users:
@@ -4193,6 +4220,14 @@ async def _collect_users_data(bot: Bot) -> tuple[list[dict], dict]:
             else:
                 premium_line = f"\n    👑 Premium: {label} (дата окончания неизвестна)"
 
+        # Живой статус подписки на промо-канал (для карточки /users) — тот же
+        # профиль стоимости, что уже есть у _is_premium выше (один запрос к
+        # Telegram на юзера), отдельного кэша/реконсиляции тут не переиспользуем
+        # (та таблица покрывает только юзеров с активным промо-Premium).
+        is_subscribed_channel = await _is_subscribed_to_promo_channel(bot, tid)
+        if is_subscribed_channel:
+            totals["subscribed_channel"] += 1
+
         days_since_active = _days_since(last_action_raw, now)
         active_7d = days_since_active is not None and days_since_active <= 7
 
@@ -4239,6 +4274,8 @@ async def _collect_users_data(bot: Bot) -> tuple[list[dict], dict]:
             "_premium_line": premium_line,
             "_last_action_label": _relative_label(last_action_raw, now),
             "_last_incoming_label": _relative_label(last_incoming_raw, now),
+            "_last_incoming_msk": _fmt_msk(last_incoming_raw),
+            "_is_subscribed_channel": is_subscribed_channel,
         })
 
     return rows, totals
@@ -4334,199 +4371,214 @@ def _fmt_ru_date(value: str) -> str:
         return value
 
 
-_USERS_HTML_YES = '<span class="b-yes">✅</span>'
-_USERS_HTML_NO = '<span class="b-no">❌</span>'
+# HTML-отчёт /users был таблицей (одна строка на юзера, все CSV-колонки,
+# сортировка кликом по заголовку) — неудобно читать, особенно с телефона.
+# Заменена на карточки (см. _build_users_html ниже): по прямому запросу
+# показываем только 9 полей на юзера, не весь набор CSV-колонок. Старая
+# версия оставлена закомментированной — на случай отката.
+# _USERS_HTML_YES = '<span class="b-yes">✅</span>'
+# _USERS_HTML_NO = '<span class="b-no">❌</span>'
+#
+# _USERS_HTML_COLUMNS = [
+#     ("Пользователь", "username"),
+#     ("Telegram ID", "telegram_id"),
+#     ("Пол", "gender"),
+#     ("Источник", "source"),
+#     ("Регистрация", "signup_date"),
+#     ("Дней с рег.", "days_since_signup"),
+#     ("Контактов", "contacts_count"),
+#     ("Сообщений", "messages_count"),
+#     ("Последнее действие", "last_action_at"),
+#     ("Собеседник писал", "last_incoming_at"),
+#     ("Активен (7 дн.)", "active_last_7d"),
+#     ("Заблокировал бота", "blocked"),
+#     ("Автоматизация выкл.", "automation_off"),
+#     ("«Ответить за меня»", "uses_reply"),
+#     ("«По скриншоту»", "uses_screenshot"),
+#     ("Live-диалог", "uses_live"),
+#     ("Анализ собеседника", "used_deep_analysis"),
+#     ("Карточка стиля", "has_style_card"),
+#     ("Premium", "is_premium_now"),
+#     ("Источник Premium", "premium_source"),
+#     ("Premium до", "premium_until"),
+#     ("Осталось Premium", "premium_remaining"),
+#     ("Автопродление", "premium_auto_renew"),
+#     ("Триал использован", "trial_used"),
+#     ("Рефералов", "referrals_made"),
+# ]
+#
+# _USERS_HTML_DATE_KEYS = {"signup_date", "last_action_at", "last_incoming_at", "premium_until"}
+# _USERS_HTML_BOOL_KEYS = {
+#     "active_last_7d", "blocked", "automation_off",
+#     "used_deep_analysis", "has_style_card", "is_premium_now",
+# }
+# _USERS_HTML_NUM_KEYS = {
+#     "telegram_id", "days_since_signup", "contacts_count", "messages_count",
+#     "uses_reply", "uses_screenshot", "uses_live", "trial_used", "referrals_made",
+# }
+#
+#
+# def _users_html_cell(key: str, value) -> tuple[str, str]:
+#     if key in _USERS_HTML_DATE_KEYS:
+#         return _fmt_ru_date(value), (value or "")
+#     if key in _USERS_HTML_BOOL_KEYS:
+#         return (_USERS_HTML_YES if value else _USERS_HTML_NO), ("1" if value else "0")
+#     if key == "premium_auto_renew":
+#         if value == "":
+#             return "—", "-1"
+#         return (_USERS_HTML_YES if value else _USERS_HTML_NO), ("1" if value else "0")
+#     if key in _USERS_HTML_NUM_KEYS:
+#         return str(value), str(value)
+#     if key == "premium_remaining":
+#         text = html.escape(value) if value else "—"
+#         return text, (value or "")
+#     text = html.escape(str(value)) if value not in (None, "") else "—"
+#     return text, (str(value).lower() if value else "")
+#
+#
+# def _build_users_html_TABLE(rows: list[dict], totals: dict) -> bytes:
+#     ordered = sorted(rows, key=lambda r: r["signup_date"] or "", reverse=True)
+#     head_html = "".join(f"<th>{html.escape(label)}</th>" for label, _ in _USERS_HTML_COLUMNS)
+#     body_rows = []
+#     for r in ordered:
+#         cells = []
+#         for _, key in _USERS_HTML_COLUMNS:
+#             display, sort_val = _users_html_cell(key, r[key])
+#             cells.append(f'<td data-sort="{html.escape(sort_val, quote=True)}">{display}</td>')
+#         row_class = ' class="row-premium"' if r["is_premium_now"] else ""
+#         body_rows.append(f"<tr{row_class}>{''.join(cells)}</tr>")
+#     return b""  # (полное тело — таблица + JS-сортировка — в истории git)
 
-# Колонки HTML-отчёта: (заголовок, ключ в rows). Тот же набор пользователей
-# и полей, что в CSV (_USERS_CSV_COLUMNS) — просто читаемое представление,
-# а не сырые да/нет и таймстампы.
-_USERS_HTML_COLUMNS = [
-    ("Пользователь", "username"),
-    ("Telegram ID", "telegram_id"),
-    ("Пол", "gender"),
-    ("Источник", "source"),
-    ("Регистрация", "signup_date"),
-    ("Дней с рег.", "days_since_signup"),
-    ("Контактов", "contacts_count"),
-    ("Сообщений", "messages_count"),
-    ("Последнее действие", "last_action_at"),
-    ("Собеседник писал", "last_incoming_at"),
-    ("Активен (7 дн.)", "active_last_7d"),
-    ("Заблокировал бота", "blocked"),
-    ("Автоматизация выкл.", "automation_off"),
-    ("«Ответить за меня»", "uses_reply"),
-    ("«По скриншоту»", "uses_screenshot"),
-    ("Live-диалог", "uses_live"),
-    ("Анализ собеседника", "used_deep_analysis"),
-    ("Карточка стиля", "has_style_card"),
-    ("Premium", "is_premium_now"),
-    ("Источник Premium", "premium_source"),
-    ("Premium до", "premium_until"),
-    ("Осталось Premium", "premium_remaining"),
-    ("Автопродление", "premium_auto_renew"),
-    ("Триал использован", "trial_used"),
-    ("Рефералов", "referrals_made"),
-]
 
-_USERS_HTML_DATE_KEYS = {"signup_date", "last_action_at", "last_incoming_at", "premium_until"}
-_USERS_HTML_BOOL_KEYS = {
-    "active_last_7d", "blocked", "automation_off",
-    "used_deep_analysis", "has_style_card", "is_premium_now",
-}
-_USERS_HTML_NUM_KEYS = {
-    "telegram_id", "days_since_signup", "contacts_count", "messages_count",
-    "uses_reply", "uses_screenshot", "uses_live", "trial_used", "referrals_made",
-}
-
-
-def _users_html_cell(key: str, value) -> tuple[str, str]:
-    """(отображаемый HTML, СЫРОЕ значение для сортировки — экранирование под
-    HTML-атрибут делает вызывающий код одним местом, см. _build_users_html,
-    чтобы не экранировать дважды). Числовые колонки решает JS сам (см.
-    <script> в _build_users_html) — если ВСЕ data-sort в колонке парсятся
-    как число, сортирует численно, иначе как строку. Даты уже хранятся в
-    rows как "ГГГГ-ММ-ДД[ ЧЧ:ММ]" (см. _csv_dt) — это само по себе
-    хронологический порядок при строковой сортировке, отдельного числового
-    представления не нужно."""
-    if key in _USERS_HTML_DATE_KEYS:
-        return _fmt_ru_date(value), (value or "")
-    if key in _USERS_HTML_BOOL_KEYS:
-        return (_USERS_HTML_YES if value else _USERS_HTML_NO), ("1" if value else "0")
-    if key == "premium_auto_renew":
-        if value == "":  # не Premium сейчас — вопрос об автопродлении не применим
-            return "—", "-1"
-        return (_USERS_HTML_YES if value else _USERS_HTML_NO), ("1" if value else "0")
-    if key in _USERS_HTML_NUM_KEYS:
-        return str(value), str(value)
-    if key == "premium_remaining":
-        text = html.escape(value) if value else "—"
-        return text, (value or "")
-    text = html.escape(str(value)) if value not in (None, "") else "—"
-    return text, (str(value).lower() if value else "")
+_USERS_CARD_BADGE_YES = 'badge-yes'
+_USERS_CARD_BADGE_NO = 'badge-no'
 
 
 def _build_users_html(rows: list[dict], totals: dict) -> bytes:
-    """Самостоятельный HTML-файл (инлайн <style>/<script>, без внешних
-    зависимостей — открывается локально без интернета): та же выборка
-    пользователей, что в CSV, но читаемая — иконки вместо да/нет, даты
-    ДД.ММ.ГГГГ, Premium-строки подсвечены цветом фона, любая колонка
-    пересортировывается кликом по заголовку (простой vanilla JS).
+    """Самостоятельный HTML-файл (инлайн <style>, без внешних зависимостей —
+    открывается локально без интернета) — карточки, одна на юзера, вместо
+    таблицы (была неудобна с телефона). Ровно 9 полей на карточку, без
+    остального набора CSV-колонок: имя, бейджи (Premium/подписка на
+    канал/рефералы), пол, источник, контактов, сообщений, когда последний
+    раз писал собеседник (МСК). CSV (_build_users_csv) не затронут — та же
+    полная выгрузка, что и раньше.
 
-    По умолчанию — сортировка по дате регистрации, сначала новые (сортируем
-    здесь же, в Python, JS дальше просто переставляет уже отрисованные
-    строки при клике)."""
-    ordered = sorted(rows, key=lambda r: r["signup_date"] or "", reverse=True)
+    По умолчанию сортировка — по дате последнего входящего сообщения от
+    собеседника, сначала самые свежие (сортируем в Python, статический
+    файл — без JS-пересортировки)."""
+    ordered = sorted(rows, key=lambda r: r["last_incoming_at"] or "", reverse=True)
 
-    head_html = "".join(f"<th>{html.escape(label)}</th>" for label, _ in _USERS_HTML_COLUMNS)
-
-    body_rows = []
+    cards = []
     for r in ordered:
-        cells = []
-        for _, key in _USERS_HTML_COLUMNS:
-            display, sort_val = _users_html_cell(key, r[key])
-            cells.append(f'<td data-sort="{html.escape(sort_val, quote=True)}">{display}</td>')
-        row_class = ' class="row-premium"' if r["is_premium_now"] else ""
-        body_rows.append(f"<tr{row_class}>{''.join(cells)}</tr>")
+        premium_badge_class = _USERS_CARD_BADGE_YES if r["is_premium_now"] else _USERS_CARD_BADGE_NO
+        premium_badge_text = "👑 Premium" if r["is_premium_now"] else "Без Premium"
+
+        sub_badge_class = _USERS_CARD_BADGE_YES if r["_is_subscribed_channel"] else _USERS_CARD_BADGE_NO
+        sub_badge_text = "📢 Подписан" if r["_is_subscribed_channel"] else "📢 Не подписан"
+
+        ref_count = r["referrals_made"]
+        ref_badge_class = _USERS_CARD_BADGE_YES if ref_count else "badge-neutral"
+
+        if r["is_premium_now"]:
+            label = _PREMIUM_SOURCE_LABELS.get(r["premium_source"], r["premium_source"])
+            if r["premium_until"]:
+                until_dt = datetime.fromisoformat(r["premium_until"])
+                suffix = " (автопродление)" if r["premium_auto_renew"] else ""
+                premium_detail = (
+                    f"{label}{suffix}, до {until_dt.strftime('%d.%m.%Y %H:%M')} UTC "
+                    f"(осталось {r['premium_remaining']})"
+                )
+            else:
+                premium_detail = f"{label} (дата окончания неизвестна)"
+        else:
+            premium_detail = "не активен"
+
+        card = f"""<div class="card">
+  <div class="name">{html.escape(r['username'])}</div>
+  <div class="badges">
+    <span class="badge {premium_badge_class}">{premium_badge_text}</span>
+    <span class="badge {sub_badge_class}">{sub_badge_text}</span>
+    <span class="badge {ref_badge_class}">🎁 {ref_count} реф.</span>
+  </div>
+  <div class="info">
+    <div class="info-row"><span class="info-label">Пол</span><span>{html.escape(r['gender'])}</span></div>
+    <div class="info-row"><span class="info-label">Источник</span><span>{html.escape(r['source'])}</span></div>
+    <div class="info-row"><span class="info-label">Контактов</span><span>{r['contacts_count']}</span></div>
+    <div class="info-row"><span class="info-label">Сообщений</span><span>{r['messages_count']}</span></div>
+    <div class="info-row"><span class="info-label">Собеседник писал</span><span>{html.escape(r['_last_incoming_msk'])}</span></div>
+    <div class="info-row"><span class="info-label">Premium</span><span>{html.escape(premium_detail)}</span></div>
+  </div>
+</div>"""
+        cards.append(card)
 
     generated_at = datetime.now(timezone.utc).strftime("%d.%m.%Y %H:%M UTC")
     doc = f"""<!DOCTYPE html>
 <html lang="ru">
 <head>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Пользователи CueMe</title>
 <style>
   :root {{ color-scheme: light; }}
   * {{ box-sizing: border-box; }}
   body {{
-    margin: 0; padding: 20px;
-    font-family: -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+    margin: 0; padding: 16px;
+    font-family: -apple-system, "Segoe UI", Roboto, Arial, sans-serif;
     background: #f4f5f7; color: #1b1f24;
   }}
-  h1 {{ font-size: 18px; margin: 0 0 4px; }}
-  .meta {{ color: #666; font-size: 13px; margin-bottom: 14px; }}
+  h1 {{ font-size: 20px; margin: 0 0 6px; }}
+  .meta {{ color: #666; font-size: 14px; margin-bottom: 14px; }}
   .summary {{
     display: flex; flex-wrap: wrap; gap: 8px 18px;
-    background: #fff; border: 1px solid #e1e4e8; border-radius: 8px;
-    padding: 10px 14px; margin-bottom: 16px; font-size: 13px;
+    background: #fff; border: 1px solid #e1e4e8; border-radius: 10px;
+    padding: 12px 16px; margin-bottom: 18px; font-size: 14px;
   }}
   .summary b {{ color: #111; }}
-  .table-wrap {{
-    overflow-x: auto; background: #fff; border: 1px solid #e1e4e8;
-    border-radius: 8px;
+  .grid {{
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+    gap: 14px;
   }}
-  table {{ border-collapse: collapse; width: 100%; font-size: 13px; white-space: nowrap; }}
-  th, td {{ padding: 7px 10px; text-align: left; border-bottom: 1px solid #eee; }}
-  th {{
-    position: sticky; top: 0; background: #fafbfc; cursor: pointer;
-    user-select: none; border-bottom: 2px solid #d7dbe0; white-space: nowrap;
+  .card {{
+    background: #fff; border: 1px solid #e1e4e8; border-radius: 14px;
+    padding: 18px; min-width: 0;
   }}
-  th:hover {{ background: #f0f2f4; }}
-  th.sort-asc::after {{ content: " ▲"; color: #888; }}
-  th.sort-desc::after {{ content: " ▼"; color: #888; }}
-  tbody tr:hover {{ background: #f6f8fa; }}
-  tr.row-premium {{ background: #fff6d8; }}
-  tr.row-premium:hover {{ background: #fdedb0; }}
-  .b-yes {{ color: #1a7f37; }}
-  .b-no {{ color: #cf222e; }}
+  .name {{
+    font-size: 20px; font-weight: 700; margin-bottom: 10px;
+    word-break: break-word;
+  }}
+  .badges {{
+    display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 14px;
+  }}
+  .badge {{
+    display: inline-block; padding: 5px 12px; border-radius: 999px;
+    font-size: 14px; font-weight: 600; white-space: nowrap;
+  }}
+  .badge-yes {{ background: #d9f2df; color: #1a7f37; }}
+  .badge-no {{ background: #eceef1; color: #6b7280; }}
+  .badge-neutral {{ background: #eceef1; color: #6b7280; }}
+  .info-row {{
+    display: flex; justify-content: space-between; gap: 12px;
+    padding: 8px 0; border-top: 1px solid #f0f1f3;
+    font-size: 16px; line-height: 1.4;
+  }}
+  .info-row:first-child {{ border-top: none; }}
+  .info-label {{ color: #6b7280; flex-shrink: 0; }}
+  .info-row span:last-child {{ text-align: right; word-break: break-word; }}
 </style>
 </head>
 <body>
 <h1>👥 Пользователи CueMe</h1>
-<div class="meta">Сформировано {generated_at} · всего {totals['total']} ·
-клик по заголовку колонки — сортировка · строки с активной Premium выделены</div>
+<div class="meta">Сформировано {generated_at} · всего {totals['total']} · сортировка — по последнему сообщению собеседника, сначала свежие</div>
 <div class="summary">
-  <span>С полом: <b>{totals['with_gender']}</b></span>
-  <span>С контактом: <b>{totals['with_contact']}</b></span>
   <span>Premium сейчас: <b>{totals['premium_now']}</b></span>
-  <span>Реферальный Premium: <b>{totals['with_ref_premium']}</b></span>
-  <span>Заблокировали бота: <b>{totals['blocked']}</b></span>
-  <span>Отключили Автоматизацию: <b>{totals['automation_off']}</b></span>
-  <span>Неактивных: <b>{totals['inactive']}</b></span>
+  <span>Подписаны на канал: <b>{totals['subscribed_channel']}</b></span>
+  <span>С контактом: <b>{totals['with_contact']}</b></span>
   <span>Активны за 7 дней: <b>{totals['active_7d']}</b></span>
 </div>
-<div class="table-wrap">
-<table>
-<thead><tr>{head_html}</tr></thead>
-<tbody>
-{"".join(body_rows)}
-</tbody>
-</table>
+<div class="grid">
+{"".join(cards)}
 </div>
-<script>
-document.querySelectorAll("th").forEach(function (th, idx) {{
-  th.addEventListener("click", function () {{
-    var table = th.closest("table");
-    var tbody = table.querySelector("tbody");
-    var rows = Array.prototype.slice.call(tbody.querySelectorAll("tr"));
-    var asc = th.dataset.sortDir !== "asc";
-    table.querySelectorAll("th").forEach(function (h) {{
-      delete h.dataset.sortDir;
-      h.classList.remove("sort-asc", "sort-desc");
-    }});
-    th.dataset.sortDir = asc ? "asc" : "desc";
-    th.classList.add(asc ? "sort-asc" : "sort-desc");
-
-    function val(tr) {{
-      var cell = tr.children[idx];
-      return cell.dataset.sort !== undefined ? cell.dataset.sort : cell.textContent;
-    }}
-    var allNumeric = rows.every(function (tr) {{
-      var v = val(tr);
-      return v === "" || !isNaN(parseFloat(v));
-    }});
-    rows.sort(function (a, b) {{
-      var va = val(a), vb = val(b);
-      if (allNumeric) {{
-        va = parseFloat(va); if (isNaN(va)) va = -Infinity;
-        vb = parseFloat(vb); if (isNaN(vb)) vb = -Infinity;
-        return asc ? va - vb : vb - va;
-      }}
-      return asc ? va.localeCompare(vb) : vb.localeCompare(va);
-    }});
-    rows.forEach(function (tr) {{ tbody.appendChild(tr); }});
-  }});
-}});
-</script>
 </body>
 </html>
 """
