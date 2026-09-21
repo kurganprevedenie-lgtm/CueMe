@@ -2,6 +2,7 @@ import asyncio
 import csv
 import difflib
 import hashlib
+import hmac
 import html
 import io
 import itertools
@@ -16,6 +17,8 @@ import uuid
 import zipfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+from aiohttp import web
 
 from aiogram import BaseMiddleware, Bot, Dispatcher, F
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
@@ -49,6 +52,10 @@ from config import (
     PREMIUM_CACHE_TTL,
     PREMIUM_CHANNEL_ID,
     PREMIUM_SUBSCRIBE_URL,
+    TRIBUTE_API_KEY,
+    TRIBUTE_WEBHOOK_PATH,
+    TRIBUTE_WEBHOOK_PORT,
+    TRIBUTE_CHANNEL_ID,
     LLM_CACHE_TTL_SEC,
     ONBOARDING_PHOTO_FILE_ID,
     ONBOARDING_PHOTO_PATH,
@@ -144,6 +151,9 @@ from storage import (
     get_pending_referral,
     get_referrer_by_code,
     get_stars_premium_until,
+    get_tribute_premium_until,
+    set_tribute_premium_until,
+    record_tribute_payment,
     get_trial_used,
     get_user,
     increment_trial_used,
@@ -483,14 +493,20 @@ async def _is_premium(bot: Bot, telegram_id: str) -> bool:
     чтобы не дёргать Telegram API на каждое сообщение. Пока PREMIUM_CHANNEL_ID
     не настроен — всегда False (только бесплатные попытки). Реферальная
     награда (_has_referral_premium), награда за подписку на промо-канал
-    (_has_promo_channel_premium) и оплата Telegram Stars (_has_stars_premium)
-    дают полный Premium в обход канала — Stars НЕ добавляет в приватный канал,
-    это независимое окно доступа, см. users.stars_premium_until."""
+    (_has_promo_channel_premium), оплата Telegram Stars (_has_stars_premium)
+    и оплата Tribute, ПОДТВЕРЖДЁННАЯ вебхуком (_has_tribute_webhook_premium)
+    дают полный Premium без похода в Telegram API — авторитетно само событие
+    оплаты, а не факт членства в канале (который может отставать/не
+    сработать на стороне Tribute, см. handle_tribute_webhook). Живая проверка
+    членства ниже остаётся фолбэком — для юзеров, оплативших ДО того, как
+    появился вебхук (тогда tribute_premium_until ещё не заполнен)."""
     if _has_referral_premium(telegram_id):
         return True
     if _has_promo_channel_premium(telegram_id):
         return True
     if _has_stars_premium(telegram_id):
+        return True
+    if _has_tribute_webhook_premium(telegram_id):
         return True
     if not PREMIUM_CHANNEL_ID:
         return False
@@ -701,6 +717,15 @@ def _has_stars_premium(telegram_id: str) -> bool:
     return bool(until and until > datetime.now(timezone.utc))
 
 
+def _has_tribute_webhook_premium(telegram_id: str) -> bool:
+    """Активно ли окно Tribute-Premium, подтверждённое вебхуком (см.
+    handle_tribute_webhook) — NULL/пусто у юзеров, оплативших до появления
+    вебхука (для них актуален только live-фолбэк на get_chat_member в
+    _is_premium)."""
+    until = get_tribute_premium_until(telegram_id)
+    return bool(until and until > datetime.now(timezone.utc))
+
+
 # ── Награда за подписку на промо-канал (ТРЕТИЙ бесплатный путь к Premium) ────
 # PROMO_CHANNEL_USERNAME — ПУБЛИЧНЫЙ промо-канал (t.me/CueMee), НЕ путать с
 # PREMIUM_CHANNEL_ID (приватный канал-пропуск Tribute, платный, отдельная
@@ -902,17 +927,22 @@ async def _check_premium_expiry_reminders(bot: Bot) -> None:
     оплате until меняется сам, отдельно сбрасывать флаг по всем местам
     продления не нужно (см. get_premium_expiry_reminder_until в storage.py).
 
-    Источники с известной датой окончания — реферал/промо-канал/Stars
-    (_premium_expiry_info). Tribute принципиально не участвует: Tribute
-    продлевает/отменяет подписку на канал-пропуск на своей стороне, боту
-    доступен только факт членства через get_chat_member, а не дата
-    окончания — заранее предупредить не можем."""
+    Источники с известной датой окончания — реферал/промо-канал/Stars и,
+    теперь, Tribute — но только если оплата подтверждена вебхуком (см.
+    tribute_premium_until/handle_tribute_webhook); Tribute-юзеров без этого
+    поля (оплатили до вебхука) by-design пропускаем — until неизвестен,
+    заранее предупредить нечем, у них остаётся только live-фолбэк на
+    get_chat_member. Tribute-напоминание намеренно жёсткое (is_subscription
+    трактуется как False, «продли, чтобы не потерять доступ»), даже если
+    подписка технически автопродлевается — мы не отслеживаем
+    cancelled_subscription, так что не можем достоверно обещать
+    автопродление; ложное «не волнуйся» хуже лишнего напоминания."""
     now = datetime.now(timezone.utc)
     window_lo, window_hi = now + _PREMIUM_EXPIRY_REMINDER_WINDOW[0], now + _PREMIUM_EXPIRY_REMINDER_WINDOW[1]
 
     for telegram_id in get_users_with_known_premium_expiry():
         source, until, is_subscription = _premium_expiry_info(telegram_id)
-        if source == "tribute" or until is None:
+        if until is None:
             continue
         if not (window_lo <= until < window_hi):
             continue
@@ -1121,6 +1151,207 @@ async def process_stars_successful_payment(message: Message, bot: Bot) -> None:
     until_label = expires_at.strftime("%d.%m.%Y %H:%M UTC")
     extra = " Продлится автоматически, спишется ещё раз через 30 дней." if is_subscription else ""
     await message.answer(f"🎉 Готово! Premium активен до {until_label}.{extra}")
+
+
+# ── Tribute webhook (события оплаты приватного канала-пропуска) ─────────────
+# Раньше в проекте такой интеграции не было вообще — Tribute управляет
+# членством в PREMIUM_CHANNEL_ID полностью САМА (добавляет/убирает по факту
+# оплаты/отмены), бот только читал итог через get_chat_member. Баг: если
+# добавление на стороне Tribute почему-то тихо не срабатывало (как у
+# @REVkazik — юзер уже был Premium по рефералке, бот об этом даже не узнал),
+# юзера приходилось добавлять вручную. Вебхук даёт боту реальное событие
+# оплаты — теперь после КАЖДОЙ успешной оплаты бот САМ, безусловно и
+# независимо от текущего Premium-статуса, пытается выдать доступ (см.
+# _grant_premium_channel_access) — не полагаясь только на Tribute.
+#
+# Формат пейлоада и заголовок подписи — по официальной документации Tribute
+# (wiki.tribute.tg/for-content-creators/api-documentation/webhooks). Точных
+# примеров тела запроса и кода проверки подписи в открытой документации нет
+# (только описание словами) — сверить с реальным телом первого тестового
+# вебхука на проде ОБЯЗАТЕЛЬНО перед боевым запуском, это единственное
+# место в правке, где нет 100% гарантии совпадения с продовым API.
+
+_TRIBUTE_GRANT_RETRIES = 3
+_TRIBUTE_GRANT_RETRY_DELAY_SECONDS = 3.0
+
+
+def _verify_tribute_signature(raw_body: bytes, signature: str) -> bool:
+    """HMAC-SHA256 тела запроса с TRIBUTE_API_KEY как секретом (hex digest) —
+    заголовок trbt-signature. hmac.compare_digest — защита от timing-атаки
+    при сравнении подписи."""
+    if not signature:
+        return False
+    expected = hmac.new(TRIBUTE_API_KEY.encode(), raw_body, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected, signature)
+
+
+async def _alert_admin_tribute_grant_failed(
+    bot: Bot, telegram_id: str, username: str | None, error: Exception | None,
+) -> None:
+    """Все попытки выдать доступ в канал не удались (см.
+    _grant_premium_channel_access) — алерт каждому из ADMIN_TELEGRAM_IDS.
+    Сам платёж/Premium-статус в БД НЕ трогаем — юзер остаётся отмечен как
+    оплативший, это чисто сигнал на ручное вмешательство (см. п.2 задачи —
+    не блокировать и не откатывать факт оплаты из-за этой ошибки)."""
+    who = f"@{username}" if username else f"id{telegram_id}"
+    reason = str(error) if error else "неизвестная ошибка"
+    text = (
+        f"⚠️ Не удалось выдать доступ в Premium-канал юзеру {who} ({telegram_id}) "
+        f"после оплаты — нужно добавить вручную.\nПричина: {reason}"
+    )
+    for admin_id in ADMIN_TELEGRAM_IDS:
+        try:
+            await bot.send_message(int(admin_id), text)
+        except Exception:
+            logging.exception("tribute: не удалось отправить алерт админу %s", admin_id)
+
+
+async def _grant_premium_channel_access(bot: Bot, telegram_id: str, username: str | None) -> None:
+    """Безусловно, после КАЖДОЙ успешной Tribute-оплаты (new_subscription/
+    renewed_subscription) — НЕ завязано на текущий is_premium_now (это и
+    была причина бага с @REVkazik: юзер уже был Premium по рефералке, и шаг
+    выдачи доступа в канал где-то пропускался). Одноразовая invite-ссылка
+    (create_chat_invite_link, member_limit=1) в личку — не
+    approve_chat_join_request: у закрытого канала без join-request потока
+    заявок нет, юзера приглашают напрямую ссылкой. Если юзер уже в канале
+    (Tribute сама справилась, или это повторная доставка вебхука на уже
+    обработанное событие) — тихо выходим, это успех, а не ошибка
+    (идемпотентность, см. п.3 задачи). 3 попытки с паузой на случай
+    временного сбоя Telegram API; если не вышло — алерт админу, платёж/
+    Premium в БД не откатываем."""
+    if not PREMIUM_CHANNEL_ID:
+        return  # канал не настроен — нечего выдавать
+
+    last_error: Exception | None = None
+    for attempt in range(1, _TRIBUTE_GRANT_RETRIES + 1):
+        try:
+            member = await bot.get_chat_member(PREMIUM_CHANNEL_ID, int(telegram_id))
+            if member.status in ("member", "administrator", "creator"):
+                return  # уже в канале — Tribute справилась сама либо повтор вебхука
+            invite = await bot.create_chat_invite_link(
+                PREMIUM_CHANNEL_ID, name=f"tribute:{telegram_id}"[:32], member_limit=1,
+            )
+            await bot.send_message(
+                int(telegram_id),
+                f"🎉 Оплата прошла! Вот ссылка в закрытый канал Premium:\n{invite.invite_link}",
+            )
+            return
+        except TelegramForbiddenError as e:
+            # Юзер заблокировал бота — ссылку в личку не доставить никаким
+            # числом попыток, это не временный сбой API. Сразу алерт.
+            last_error = e
+            break
+        except Exception as e:
+            last_error = e
+            logging.warning(
+                "tribute: попытка %d/%d выдать доступ в канал %s не удалась: %s",
+                attempt, _TRIBUTE_GRANT_RETRIES, telegram_id, e,
+            )
+            if attempt < _TRIBUTE_GRANT_RETRIES:
+                await asyncio.sleep(_TRIBUTE_GRANT_RETRY_DELAY_SECONDS)
+
+    await _alert_admin_tribute_grant_failed(bot, telegram_id, username, last_error)
+
+
+async def _handle_tribute_subscription_event(bot: Bot, event_name: str, payload: dict) -> None:
+    """new_subscription/renewed_subscription — обновляет tribute_premium_until
+    (окно Premium теперь ИЗВЕСТНО боту, не только факт членства, см.
+    _has_tribute_webhook_premium/_premium_expiry_info) и безусловно пытается
+    выдать доступ в канал (_grant_premium_channel_access) — правильная
+    логика из задачи: оплата → обновить premium_until → отдельно и
+    безусловно выдать доступ, не завязывая на прежний Premium-статус.
+    Идемпотентно по (subscription_id, period_id) — record_tribute_payment,
+    тот же паттерн UNIQUE-констрейнта, что у record_star_payment."""
+    channel_id = payload.get("channel_id")
+    if TRIBUTE_CHANNEL_ID and str(channel_id) != TRIBUTE_CHANNEL_ID:
+        return  # событие для другого канала на этом же API-ключе
+
+    telegram_id = str(payload.get("telegram_user_id") or "")
+    subscription_id = payload.get("subscription_id")
+    period_id = payload.get("period_id")
+    expires_at_raw = payload.get("expires_at")
+    if not telegram_id or subscription_id is None or period_id is None or not expires_at_raw:
+        logging.warning("tribute: неожиданный payload события %s: %r", event_name, payload)
+        return
+
+    try:
+        expires_at = datetime.fromisoformat(str(expires_at_raw).replace("Z", "+00:00"))
+    except ValueError:
+        logging.warning("tribute: не удалось распарсить expires_at %r", expires_at_raw)
+        return
+
+    is_new = record_tribute_payment(
+        telegram_id=telegram_id, subscription_id=int(subscription_id), period_id=int(period_id),
+        event_name=event_name, amount=int(payload.get("amount") or 0),
+        currency=str(payload.get("currency") or ""), expires_at=expires_at,
+    )
+    if not is_new:
+        return  # повторная доставка того же события (subscription_id+period_id) — уже обработано
+
+    set_tribute_premium_until(telegram_id, expires_at)
+    upsert_user(telegram_id, f"user{telegram_id}")
+    record_event(telegram_id, "tribute_payment", f"{event_name}:{payload.get('amount')}")
+
+    username = payload.get("telegram_username")
+    until_label = expires_at.strftime("%d.%m.%Y %H:%M UTC")
+    try:
+        await bot.send_message(int(telegram_id), f"🎉 Оплата прошла! Premium активен до {until_label}.")
+    except Exception:
+        logging.warning("tribute: не удалось отправить подтверждение оплаты %s", telegram_id)
+
+    # Безусловно — независимо от того, был ли уже Premium через другой
+    # источник (реферал/промо/Stars) до этой оплаты. Именно этот шаг раньше
+    # где-то пропускался и вызывал баг с @REVkazik.
+    await _grant_premium_channel_access(bot, telegram_id, username)
+
+
+async def handle_tribute_webhook(request: web.Request) -> web.Response:
+    raw_body = await request.read()
+    signature = request.headers.get("trbt-signature", "")
+    if not _verify_tribute_signature(raw_body, signature):
+        logging.warning("tribute: неверная подпись вебхука")
+        return web.json_response({"status": "invalid signature"}, status=401)
+
+    try:
+        event = json.loads(raw_body)
+    except ValueError:
+        return web.json_response({"status": "bad json"}, status=400)
+
+    name = event.get("name")
+    payload = event.get("payload") or {}
+    bot: Bot = request.app["bot"]
+
+    if name in ("new_subscription", "renewed_subscription"):
+        try:
+            await _handle_tribute_subscription_event(bot, name, payload)
+        except Exception:
+            # 200 всё равно возвращаем — иначе Tribute будет ретраить вебхук
+            # до ~24ч (см. комментарий выше про её retry-политику), а сбой
+            # уже залогирован — при задублированном событии record_tribute_payment
+            # всё равно идемпотентен, повторная попытка ничего не сломает.
+            logging.exception("tribute: сбой обработки события %s", name)
+    # Остальные типы (donation/product/order/cancelled_subscription) нас
+    # пока не касаются — просто подтверждаем доставку, чтобы Tribute не ретраила.
+
+    return web.json_response({"status": "ok"})
+
+
+async def _start_tribute_webhook_server(bot: Bot) -> None:
+    """Поднимает aiohttp-сервер ТОЛЬКО если TRIBUTE_API_KEY задан — иначе
+    вебхук выключен полностью, бот работает как раньше (только polling).
+    Слушает локально на TRIBUTE_WEBHOOK_PORT — наружу нужен реверс-прокси
+    (nginx/caddy) с HTTPS, Tribute требует https-адрес в настройках вебхука
+    в личном кабинете."""
+    if not TRIBUTE_API_KEY:
+        return
+    app = web.Application()
+    app["bot"] = bot
+    app.router.add_post(TRIBUTE_WEBHOOK_PATH, handle_tribute_webhook)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", TRIBUTE_WEBHOOK_PORT)
+    await site.start()
+    logging.info("tribute webhook: слушаю 0.0.0.0:%d%s", TRIBUTE_WEBHOOK_PORT, TRIBUTE_WEBHOOK_PATH)
 
 
 async def _referral_link(bot: Bot, code: str) -> str:
@@ -6628,14 +6859,16 @@ def _premium_expiry_info(telegram_id: str) -> tuple[str, datetime | None, bool]:
     точка правды и для текста, и для экспорта.
 
     Порядок проверки — тот же приоритет, что уже использует _is_premium
-    (реферал → промо-канал → Stars → членство в канале Tribute): источник
-    "tribute" возвращается, только если ни один из первых трёх не дал
-    активного окна — это ПОДРАЗУМЕВАЕТ, что _is_premium(telegram_id) уже
-    True (иначе Premium вообще нет, вызывать не нужно). until=None только
-    для Tribute — точной даты окончания бот не знает (Tribute продлевает/
-    отменяет подписку на своей стороне, боту доступен только факт членства
-    через get_chat_member). is_subscription — True только для Stars-тарифа
-    "месяц" (нативная подписка с автопродлением), иначе False."""
+    (реферал → промо-канал → Stars → Tribute-вебхук → членство в канале
+    Tribute): источник "tribute" с until=None возвращается, только если
+    НИКАКОГО активного окна нет вообще — это ПОДРАЗУМЕВАЕТ, что
+    _is_premium(telegram_id) уже True (иначе Premium вообще нет, вызывать
+    не нужно), а значит юзер состоит в канале, просто дата окончания
+    неизвестна (оплатил ДО появления Tribute-вебхука — see
+    tribute_premium_until). Если вебхук подтверждал оплату — until известен
+    и "tribute" возвращается с реальной датой. is_subscription — True
+    только для Stars-тарифа "месяц" (нативная подписка с автопродлением),
+    иначе False."""
     now = datetime.now(timezone.utc)
 
     until = get_deep_analysis_free_until(telegram_id)
@@ -6650,6 +6883,10 @@ def _premium_expiry_info(telegram_id: str) -> tuple[str, datetime | None, bool]:
     if until and until > now:
         payment = get_latest_star_payment(telegram_id)
         return "stars", until, bool(payment and payment["is_subscription"])
+
+    until = get_tribute_premium_until(telegram_id)
+    if until and until > now:
+        return "tribute", until, False
 
     return "tribute", None, False
 
@@ -6682,7 +6919,14 @@ def _premium_expiry_line(telegram_id: str) -> str:
             f"(осталось {_format_remaining(until - now)})."
         )
 
-    # source == "tribute" — until=None, точную дату окончания бот не знает.
+    # source == "tribute": until известен, если оплата подтверждена вебхуком
+    # (см. tribute_premium_until/_check_premium_expiry_reminders) — иначе
+    # None (оплатил до появления вебхука, точная дата неизвестна боту).
+    if until:
+        return (
+            f"💎 Подписка Tribute — действует до {_format_until(until)} "
+            f"(осталось {_format_remaining(until - now)}). Продление и отмена — на стороне Tribute."
+        )
     return (
         "💎 Подписка оформлена через Tribute — продление и отмена на их "
         "стороне, точную дату окончания бот не знает."
@@ -7004,6 +7248,7 @@ async def main() -> None:
         BotCommand(command="rebuild",     description="Пересобрать все карточки"),
     ])
     asyncio.create_task(_reconcile_promo_channel_premium(bot))
+    await _start_tribute_webhook_server(bot)  # no-op, если TRIBUTE_API_KEY не задан
     await dp.start_polling(
         bot,
         allowed_updates=[

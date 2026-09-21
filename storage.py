@@ -179,6 +179,23 @@ def init_db() -> None:
                 created_at       TEXT NOT NULL
             );
 
+            -- События Tribute-вебхука (main.py: handle_tribute_webhook) —
+            -- new_subscription/renewed_subscription. UNIQUE(subscription_id,
+            -- period_id) — идемпотентность: Tribute ретраит доставку при
+            -- таймауте/5xx на нашей стороне, тот же period_id придёт снова.
+            CREATE TABLE IF NOT EXISTS tribute_payments (
+                id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                telegram_id      TEXT NOT NULL,
+                subscription_id  INTEGER NOT NULL,
+                period_id        INTEGER NOT NULL,
+                event_name       TEXT NOT NULL,   -- 'new_subscription' | 'renewed_subscription'
+                amount           INTEGER NOT NULL,
+                currency         TEXT NOT NULL,
+                expires_at       TEXT NOT NULL,   -- окно Premium ПОСЛЕ этого платежа (UTC ISO)
+                created_at       TEXT NOT NULL,
+                UNIQUE(subscription_id, period_id)
+            );
+
             -- Каждый вариант ответа, который бот РЕАЛЬНО показал пользователю
             -- (после генерации, до отправки — считаем и неиспользованные, нужно
             -- для % использования). contact_id может быть NULL (скриншот без
@@ -365,6 +382,18 @@ def init_db() -> None:
         # приватном канале Tribute (это отдельный, параллельный способ оплаты,
         # тот же паттерн *_until, что у реферальной и промо-наград выше).
         _add_column_if_missing(conn, "users", "stars_premium_until", "TEXT")
+        # Окно Premium, подтверждённое Tribute-вебхуком (main.py:
+        # handle_tribute_webhook) — до этой правки Tribute-источник вообще не
+        # хранил дату окончания (until всегда был None, см. _premium_expiry_info
+        # в main.py: "tribute" источник — дата окончания неизвестна, только
+        # факт членства в канале). Теперь, когда вебхук реально приходит,
+        # используется как быстрый путь в _is_premium (без похода в Telegram
+        # API за get_chat_member) и как источник until для напоминания об
+        # истечении (_check_premium_expiry_reminders) — раньше Tribute было
+        # структурно невозможно туда включить. Membership-проверка через
+        # get_chat_member остаётся как фолбэк для юзеров без этой колонки
+        # (оплатили до вебхука, ещё не было renewed_subscription).
+        _add_column_if_missing(conn, "users", "tribute_premium_until", "TEXT")
         # Срок (until), про который юзеру уже отправили суточное напоминание об
         # истечении Premium (main._check_premium_expiry_reminders) — сравнение
         # с ТЕКУЩИМ until нужного источника вместо простого boolean-флага: при
@@ -1394,11 +1423,13 @@ def get_users_with_active_promo_premium() -> list[str]:
 
 def get_users_with_known_premium_expiry() -> list[str]:
     """telegram_id юзеров хотя бы с одним окном Premium, у которого известна
-    дата окончания — реферал/промо-канал/Stars. Грубый префильтр для суточного
-    напоминания об истечении (main._check_premium_expiry_reminders), точный
-    источник/срок по приоритету считает _premium_expiry_info в main.py. Tribute
-    сюда не попадает — у него нет известной даты окончания (биллинг на стороне
-    Tribute, боту доступен только факт членства в канале)."""
+    дата окончания — реферал/промо-канал/Stars/Tribute-с-вебхуком. Грубый
+    префильтр для суточного напоминания об истечении
+    (main._check_premium_expiry_reminders), точный источник/срок по
+    приоритету считает _premium_expiry_info в main.py. Tribute БЕЗ
+    tribute_premium_until (оплатил до появления вебхука) сюда не попадает —
+    для него дата окончания так и остаётся неизвестной (только live-факт
+    членства в канале через get_chat_member)."""
     with _conn() as conn:
         rows = conn.execute(
             """
@@ -1406,6 +1437,7 @@ def get_users_with_known_premium_expiry() -> list[str]:
             WHERE deep_analysis_free_until IS NOT NULL
                OR promo_channel_premium_until IS NOT NULL
                OR stars_premium_until IS NOT NULL
+               OR tribute_premium_until IS NOT NULL
             """,
         ).fetchall()
     return [row["telegram_id"] for row in rows]
@@ -1468,6 +1500,63 @@ def get_stars_premium_until(telegram_id: str) -> datetime | None:
         return datetime.fromisoformat(row["stars_premium_until"])
     except ValueError:
         return None
+
+
+def set_tribute_premium_until(telegram_id: str, until: datetime) -> None:
+    """Ставит окно Tribute-Premium (подтверждено вебхуком) до until (UTC
+    datetime). Создаёт строку users, если её ещё нет."""
+    with _conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO users (telegram_id, my_id, created_at, tribute_premium_until)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(telegram_id) DO UPDATE SET
+                tribute_premium_until = excluded.tribute_premium_until
+            """,
+            (telegram_id, f"user{telegram_id}", _now(), until.isoformat()),
+        )
+
+
+def get_tribute_premium_until(telegram_id: str) -> datetime | None:
+    """Момент окончания текущего окна Tribute-Premium (tz-aware UTC) или
+    None — либо юзер не платил через Tribute, либо платил ДО того, как
+    появился вебхук (тогда актуальна только live-проверка членства в
+    канале, см. main._is_premium)."""
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT tribute_premium_until FROM users WHERE telegram_id = ?",
+            (telegram_id,),
+        ).fetchone()
+    if not row or not row["tribute_premium_until"]:
+        return None
+    try:
+        return datetime.fromisoformat(row["tribute_premium_until"])
+    except ValueError:
+        return None
+
+
+def record_tribute_payment(
+    telegram_id: str, subscription_id: int, period_id: int, event_name: str,
+    amount: int, currency: str, expires_at: datetime,
+) -> bool:
+    """Логирует событие Tribute-вебхука. UNIQUE(subscription_id, period_id) —
+    идемпотентность: Tribute ретраит доставку при таймауте/5xx на нашей
+    стороне (тот же period_id придёт снова) — возвращает False (ничего не
+    сделал), если такая пара уже записана, иначе True — вызывающий код
+    применяет set_tribute_premium_until/выдаёт доступ в канал только при True."""
+    with _conn() as conn:
+        try:
+            conn.execute(
+                """
+                INSERT INTO tribute_payments
+                    (telegram_id, subscription_id, period_id, event_name, amount, currency, expires_at, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (telegram_id, subscription_id, period_id, event_name, amount, currency, expires_at.isoformat(), _now()),
+            )
+        except sqlite3.IntegrityError:
+            return False
+    return True
 
 
 def record_star_payment(

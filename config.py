@@ -184,6 +184,24 @@ FIRST_BUILD_THRESHOLD = int(os.getenv("FIRST_BUILD_THRESHOLD", "15"))
 PREMIUM_CHANNEL_ID = os.getenv("PREMIUM_CHANNEL_ID")
 # Ссылка на оформление подписки (со страницы канала в Tribute) — показываем в пейволле.
 PREMIUM_SUBSCRIBE_URL = os.getenv("PREMIUM_SUBSCRIBE_URL", "")
+
+# Вебхук от Tribute (Dashboard → Settings → API Keys — там же генерируется
+# API-ключ, он же секрет подписи trbt-signature) — см. main.py:
+# handle_tribute_webhook/_grant_premium_channel_access. Раньше в проекте
+# такой интеграции не было вообще: Tribute управляет членством в
+# PREMIUM_CHANNEL_ID полностью сама, бот только читал итог через
+# get_chat_member — если добавление на стороне Tribute тихо не срабатывало
+# (как в баге с @REVkazik), бот об этом даже не узнавал. Вебхук даёт боту
+# реальное событие оплаты, чтобы самостоятельно и безусловно попытаться
+# выдать доступ (invite-ссылка), независимо от того, что сделала Tribute.
+# Пусто — вебхук-сервер не поднимается (aiohttp не запускается в main()).
+TRIBUTE_API_KEY = os.getenv("TRIBUTE_API_KEY", "")
+TRIBUTE_WEBHOOK_PATH = os.getenv("TRIBUTE_WEBHOOK_PATH", "/tribute/webhook")
+TRIBUTE_WEBHOOK_PORT = int(os.getenv("TRIBUTE_WEBHOOK_PORT", "8081"))
+# Опциональная доп. проверка: channel_id из пейлоада Tribute (их внутренний
+# ID канала, НЕ Telegram chat_id) — если задан, события для чужого канала
+# игнорируются. Пусто (по умолчанию) — не фильтруем, предполагаем один канал.
+TRIBUTE_CHANNEL_ID = os.getenv("TRIBUTE_CHANNEL_ID", "")
 # Сколько бесплатных генераций (Ответить за меня/По скриншоту) даём
 # до пейволла. Остальные функции (анализ собеседника и т.п.) только по подписке.
 FREE_TRIAL_REQUESTS = int(os.getenv("FREE_TRIAL_REQUESTS", "5"))
