@@ -206,7 +206,7 @@ PROMO_CHANNEL_REWARD_DAYS = int(os.getenv("PROMO_CHANNEL_REWARD_DAYS", "3"))
 # Stars-подписка с автопродлением (см. STARS_SUBSCRIPTION_PERIOD).
 STAR_PRICE_DAY = int(os.getenv("STAR_PRICE_DAY", "15"))
 STAR_PRICE_WEEK = int(os.getenv("STAR_PRICE_WEEK", "60"))
-STAR_PRICE_MONTH = int(os.getenv("STAR_PRICE_MONTH", "175"))
+STAR_PRICE_MONTH = int(os.getenv("STAR_PRICE_MONTH", "88"))
 # Telegram Stars поддерживает РОВНО одно значение периода подписки — 30 дней.
 STARS_SUBSCRIPTION_PERIOD = 2592000
 
