@@ -127,6 +127,9 @@ from storage import (
     get_promo_channel_premium_until,
     get_promo_channel_pause,
     get_users_with_active_promo_premium,
+    get_users_with_known_premium_expiry,
+    get_premium_expiry_reminder_until,
+    set_premium_expiry_reminder_until,
     pause_promo_channel_premium,
     resume_promo_channel_premium,
     get_ideal_date,
@@ -594,24 +597,31 @@ async def _require_premium(bot: Bot, target: Message, telegram_id: str, edit: bo
     return False
 
 
-async def _require_premium_or_free_trial(
-    bot: Bot, target: Message, telegram_id: str,
-    get_trial_used_fn, edit: bool = False,
-) -> bool:
-    """Гейт для функций с ОДНОЙ бесплатной попыткой на юзера («Анализ
-    собеседника» / «Идеальное свидание» — каждая фича считается отдельно
-    своим полем в users, НЕ переиспользует общий users.trial_used от «Ответ
-    с CueMe»). Premium активен — пропускает без ограничений. Иначе, если
-    пробник ещё не потрачен — пропускает (списание делает вызывающий код
-    ПОСЛЕ успешной генерации, см. _charge_feature_trial_if_needed). Пробник
-    уже потрачен — обычный пейволл, как раньше у _require_premium."""
-    if await _is_premium(bot, telegram_id):
-        return True
-    if not get_trial_used_fn(telegram_id):
-        return True
-
-    await _send_paywall(target, "Эта функция доступна только по подписке CueMe Premium.", edit=edit)
-    return False
+# Гейт-на-входе для «Анализ собеседника»/«Идеальное свидание» — блокировал
+# доступ ТЕКСТОВОЙ заглушкой сразу, без генерации, как только пробник
+# потрачен. Заменён на «видимый» пейволл (задача «повышение конверсии»):
+# карточка теперь считается ПОЛНОСТЬЮ в любом случае (не дороже — тот же
+# кэш, что у Premium), а урезание/полный показ решается на этапе рендера в
+# самих _run_deep_analysis/_run_ideal_date (full_access). Оставлено
+# закомментированным на случай отката к простому текстовому пейволлу.
+# async def _require_premium_or_free_trial(
+#     bot: Bot, target: Message, telegram_id: str,
+#     get_trial_used_fn, edit: bool = False,
+# ) -> bool:
+#     """Гейт для функций с ОДНОЙ бесплатной попыткой на юзера («Анализ
+#     собеседника» / «Идеальное свидание» — каждая фича считается отдельно
+#     своим полем в users, НЕ переиспользует общий users.trial_used от «Ответ
+#     с CueMe»). Premium активен — пропускает без ограничений. Иначе, если
+#     пробник ещё не потрачен — пропускает (списание делает вызывающий код
+#     ПОСЛЕ успешной генерации, см. _charge_feature_trial_if_needed). Пробник
+#     уже потрачен — обычный пейволл, как раньше у _require_premium."""
+#     if await _is_premium(bot, telegram_id):
+#         return True
+#     if not get_trial_used_fn(telegram_id):
+#         return True
+#
+#     await _send_paywall(target, "Эта функция доступна только по подписке CueMe Premium.", edit=edit)
+#     return False
 
 
 async def _charge_feature_trial_if_needed(bot: Bot, telegram_id: str, mark_trial_used_fn) -> None:
@@ -877,13 +887,68 @@ async def _notify_promo_premium_resumed(bot: Bot, telegram_id: str, until: datet
         logging.warning("promo premium resume notify failed: telegram_id=%s", telegram_id)
 
 
+_PREMIUM_EXPIRY_REMINDER_WINDOW = (timedelta(hours=24), timedelta(hours=48))
+
+
+async def _check_premium_expiry_reminders(bot: Bot) -> None:
+    """Напоминание об окончании Premium — ровно один раз на конкретный срок
+    истечения (until), окно 24-48ч до него (_PREMIUM_EXPIRY_REMINDER_WINDOW).
+    Суточной сверки достаточно, чтобы ни один until не проскочил мимо окна:
+    интервал проверки (24ч) равен ширине окна (24ч), так что любой until
+    попадёт хотя бы в одну проверку. «Уже напоминали именно про этот срок»
+    сравнивается с premium_expiry_reminder_until — при новом продлении/
+    оплате until меняется сам, отдельно сбрасывать флаг по всем местам
+    продления не нужно (см. get_premium_expiry_reminder_until в storage.py).
+
+    Источники с известной датой окончания — реферал/промо-канал/Stars
+    (_premium_expiry_info). Tribute принципиально не участвует: Tribute
+    продлевает/отменяет подписку на канал-пропуск на своей стороне, боту
+    доступен только факт членства через get_chat_member, а не дата
+    окончания — заранее предупредить не можем."""
+    now = datetime.now(timezone.utc)
+    window_lo, window_hi = now + _PREMIUM_EXPIRY_REMINDER_WINDOW[0], now + _PREMIUM_EXPIRY_REMINDER_WINDOW[1]
+
+    for telegram_id in get_users_with_known_premium_expiry():
+        source, until, is_subscription = _premium_expiry_info(telegram_id)
+        if source == "tribute" or until is None:
+            continue
+        if not (window_lo <= until < window_hi):
+            continue
+        if get_premium_expiry_reminder_until(telegram_id) == until:
+            continue  # уже напоминали именно про этот срок
+
+        remaining = _format_remaining(until - now)
+        if is_subscription:
+            # Stars-подписка «месяц» — автопродление, списывается Telegram-ом
+            # самим; мягкий текст, не призыв купить заново.
+            text = (
+                f"⏳ Подписка скоро продлится автоматически (через {remaining}) — "
+                "если хочешь отменить, это можно сделать в Telegram: "
+                "Настройки → Мои подписки."
+            )
+            kb = None
+        else:
+            text = f"⏳ Подписка заканчивается через {remaining} — продли, чтобы не потерять доступ."
+            b = InlineKeyboardBuilder()
+            b.button(text="👑 Подписка", callback_data="show_premium")
+            kb = b.as_markup()
+
+        try:
+            await bot.send_message(int(telegram_id), text, reply_markup=kb)
+        except Exception:
+            logging.warning("premium expiry reminder notify failed: telegram_id=%s", telegram_id)
+        set_premium_expiry_reminder_until(telegram_id, until)
+
+
 async def _reconcile_promo_channel_premium(bot: Bot) -> None:
-    """Суточная подстраховка на случай пропущенного chat_member-события
-    (например, бот был офлайн): проходит по всем юзерам с активным окном
-    промо-Premium, явно перепроверяет членство через bot.get_chat_member и
-    ставит на паузу тех, кто уже не подписан, а событие поймать не удалось.
-    Отдельного планировщика (cron/APScheduler) в проекте нет — это обычный
-    фоновый asyncio-таск, запускается один раз из main()."""
+    """Единственный фоновый суточный таск в проекте (нет cron/APScheduler) —
+    обе независимые суточные проверки живут в одном цикле, а не в отдельных
+    тасках: 1) подстраховка на случай пропущенного chat_member-события для
+    промо-Premium (проходит по всем юзерам с активным окном, явно
+    перепроверяет членство через bot.get_chat_member и ставит на паузу тех,
+    кто уже не подписан, а событие поймать не удалось); 2) напоминание об
+    истечении Premium (_check_premium_expiry_reminders). Запускается один
+    раз из main()."""
     while True:
         await asyncio.sleep(24 * 60 * 60)
         try:
@@ -904,6 +969,11 @@ async def _reconcile_promo_channel_premium(bot: Bot) -> None:
                     await _notify_promo_premium_paused(bot, telegram_id)
         except Exception:
             logging.exception("promo channel reconciliation pass failed")
+
+        try:
+            await _check_premium_expiry_reminders(bot)
+        except Exception:
+            logging.exception("premium expiry reminder pass failed")
 
 
 # ── Stars-подписка (Telegram Stars, XTR) ──────────────────────────────────────
@@ -2380,6 +2450,60 @@ def deep_analysis_result_kb(contact_id: int) -> InlineKeyboardMarkup:
     return _with_back_to_menu(b.as_markup())
 
 
+def deep_analysis_free_trial_result_kb(contact_id: int) -> InlineKeyboardMarkup:
+    """Тот же полный результат, что deep_analysis_result_kb, но это
+    единственная бесплатная попытка юзера (см. _run_deep_analysis) — под
+    результатом отдельная строка-CTA к подписке, помимо «Обновить»/«Назад»."""
+    b = InlineKeyboardBuilder()
+    b.button(text="🔄 Обновить анализ", callback_data=f"deepan_refresh:{contact_id}")
+    b.button(text="Хочешь больше разборов? → 👑 Подписка", callback_data="show_premium")
+    b.adjust(1)
+    return _with_back_to_menu(b.as_markup())
+
+
+def deep_analysis_teaser_kb(contact_id: int) -> InlineKeyboardMarkup:
+    """«Видимый» пейволл после исчерпания бесплатной попытки (см.
+    _format_deep_analysis_teaser) — вместо текстовой заглушки."""
+    b = InlineKeyboardBuilder()
+    b.button(text="👑 Разблокировать полный анализ", callback_data="show_premium")
+    b.button(text="🔄 Обновить анализ", callback_data=f"deepan_refresh:{contact_id}")
+    b.adjust(1)
+    return _with_back_to_menu(b.as_markup())
+
+
+_DEEP_ANALYSIS_FREE_METRIC_KEYS = ("balance", "response_speed")
+_DEEP_ANALYSIS_LOCKED_TEASER = (
+    "🔒 Ещё 6 разборов доступны в Premium — инициатива, паузы, кто чаще "
+    "спрашивает, совпадение по времени, динамика переписки, персональные "
+    "рекомендации."
+)
+
+
+def _format_deep_analysis_teaser(name: str, metrics: dict) -> str:
+    """Урезанная карточка для юзера без Premium с уже потраченной бесплатной
+    попыткой — первые 2 метрики (_DEEP_ANALYSIS_FREE_METRIC_KEYS) полностью,
+    остальные секции заменены одним тизер-блоком. Метрики и интерпретации
+    посчитаны ПОЛНОСТЬЮ как обычно (см. _gen_deep_analysis, тот же кэш, что
+    у Premium-юзеров) — здесь только решаем, что показать."""
+    meta = metrics.get("_meta") or {}
+    header = f"🔬 Анализ собеседника — {html.escape(name)}\n"
+    if meta.get("total"):
+        header += f"<i>{meta['total']} сообщений, {html.escape(meta.get('date_from', ''))} — {html.escape(meta.get('date_to', ''))}</i>\n"
+    header += "\n"
+
+    parts = []
+    for key in _DEEP_ANALYSIS_FREE_METRIC_KEYS:
+        m = metrics.get(key)
+        if not m:
+            continue
+        text = m.get("interpretation") or m["fact"]
+        text += _quote_examples_suffix(m)
+        parts.append(f"<b>{_METRIC_EMOJI.get(key, '')} {html.escape(m['label'])}</b>\n{html.escape(text)}")
+    metric_parts = "\n\n".join(parts)
+
+    return f"{header}{metric_parts}\n\n{_DEEP_ANALYSIS_LOCKED_TEASER}"
+
+
 # async def _run_deep_analysis(
 #     bot: Bot, target: Message, telegram_id: str, contact_id: int, edit: bool = False
 # ) -> None:
@@ -2642,14 +2766,18 @@ def _format_deep_analysis_text(name: str, metrics: dict, dynamics_text: str, syn
 async def _run_deep_analysis(
     bot: Bot, target: Message, telegram_id: str, contact_id: int, edit: bool = False
 ) -> None:
-    # Реферальная награда теперь даёт полный Premium (учтено внутри _is_premium,
-    # которую вызывает _require_premium_or_free_trial) — отдельной проверки
-    # тут больше не нужно. Плюс одноразовый бесплатный пробник на саму эту
-    # фичу (см. _require_premium_or_free_trial), отдельно от users.trial_used.
-    if not await _require_premium_or_free_trial(
-        bot, target, telegram_id, get_analysis_trial_used, edit=edit
-    ):
-        return
+    # «Видимый» пейволл вместо блокировки на входе: карточка считается
+    # ПОЛНОСТЬЮ в любом случае (тот же кэш, что у Premium — не дороже), а
+    # решение показать всё/урезанно принимается только на этапе рендера
+    # ниже (full_access). is_free_trial_result — эта генерация и есть
+    # единственная бесплатная попытка юзера (ещё не потрачена, не Premium) —
+    # только в этом случае под полным результатом добавляется CTA-строка к
+    # подписке (deep_analysis_free_trial_result_kb), см. п.2 конверсии.
+    is_premium = await _is_premium(bot, telegram_id)
+    trial_used_before = get_analysis_trial_used(telegram_id)
+    full_access = is_premium or not trial_used_before
+    is_free_trial_result = full_access and not is_premium
+
     contact = get_contact_by_id(contact_id)
     if not contact:
         text = "Контакт не найден."
@@ -2689,6 +2817,23 @@ async def _run_deep_analysis(
     advice = data["advice_text"]
     message_text = data["message_text"]
 
+    if not full_access:
+        # Пробник уже потрачен, Premium нет — «видимый» пейволл: первые 2
+        # секции полностью + тизер вместо остальных, а не текстовая
+        # заглушка. Всегда простым текстом (не Rich Message) — сюда ведёт
+        # кнопка «👑 Разблокировать», а cb_show_premium редактирует ЭТО ЖЕ
+        # сообщение (edit_text), что для Rich Message не гарантировано.
+        await _edit_or_answer_long(
+            progress_msg, _format_deep_analysis_teaser(name, metrics),
+            reply_markup=deep_analysis_teaser_kb(contact_id), parse_mode="HTML",
+        )
+        return
+
+    result_kb = (
+        deep_analysis_free_trial_result_kb(contact_id) if is_free_trial_result
+        else deep_analysis_result_kb(contact_id)
+    )
+
     # Rich Message (заголовки + цитаты на метрику + таблица динамики) —
     # основной путь; ЛЮБОЙ сбой (отказ Bot API, нет капабилити у клиента и
     # т.п.) откатывается на обычный текст, чтобы пользователь в любом случае
@@ -2705,7 +2850,7 @@ async def _run_deep_analysis(
         await bot.send_rich_message(
             chat_id=progress_msg.chat.id,
             rich_message=InputRichMessage(html=rich_html),
-            reply_markup=deep_analysis_result_kb(contact_id),
+            reply_markup=result_kb,
         )
         sent_rich = True
     except Exception:
@@ -2719,7 +2864,7 @@ async def _run_deep_analysis(
     else:
         await _edit_or_answer_long(
             progress_msg, _format_deep_analysis_text(name, metrics, dynamics_text, synthesis, advice, message_text),
-            reply_markup=deep_analysis_result_kb(contact_id), parse_mode="HTML",
+            reply_markup=result_kb, parse_mode="HTML",
         )
 
     await _charge_feature_trial_if_needed(bot, telegram_id, mark_analysis_trial_used)
@@ -2845,9 +2990,46 @@ def _format_ideal_date(name: str, data: dict) -> str:
     )
 
 
+_IDEAL_DATE_LOCKED_TEASER = (
+    "🔒 Идеи подарков доступны в Premium — конкретные варианты под этого "
+    "человека, а не общие категории."
+)
+
+
+def _format_ideal_date_teaser(name: str, data: dict) -> str:
+    """Урезанная версия для юзера без Premium с уже потраченной бесплатной
+    попыткой. build_ideal_date (llm.py) генерирует РОВНО одну идею свидания
+    + один блок подарков (не список вариантов на выбор) — «первая идея» из
+    задачи конверсии это единственная идея свидания, она показывается
+    полностью, а блок подарков заменяется тизером."""
+    return (
+        f"💐 Идеальное свидание — {name}\n\n"
+        f"{data['date_idea'].strip()}\n\n"
+        f"{_IDEAL_DATE_LOCKED_TEASER}"
+    )
+
+
 def ideal_date_result_kb(contact_id: int) -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     b.button(text="🔄 Другая идея", callback_data=f"idealdate_refresh:{contact_id}")
+    return _with_back_to_menu(b.as_markup())
+
+
+def ideal_date_free_trial_result_kb(contact_id: int) -> InlineKeyboardMarkup:
+    """Тот же полный результат, что ideal_date_result_kb, но это единственная
+    бесплатная попытка юзера — под результатом отдельная строка-CTA."""
+    b = InlineKeyboardBuilder()
+    b.button(text="🔄 Другая идея", callback_data=f"idealdate_refresh:{contact_id}")
+    b.button(text="Хочешь больше идей? → 👑 Подписка", callback_data="show_premium")
+    b.adjust(1)
+    return _with_back_to_menu(b.as_markup())
+
+
+def ideal_date_teaser_kb(contact_id: int) -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    b.button(text="👑 Разблокировать подарки", callback_data="show_premium")
+    b.button(text="🔄 Другая идея", callback_data=f"idealdate_refresh:{contact_id}")
+    b.adjust(1)
     return _with_back_to_menu(b.as_markup())
 
 
@@ -2855,12 +3037,13 @@ async def _run_ideal_date(
     bot: Bot, target: Message, telegram_id: str, contact_id: int,
     edit: bool = False, fresh: bool = False,
 ) -> None:
-    # Одноразовый бесплатный пробник на эту фичу, отдельно от users.trial_used
-    # (см. _require_premium_or_free_trial).
-    if not await _require_premium_or_free_trial(
-        bot, target, telegram_id, get_date_trial_used, edit=edit
-    ):
-        return
+    # «Видимый» пейволл вместо блокировки на входе — см. коммент у
+    # _run_deep_analysis, та же схема: full_access решает рендер, не вход.
+    is_premium = await _is_premium(bot, telegram_id)
+    trial_used_before = get_date_trial_used(telegram_id)
+    full_access = is_premium or not trial_used_before
+    is_free_trial_result = full_access and not is_premium
+
     contact = get_contact_by_id(contact_id)
     if not contact:
         text = "Контакт не найден."
@@ -2892,7 +3075,18 @@ async def _run_ideal_date(
         )
         return
 
-    await _edit_or_answer_long(progress_msg, _format_ideal_date(name, data), reply_markup=ideal_date_result_kb(contact_id))
+    if not full_access:
+        await _edit_or_answer_long(
+            progress_msg, _format_ideal_date_teaser(name, data),
+            reply_markup=ideal_date_teaser_kb(contact_id),
+        )
+        return
+
+    result_kb = (
+        ideal_date_free_trial_result_kb(contact_id) if is_free_trial_result
+        else ideal_date_result_kb(contact_id)
+    )
+    await _edit_or_answer_long(progress_msg, _format_ideal_date(name, data), reply_markup=result_kb)
     await _charge_feature_trial_if_needed(bot, telegram_id, mark_date_trial_used)
 
 

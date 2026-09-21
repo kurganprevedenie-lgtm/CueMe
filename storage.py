@@ -360,6 +360,12 @@ def init_db() -> None:
         # приватном канале Tribute (это отдельный, параллельный способ оплаты,
         # тот же паттерн *_until, что у реферальной и промо-наград выше).
         _add_column_if_missing(conn, "users", "stars_premium_until", "TEXT")
+        # Срок (until), про который юзеру уже отправили суточное напоминание об
+        # истечении Premium (main._check_premium_expiry_reminders) — сравнение
+        # с ТЕКУЩИМ until нужного источника вместо простого boolean-флага: при
+        # новом продлении/оплате until меняется сам, повторного явного сброса
+        # флага в местах продления не нужно (см. get_premium_expiry_reminder_until).
+        _add_column_if_missing(conn, "users", "premium_expiry_reminder_until", "TEXT")
         # Одноразовый бесплатный пробник на «Анализ собеседника» и отдельно на
         # «Идеальное свидание» — НЕ то же самое, что users.trial_used (это
         # счётчик «Ответ с CueMe» из FREE_TRIAL_REQUESTS попыток). Каждая из
@@ -1362,6 +1368,52 @@ def get_users_with_active_promo_premium() -> list[str]:
             "SELECT telegram_id FROM users WHERE promo_channel_premium_until IS NOT NULL",
         ).fetchall()
     return [row["telegram_id"] for row in rows]
+
+
+def get_users_with_known_premium_expiry() -> list[str]:
+    """telegram_id юзеров хотя бы с одним окном Premium, у которого известна
+    дата окончания — реферал/промо-канал/Stars. Грубый префильтр для суточного
+    напоминания об истечении (main._check_premium_expiry_reminders), точный
+    источник/срок по приоритету считает _premium_expiry_info в main.py. Tribute
+    сюда не попадает — у него нет известной даты окончания (биллинг на стороне
+    Tribute, боту доступен только факт членства в канале)."""
+    with _conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT telegram_id FROM users
+            WHERE deep_analysis_free_until IS NOT NULL
+               OR promo_channel_premium_until IS NOT NULL
+               OR stars_premium_until IS NOT NULL
+            """,
+        ).fetchall()
+    return [row["telegram_id"] for row in rows]
+
+
+def get_premium_expiry_reminder_until(telegram_id: str) -> datetime | None:
+    """Срок (until), про который юзеру уже отправили напоминание об истечении
+    — сравнивается с ТЕКУЩИМ until нужного источника: если они совпадают,
+    напоминание уже было именно про этот срок (не слать повторно за тот же
+    период подписки); если различаются (новое продление/оплата дало новый
+    until) — считается, что напоминания ещё не было, шлём заново."""
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT premium_expiry_reminder_until FROM users WHERE telegram_id = ?",
+            (telegram_id,),
+        ).fetchone()
+    if not row or not row["premium_expiry_reminder_until"]:
+        return None
+    try:
+        return datetime.fromisoformat(row["premium_expiry_reminder_until"])
+    except ValueError:
+        return None
+
+
+def set_premium_expiry_reminder_until(telegram_id: str, until: datetime) -> None:
+    with _conn() as conn:
+        conn.execute(
+            "UPDATE users SET premium_expiry_reminder_until = ? WHERE telegram_id = ?",
+            (until.isoformat(), telegram_id),
+        )
 
 
 # ── Stars-подписка (Telegram Stars, независимо от канала-пропуска Tribute) ────
