@@ -232,6 +232,11 @@ def init_db() -> None:
         # (см. main.py: _send_main_menu). Новым юзерам ставится сразу 1 при
         # /start (cmd_start, is_new) — они эту клавиатуру никогда не видели.
         _add_column_if_missing(conn, "users", "legacy_kb_cleared", "INTEGER NOT NULL DEFAULT 0")
+        # Разовая рассылка про снижение цены Premium (main.py:
+        # /broadcast_price_drop) — повторный запуск команды должен уходить
+        # ТОЛЬКО тем, кто ещё не получал именно эту рассылку (новым юзерам с
+        # прошлого раза), а не всем заново. 0 (default) — ещё не отправляли.
+        _add_column_if_missing(conn, "users", "price_drop_broadcast_sent", "INTEGER NOT NULL DEFAULT 0")
         # Реферальная награда: до какого момента (UTC ISO) у пригласившего
         # активна полная Premium-подписка (имя колонки историческое — раньше
         # награда покрывала только «Анализ собеседника»). NULL = награды нет.
@@ -463,6 +468,23 @@ def mark_legacy_kb_cleared(telegram_id: str) -> None:
     with _conn() as conn:
         conn.execute(
             "UPDATE users SET legacy_kb_cleared = 1 WHERE telegram_id = ?", (telegram_id,)
+        )
+
+
+def get_users_without_price_drop_broadcast() -> list[sqlite3.Row]:
+    """Юзеры, которым ещё НЕ уходила рассылка про снижение цены Premium —
+    повторный /broadcast_price_drop шлёт только им (новым с прошлого раза),
+    не всем заново."""
+    with _conn() as conn:
+        return conn.execute(
+            "SELECT telegram_id FROM users WHERE price_drop_broadcast_sent = 0",
+        ).fetchall()
+
+
+def mark_price_drop_broadcast_sent(telegram_id: str) -> None:
+    with _conn() as conn:
+        conn.execute(
+            "UPDATE users SET price_drop_broadcast_sent = 1 WHERE telegram_id = ?", (telegram_id,)
         )
 
 

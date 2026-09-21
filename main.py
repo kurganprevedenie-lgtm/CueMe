@@ -152,6 +152,8 @@ from storage import (
     mark_bot_unblocked,
     is_legacy_kb_cleared,
     mark_legacy_kb_cleared,
+    get_users_without_price_drop_broadcast,
+    mark_price_drop_broadcast_sent,
     mark_date_trial_used,
     mark_referral_credited,
     merge_manual_contact_into,
@@ -1274,12 +1276,18 @@ def _price_drop_kb() -> InlineKeyboardMarkup:
 
 @dp.message(Command("broadcast_price_drop"))
 async def cmd_broadcast_price_drop(message: Message) -> None:
+    """Команду можно запускать повторно — каждый раз уходит только тем, кто
+    ещё не получал именно эту рассылку (price_drop_broadcast_sent), т.е.
+    новым юзерам с прошлого раза, а не всем заново."""
     if not _is_admin(message.from_user.id):
         return
-    users = list_all_users()
+    users = get_users_without_price_drop_broadcast()
+    if not users:
+        await message.answer("Новых получателей нет — все, кто есть в базе, уже получили эту рассылку.")
+        return
     await message.answer(
-        f"⚠️ Разослать объявление о снижении цены {len(users)} пользователям? "
-        "Действие необратимо.",
+        f"⚠️ Разослать объявление о снижении цены {len(users)} новым пользователям "
+        "(тем, кто ещё не получал эту рассылку)? Действие необратимо.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
             InlineKeyboardButton(text="✅ Да, разослать", callback_data="bcast:price_drop:confirm"),
             InlineKeyboardButton(text="❌ Отмена", callback_data="bcast:price_drop:cancel"),
@@ -1290,8 +1298,11 @@ async def cmd_broadcast_price_drop(message: Message) -> None:
 async def _run_broadcast_price_drop(bot: Bot, requester_id: int) -> None:
     """Фон — не блокирует основной event loop. Задержка между отправками —
     под лимиты Telegram Bot API (~30 сообщений/сек), тот же паттерн, что
-    _run_broadcast_invite."""
-    users = list_all_users()
+    _run_broadcast_invite. Только юзеры без price_drop_broadcast_sent —
+    успешная отправка и «заблокировал бота» помечаются сразу (второй раз
+    всё равно не уйдёт), обычная ошибка НЕ помечается — попробуем ещё раз
+    при следующем запуске команды."""
+    users = get_users_without_price_drop_broadcast()
     sent = failed = blocked = 0
 
     for u in users:
@@ -1299,8 +1310,10 @@ async def _run_broadcast_price_drop(bot: Bot, requester_id: int) -> None:
         try:
             await bot.send_message(int(telegram_id), _PRICE_DROP_TEXT, reply_markup=_price_drop_kb())
             sent += 1
+            mark_price_drop_broadcast_sent(telegram_id)
         except TelegramForbiddenError:
             mark_bot_blocked(telegram_id)
+            mark_price_drop_broadcast_sent(telegram_id)
             blocked += 1
         except Exception:
             logging.exception("broadcast_price_drop: сбой для %s", telegram_id)
@@ -1311,7 +1324,8 @@ async def _run_broadcast_price_drop(bot: Bot, requester_id: int) -> None:
         await bot.send_message(
             requester_id,
             f"✅ Рассылка про снижение цены завершена.\n"
-            f"Отправлено: {sent}\nЗаблокировали бота: {blocked}\nОшибок: {failed}",
+            f"Отправлено: {sent}\nЗаблокировали бота: {blocked}\nОшибок: {failed}"
+            + ("\n\nОшибки не помечены как отправленные — попадут в следующий запуск команды." if failed else ""),
         )
     except Exception:
         logging.exception("broadcast_price_drop: не удалось отчитаться перед %s", requester_id)
