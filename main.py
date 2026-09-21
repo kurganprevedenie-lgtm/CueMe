@@ -1255,6 +1255,84 @@ async def cb_broadcast_invite_cancel(call: CallbackQuery) -> None:
     await call.message.edit_text("Отменено.")
 
 
+# ── /broadcast_price_drop — разовое объявление о снижении цены Premium ───────
+# (только админ, тот же паттерн, что /broadcast_invite выше). Кнопка ведёт
+# прямо на экран «Подписка» (show_premium) — без промокода, цена уже
+# снижена по умолчанию (см. config.py: STAR_PRICE_MONTH).
+
+_PRICE_DROP_TEXT = (
+    "Привет! Мы снизили цену Premium — было 300 ₽/мес, теперь 150 ₽/мес "
+    "для новых пользователей. Успей, пока действует новая цена 👇"
+)
+
+
+def _price_drop_kb() -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    b.button(text="👑 Оформить Premium", callback_data="show_premium")
+    return b.as_markup()
+
+
+@dp.message(Command("broadcast_price_drop"))
+async def cmd_broadcast_price_drop(message: Message) -> None:
+    if not _is_admin(message.from_user.id):
+        return
+    users = list_all_users()
+    await message.answer(
+        f"⚠️ Разослать объявление о снижении цены {len(users)} пользователям? "
+        "Действие необратимо.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="✅ Да, разослать", callback_data="bcast:price_drop:confirm"),
+            InlineKeyboardButton(text="❌ Отмена", callback_data="bcast:price_drop:cancel"),
+        ]]),
+    )
+
+
+async def _run_broadcast_price_drop(bot: Bot, requester_id: int) -> None:
+    """Фон — не блокирует основной event loop. Задержка между отправками —
+    под лимиты Telegram Bot API (~30 сообщений/сек), тот же паттерн, что
+    _run_broadcast_invite."""
+    users = list_all_users()
+    sent = failed = blocked = 0
+
+    for u in users:
+        telegram_id = u["telegram_id"]
+        try:
+            await bot.send_message(int(telegram_id), _PRICE_DROP_TEXT, reply_markup=_price_drop_kb())
+            sent += 1
+        except TelegramForbiddenError:
+            mark_bot_blocked(telegram_id)
+            blocked += 1
+        except Exception:
+            logging.exception("broadcast_price_drop: сбой для %s", telegram_id)
+            failed += 1
+        await asyncio.sleep(0.05)
+
+    try:
+        await bot.send_message(
+            requester_id,
+            f"✅ Рассылка про снижение цены завершена.\n"
+            f"Отправлено: {sent}\nЗаблокировали бота: {blocked}\nОшибок: {failed}",
+        )
+    except Exception:
+        logging.exception("broadcast_price_drop: не удалось отчитаться перед %s", requester_id)
+
+
+@dp.callback_query(F.data == "bcast:price_drop:confirm")
+async def cb_broadcast_price_drop_confirm(call: CallbackQuery, bot: Bot) -> None:
+    if not _is_admin(call.from_user.id):
+        await call.answer()
+        return
+    await call.answer()
+    await call.message.edit_text("Рассылка началась в фоне — пришлю итоги, когда закончится.")
+    asyncio.create_task(_run_broadcast_price_drop(bot, call.from_user.id))
+
+
+@dp.callback_query(F.data == "bcast:price_drop:cancel")
+async def cb_broadcast_price_drop_cancel(call: CallbackQuery) -> None:
+    await call.answer()
+    await call.message.edit_text("Отменено.")
+
+
 class ReferralRedeem(StatesGroup):
     waiting_for_code = State()
 
