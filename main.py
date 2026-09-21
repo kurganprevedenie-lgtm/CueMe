@@ -4454,19 +4454,38 @@ _USERS_CARD_BADGE_YES = 'badge-yes'
 _USERS_CARD_BADGE_NO = 'badge-no'
 
 
-def _build_users_html(rows: list[dict], totals: dict) -> bytes:
-    """Самостоятельный HTML-файл (инлайн <style>, без внешних зависимостей —
-    открывается локально без интернета) — карточки, одна на юзера, вместо
-    таблицы (была неудобна с телефона). Ровно 9 полей на карточку, без
-    остального набора CSV-колонок: имя, бейджи (Premium/подписка на
-    канал/рефералы), пол, источник, контактов, сообщений, когда последний
-    раз писал собеседник (МСК). CSV (_build_users_csv) не затронут — та же
-    полная выгрузка, что и раньше.
+_USERS_SORT_FIELDS = [
+    # (ключ поля сортировки для JS, атрибут data-*, тип, подпись кнопки)
+    ("signup", "signup", "str", "Дата регистрации"),
+    ("contacts", "contacts", "num", "Контактов"),
+    ("messages", "messages", "num", "Сообщений"),
+    ("lastincoming", "lastincoming", "str", "Собеседник писал"),
+    ("referrals", "referrals", "num", "Рефералов"),
+]
 
-    По умолчанию сортировка — по дате последнего входящего сообщения от
-    собеседника, сначала самые свежие (сортируем в Python, статический
-    файл — без JS-пересортировки)."""
-    ordered = sorted(rows, key=lambda r: r["last_incoming_at"] or "", reverse=True)
+
+def _build_users_html(rows: list[dict], totals: dict) -> bytes:
+    """Самостоятельный HTML-файл (инлайн <style>/<script>, без внешних
+    зависимостей и без CDN — открывается и работает офлайн) — карточки,
+    одна на юзера, вместо таблицы. Ровно 9 полей на карточку: имя, бейджи
+    (Premium/подписка на канал/рефералы), пол, источник, контактов,
+    сообщений, когда последний раз писал собеседник (МСК), статус Premium.
+    CSV (_build_users_csv) не затронут — та же полная выгрузка, что и раньше.
+
+    Поиск/фильтры/сортировка — целиком на JS в браузере (данные лежат в
+    data-* атрибутах карточек, см. цикл ниже), сервер тут ни при чём — файл
+    статический. По умолчанию (до любого взаимодействия) — сортировка по
+    дате регистрации, сначала новые: и в порядке карточек в HTML (на случай
+    просмотра без JS), и как начальное состояние сортировки в JS."""
+    ordered = sorted(rows, key=lambda r: r["signup_date"] or "", reverse=True)
+
+    # Источник — динамический список уникальных значений, которые реально
+    # встречаются в данных (не хардкод). Пол — та же логика, но секция
+    # фильтра вообще не рендерится, если поле никому не заполнено (все "?").
+    sources_present = sorted({r["source"] for r in rows})
+    genders_present = sorted({r["gender"] for r in rows})
+    show_gender_filter = any(r["gender"] != "?" for r in rows)
+    gender_display = {"?": "не указан"}
 
     cards = []
     for r in ordered:
@@ -4493,7 +4512,20 @@ def _build_users_html(rows: list[dict], totals: dict) -> bytes:
         else:
             premium_detail = "не активен"
 
-        card = f"""<div class="card">
+        data_attrs = (
+            f'data-name="{html.escape(r["username"].lower(), quote=True)}" '
+            f'data-premium="{1 if r["is_premium_now"] else 0}" '
+            f'data-subscribed="{1 if r["_is_subscribed_channel"] else 0}" '
+            f'data-referrals="{ref_count}" '
+            f'data-source="{html.escape(r["source"], quote=True)}" '
+            f'data-gender="{html.escape(r["gender"], quote=True)}" '
+            f'data-signup="{html.escape(r["signup_date"] or "", quote=True)}" '
+            f'data-contacts="{r["contacts_count"]}" '
+            f'data-messages="{r["messages_count"]}" '
+            f'data-lastincoming="{html.escape(r["last_incoming_at"] or "", quote=True)}"'
+        )
+
+        card = f"""<div class="card" {data_attrs}>
   <div class="name">{html.escape(r['username'])}</div>
   <div class="badges">
     <span class="badge {premium_badge_class}">{premium_badge_text}</span>
@@ -4511,6 +4543,28 @@ def _build_users_html(rows: list[dict], totals: dict) -> bytes:
 </div>"""
         cards.append(card)
 
+    source_checkboxes = "".join(
+        f'<label class="chk"><input type="checkbox" class="f-source" value="{html.escape(s, quote=True)}">'
+        f'<span>{html.escape(s)}</span></label>'
+        for s in sources_present
+    )
+    gender_section = ""
+    if show_gender_filter:
+        gender_checkboxes = "".join(
+            f'<label class="chk"><input type="checkbox" class="f-gender" value="{html.escape(g, quote=True)}">'
+            f'<span>{html.escape(gender_display.get(g, g))}</span></label>'
+            for g in genders_present
+        )
+        gender_section = f"""<div class="filter-group">
+  <div class="filter-group-title">Пол</div>
+  <div class="chk-row">{gender_checkboxes}</div>
+</div>"""
+
+    sort_buttons = "".join(
+        f'<button type="button" class="sort-btn" data-field="{field}" data-type="{typ}">{label}</button>'
+        for field, _, typ, label in _USERS_SORT_FIELDS
+    )
+
     generated_at = datetime.now(timezone.utc).strftime("%d.%m.%Y %H:%M UTC")
     doc = f"""<!DOCTYPE html>
 <html lang="ru">
@@ -4527,13 +4581,54 @@ def _build_users_html(rows: list[dict], totals: dict) -> bytes:
     background: #f4f5f7; color: #1b1f24;
   }}
   h1 {{ font-size: 20px; margin: 0 0 6px; }}
-  .meta {{ color: #666; font-size: 14px; margin-bottom: 14px; }}
+  .meta {{ color: #666; font-size: 14px; margin-bottom: 4px; }}
+  .meta b {{ color: #111; }}
   .summary {{
     display: flex; flex-wrap: wrap; gap: 8px 18px;
     background: #fff; border: 1px solid #e1e4e8; border-radius: 10px;
-    padding: 12px 16px; margin-bottom: 18px; font-size: 14px;
+    padding: 12px 16px; margin: 12px 0 16px; font-size: 14px;
   }}
   .summary b {{ color: #111; }}
+
+  .search-box {{
+    display: block; width: 100%; padding: 14px 16px; font-size: 17px;
+    border: 1px solid #d7dbe0; border-radius: 12px; margin-bottom: 12px;
+    background: #fff; color: #1b1f24;
+  }}
+  .search-box:focus {{ outline: 2px solid #6b8fff; border-color: transparent; }}
+
+  details.filters {{
+    background: #fff; border: 1px solid #e1e4e8; border-radius: 12px;
+    margin-bottom: 12px; padding: 4px 16px;
+  }}
+  details.filters summary {{
+    padding: 12px 0; font-size: 16px; font-weight: 600; cursor: pointer;
+    user-select: none; list-style: none;
+  }}
+  details.filters summary::-webkit-details-marker {{ display: none; }}
+  details.filters summary::before {{ content: "▸ "; }}
+  details.filters[open] summary::before {{ content: "▾ "; }}
+  .filter-group {{ padding: 6px 0 14px; border-top: 1px solid #f0f1f3; }}
+  .filter-group:first-of-type {{ border-top: none; }}
+  .filter-group-title {{ font-size: 14px; color: #6b7280; margin-bottom: 8px; font-weight: 600; }}
+  .chk-row {{ display: flex; flex-wrap: wrap; gap: 8px; }}
+  .chk {{
+    display: flex; align-items: center; gap: 8px;
+    background: #f4f5f7; border: 1px solid #e1e4e8; border-radius: 10px;
+    padding: 10px 14px; font-size: 15px; cursor: pointer; min-height: 44px;
+    user-select: none;
+  }}
+  .chk input {{ width: 20px; height: 20px; flex-shrink: 0; accent-color: #1a7f37; }}
+  .chk:has(input:checked) {{ background: #d9f2df; border-color: #1a7f37; }}
+
+  .sort-row {{ display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 16px; }}
+  .sort-btn {{
+    background: #fff; border: 1px solid #d7dbe0; border-radius: 999px;
+    padding: 10px 16px; font-size: 15px; cursor: pointer; min-height: 44px;
+    color: #1b1f24; font-family: inherit;
+  }}
+  .sort-btn.active {{ background: #1b1f24; color: #fff; border-color: #1b1f24; }}
+
   .grid {{
     display: grid;
     grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
@@ -4565,20 +4660,143 @@ def _build_users_html(rows: list[dict], totals: dict) -> bytes:
   .info-row:first-child {{ border-top: none; }}
   .info-label {{ color: #6b7280; flex-shrink: 0; }}
   .info-row span:last-child {{ text-align: right; word-break: break-word; }}
+  .empty-state {{
+    background: #fff; border: 1px dashed #d7dbe0; border-radius: 12px;
+    padding: 32px 16px; text-align: center; color: #6b7280; font-size: 16px;
+  }}
 </style>
 </head>
 <body>
 <h1>👥 Пользователи CueMe</h1>
-<div class="meta">Сформировано {generated_at} · всего {totals['total']} · сортировка — по последнему сообщению собеседника, сначала свежие</div>
+<div class="meta">Сформировано {generated_at} · всего {totals['total']} · показано <b id="visibleCount">{totals['total']}</b></div>
 <div class="summary">
   <span>Premium сейчас: <b>{totals['premium_now']}</b></span>
   <span>Подписаны на канал: <b>{totals['subscribed_channel']}</b></span>
   <span>С контактом: <b>{totals['with_contact']}</b></span>
   <span>Активны за 7 дней: <b>{totals['active_7d']}</b></span>
 </div>
-<div class="grid">
+
+<input type="text" class="search-box" id="searchBox" placeholder="🔍 Поиск по имени или username…">
+
+<details class="filters">
+  <summary>Фильтры</summary>
+  <div class="filter-group">
+    <div class="filter-group-title">Быстрые фильтры</div>
+    <div class="chk-row">
+      <label class="chk"><input type="checkbox" id="f-premium"><span>👑 Только Premium</span></label>
+      <label class="chk"><input type="checkbox" id="f-subscribed"><span>📢 Только подписанные на канал</span></label>
+      <label class="chk"><input type="checkbox" id="f-referrals"><span>🎁 Только с рефералами</span></label>
+    </div>
+  </div>
+  <div class="filter-group">
+    <div class="filter-group-title">Источник</div>
+    <div class="chk-row">{source_checkboxes}</div>
+  </div>
+  {gender_section}
+</details>
+
+<div class="sort-row">{sort_buttons}</div>
+
+<div class="grid" id="grid">
 {"".join(cards)}
 </div>
+<div class="empty-state" id="emptyState" hidden>Совпадений не найдено</div>
+
+<script>
+(function () {{
+  var grid = document.getElementById("grid");
+  var cards = Array.prototype.slice.call(grid.querySelectorAll(".card"));
+  var searchBox = document.getElementById("searchBox");
+  var fPremium = document.getElementById("f-premium");
+  var fSubscribed = document.getElementById("f-subscribed");
+  var fReferrals = document.getElementById("f-referrals");
+  var sourceBoxes = Array.prototype.slice.call(document.querySelectorAll(".f-source"));
+  var genderBoxes = Array.prototype.slice.call(document.querySelectorAll(".f-gender"));
+  var sortButtons = Array.prototype.slice.call(document.querySelectorAll(".sort-btn"));
+  var visibleCountEl = document.getElementById("visibleCount");
+  var emptyStateEl = document.getElementById("emptyState");
+
+  var sortField = "signup";
+  var sortType = "str";
+  var sortAsc = false;  // по умолчанию — сначала новые (убывание)
+
+  function checkedValues(boxes) {{
+    return boxes.filter(function (b) {{ return b.checked; }}).map(function (b) {{ return b.value; }});
+  }}
+
+  function applyFilters() {{
+    var query = searchBox.value.trim().toLowerCase();
+    var sources = checkedValues(sourceBoxes);
+    var genders = checkedValues(genderBoxes);
+    var visible = 0;
+
+    cards.forEach(function (card) {{
+      var ok = true;
+      if (query && card.dataset.name.indexOf(query) === -1) ok = false;
+      if (ok && fPremium.checked && card.dataset.premium !== "1") ok = false;
+      if (ok && fSubscribed.checked && card.dataset.subscribed !== "1") ok = false;
+      if (ok && fReferrals.checked && Number(card.dataset.referrals) <= 0) ok = false;
+      if (ok && sources.length && sources.indexOf(card.dataset.source) === -1) ok = false;
+      if (ok && genders.length && genders.indexOf(card.dataset.gender) === -1) ok = false;
+      card.hidden = !ok;
+      if (ok) visible++;
+    }});
+
+    visibleCountEl.textContent = visible;
+    emptyStateEl.hidden = visible !== 0;
+  }}
+
+  function applySort() {{
+    cards.sort(function (a, b) {{
+      var va = a.dataset[sortField] || "";
+      var vb = b.dataset[sortField] || "";
+      var cmp;
+      if (sortType === "num") {{
+        cmp = Number(va) - Number(vb);
+      }} else {{
+        // Пустая дата — всегда в самый конец, независимо от направления.
+        if (va === "" && vb === "") cmp = 0;
+        else if (va === "") cmp = 1;
+        else if (vb === "") cmp = -1;
+        else cmp = va < vb ? -1 : (va > vb ? 1 : 0);
+      }}
+      return sortAsc ? cmp : -cmp;
+    }});
+    cards.forEach(function (card) {{ grid.appendChild(card); }});
+  }}
+
+  function updateSortButtons() {{
+    sortButtons.forEach(function (btn) {{
+      var active = btn.dataset.field === sortField;
+      btn.classList.toggle("active", active);
+      var base = btn.textContent.replace(/ [▲▼]$/, "");
+      btn.textContent = active ? base + (sortAsc ? " ▲" : " ▼") : base;
+    }});
+  }}
+
+  searchBox.addEventListener("input", applyFilters);
+  [fPremium, fSubscribed, fReferrals].concat(sourceBoxes, genderBoxes).forEach(function (el) {{
+    el.addEventListener("change", applyFilters);
+  }});
+  sortButtons.forEach(function (btn) {{
+    btn.addEventListener("click", function () {{
+      var field = btn.dataset.field;
+      if (field === sortField) {{
+        sortAsc = !sortAsc;
+      }} else {{
+        sortField = field;
+        sortType = btn.dataset.type;
+        sortAsc = false;
+      }}
+      updateSortButtons();
+      applySort();
+    }});
+  }});
+
+  updateSortButtons();
+  applyFilters();
+}})();
+</script>
 </body>
 </html>
 """
