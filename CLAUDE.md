@@ -94,24 +94,28 @@ LLM вызывается лениво — только при запросе п�
 - Парсинг: stdlib `json`
 - Локальные признаки: `features.py` (чистый Python, без LLM)
 - Парсер JSON-экспорта: `tg_parser.py`
-- LLM: каскад с fallback — **Gemini** (основной, теперь САМ мультимодельный
-  каскад на каждый из 7 ключей — см. `GeminiProvider._MODEL_CASCADE` в
-  `llm.py`: Gemma 4 31B/26B, 14400 запросов/день каждая, в приоритете →
-  Gemini 3.1/3.5 Flash Lite, 500/день → обычные Flash-модели по кругу,
-  20/день каждая; и лимит, и перегрузка модели переключают на следующую
-  модель того же ключа, следующий ключ — только когда весь каскад моделей
-  исчерпан) → **Groq** (`openai/gpt-oss-120b`) → **Cloudflare Workers
+- LLM: каскад с fallback — **Groq** (`openai/gpt-oss-120b`, основной с
+  2026-09-23 — стабильнее по времени ответа под нагрузкой, чем Gemini) →
+  **Gemini** (fallback 1, сам мультимодельный каскад на каждый из 7 ключей —
+  см. `GeminiProvider._MODEL_CASCADE` в `llm.py`: Gemma 4 31B/26B, 14400
+  запросов/день каждая, в приоритете → Gemini 3.1/3.5 Flash Lite, 500/день →
+  обычные Flash-модели по кругу, 20/день каждая; и лимит, и перегрузка/
+  таймаут модели переключают на следующую модель того же ключа, следующий
+  ключ — только когда весь каскад моделей исчерпан) → **Cloudflare Workers
   AI** (`llama-3.3-70b`, бесплатный тир ~1300 запросов/день, опционален) →
   **Cerebras** (`llama-3.3-70b`, бесплатный тир, опционален) → **Mistral**
   (`mistral-small-latest`, бесплатный тир, опционален) → **GitHub Models**
   (`gpt-4o-mini`, бесплатный тир, опционален) → **OpenRouter**
-  (`openai/gpt-oss-20b:free`). Порядок в `LLM_PROVIDER_ORDER` (.env).
+  (`openai/gpt-oss-20b:free`). Порядок в `LLM_PROVIDER_ORDER` (.env,
+  дефолт в `config.py`).
   Миграция 2026-08: gemini-2.5-flash/llama-3.3-70b-versatile/
   llama-3.3-70b-instruct:free отключены провайдерами, заменены на модели
   выше (проверено вживую через `tools/check_keys.py`). Миграция 2026-09:
   каскад Gemini падал с HTTP 400 на угаданных/устаревших id — реальные id
   получены живым `GET /v1beta/models` (`tools/list_gemini_models.py`) и
-  проверены на каждую модель (`tools/check_keys.py`). gpt-oss — reasoning-
+  проверены на каждую модель (`tools/check_keys.py`); Gemini под нагрузкой
+  давал аномальные задержки (до 70с на одну попытку) — таймаут срезан до
+  25с и Groq поставлен первым в каскаде. gpt-oss — reasoning-
   модели, тратят часть `max_tokens` на рассуждения до ответа — у
   GroqProvider/OpenRouterProvider в `llm.py` есть `_REASONING_BUFFER`.
   Vision (скриншоты) — отдельно, Groq/Gemini (см. `VISION_MODEL` в config.py)

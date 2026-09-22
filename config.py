@@ -101,10 +101,13 @@ ONBOARDING_PHOTO_FILE_ID = os.getenv("ONBOARDING_PHOTO_FILE_ID", "")
 # Пока отдельного поста нет — ведёт на канал целиком.
 ONBOARDING_JSON_POST_URL = os.getenv("ONBOARDING_JSON_POST_URL", "https://t.me/CueMee")
 
-# Порядок каскада LLM (через запятую). Дефолт — Gemini основной. На сервере без
-# GEMINI_PROXY имеет смысл поставить groq первым: "groq,gemini,openrouter".
+# Порядок каскада LLM (через запятую). 2026-09-23: Groq поставлен первым —
+# Gemini (несмотря на большие лимиты у Gemma-моделей) периодически даёт
+# аномальные задержки/перегрузку на стороне Google под нагрузкой (см. llm.py:
+# GeminiProvider, инциденты 2026-09-22/23), Groq стабильнее по времени ответа.
+# Gemini остаётся в каскаде вторым — фолбэк, а не выключен совсем.
 LLM_PROVIDER_ORDER = os.getenv(
-    "LLM_PROVIDER_ORDER", "gemini,groq,cloudflare,cerebras,mistral,githubmodels,nim,internai,openrouter"
+    "LLM_PROVIDER_ORDER", "groq,gemini,cloudflare,cerebras,mistral,githubmodels,nim,internai,openrouter"
 )
 
 # TTL кэша LLM-ответов (сек). Ключ контент-адресный (включает карточки стиля),
