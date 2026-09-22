@@ -3862,7 +3862,6 @@ async def handle_business_message(event: Message, bot: Bot) -> None:
 NOTIFY_DELETED_WITHOUT_TEXT = True  # False — молча пропускать удаления без известного текста
 
 
-@dp.deleted_business_messages()
 async def _send_deleted_media_notice(
     bot: Bot, owner_id: str, name: str, media_type: str, media_path: str, caption_text: str | None,
 ) -> None:
@@ -3894,6 +3893,7 @@ async def _send_deleted_media_notice(
         )
 
 
+@dp.deleted_business_messages()
 async def handle_deleted_business_messages(event: BusinessMessagesDeleted, bot: Bot) -> None:
     # ВРЕМЕННЫЙ диагностический лог (убрать после отладки).
     logging.info(
