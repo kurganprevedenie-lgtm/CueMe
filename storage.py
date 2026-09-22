@@ -414,17 +414,6 @@ def init_db() -> None:
         # сообщение уже сохранялось и раньше, просто file_id нигде не
         # оседал и был потерян навсегда.
         _add_column_if_missing(conn, "business_messages", "photo_file_id", "TEXT")
-        # Локальный кэш медиа входящих сообщений (photo/voice/video_note/video) —
-        # для пересылки, если собеседник удалит сообщение (main.py:
-        # _cache_incoming_media/handle_deleted_business_messages). В отличие
-        # от photo_file_id (удалённый file_id Telegram, для /export) — тут
-        # РЕАЛЬНЫЙ файл на диске, скачанный СРАЗУ при получении, т.к. после
-        # удаления file_id может стать недоступен. media_path — NULL, если
-        # медиа не было, скачивание не удалось, или файл уже почищен по
-        # возрасту (см. _cleanup_deleted_media_cache) — media_type в этом
-        # случае остаётся как исторический факт "тут было медиа".
-        _add_column_if_missing(conn, "business_messages", "media_type", "TEXT")
-        _add_column_if_missing(conn, "business_messages", "media_path", "TEXT")
 
         # Индексы под горячие выборки (пересборка карточек, чтение истории)
         _create_index_if_missing(
@@ -2049,26 +2038,20 @@ def save_business_message(
     tg_message_id: int | None,
     raw_meta: dict,
     photo_file_id: str | None = None,
-    media_type: str | None = None,
-    media_path: str | None = None,
 ) -> int | None:
     """Сохраняет business-сообщение. Возвращает id вставленного ряда, или None,
     если это дубль (повторная доставка того же connection_id+chat_ref+tg_message_id) —
     id нужен вызывающему коду, чтобы привязать к сообщению результат сопоставления
     с подсказкой (см. suggestion_matches/mark_suggestion_matched).
     photo_file_id — Telegram file_id самой большой версии фото (если сообщение
-    фото, с подписью или без), для просмотра в /export (см. tools/export.py).
-    media_type/media_path — локальный кэш медиа входящих (photo/voice/
-    video_note) на случай удаления собеседником, см. main.py:
-    _cache_incoming_media/handle_deleted_business_messages."""
+    фото, с подписью или без), для просмотра в /export (см. tools/export.py)."""
     with _conn() as conn:
         cur = conn.execute(
             """
             INSERT OR IGNORE INTO business_messages
                 (connection_id, owner_user_id, chat_ref, direction,
-                 text, date, tg_message_id, raw_meta, photo_file_id,
-                 media_type, media_path)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 text, date, tg_message_id, raw_meta, photo_file_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 connection_id,
@@ -2080,34 +2063,9 @@ def save_business_message(
                 tg_message_id,
                 json.dumps(raw_meta, ensure_ascii=False),
                 photo_file_id,
-                media_type,
-                media_path,
             ),
         )
         return cur.lastrowid if cur.rowcount > 0 else None
-
-
-def get_and_clear_stale_media(older_than: datetime) -> list[str]:
-    """Возвращает пути к файлам скачанного медиа (photo/voice/video_note/video,
-    см. media_path) старше older_than (по business_messages.date — момент
-    отправки сообщения, он же момент скачивания — см. main.py:
-    _cache_incoming_media, скачивание всегда СРАЗУ при получении) и сразу
-    чистит media_path в БД (NULL). Сама строка сообщения (текст, direction
-    и т.п.) НЕ трогается — это постоянная история переписки, участвует в
-    семплах для карточек стиля; чистим только тяжёлые файлы на диске.
-    media_type остаётся — исторический факт "тут было медиа", просто файл
-    больше не хранится. Вызывающий код (main._cleanup_deleted_media_cache)
-    удаляет сами файлы с диска по возвращённым путям."""
-    with _conn() as conn:
-        rows = conn.execute(
-            "SELECT media_path FROM business_messages WHERE media_path IS NOT NULL AND date < ?",
-            (older_than.isoformat(),),
-        ).fetchall()
-        conn.execute(
-            "UPDATE business_messages SET media_path = NULL WHERE media_path IS NOT NULL AND date < ?",
-            (older_than.isoformat(),),
-        )
-    return [r["media_path"] for r in rows]
 
 
 # ── suggestions (использование подсказок бота в реальной переписке) ───────────
