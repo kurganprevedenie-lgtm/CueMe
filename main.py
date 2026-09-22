@@ -30,6 +30,7 @@ from aiogram.types import (
     BotCommand,
     BufferedInputFile,
     BusinessConnection,
+    BusinessMessagesDeleted,
     CallbackQuery, ChatMemberUpdated, CopyTextButton, Document, ErrorEvent, FSInputFile,
     InputMediaDocument, InputRichMessage, LinkPreviewOptions, Message,
     InlineKeyboardButton, InlineKeyboardMarkup,
@@ -120,6 +121,8 @@ from storage import (
     get_any_user_samples,
     get_biz_messages_for_contact,
     get_business_connection,
+    get_business_message_by_tg_id,
+    get_contact_id_for_chat_ref,
     get_business_connections_history,
     get_contact_last_messages,
     get_recent_unmatched_suggestions,
@@ -3674,6 +3677,62 @@ async def handle_business_message(event: Message, bot: Bot) -> None:
             )
         except Exception:
             logging.exception("не удалось отправить уведомление об автослиянии контакта")
+
+
+# ── Удаление business-сообщений собеседником ───────────────────────────────────
+# Отдельного кэша текста под это не заводим — business_messages УЖЕ хранит
+# текст каждого сообщения (включая caption у фото и расшифровку голосовых,
+# см. _message_text в handle_business_message выше) с уникальным ключом
+# (connection_id, chat_ref, tg_message_id) — см. get_business_message_by_tg_id
+# в storage.py. Отдельной TTL-очистки тоже не нужно: это постоянное
+# хранилище проекта (участвует в семплах для карточек стиля), удалять из
+# него по возрасту специально под эту фичу значило бы ломать существующую
+# логику. Если сообщения в базе нет (пришло до того, как бот его сохранил,
+# или это не текст/не caption — стикер, голосовое без транскрипции и т.п.)
+# — текст просто недоступен, см. NOTIFY_DELETED_WITHOUT_TEXT ниже.
+
+NOTIFY_DELETED_WITHOUT_TEXT = True  # False — молча пропускать удаления без известного текста
+
+
+@dp.deleted_business_messages()
+async def handle_deleted_business_messages(event: BusinessMessagesDeleted, bot: Bot) -> None:
+    conn_id = event.business_connection_id
+    conn_row = await asyncio.to_thread(get_business_connection, conn_id)
+    if not conn_row:
+        logging.warning("deleted_business_messages: unknown connection %s", conn_id)
+        return
+    owner_id = conn_row["owner_user_id"]
+    chat_ref = _chat_ref(event.chat.id)
+
+    contact_id = await asyncio.to_thread(get_contact_id_for_chat_ref, owner_id, chat_ref)
+    contact = await asyncio.to_thread(get_contact_by_id, contact_id) if contact_id else None
+    name = _contact_name(contact) if contact else "Собеседник"
+
+    for tg_message_id in event.message_ids:
+        row = await asyncio.to_thread(get_business_message_by_tg_id, conn_id, chat_ref, tg_message_id)
+        # Реагируем ТОЛЬКО на удаление ВХОДЯЩИХ (direction тот же принцип,
+        # что в handle_business_message: "in" = прислал собеседник, не
+        # владелец). Если строки нет вообще — направление НЕИЗВЕСТНО, и
+        # молчим: рисковать написать юзеру "собеседник удалил", когда на
+        # самом деле он сам удалил своё же сообщение, хуже, чем пропустить
+        # уведомление (NOTIFY_DELETED_WITHOUT_TEXT относится только к
+        # случаю "точно входящее, но текста нет" — сообщение БЕЗ текста/
+        # caption, не к "сообщения нет в базе вовсе").
+        if not row or row["direction"] != "in":
+            continue
+
+        text = row["text"]
+        if text:
+            notice = f"🗑 {name} удалил(а) сообщение:\n«{text}»"
+        elif NOTIFY_DELETED_WITHOUT_TEXT:
+            notice = f"🗑 {name} удалил(а) сообщение (текст недоступен)"
+        else:
+            continue
+
+        try:
+            await bot.send_message(int(owner_id), notice)
+        except Exception:
+            logging.exception("deleted_business_messages: не удалось уведомить owner=%s", owner_id)
 
 
 # ── /start ────────────────────────────────────────────────────────────────────

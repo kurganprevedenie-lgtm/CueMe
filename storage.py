@@ -1961,6 +1961,27 @@ def get_business_connection(connection_id: str) -> sqlite3.Row | None:
         ).fetchone()
 
 
+def get_business_message_by_tg_id(
+    connection_id: str, chat_ref: str, tg_message_id: int,
+) -> sqlite3.Row | None:
+    """Достаёт уже сохранённое business-сообщение по тому же ключу, что и
+    idx_biz_msg_unique (connection_id, chat_ref, tg_message_id) — используется
+    для показа текста удалённого собеседником сообщения (main.py:
+    handle_deleted_business_messages). Отдельного кэша под это не заводим:
+    business_messages УЖЕ хранит текст каждого сообщения с этим самым
+    уникальным ключом, дублировать хранилище незачем. None — сообщения нет
+    в базе (например, пришло до того, как бот его сохранил, или это не
+    текстовое сообщение без caption)."""
+    with _conn() as conn:
+        return conn.execute(
+            """
+            SELECT * FROM business_messages
+            WHERE connection_id = ? AND chat_ref = ? AND tg_message_id = ?
+            """,
+            (connection_id, chat_ref, tg_message_id),
+        ).fetchone()
+
+
 def get_latest_business_connection(owner_user_id: str) -> sqlite3.Row | None:
     """Самое свежее подключение Business API у юзера (может переподключаться
     несколько раз — connection_id новый каждый раз). is_enabled=0 значит
