@@ -3553,7 +3553,9 @@ def _match_outgoing_to_suggestion(
 
 _DELETED_MEDIA_DIR = Path("cache/deleted_media")
 _DELETED_MEDIA_MAX_AGE_HOURS = 48  # см. _cleanup_deleted_media_cache
-_MEDIA_TYPE_LABELS = {"photo": "фото", "voice": "голосовое", "video_note": "видеосообщение"}
+_MEDIA_TYPE_LABELS = {
+    "photo": "фото", "voice": "голосовое", "video_note": "видео-кружок", "video": "видео",
+}
 
 
 async def _cache_incoming_media(bot: Bot, event: Message, conn_id: str) -> tuple[str | None, str | None]:
@@ -3568,8 +3570,8 @@ async def _cache_incoming_media(bot: Bot, event: Message, conn_id: str) -> tuple
     фичи не стоит, а голосовые небольшие, задваивание дёшево.
 
     Возвращает (media_type, file_path) — (None, None), если это не
-    photo/voice/video_note или скачивание не удалось (сетевая ошибка,
-    превышение размера и т.п. — не роняет обработку сообщения, см.
+    photo/voice/video_note/video или скачивание не удалось (сетевая
+    ошибка, превышение размера и т.п. — не роняет обработку сообщения, см.
     handle_business_message)."""
     if event.photo:
         media, media_type, ext = event.photo[-1], "photo", "jpg"
@@ -3577,6 +3579,8 @@ async def _cache_incoming_media(bot: Bot, event: Message, conn_id: str) -> tuple
         media, media_type, ext = event.voice, "voice", "ogg"
     elif event.video_note:
         media, media_type, ext = event.video_note, "video_note", "mp4"
+    elif event.video:
+        media, media_type, ext = event.video, "video", "mp4"
     else:
         return None, None
 
@@ -3595,7 +3599,7 @@ async def _cache_incoming_media(bot: Bot, event: Message, conn_id: str) -> tuple
 
 
 async def _cleanup_deleted_media_cache() -> None:
-    """Чистит скачанные файлы медиа (photo/voice/video_note, см.
+    """Чистит скачанные файлы медиа (photo/voice/video_note/video, см.
     _cache_incoming_media) старше _DELETED_MEDIA_MAX_AGE_HOURS — вызывается
     из общего суточного таска (_reconcile_promo_channel_premium), отдельный
     планировщик не заводим. Строки business_messages НЕ трогает (постоянная
@@ -3775,9 +3779,9 @@ async def _send_deleted_media_notice(
     bot: Bot, owner_id: str, name: str, media_type: str, media_path: str, caption_text: str | None,
 ) -> None:
     """Пересылает владельцу скачанное медиа удалённого входящего сообщения
-    (см. _cache_incoming_media). photo/voice поддерживают caption — туда же
-    уходит подпись-уведомление (+ исходный caption фото, если был, он же
-    caption_text — captions у voice не бывает содержательным, но поле то
+    (см. _cache_incoming_media). photo/voice/video поддерживают caption —
+    туда же уходит подпись-уведомление (+ исходный caption, если был, он же
+    caption_text — у voice содержательного caption не бывает, но поле то
     же). video_note caption не поддерживает вообще (ограничение Bot API,
     не наше) — уведомление уходит ОТДЕЛЬНЫМ текстовым сообщением следом.
     Файл может быть уже почищен _cleanup_deleted_media_cache (устарел) —
@@ -3791,6 +3795,8 @@ async def _send_deleted_media_notice(
             await bot.send_photo(int(owner_id), file, caption=caption[:1024])
         elif media_type == "voice":
             await bot.send_voice(int(owner_id), file, caption=caption[:1024])
+        elif media_type == "video":
+            await bot.send_video(int(owner_id), file, caption=caption[:1024])
         elif media_type == "video_note":
             await bot.send_video_note(int(owner_id), file)
             await bot.send_message(int(owner_id), notice)

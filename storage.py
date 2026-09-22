@@ -414,7 +414,7 @@ def init_db() -> None:
         # сообщение уже сохранялось и раньше, просто file_id нигде не
         # оседал и был потерян навсегда.
         _add_column_if_missing(conn, "business_messages", "photo_file_id", "TEXT")
-        # Локальный кэш медиа входящих сообщений (photo/voice/video_note) —
+        # Локальный кэш медиа входящих сообщений (photo/voice/video_note/video) —
         # для пересылки, если собеседник удалит сообщение (main.py:
         # _cache_incoming_media/handle_deleted_business_messages). В отличие
         # от photo_file_id (удалённый file_id Telegram, для /export) — тут
@@ -2088,7 +2088,7 @@ def save_business_message(
 
 
 def get_and_clear_stale_media(older_than: datetime) -> list[str]:
-    """Возвращает пути к файлам скачанного медиа (photo/voice/video_note,
+    """Возвращает пути к файлам скачанного медиа (photo/voice/video_note/video,
     см. media_path) старше older_than (по business_messages.date — момент
     отправки сообщения, он же момент скачивания — см. main.py:
     _cache_incoming_media, скачивание всегда СРАЗУ при получении) и сразу
