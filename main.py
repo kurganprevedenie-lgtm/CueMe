@@ -1588,6 +1588,92 @@ async def cb_broadcast_price_drop_cancel(call: CallbackQuery) -> None:
     await call.message.edit_text("Отменено.")
 
 
+# ── /broadcast_admin — универсальная разовая рассылка ПРОИЗВОЛЬНОГО текста ───
+# (только админ). В отличие от /broadcast_invite и /broadcast_price_drop —
+# не привязана к конкретной фиче, текст берётся из самого сообщения команды
+# (всё после "/broadcast_admin "), чтобы не заводить новую команду под
+# каждое разовое объявление (например про временные перебои у LLM-провайдеров).
+# Текст на подтверждении хранится в памяти по admin_id — короткоживущий,
+# переживать перезапуск бота не должен (это разовое действие в рамках сессии).
+
+_pending_admin_broadcasts: dict[int, str] = {}
+
+
+@dp.message(Command("broadcast_admin"))
+async def cmd_broadcast_admin(message: Message) -> None:
+    if not _is_admin(message.from_user.id):
+        return
+    parts = (message.text or "").split(maxsplit=1)
+    text = parts[1].strip() if len(parts) == 2 else ""
+    if not text:
+        await message.answer("Использование: /broadcast_admin <текст сообщения для всех пользователей>")
+        return
+
+    users = list_all_users()
+    _pending_admin_broadcasts[message.from_user.id] = text
+    preview = text if len(text) <= 500 else text[:500] + "…"
+    await message.answer(
+        f"⚠️ Разослать это сообщение {len(users)} пользователям? Действие необратимо.\n\n"
+        f"—— текст ——\n{preview}",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="✅ Да, разослать", callback_data="bcast:admin:confirm"),
+            InlineKeyboardButton(text="❌ Отмена", callback_data="bcast:admin:cancel"),
+        ]]),
+    )
+
+
+async def _run_broadcast_admin(bot: Bot, requester_id: int, text: str) -> None:
+    """Фон — не блокирует основной event loop. Задержка между отправками —
+    под лимиты Telegram Bot API (~30 сообщений/сек), тот же паттерн, что
+    _run_broadcast_invite/_run_broadcast_price_drop. Разовая — без трекинга
+    "кому уже уходило" (в отличие от price_drop), повторный запуск команды
+    с новым текстом снова уйдёт всем."""
+    users = list_all_users()
+    sent = failed = blocked = 0
+
+    for u in users:
+        telegram_id = u["telegram_id"]
+        try:
+            await bot.send_message(int(telegram_id), text)
+            sent += 1
+        except TelegramForbiddenError:
+            mark_bot_blocked(telegram_id)
+            blocked += 1
+        except Exception:
+            logging.exception("broadcast_admin: сбой для %s", telegram_id)
+            failed += 1
+        await asyncio.sleep(0.05)
+
+    try:
+        await bot.send_message(
+            requester_id,
+            f"✅ Рассылка завершена.\nОтправлено: {sent}\nЗаблокировали бота: {blocked}\nОшибок: {failed}",
+        )
+    except Exception:
+        logging.exception("broadcast_admin: не удалось отчитаться перед %s", requester_id)
+
+
+@dp.callback_query(F.data == "bcast:admin:confirm")
+async def cb_broadcast_admin_confirm(call: CallbackQuery, bot: Bot) -> None:
+    if not _is_admin(call.from_user.id):
+        await call.answer()
+        return
+    text = _pending_admin_broadcasts.pop(call.from_user.id, None)
+    await call.answer()
+    if not text:
+        await call.message.edit_text("Текст не найден (истёк или бот перезапускался) — запусти /broadcast_admin заново.")
+        return
+    await call.message.edit_text("Рассылка началась в фоне — пришлю итоги, когда закончится.")
+    asyncio.create_task(_run_broadcast_admin(bot, call.from_user.id, text))
+
+
+@dp.callback_query(F.data == "bcast:admin:cancel")
+async def cb_broadcast_admin_cancel(call: CallbackQuery) -> None:
+    _pending_admin_broadcasts.pop(call.from_user.id, None)
+    await call.answer()
+    await call.message.edit_text("Отменено.")
+
+
 class ReferralRedeem(StatesGroup):
     waiting_for_code = State()
 
