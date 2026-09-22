@@ -41,6 +41,14 @@ OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 CEREBRAS_API_KEY = os.getenv("CEREBRAS_API_KEY")
 # Mistral (La Plateforme) — бесплатный тир. Тоже опционален, как Cerebras.
 MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY")
+# Мультиаккаунтинг Mistral (опционально): несколько ключей через запятую —
+# та же логика, что у GEMINI_API_KEYS/GROQ_API_KEYS выше, код перебирает их
+# по кругу. Помогает только если ключи из РАЗНЫХ аккаунтов Mistral. Если
+# MISTRAL_API_KEYS не задан — используется один MISTRAL_API_KEY.
+_mistral_keys_raw = os.getenv("MISTRAL_API_KEYS", "")
+MISTRAL_API_KEYS = [k.strip() for k in _mistral_keys_raw.split(",") if k.strip()]
+if not MISTRAL_API_KEYS and MISTRAL_API_KEY:
+    MISTRAL_API_KEYS = [MISTRAL_API_KEY]
 # Cloudflare Workers AI — бесплатный тир (~10 000 нейронов/день, ~1300 LLM-
 # ответов/день), нужны ОБА значения (account ID из дашборда Cloudflare + API
 # токен с правами Workers AI). Опционален, как Cerebras/Mistral.

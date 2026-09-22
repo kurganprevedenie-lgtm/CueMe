@@ -1,6 +1,8 @@
 """Диагностика живости всех API-ключей (Gemini, Groq, Cloudflare, Cerebras,
 Mistral, GitHub Models, NVIDIA NIM, OpenRouter) без ротации — каждый ключ
-бьётся отдельным запросом, чтобы увидеть его реальный статус.
+бьётся отдельным запросом, чтобы увидеть его реальный статус. Gemini/Groq/
+Mistral поддерживают несколько ключей (мультиаккаунтинг, см. config.py) —
+проверяется каждый ключ из списка по отдельности, не только первый.
 
 Название модели для каждого провайдера читается ИЗ llm.py (Provider._MODEL),
 а не дублируется здесь строкой — раньше было дублирование, и правка модели в
@@ -27,7 +29,7 @@ from config import (
     GEMINI_PROXY,
     GITHUB_MODELS_TOKEN,
     GROQ_API_KEYS,
-    MISTRAL_API_KEY,
+    MISTRAL_API_KEYS,
     NVIDIA_NIM_API_KEY,
     OPENROUTER_API_KEY,
 )
@@ -220,7 +222,7 @@ async def main() -> None:
         print(f"  {'OK' if ok else 'FAIL'} -> {detail!r}")
 
     await _run_group("Cerebras", [CEREBRAS_API_KEY] if CEREBRAS_API_KEY else [], check_cerebras)
-    await _run_group("Mistral", [MISTRAL_API_KEY] if MISTRAL_API_KEY else [], check_mistral)
+    await _run_group("Mistral", MISTRAL_API_KEYS, check_mistral)
     await _run_group(
         "GitHub Models", [GITHUB_MODELS_TOKEN] if GITHUB_MODELS_TOKEN else [], check_github_models,
     )

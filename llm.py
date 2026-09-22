@@ -59,7 +59,7 @@ from config import (
     GITHUB_MODELS_TOKEN,
     GROQ_API_KEYS,
     LLM_PROVIDER_ORDER,
-    MISTRAL_API_KEY,
+    MISTRAL_API_KEYS,
     NVIDIA_NIM_API_KEY,
     OPENROUTER_API_KEY,
     REPLY_STYLES,
@@ -188,6 +188,22 @@ def _groq_keys_rotated() -> list[str]:
         return []
     start = _groq_key_cursor % len(keys)
     _groq_key_cursor = (start + 1) % len(keys)
+    return keys[start:] + keys[:start]
+
+
+# ── Мультиаккаунтинг Mistral: round-robin по нескольким ключам (та же
+# логика, что у Gemini/Groq выше) ────────────────────────────────────────────
+
+_mistral_key_cursor = 0
+
+
+def _mistral_keys_rotated() -> list[str]:
+    global _mistral_key_cursor
+    keys = MISTRAL_API_KEYS
+    if not keys:
+        return []
+    start = _mistral_key_cursor % len(keys)
+    _mistral_key_cursor = (start + 1) % len(keys)
     return keys[start:] + keys[:start]
 
 
@@ -579,14 +595,11 @@ class MistralProvider(LLMProvider):
     # Датированное имя подтверждено как присутствующее в лимитах аккаунта.
     _MODEL = "mistral-small-2603"
 
-    async def ask(self, prompt: str, max_tokens: int) -> str:
-        if not MISTRAL_API_KEY:
-            raise ProviderError("MISTRAL_API_KEY не задан")
-
+    async def _ask_with_key(self, prompt: str, max_tokens: int, key: str) -> str:
         async with httpx.AsyncClient(timeout=90.0, trust_env=False) as client:
             resp = await client.post(
                 self._URL,
-                headers={"Authorization": f"Bearer {MISTRAL_API_KEY}"},
+                headers={"Authorization": f"Bearer {key}"},
                 json={
                     "model": self._MODEL,
                     "messages": [{"role": "user", "content": prompt}],
@@ -594,8 +607,14 @@ class MistralProvider(LLMProvider):
                 },
             )
 
-        if resp.status_code == 429:
-            raise RateLimitError("Лимит Mistral исчерпан.")
+        # Любой 4xx — проблема КОНКРЕТНОГО ключа (невалиден, нет доступа, лимит
+        # именно на нём), не сервиса в целом — есть смысл пробовать следующий
+        # ключ (та же логика, что у Groq/Gemini).
+        if 400 <= resp.status_code < 500:
+            raise RateLimitError(
+                f"Mistral ключ {_mask_key(key)}: HTTP {resp.status_code} — "
+                "невалиден, нет доступа или лимит."
+            )
 
         if resp.status_code in (500, 502, 503):
             raise ProviderError(f"Mistral {resp.status_code}: {resp.text[:200]}")
@@ -605,6 +624,24 @@ class MistralProvider(LLMProvider):
 
         # content может прийти null, не только "" — reasoning ушёл весь бюджет.
         return (resp.json()["choices"][0]["message"].get("content") or "").strip()
+
+    async def ask(self, prompt: str, max_tokens: int) -> str:
+        """Перебирает ключи Mistral по кругу (мультиаккаунтинг), как Groq/Gemini."""
+        keys = _mistral_keys_rotated()
+        if not keys:
+            raise ProviderError("MISTRAL_API_KEY(S) не задан")
+
+        last_exc: Exception = RateLimitError("Ни один ключ Mistral не сработал.")
+        for i, key in enumerate(keys):
+            try:
+                return await self._ask_with_key(prompt, max_tokens, key)
+            except RateLimitError as e:
+                last_exc = e
+                if i + 1 < len(keys):
+                    log.warning("Mistral: %s — пробую следующий ключ (%d/%d)",
+                                e, i + 2, len(keys))
+                continue
+        raise last_exc
 
 
 # ── GitHub Models (бесплатный тир от GitHub-аккаунта, OpenAI-совместимый) ────
