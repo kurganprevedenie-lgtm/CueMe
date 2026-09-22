@@ -3696,6 +3696,14 @@ NOTIFY_DELETED_WITHOUT_TEXT = True  # False — молча пропускать 
 
 @dp.deleted_business_messages()
 async def handle_deleted_business_messages(event: BusinessMessagesDeleted, bot: Bot) -> None:
+    # ВРЕМЕННЫЙ диагностический лог (убрать после отладки) — если этой
+    # строки нет в консоли при удалении сообщения, апдейт вообще не долетает
+    # до хендлера (Telegram/allowed_updates/aiogram-роутинг), и проблема не
+    # в логике ниже.
+    logging.info(
+        "deleted_business_messages RAW: conn=%s chat_id=%s message_ids=%s",
+        event.business_connection_id, event.chat.id, event.message_ids,
+    )
     conn_id = event.business_connection_id
     conn_row = await asyncio.to_thread(get_business_connection, conn_id)
     if not conn_row:
@@ -3710,6 +3718,11 @@ async def handle_deleted_business_messages(event: BusinessMessagesDeleted, bot: 
 
     for tg_message_id in event.message_ids:
         row = await asyncio.to_thread(get_business_message_by_tg_id, conn_id, chat_ref, tg_message_id)
+        # ВРЕМЕННЫЙ диагностический лог (убрать после отладки).
+        logging.info(
+            "deleted_business_messages LOOKUP: tg_message_id=%s found=%s direction=%s",
+            tg_message_id, bool(row), row["direction"] if row else None,
+        )
         # Реагируем ТОЛЬКО на удаление ВХОДЯЩИХ (direction тот же принцип,
         # что в handle_business_message: "in" = прислал собеседник, не
         # владелец). Если строки нет вообще — направление НЕИЗВЕСТНО, и
