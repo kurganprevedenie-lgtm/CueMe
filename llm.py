@@ -2,10 +2,14 @@
 llm.py — обёртки над LLM-провайдерами с каскадным fallback.
 
 Порядок попыток (дефолтный, см. LLM_PROVIDER_ORDER в config.py):
-  1. Gemini      (gemini-flash-latest, живой алиас — сам следует за текущей   — основной
-                  рекомендованной flash-моделью Google, не привязан к
-                  конкретной версии, которую Google рано или поздно отключит
-                  для новых ключей, см. миграцию 2026-08 ниже)
+  1. Gemini      (мультимодельный каскад НА КАЖДЫЙ из 7 ключей, см.        — основной
+                  GeminiProvider._MODEL_CASCADE ниже и миграцию 2026-09.
+                  Приоритет по дневному лимиту: Gemma 4 31B/26B (14400/день
+                  каждая) → 3.1/3.5 Flash Lite (500/день) → обычные Flash-
+                  модели по кругу (20/день каждая). И лимит (4xx), и
+                  перегрузка (5xx) переключают на следующую модель ТОГО ЖЕ
+                  ключа — только когда весь каскад моделей исчерпан на
+                  ключе, переходим к следующему ключу.)
   2. Groq        (openai/gpt-oss-120b, см. миграцию 2026-08)  — fallback 1
   3. Cloudflare  (llama-3.3-70b, бесплатный тир, ~1300 запросов/день) — fallback 2
   4. Cerebras    (gpt-oss-120b, см. миграцию 2026-09 ниже) — fallback 3
@@ -41,6 +45,16 @@ Cloudflare/Cerebras/Mistral/GitHub Models/NVIDIA NIM/Intern AI пропуска�
 остальной каскад работает как раньше без них.
 
 Если все провайдеры недоступны — пробрасывается последнее исключение.
+
+Миграция 2026-09 (Gemini): весь каскад падал с HTTP 400 из-за угаданных/
+устаревших id моделей (gemini-2.5-flash-lite, например, оказался вообще
+снят с обслуживания — 404 "no longer available to new users"). Реальные id
+получены живым GET /v1beta/models (см. tools/list_gemini_models.py) и
+проверены реальным generateContent на каждую модель (tools/check_keys.py:
+run_gemini_check) — заодно нашлись два несовместимых с thinkingConfig
+случая: Gemma вообще не принимает этот параметр (400 "Thinking budget is
+not supported"), gemini-3.5-flash-lite падает именно на thinkingBudget=0
+(без поля работает нормально) — см. GeminiProvider._NO_THINKING_CONFIG.
 """
 
 import base64
@@ -526,34 +540,65 @@ class GroqProvider(LLMProvider):
 
 class GeminiProvider(LLMProvider):
     name = "Gemini"
-    # gemini-2.5-flash отключён Google для новых ключей (миграция 2026-08) —
-    # gemini-flash-latest живой алиас на текущую рекомендованную flash-модель.
-    # 2026-09-22: gemini-flash-latest словил HTTP 503 «high demand» на всех
-    # 7 ключах разом (перегрузка именно этой модели у Google, не наша
-    # проблема — см. GeminiProvider._ask_with_key: 503 не ключ-специфичен,
-    # каскад и так падает на Groq после первой же попытки). Переключились на
-    # gemini-flash-lite-latest — свой отдельный пул мощностей у Google, может
-    # быть свободен, когда обычный flash перегружен; ответы попроще/победнее,
-    # чем у flash. Если понадобится вернуть — просто верни этой строке
-    # значение "gemini-flash-latest".
-    _MODEL = "gemini-flash-lite-latest"
+    # 2026-09-23: id моделей подтверждены ЖИВЫМ запросом GET /v1beta/models
+    # (см. tools/list_gemini_models.py) — раньше падали на угаданных/устаревших
+    # id (HTTP 400). Каскад моделей ВНУТРИ одного ключа, приоритет по дневному
+    # лимиту (цифры — со слов пользователя, независимо не перепроверялись
+    # документацией Google, только сами id и реальная работоспособность —
+    # tools/probe_gemini_models.py):
+    #   1) Gemma 4 31B / 26B — открытые модели, 14400 запросов/день каждая
+    #      (самый большой пул на порядок — используем в первую очередь для
+    #      основной массы запросов; качество попроще полноценного Gemini,
+    #      но с таким лимитом это лучший вариант по умолчанию)
+    #   2) 3.1 / 3.5 Flash Lite — 500/день каждая
+    #   3) Обычные Flash-модели — 20/день КАЖДАЯ (используем по кругу)
+    # Модель-специфичные ошибки (лимит 429, битый id 400, перегрузка 503 —
+    # см. живую проверку gemini-3.7-flash ниже) переключают на СЛЕДУЮЩУЮ
+    # МОДЕЛЬ в этом списке, не сразу на следующий ключ — 5xx оказался
+    # моделе-специфичным (см. инцидент 2026-09-22: gemini-flash-latest словил
+    # 503, при этом другие модели на том же ключе тут же отработали нормально),
+    # так что «сдаваться сразу» на 5xx больше не имеет смысла — есть куда
+    # переключиться на том же ключе. Только когда ВЕСЬ список моделей исчерпан
+    # для ключа — переходим к следующему ключу и начинаем список заново.
+    _MODEL_CASCADE = [
+        "gemma-4-31b-it",
+        "gemma-4-26b-a4b-it",
+        "gemini-3.1-flash-lite",
+        "gemini-3.5-flash-lite",
+        "gemini-2.5-flash",
+        "gemini-3.7-flash",
+        "gemini-3.8-flash",
+        "gemini-3-flash-preview",  # «3 Flash» — нет отдельного non-preview id
+        "gemini-3.5-flash",
+        "gemini-3.6-flash",
+        # gemini-2.5-flash-lite НЕ включена — живая проверка вернула 404
+        # "no longer available to new users", Google сам указывает вместо
+        # неё gemini-3.5-flash-lite (уже есть в списке выше, тир Lite).
+    ]
+
+    # thinkingConfig — Gemini-специфичная штука, отключает «размышления» перед
+    # ответом. Живая проверка (tools/probe_gemini_models.py) показала: Gemma
+    # вообще не поддерживает этот параметр (HTTP 400 "Thinking budget is not
+    # supported for this model"), а gemini-3.5-flash-lite падает конкретно на
+    # thinkingBudget=0 (HTTP 400 "invalid argument", без этого поля — работает
+    # нормально). Остальные Flash-модели в каскаде выше — с полем работают ок.
+    _NO_THINKING_CONFIG = frozenset({
+        "gemma-4-31b-it", "gemma-4-26b-a4b-it", "gemini-3.5-flash-lite",
+    })
 
     @staticmethod
-    def _url(key: str) -> str:
-        return (
-            f"https://generativelanguage.googleapis.com/v1beta/models/"
-            f"{GeminiProvider._MODEL}:generateContent?key={key}"
-        )
+    def _url(model: str, key: str) -> str:
+        return f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
 
-    async def _ask_with_key(self, prompt: str, max_tokens: int, key: str) -> str:
+    async def _ask_with_key(self, prompt: str, max_tokens: int, key: str, model: str) -> str:
+        generation_config = {"maxOutputTokens": max_tokens}
+        if model not in self._NO_THINKING_CONFIG:
+            # Отключаем «thinking» — иначе модель тратит бюджет на размышления
+            # и возвращает ответ без текста, из-за чего провайдер пропускался зря.
+            generation_config["thinkingConfig"] = {"thinkingBudget": 0}
         payload = {
             "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-            "generationConfig": {
-                "maxOutputTokens": max_tokens,
-                # Отключаем «thinking» — иначе flash тратит бюджет на размышления
-                # и возвращает ответ без текста, из-за чего провайдер пропускался зря.
-                "thinkingConfig": {"thinkingBudget": 0},
-            },
+            "generationConfig": generation_config,
         }
 
         # Gemini заблокирован по гео в ряде регионов (РФ) — при заданном GEMINI_PROXY
@@ -562,25 +607,24 @@ class GeminiProvider(LLMProvider):
         if GEMINI_PROXY:
             client_kwargs["proxy"] = GEMINI_PROXY
         async with httpx.AsyncClient(**client_kwargs) as client:
-            resp = await _tracked_post(self.name, key, client, self._url(key), json=payload)
+            resp = await _tracked_post(self.name, key, client, self._url(model, key), json=payload)
 
-        # Любой 4xx (400-499) — проблема КОНКРЕТНОГО ключа: невалиден, нет доступа
-        # к модели/API, исчерпан лимит именно на нём. Тело запроса у нас статичное
-        # и заведомо корректное, так что 4xx может означать только «что-то не так
-        # с ключом», а не с запросом — есть смысл пробовать следующий ключ. На
-        # практике встречаются и 429 (лимит), и 404 (API не подключён), и 400
-        # («API key not valid» для битого ключа) — коды разные, причина одна.
+        # Любой 4xx (400-499) — проблема конкретного ключа/модели: невалиден,
+        # нет доступа, исчерпан лимит именно на них — есть смысл пробовать
+        # следующую модель (или следующий ключ, когда модели кончились).
         if 400 <= resp.status_code < 500:
             raise RateLimitError(
-                f"Gemini ключ {_mask_key(key)}: HTTP {resp.status_code} — "
+                f"Gemini {model} ключ {_mask_key(key)}: HTTP {resp.status_code} — "
                 "невалиден, нет доступа или лимит."
             )
 
+        # 5xx — тоже переключаем модель (не сразу сдаёмся, см. докстринг класса
+        # выше): перегрузка бывает у конкретной модели, а не у всего Gemini.
         if resp.status_code in (500, 502, 503):
-            raise ProviderError(f"Gemini {resp.status_code}: {resp.text[:200]}")
+            raise ProviderError(f"Gemini {model} {resp.status_code}: {resp.text[:200]}")
 
         if not resp.is_success:
-            raise ProviderError(f"Gemini {resp.status_code}: {resp.text[:200]}")
+            raise ProviderError(f"Gemini {model} {resp.status_code}: {resp.text[:200]}")
 
         data = resp.json()
         # Достаём текст из всех частей (на случай нескольких parts)
@@ -591,30 +635,37 @@ class GeminiProvider(LLMProvider):
             if text:
                 return text
             reason = cand.get("finishReason", "?")
-            raise ProviderError(f"Gemini: пустой ответ (finishReason={reason})")
+            raise ProviderError(f"Gemini {model}: пустой ответ (finishReason={reason})")
         except (KeyError, IndexError) as e:
-            raise ProviderError(f"Gemini: неожиданный формат ответа — {e}") from e
+            raise ProviderError(f"Gemini {model}: неожиданный формат ответа — {e}") from e
 
     async def ask(self, prompt: str, max_tokens: int) -> str:
-        """Перебирает ключи Gemini по кругу (мультиаккаунтинг). На 401/403/404/429
-        пробует следующий ключ — это проблема конкретного ключа/аккаунта (невалиден,
-        нет доступа, исчерпан лимит), а не сервиса в целом. На прочих ошибках (5xx,
-        сеть) сдаётся сразу: они не ключ-специфичны, все ключи упрутся в то же самое
-        — быстрее отдать каскаду шанс на Groq."""
+        """Двойной перебор: для каждого ключа (round-robin, мультиаккаунтинг) —
+        весь _MODEL_CASCADE по приоритету лимита (Gemma → Flash Lite → Flash).
+        И 4xx (лимит/невалиден), и 5xx (перегрузка) переключают на следующую
+        модель для ТОГО ЖЕ ключа — см. докстринг класса. Следующий ключ — только
+        когда весь список моделей исчерпан на текущем. Сетевые исключения
+        (таймаут/DNS/коннект) НЕ ловятся здесь — сразу наружу, в общий каскад
+        (_ask() пойдёт на Groq): при полном сетевом сбое перебирать 7×10
+        комбинаций бессмысленно, все упрутся в то же самое."""
         keys = _gemini_keys_rotated()
         if not keys:
             raise ProviderError("GEMINI_API_KEY(S) не задан")
 
-        last_exc: Exception = RateLimitError("Ни один ключ Gemini не сработал.")
-        for i, key in enumerate(keys):
-            try:
-                return await self._ask_with_key(prompt, max_tokens, key)
-            except RateLimitError as e:
-                last_exc = e
-                if i + 1 < len(keys):
-                    log.warning("Gemini: %s — пробую следующий ключ (%d/%d)",
-                                e, i + 2, len(keys))
-                continue
+        last_exc: Exception = RateLimitError("Ни один ключ/модель Gemini не сработали.")
+        for ki, key in enumerate(keys):
+            for mi, model in enumerate(self._MODEL_CASCADE):
+                try:
+                    return await self._ask_with_key(prompt, max_tokens, key, model)
+                except (RateLimitError, ProviderError) as e:
+                    last_exc = e
+                    if mi + 1 < len(self._MODEL_CASCADE):
+                        log.warning("Gemini: %s — пробую следующую модель (%d/%d) на том же ключе",
+                                    e, mi + 2, len(self._MODEL_CASCADE))
+                    continue
+            if ki + 1 < len(keys):
+                log.warning("Gemini: все модели исчерпаны на ключе %s — пробую следующий ключ (%d/%d)",
+                            _mask_key(key), ki + 2, len(keys))
         raise last_exc
 
 

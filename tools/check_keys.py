@@ -52,17 +52,19 @@ def _mask(key: str) -> str:
     return f"...{key[-4:]}" if len(key) > 4 else "***"
 
 
-async def check_gemini(key: str) -> tuple[bool, str]:
-    url = (
-        "https://generativelanguage.googleapis.com/v1beta/models/"
-        f"{GeminiProvider._MODEL}:generateContent?key={key}"
-    )
+async def check_gemini_model(key: str, model: str) -> tuple[bool, str]:
+    """Один запрос к ОДНОЙ модели каскада (GeminiProvider._MODEL_CASCADE) —
+    id моделей и payload (thinkingConfig — не все модели его поддерживают,
+    см. GeminiProvider._NO_THINKING_CONFIG) читаются прямо из llm.py, не
+    дублируются здесь строкой, чтобы правка каскада не расходилась с
+    диагностикой молча."""
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
+    generation_config = {"maxOutputTokens": 100}
+    if model not in GeminiProvider._NO_THINKING_CONFIG:
+        generation_config["thinkingConfig"] = {"thinkingBudget": 0}
     payload = {
         "contents": [{"role": "user", "parts": [{"text": "Ответь одним словом: тест пройден?"}]}],
-        # thinkingBudget=0 не всегда полностью гасит "мысли" модели (иногда всё
-        # равно тратит часть бюджета до текста) — берём запас, тот же принцип,
-        # что у reasoning-моделей Groq/OpenRouter ниже.
-        "generationConfig": {"maxOutputTokens": 100, "thinkingConfig": {"thinkingBudget": 0}},
+        "generationConfig": generation_config,
     }
     kwargs = {"timeout": 30.0, "trust_env": False}
     if GEMINI_PROXY:
@@ -211,6 +213,28 @@ async def check_openrouter(key: str) -> tuple[bool, str]:
     return True, text
 
 
+async def run_gemini_check() -> None:
+    """Отдельно от _run_group ниже — Gemini теперь каскад МОДЕЛЕЙ на каждый
+    ключ (см. GeminiProvider._MODEL_CASCADE в llm.py), простого OK/FAIL на
+    ключ уже недостаточно: важно видеть, какая именно модель прошла первой
+    (обычно Gemma — самый большой лимит) и где стоит следующая по приоритету
+    модель, если основная упёрлась в лимит/перегрузку."""
+    keys = GEMINI_API_KEYS
+    print(f"\n=== Gemini: всего ключей {len(keys)}, моделей в каскаде {len(GeminiProvider._MODEL_CASCADE)} ===")
+    if not keys:
+        print("  (не задано)")
+        return
+    for i, key in enumerate(keys):
+        print(f"  ключ #{i} ({_mask(key)}):")
+        for model in GeminiProvider._MODEL_CASCADE:
+            try:
+                ok, detail = await check_gemini_model(key, model)
+            except Exception as e:
+                ok, detail = False, f"исключение: {type(e).__name__}: {e}"
+            status = "OK" if ok else "FAIL"
+            print(f"    {model}: {status} -> {detail!r}")
+
+
 async def _run_group(title: str, keys: list[str], checker) -> None:
     print(f"\n=== {title}: всего ключей {len(keys)} ===")
     if not keys:
@@ -226,7 +250,7 @@ async def _run_group(title: str, keys: list[str], checker) -> None:
 
 
 async def main() -> None:
-    await _run_group("Gemini", GEMINI_API_KEYS, check_gemini)
+    await run_gemini_check()
     await _run_group("Groq", GROQ_API_KEYS, check_groq)
 
     print("\n=== Cloudflare Workers AI ===")
