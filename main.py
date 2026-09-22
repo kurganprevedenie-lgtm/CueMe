@@ -93,6 +93,8 @@ from llm import (
     analyze_reply_dynamics,
     get_forced_provider,
     get_provider_stats,
+    get_provider_stats_snapshot,
+    KNOWN_DAILY_LIMITS,
     live_coach_step,
     make_features_summary,
     sample_texts,
@@ -5574,6 +5576,47 @@ async def cmd_provider(message: Message) -> None:
             f"✅ Принудительно выбран: {result}.\n"
             "Перепиши любое сообщение для проверки. /provider auto — вернуть каскад."
         )
+
+
+# ── /apistatus — живая загрузка провайдеров по ключам (только для админа) ────
+# В отличие от /provider (общая ok/rate_limit/error статистика по провайдеру
+# целиком), тут разбивка ПО КЛЮЧАМ — какой конкретно ключ заблокирован/близок
+# к лимиту, плюс сырые rate-limit заголовки, если провайдер их отдаёт (см.
+# llm.py: _track_response/get_provider_stats_snapshot). In-memory, с рестарта
+# бота — не переживает деплой.
+
+def _format_apistatus(snapshot: dict[tuple[str, str], dict]) -> str:
+    if not snapshot:
+        return "Пока нет ни одного вызова с последнего рестарта."
+
+    by_provider: dict[str, list[tuple[str, dict]]] = {}
+    for (provider, key_tail), data in snapshot.items():
+        by_provider.setdefault(provider, []).append((key_tail, data))
+
+    blocks = []
+    for name in PROVIDER_NAMES:
+        entries = by_provider.get(name)
+        if not entries:
+            continue
+        lines = [f"<b>{html.escape(name)}</b>"]
+        for key_tail, data in sorted(entries):
+            reqs, errs = data["requests_24h"], data["errors_1h"]
+            limit = KNOWN_DAILY_LIMITS.get(name)
+            quota = f" (лимит {limit}/сутки)" if limit else ""
+            lines.append(f"  ...{html.escape(key_tail)}: {reqs} запросов/24ч{quota}, {errs} ошибок за час")
+            for h, v in data["headers"].items():
+                lines.append(f"    {html.escape(h)}: {html.escape(v)}")
+        blocks.append("\n".join(lines))
+
+    return "\n\n".join(blocks) if blocks else "Пока нет ни одного вызова с последнего рестарта."
+
+
+@dp.message(Command("apistatus"))
+async def cmd_apistatus(message: Message) -> None:
+    if not _is_admin(message.from_user.id):
+        return
+    text = "📡 Статус API по ключам (с рестарта бота):\n\n" + _format_apistatus(get_provider_stats_snapshot())
+    await _answer_long(message, text, parse_mode="HTML")
 
 
 # ── 🎯 Мой стиль с конкретным человеком ──────────────────────────────────────

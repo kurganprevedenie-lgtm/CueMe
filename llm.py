@@ -175,6 +175,25 @@ def get_provider_stats_snapshot() -> dict[tuple[str, str], dict]:
     return out
 
 
+async def _tracked_post(
+    provider: str, key: str, client: httpx.AsyncClient, url: str, **kwargs,
+) -> httpx.Response:
+    """POST + учёт статистики для /apistatus (_track_response выше) — единая
+    точка вызова во всех провайдерах ниже, чтобы не дублировать try/except в
+    каждом из них. Сетевое исключение (таймаут/DNS/коннект — response вообще
+    не получен) тоже трекается, как resp=None, а затем пробрасывается как
+    есть — вызывающий код (ask()/_ask_with_key() каждого провайдера) сам
+    решает, RateLimitError это или ProviderError, эта функция логику ошибок
+    не меняет, только добавляет наблюдение поверх."""
+    try:
+        resp = await client.post(url, **kwargs)
+    except Exception:
+        _track_response(provider, key, None)
+        raise
+    _track_response(provider, key, resp)
+    return resp
+
+
 # ── Абстрактный провайдер ─────────────────────────────────────────────────────
 
 class LLMProvider(ABC):
@@ -454,7 +473,8 @@ class GroqProvider(LLMProvider):
 
     async def _ask_with_key(self, prompt: str, max_tokens: int, key: str) -> str:
         async with httpx.AsyncClient(timeout=90.0, trust_env=False) as client:
-            resp = await client.post(
+            resp = await _tracked_post(
+                self.name, key, client,
                 self._URL,
                 headers={"Authorization": f"Bearer {key}"},
                 json={
@@ -542,7 +562,7 @@ class GeminiProvider(LLMProvider):
         if GEMINI_PROXY:
             client_kwargs["proxy"] = GEMINI_PROXY
         async with httpx.AsyncClient(**client_kwargs) as client:
-            resp = await client.post(self._url(key), json=payload)
+            resp = await _tracked_post(self.name, key, client, self._url(key), json=payload)
 
         # Любой 4xx (400-499) — проблема КОНКРЕТНОГО ключа: невалиден, нет доступа
         # к модели/API, исчерпан лимит именно на нём. Тело запроса у нас статичное
@@ -616,7 +636,8 @@ class CloudflareProvider(LLMProvider):
             raise ProviderError("CLOUDFLARE_ACCOUNT_ID/CLOUDFLARE_API_TOKEN не заданы")
 
         async with httpx.AsyncClient(timeout=90.0, trust_env=False) as client:
-            resp = await client.post(
+            resp = await _tracked_post(
+                self.name, CLOUDFLARE_API_TOKEN, client,
                 self._url(),
                 headers={"Authorization": f"Bearer {CLOUDFLARE_API_TOKEN}"},
                 json={
@@ -659,7 +680,8 @@ class CerebrasProvider(LLMProvider):
             raise ProviderError("CEREBRAS_API_KEY не задан")
 
         async with httpx.AsyncClient(timeout=90.0, trust_env=False) as client:
-            resp = await client.post(
+            resp = await _tracked_post(
+                self.name, CEREBRAS_API_KEY, client,
                 self._URL,
                 headers={"Authorization": f"Bearer {CEREBRAS_API_KEY}"},
                 json={
@@ -697,7 +719,8 @@ class MistralProvider(LLMProvider):
 
     async def _ask_with_key(self, prompt: str, max_tokens: int, key: str) -> str:
         async with httpx.AsyncClient(timeout=90.0, trust_env=False) as client:
-            resp = await client.post(
+            resp = await _tracked_post(
+                self.name, key, client,
                 self._URL,
                 headers={"Authorization": f"Bearer {key}"},
                 json={
@@ -756,7 +779,8 @@ class GitHubModelsProvider(LLMProvider):
             raise ProviderError("GITHUB_MODELS_TOKEN не задан")
 
         async with httpx.AsyncClient(timeout=90.0, trust_env=False) as client:
-            resp = await client.post(
+            resp = await _tracked_post(
+                self.name, GITHUB_MODELS_TOKEN, client,
                 self._URL,
                 headers={
                     "Authorization": f"Bearer {GITHUB_MODELS_TOKEN}",
@@ -799,7 +823,8 @@ class NIMProvider(LLMProvider):
             raise ProviderError("NVIDIA_NIM_API_KEY не задан")
 
         async with httpx.AsyncClient(timeout=90.0, trust_env=False) as client:
-            resp = await client.post(
+            resp = await _tracked_post(
+                self.name, NVIDIA_NIM_API_KEY, client,
                 self._URL,
                 headers={"Authorization": f"Bearer {NVIDIA_NIM_API_KEY}"},
                 json={
@@ -840,7 +865,8 @@ class InternAIProvider(LLMProvider):
             raise ProviderError("INTERN_AI_API_KEY не задан")
 
         async with httpx.AsyncClient(timeout=90.0, trust_env=False) as client:
-            resp = await client.post(
+            resp = await _tracked_post(
+                self.name, INTERN_AI_API_KEY, client,
                 self._URL,
                 headers={"Authorization": f"Bearer {INTERN_AI_API_KEY}"},
                 json={
@@ -889,7 +915,8 @@ class OpenRouterProvider(LLMProvider):
             raise ProviderError("OPENROUTER_API_KEY не задан")
 
         async with httpx.AsyncClient(timeout=90.0, trust_env=False) as client:
-            resp = await client.post(
+            resp = await _tracked_post(
+                self.name, OPENROUTER_API_KEY, client,
                 self._URL,
                 headers={
                     "Authorization": f"Bearer {OPENROUTER_API_KEY}",
