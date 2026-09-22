@@ -122,6 +122,7 @@ from storage import (
     get_biz_messages_for_contact,
     get_business_connection,
     get_business_message_by_tg_id,
+    get_and_clear_stale_media,
     get_contact_id_for_chat_ref,
     get_business_connections_history,
     get_contact_last_messages,
@@ -977,13 +978,14 @@ async def _check_premium_expiry_reminders(bot: Bot) -> None:
 
 async def _reconcile_promo_channel_premium(bot: Bot) -> None:
     """Единственный фоновый суточный таск в проекте (нет cron/APScheduler) —
-    обе независимые суточные проверки живут в одном цикле, а не в отдельных
+    все независимые суточные проверки живут в одном цикле, а не в отдельных
     тасках: 1) подстраховка на случай пропущенного chat_member-события для
     промо-Premium (проходит по всем юзерам с активным окном, явно
     перепроверяет членство через bot.get_chat_member и ставит на паузу тех,
     кто уже не подписан, а событие поймать не удалось); 2) напоминание об
-    истечении Premium (_check_premium_expiry_reminders). Запускается один
-    раз из main()."""
+    истечении Premium (_check_premium_expiry_reminders); 3) чистка
+    устаревшего кэша скачанного медиа удаляемых business-сообщений
+    (_cleanup_deleted_media_cache). Запускается один раз из main()."""
     while True:
         await asyncio.sleep(24 * 60 * 60)
         try:
@@ -1009,6 +1011,11 @@ async def _reconcile_promo_channel_premium(bot: Bot) -> None:
             await _check_premium_expiry_reminders(bot)
         except Exception:
             logging.exception("premium expiry reminder pass failed")
+
+        try:
+            await _cleanup_deleted_media_cache()
+        except Exception:
+            logging.exception("deleted-media cache cleanup pass failed")
 
 
 # ── Stars-подписка (Telegram Stars, XTR) ──────────────────────────────────────
@@ -3544,12 +3551,72 @@ def _match_outgoing_to_suggestion(
     mark_suggestion_matched(best_row["id"], business_message_id, best_ratio, match_kind)
 
 
+_DELETED_MEDIA_DIR = Path("cache/deleted_media")
+_DELETED_MEDIA_MAX_AGE_HOURS = 48  # см. _cleanup_deleted_media_cache
+_MEDIA_TYPE_LABELS = {"photo": "фото", "voice": "голосовое", "video_note": "видеосообщение"}
+
+
+async def _cache_incoming_media(bot: Bot, event: Message, conn_id: str) -> tuple[str | None, str | None]:
+    """Скачивает медиа ВХОДЯЩЕГО business-сообщения на диск СРАЗУ при
+    получении — не откладывая до момента удаления, т.к. после удаления
+    file_id может стать недоступен для скачивания. Вызывать ТОЛЬКО для
+    direction="in" (исходящие свои сообщения юзеру незачем пересылать при
+    удалении, см. handle_business_message). Голосовые сообщения тут
+    скачиваются ВТОРОЙ раз (первый — в _message_text, для расшифровки
+    Whisper) — сознательно не объединял: _message_text общий хелпер для
+    многих флоу, не только business-входящих, усложнять его ради этой
+    фичи не стоит, а голосовые небольшие, задваивание дёшево.
+
+    Возвращает (media_type, file_path) — (None, None), если это не
+    photo/voice/video_note или скачивание не удалось (сетевая ошибка,
+    превышение размера и т.п. — не роняет обработку сообщения, см.
+    handle_business_message)."""
+    if event.photo:
+        media, media_type, ext = event.photo[-1], "photo", "jpg"
+    elif event.voice:
+        media, media_type, ext = event.voice, "voice", "ogg"
+    elif event.video_note:
+        media, media_type, ext = event.video_note, "video_note", "mp4"
+    else:
+        return None, None
+
+    conn_dir = _DELETED_MEDIA_DIR / conn_id
+    file_path = conn_dir / f"{event.message_id}.{ext}"
+    try:
+        conn_dir.mkdir(parents=True, exist_ok=True)
+        await bot.download(media, destination=file_path)
+    except Exception:
+        logging.exception(
+            "deleted-media cache: не удалось скачать %s (message_id=%s)",
+            media_type, event.message_id,
+        )
+        return None, None
+    return media_type, str(file_path)
+
+
+async def _cleanup_deleted_media_cache() -> None:
+    """Чистит скачанные файлы медиа (photo/voice/video_note, см.
+    _cache_incoming_media) старше _DELETED_MEDIA_MAX_AGE_HOURS — вызывается
+    из общего суточного таска (_reconcile_promo_channel_premium), отдельный
+    планировщик не заводим. Строки business_messages НЕ трогает (постоянная
+    история переписки, участвует в семплах для карточек стиля) — только сам
+    файл на диске и ссылку на него (см. get_and_clear_stale_media)."""
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=_DELETED_MEDIA_MAX_AGE_HOURS)
+    paths = await asyncio.to_thread(get_and_clear_stale_media, cutoff)
+    for path in paths:
+        try:
+            Path(path).unlink(missing_ok=True)
+        except Exception:
+            logging.warning("deleted-media cleanup: не удалось удалить файл %s", path)
+
+
 def _persist_business_message(
     *, conn_id: str, owner_id: str, chat_ref: str, direction: str,
     text: str | None, is_voice: bool, date: str, tg_message_id: int,
     contact_tg_id: str, chat_first_name: str | None, chat_last_name: str | None,
     chat_username: str | None, sender_username: str | None,
     photo_file_id: str | None = None,
+    media_type: str | None = None, media_path: str | None = None,
 ) -> tuple[int | None, tuple[str, str] | None]:
     """Синхронная DB-часть обработки business-сообщения: сохранение + резолв контакта
     + троттлинг refresh + сопоставление с подсказками CueMe (для исходящих).
@@ -3562,6 +3629,7 @@ def _persist_business_message(
         connection_id=conn_id, owner_user_id=owner_id, chat_ref=chat_ref,
         direction=direction, text=text, date=date, tg_message_id=tg_message_id,
         raw_meta=_msg_meta(text, is_voice), photo_file_id=photo_file_id,
+        media_type=media_type, media_path=media_path,
     )
     if message_id is None:
         # Повторная доставка того же сообщения — не триггерим пересборку.
@@ -3647,6 +3715,13 @@ async def handle_business_message(event: Message, bot: Bot) -> None:
     # event.caption уже попал в text через _message_text выше, если было.
     photo_file_id = event.photo[-1].file_id if event.photo else None
 
+    # Кэш медиа на случай удаления — ТОЛЬКО для входящих (см.
+    # _cache_incoming_media): свои же исходящие фото/голосовые/кружки юзеру
+    # незачем пересылать, если он сам их удалит.
+    media_type = media_path = None
+    if direction == "in":
+        media_type, media_path = await _cache_incoming_media(bot, event, conn_id)
+
     # Синхронную DB-часть уводим в поток, чтобы не блокировать event loop.
     contact_id_for_rebuild, merge_notice = await asyncio.to_thread(
         _persist_business_message,
@@ -3657,6 +3732,7 @@ async def handle_business_message(event: Message, bot: Bot) -> None:
         chat_username=getattr(event.chat, "username", None),
         sender_username=event.from_user.username if event.from_user else None,
         photo_file_id=photo_file_id,
+        media_type=media_type, media_path=media_path,
     )
 
     if contact_id_for_rebuild:
@@ -3695,6 +3771,35 @@ NOTIFY_DELETED_WITHOUT_TEXT = True  # False — молча пропускать 
 
 
 @dp.deleted_business_messages()
+async def _send_deleted_media_notice(
+    bot: Bot, owner_id: str, name: str, media_type: str, media_path: str, caption_text: str | None,
+) -> None:
+    """Пересылает владельцу скачанное медиа удалённого входящего сообщения
+    (см. _cache_incoming_media). photo/voice поддерживают caption — туда же
+    уходит подпись-уведомление (+ исходный caption фото, если был, он же
+    caption_text — captions у voice не бывает содержательным, но поле то
+    же). video_note caption не поддерживает вообще (ограничение Bot API,
+    не наше) — уведомление уходит ОТДЕЛЬНЫМ текстовым сообщением следом.
+    Файл может быть уже почищен _cleanup_deleted_media_cache (устарел) —
+    тогда просто не существует на диске, вызывающий код это уже проверил."""
+    label = _MEDIA_TYPE_LABELS.get(media_type, "медиа")
+    notice = f"🗑 {name} удалил(а) {label}"
+    caption = notice + (f"\n\n«{caption_text}»" if caption_text else "")
+    file = FSInputFile(media_path)
+    try:
+        if media_type == "photo":
+            await bot.send_photo(int(owner_id), file, caption=caption[:1024])
+        elif media_type == "voice":
+            await bot.send_voice(int(owner_id), file, caption=caption[:1024])
+        elif media_type == "video_note":
+            await bot.send_video_note(int(owner_id), file)
+            await bot.send_message(int(owner_id), notice)
+    except Exception:
+        logging.exception(
+            "deleted_business_messages: не удалось переслать %s owner=%s", media_type, owner_id,
+        )
+
+
 async def handle_deleted_business_messages(event: BusinessMessagesDeleted, bot: Bot) -> None:
     conn_id = event.business_connection_id
     conn_row = await asyncio.to_thread(get_business_connection, conn_id)
@@ -3722,7 +3827,22 @@ async def handle_deleted_business_messages(event: BusinessMessagesDeleted, bot: 
             continue
 
         text = row["text"]
-        if text:
+        media_type = row["media_type"] if "media_type" in row.keys() else None
+        media_path = row["media_path"] if "media_path" in row.keys() else None
+
+        if media_type and media_path and Path(media_path).is_file():
+            await _send_deleted_media_notice(bot, owner_id, name, media_type, media_path, text)
+            continue
+
+        if media_type:
+            # Медиа было, но файл уже недоступен (не удалось скачать при
+            # получении, или почищен по возрасту — _cleanup_deleted_media_cache)
+            # — честно говорим, что медиа, а не текст, раз тип известен.
+            if not NOTIFY_DELETED_WITHOUT_TEXT:
+                continue
+            label = _MEDIA_TYPE_LABELS.get(media_type, "медиа")
+            notice = f"🗑 {name} удалил(а) {label} (файл недоступен)"
+        elif text:
             notice = f"🗑 {name} удалил(а) сообщение:\n«{text}»"
         elif NOTIFY_DELETED_WITHOUT_TEXT:
             notice = f"🗑 {name} удалил(а) сообщение (текст недоступен)"
