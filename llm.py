@@ -85,6 +85,96 @@ class ProviderError(RuntimeError):
     """Временная ошибка одного провайдера (5xx, таймаут). Триггерит fallback."""
 
 
+# ── Мониторинг загрузки провайдеров (main.py: /apistatus) ────────────────────
+# In-memory, per (provider_name, последние_4_символа_ключа) — не в БД, это
+# оперативные данные, переживать перезапуск бота не обязаны.
+#
+# Заголовки rate-limit называются у каждого провайдера по-своему, и не все их
+# вообще отдают — вместо хардкода конкретных имён под каждого, при каждом
+# ответе сканируем ЛЮБОЙ заголовок, в имени которого есть "ratelimit" или
+# "retry-after" (без разбора регистра), и сохраняем как есть, без интерпретации
+# значений. Живьём подтверждено (вебпоиск на момент добавления, 2026-09):
+# Groq отдаёт полный набор (x-ratelimit-limit-requests/-tokens,
+# x-ratelimit-remaining-requests/-tokens, x-ratelimit-reset-requests/-tokens);
+# Mistral отдаёт как минимум x-ratelimit-remaining. Gemini/Cloudflare/Cerebras/
+# GitHub Models/NVIDIA NIM/Intern AI/OpenRouter — либо не проверялись живьём,
+# либо не публикуют таких заголовков в доке; для них /apistatus падает на
+# локальный счётчик запросов/ошибок ниже, без выдуманных числовых лимитов.
+#
+# Статические дневные лимиты — ТОЛЬКО там, где уже задокументированы в этом
+# же файле (докстринг модуля выше) — не гадаем по непроверенным источникам.
+KNOWN_DAILY_LIMITS: dict[str, int] = {
+    "Cloudflare": 1300,  # см. докстринг модуля выше: "~1300 LLM-ответов/день"
+}
+
+_STATS_WINDOW_SECONDS = 24 * 60 * 60
+
+
+class _ProviderKeyStats:
+    __slots__ = ("headers", "requests", "errors")
+
+    def __init__(self) -> None:
+        self.headers: dict[str, str] = {}
+        self.requests: list[float] = []
+        self.errors: list[float] = []
+
+
+_provider_stats: dict[tuple[str, str], _ProviderKeyStats] = {}
+_RATE_HEADER_HINTS = ("ratelimit", "retry-after")
+
+
+def _key_tail(key: str) -> str:
+    return key[-4:] if len(key) > 4 else "????"
+
+
+def _trim_old(timestamps: list[float], now: float) -> list[float]:
+    cutoff = now - _STATS_WINDOW_SECONDS
+    return [t for t in timestamps if t >= cutoff]
+
+
+def _track_response(provider: str, key: str, resp: "httpx.Response | None") -> None:
+    """Вызывать ПОСЛЕ каждого HTTP-запроса к провайдеру каскада — и успешного,
+    и с ошибкой (включая сетевые исключения — тогда resp=None). Копит данные
+    для /apistatus (main.py: get_provider_stats_snapshot): свой счётчик
+    запросов/ошибок за 24ч (список таймстемпов, тут же обрезается) и —
+    отдельно, best-effort — заголовки лимитов, если провайдер их прислал."""
+    now = time.time()
+    ident = (provider, _key_tail(key))
+    st = _provider_stats.setdefault(ident, _ProviderKeyStats())
+
+    st.requests.append(now)
+    st.requests = _trim_old(st.requests, now)
+
+    is_error = resp is None or resp.status_code == 429 or resp.status_code >= 500 or not resp.is_success
+    if is_error:
+        st.errors.append(now)
+        st.errors = _trim_old(st.errors, now)
+
+    if resp is not None:
+        found = {
+            k: v for k, v in resp.headers.items()
+            if any(hint in k.lower() for hint in _RATE_HEADER_HINTS)
+        }
+        if found:
+            st.headers = found
+
+
+def get_provider_stats_snapshot() -> dict[tuple[str, str], dict]:
+    """Снимок текущей статистики для /apistatus (main.py) — (provider,
+    маска_ключа) -> {"headers": {...}, "requests_24h": int, "errors_1h": int}."""
+    now = time.time()
+    out: dict[tuple[str, str], dict] = {}
+    for ident, st in _provider_stats.items():
+        reqs = _trim_old(st.requests, now)
+        errs_1h = [t for t in st.errors if t >= now - 3600]
+        out[ident] = {
+            "headers": dict(st.headers),
+            "requests_24h": len(reqs),
+            "errors_1h": len(errs_1h),
+        }
+    return out
+
+
 # ── Абстрактный провайдер ─────────────────────────────────────────────────────
 
 class LLMProvider(ABC):
@@ -417,9 +507,16 @@ class GroqProvider(LLMProvider):
 class GeminiProvider(LLMProvider):
     name = "Gemini"
     # gemini-2.5-flash отключён Google для новых ключей (миграция 2026-08) —
-    # gemini-flash-latest живой алиас на текущую рекомендованную flash-модель,
-    # не требует ручной миграции при следующем отключении версии.
-    _MODEL = "gemini-flash-latest"
+    # gemini-flash-latest живой алиас на текущую рекомендованную flash-модель.
+    # 2026-09-22: gemini-flash-latest словил HTTP 503 «high demand» на всех
+    # 7 ключах разом (перегрузка именно этой модели у Google, не наша
+    # проблема — см. GeminiProvider._ask_with_key: 503 не ключ-специфичен,
+    # каскад и так падает на Groq после первой же попытки). Переключились на
+    # gemini-flash-lite-latest — свой отдельный пул мощностей у Google, может
+    # быть свободен, когда обычный flash перегружен; ответы попроще/победнее,
+    # чем у flash. Если понадобится вернуть — просто верни этой строке
+    # значение "gemini-flash-latest".
+    _MODEL = "gemini-flash-lite-latest"
 
     @staticmethod
     def _url(key: str) -> str:
