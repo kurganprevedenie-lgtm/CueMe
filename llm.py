@@ -11,7 +11,9 @@ llm.py — обёртки над LLM-провайдерами с каскадн�
   4. Cerebras    (gpt-oss-120b, см. миграцию 2026-09 ниже) — fallback 3
   5. Mistral     (mistral-small-2603, см. миграцию 2026-09 ниже) — fallback 4
   6. GitHub Models (gpt-4o-mini, бесплатный тир)          — fallback 5
-  7. OpenRouter  (openrouter/free, см. миграцию 2026-09 ниже) — fallback 6
+  7. NVIDIA NIM  (meta/llama-3.1-70b-instruct, бесплатный тир, НЕ проверено
+                  вживую — см. класс NIMProvider)          — fallback 6
+  8. OpenRouter  (openrouter/free, см. миграцию 2026-09 ниже) — fallback 7
 
 Миграция 2026-08: llama-3.3-70b-versatile отключён на Groq, gemini-2.5-flash
 отключён для новых ключей на Gemini, meta-llama/llama-3.3-70b-instruct:free
@@ -32,9 +34,9 @@ llm.py — обёртки над LLM-провайдерами с каскадн�
 mistral-small-2603 (подтверждено вживую как существующая модель в лимитах
 аккаунта на organization limits, console.mistral.ai).
 
-Cloudflare/Cerebras/Mistral/GitHub Models пропускаются автоматически, если
-их ключ(и) не заданы в .env (см. .env.example) — остальной каскад работает
-как раньше без них.
+Cloudflare/Cerebras/Mistral/GitHub Models/NVIDIA NIM пропускаются
+автоматически, если их ключ(и) не заданы в .env (см. .env.example) —
+остальной каскад работает как раньше без них.
 
 Если все провайдеры недоступны — пробрасывается последнее исключение.
 """
@@ -58,6 +60,7 @@ from config import (
     GROQ_API_KEYS,
     LLM_PROVIDER_ORDER,
     MISTRAL_API_KEY,
+    NVIDIA_NIM_API_KEY,
     OPENROUTER_API_KEY,
     REPLY_STYLES,
     VISION_MODEL,
@@ -642,6 +645,46 @@ class GitHubModelsProvider(LLMProvider):
         return (resp.json()["choices"][0]["message"].get("content") or "").strip()
 
 
+# ── NVIDIA NIM (build.nvidia.com, бесплатный тир, OpenAI-совместимый формат) ──
+
+class NIMProvider(LLMProvider):
+    name = "NVIDIA NIM"
+    _URL   = "https://integrate.api.nvidia.com/v1/chat/completions"
+    # Ключа на момент добавления провайдера ещё не было — модель НЕ проверена
+    # вживую на реальном ключе (тот же риск, что у OpenRouterProvider._MODEL
+    # выше) — прогнать через tools/check_keys.py перед тем, как полагаться на
+    # это в проде. meta/llama-3.1-70b-instruct — из каталога build.nvidia.com,
+    # входит в бесплатный тир на момент добавления.
+    _MODEL = "meta/llama-3.1-70b-instruct"
+
+    async def ask(self, prompt: str, max_tokens: int) -> str:
+        if not NVIDIA_NIM_API_KEY:
+            raise ProviderError("NVIDIA_NIM_API_KEY не задан")
+
+        async with httpx.AsyncClient(timeout=90.0, trust_env=False) as client:
+            resp = await client.post(
+                self._URL,
+                headers={"Authorization": f"Bearer {NVIDIA_NIM_API_KEY}"},
+                json={
+                    "model": self._MODEL,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "max_tokens": max_tokens,
+                },
+            )
+
+        if resp.status_code == 429:
+            raise RateLimitError("Лимит NVIDIA NIM исчерпан.")
+
+        if resp.status_code in (500, 502, 503):
+            raise ProviderError(f"NVIDIA NIM {resp.status_code}: {resp.text[:200]}")
+
+        if not resp.is_success:
+            raise ProviderError(f"NVIDIA NIM {resp.status_code}: {resp.text[:200]}")
+
+        # content может прийти null, не только "" — reasoning ушёл весь бюджет.
+        return (resp.json()["choices"][0]["message"].get("content") or "").strip()
+
+
 # ── OpenRouter ────────────────────────────────────────────────────────────────
 
 class OpenRouterProvider(LLMProvider):
@@ -703,10 +746,11 @@ _PROVIDER_REGISTRY = {
     "cerebras":     CerebrasProvider,
     "mistral":      MistralProvider,
     "githubmodels": GitHubModelsProvider,
+    "nim":          NIMProvider,
     "openrouter":   OpenRouterProvider,
 }
 _DEFAULT_ORDER = [
-    "gemini", "groq", "cloudflare", "cerebras", "mistral", "githubmodels", "openrouter",
+    "gemini", "groq", "cloudflare", "cerebras", "mistral", "githubmodels", "nim", "openrouter",
 ]
 
 

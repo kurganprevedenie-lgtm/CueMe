@@ -49,6 +49,10 @@ CLOUDFLARE_API_TOKEN  = os.getenv("CLOUDFLARE_API_TOKEN")
 # GitHub Models — бесплатный тир от обычного GitHub-аккаунта (Fine-grained
 # PAT с правом models:read). Опционален, как Cerebras/Mistral.
 GITHUB_MODELS_TOKEN = os.getenv("GITHUB_MODELS_TOKEN")
+# NVIDIA NIM (build.nvidia.com) — бесплатный тир, OpenAI-совместимый формат.
+# Опционален, как Cerebras/Mistral/GitHub Models — не задан, NIMProvider
+# пропускается в каскаде без ошибки (см. llm.py).
+NVIDIA_NIM_API_KEY = os.getenv("NVIDIA_NIM_API_KEY")
 
 # telegram_id разработчика — кому доступны админ-команды (/provider, /users,
 # /export, /sources и т.п.), не должны быть открыты всем.
@@ -88,7 +92,7 @@ ONBOARDING_JSON_POST_URL = os.getenv("ONBOARDING_JSON_POST_URL", "https://t.me/C
 # Порядок каскада LLM (через запятую). Дефолт — Gemini основной. На сервере без
 # GEMINI_PROXY имеет смысл поставить groq первым: "groq,gemini,openrouter".
 LLM_PROVIDER_ORDER = os.getenv(
-    "LLM_PROVIDER_ORDER", "gemini,groq,cloudflare,cerebras,mistral,githubmodels,openrouter"
+    "LLM_PROVIDER_ORDER", "gemini,groq,cloudflare,cerebras,mistral,githubmodels,nim,openrouter"
 )
 
 # TTL кэша LLM-ответов (сек). Ключ контент-адресный (включает карточки стиля),
