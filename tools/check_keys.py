@@ -220,7 +220,7 @@ async def _run_group(title: str, keys: list[str], checker) -> None:
         try:
             ok, detail = await checker(key)
         except Exception as e:
-            ok, detail = False, f"исключение: {e}"
+            ok, detail = False, f"исключение: {type(e).__name__}: {e}"
         status = "OK" if ok else "FAIL"
         print(f"  ключ #{i} ({_mask(key)}): {status} -> {detail!r}")
 
@@ -236,7 +236,7 @@ async def main() -> None:
         try:
             ok, detail = await check_cloudflare(CLOUDFLARE_ACCOUNT_ID, CLOUDFLARE_API_TOKEN)
         except Exception as e:
-            ok, detail = False, f"исключение: {e}"
+            ok, detail = False, f"исключение: {type(e).__name__}: {e}"
         print(f"  {'OK' if ok else 'FAIL'} -> {detail!r}")
 
     await _run_group("Cerebras", [CEREBRAS_API_KEY] if CEREBRAS_API_KEY else [], check_cerebras)
