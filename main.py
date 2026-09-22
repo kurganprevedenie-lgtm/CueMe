@@ -3807,6 +3807,11 @@ async def _send_deleted_media_notice(
 
 
 async def handle_deleted_business_messages(event: BusinessMessagesDeleted, bot: Bot) -> None:
+    # ВРЕМЕННЫЙ диагностический лог (убрать после отладки).
+    logging.info(
+        "deleted_business_messages RAW: conn=%s chat_id=%s message_ids=%s",
+        event.business_connection_id, event.chat.id, event.message_ids,
+    )
     conn_id = event.business_connection_id
     conn_row = await asyncio.to_thread(get_business_connection, conn_id)
     if not conn_row:
@@ -3821,6 +3826,12 @@ async def handle_deleted_business_messages(event: BusinessMessagesDeleted, bot: 
 
     for tg_message_id in event.message_ids:
         row = await asyncio.to_thread(get_business_message_by_tg_id, conn_id, chat_ref, tg_message_id)
+        # ВРЕМЕННЫЙ диагностический лог (убрать после отладки).
+        logging.info(
+            "deleted_business_messages LOOKUP: tg_message_id=%s found=%s direction=%s media_type=%s",
+            tg_message_id, bool(row), row["direction"] if row else None,
+            row["media_type"] if row and "media_type" in row.keys() else None,
+        )
         # Реагируем ТОЛЬКО на удаление ВХОДЯЩИХ (direction тот же принцип,
         # что в handle_business_message: "in" = прислал собеседник, не
         # владелец). Если строки нет вообще — направление НЕИЗВЕСТНО, и
