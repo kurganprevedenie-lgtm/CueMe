@@ -1,8 +1,9 @@
 """Диагностика живости всех API-ключей (Gemini, Groq, Cloudflare, Cerebras,
-Mistral, GitHub Models, NVIDIA NIM, OpenRouter) без ротации — каждый ключ
-бьётся отдельным запросом, чтобы увидеть его реальный статус. Gemini/Groq/
-Mistral поддерживают несколько ключей (мультиаккаунтинг, см. config.py) —
-проверяется каждый ключ из списка по отдельности, не только первый.
+Mistral, GitHub Models, NVIDIA NIM, Intern AI, OpenRouter) без ротации —
+каждый ключ бьётся отдельным запросом, чтобы увидеть его реальный статус.
+Gemini/Groq/Mistral поддерживают несколько ключей (мультиаккаунтинг, см.
+config.py) — проверяется каждый ключ из списка по отдельности, не только
+первый.
 
 Название модели для каждого провайдера читается ИЗ llm.py (Provider._MODEL),
 а не дублируется здесь строкой — раньше было дублирование, и правка модели в
@@ -11,8 +12,8 @@ llm.py (например миграция на новую модель посл�
 старую, уже мёртвую модель, и диагностика врала. Актуально только для
 провайдеров, у которых MODEL — не переменная запроса, а фиксированный
 атрибут класса (Cloudflare/Cerebras/Mistral/GitHub Models/NVIDIA NIM/
-OpenRouter) — Gemini/Groq модель тоже читают из своих провайдеров ниже,
-для единообразия.
+Intern AI/OpenRouter) — Gemini/Groq модель тоже читают из своих
+провайдеров ниже, для единообразия.
 
 Запуск на сервере: python3.13 -m tools.check_keys (или ./venv/bin/python -m
 tools.check_keys, если зависимости стоят в venv, см. cueme-bot.service)
@@ -29,6 +30,7 @@ from config import (
     GEMINI_PROXY,
     GITHUB_MODELS_TOKEN,
     GROQ_API_KEYS,
+    INTERN_AI_API_KEY,
     MISTRAL_API_KEYS,
     NVIDIA_NIM_API_KEY,
     OPENROUTER_API_KEY,
@@ -39,6 +41,7 @@ from llm import (
     GeminiProvider,
     GitHubModelsProvider,
     GroqProvider,
+    InternAIProvider,
     MistralProvider,
     NIMProvider,
     OpenRouterProvider,
@@ -170,6 +173,21 @@ async def check_nim(key: str) -> tuple[bool, str]:
     return True, text
 
 
+async def check_intern_ai(key: str) -> tuple[bool, str]:
+    url = InternAIProvider._URL
+    payload = {
+        "model": InternAIProvider._MODEL,
+        "messages": [{"role": "user", "content": "Ответь одним словом: тест пройден?"}],
+        "max_tokens": 20,
+    }
+    async with httpx.AsyncClient(timeout=30.0, trust_env=False) as client:
+        resp = await client.post(url, headers={"Authorization": f"Bearer {key}"}, json=payload)
+    if not resp.is_success:
+        return False, f"HTTP {resp.status_code} — {resp.text[:150]}"
+    text = resp.json()["choices"][0]["message"]["content"].strip()
+    return True, text
+
+
 async def check_openrouter(key: str) -> tuple[bool, str]:
     url = OpenRouterProvider._URL
     payload = {
@@ -227,6 +245,7 @@ async def main() -> None:
         "GitHub Models", [GITHUB_MODELS_TOKEN] if GITHUB_MODELS_TOKEN else [], check_github_models,
     )
     await _run_group("NVIDIA NIM", [NVIDIA_NIM_API_KEY] if NVIDIA_NIM_API_KEY else [], check_nim)
+    await _run_group("Intern AI", [INTERN_AI_API_KEY] if INTERN_AI_API_KEY else [], check_intern_ai)
     await _run_group("OpenRouter", [OPENROUTER_API_KEY] if OPENROUTER_API_KEY else [], check_openrouter)
 
 

@@ -13,7 +13,9 @@ llm.py — обёртки над LLM-провайдерами с каскадн�
   6. GitHub Models (gpt-4o-mini, бесплатный тир)          — fallback 5
   7. NVIDIA NIM  (meta/llama-3.1-70b-instruct, бесплатный тир, НЕ проверено
                   вживую — см. класс NIMProvider)          — fallback 6
-  8. OpenRouter  (openrouter/free, см. миграцию 2026-09 ниже) — fallback 7
+  8. Intern AI   (intern-latest, живой алиас, бесплатный тир,
+                  лимит 30 запросов/мин)                   — fallback 7
+  9. OpenRouter  (openrouter/free, см. миграцию 2026-09 ниже) — fallback 8
 
 Миграция 2026-08: llama-3.3-70b-versatile отключён на Groq, gemini-2.5-flash
 отключён для новых ключей на Gemini, meta-llama/llama-3.3-70b-instruct:free
@@ -34,7 +36,7 @@ llm.py — обёртки над LLM-провайдерами с каскадн�
 mistral-small-2603 (подтверждено вживую как существующая модель в лимитах
 аккаунта на organization limits, console.mistral.ai).
 
-Cloudflare/Cerebras/Mistral/GitHub Models/NVIDIA NIM пропускаются
+Cloudflare/Cerebras/Mistral/GitHub Models/NVIDIA NIM/Intern AI пропускаются
 автоматически, если их ключ(и) не заданы в .env (см. .env.example) —
 остальной каскад работает как раньше без них.
 
@@ -59,6 +61,7 @@ from config import (
     GITHUB_MODELS_TOKEN,
     GROQ_API_KEYS,
     LLM_PROVIDER_ORDER,
+    INTERN_AI_API_KEY,
     MISTRAL_API_KEYS,
     NVIDIA_NIM_API_KEY,
     OPENROUTER_API_KEY,
@@ -722,6 +725,48 @@ class NIMProvider(LLMProvider):
         return (resp.json()["choices"][0]["message"].get("content") or "").strip()
 
 
+# ── Intern AI / InternLM (书生浦语, chat.intern-ai.org.cn, бесплатный тир,
+# OpenAI-совместимый формат) ──────────────────────────────────────────────────
+
+class InternAIProvider(LLMProvider):
+    name = "Intern AI"
+    _URL   = "https://chat.intern-ai.org.cn/api/v1/chat/completions"
+    # "intern-latest" — живой алиас на текущую рекомендованную модель (тот же
+    # принцип, что у gemini-flash-latest в GeminiProvider — не привязан к
+    # конкретной версии). Лимит по документации — 30 запросов/мин на юзера
+    # (токен), сверх каскада отдельно не троттлим — 429 уйдёт в RateLimitError
+    # и пойдёт следующий провайдер, как у всех остальных.
+    _MODEL = "intern-latest"
+
+    async def ask(self, prompt: str, max_tokens: int) -> str:
+        if not INTERN_AI_API_KEY:
+            raise ProviderError("INTERN_AI_API_KEY не задан")
+
+        async with httpx.AsyncClient(timeout=90.0, trust_env=False) as client:
+            resp = await client.post(
+                self._URL,
+                headers={"Authorization": f"Bearer {INTERN_AI_API_KEY}"},
+                json={
+                    "model": self._MODEL,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "max_tokens": max_tokens,
+                },
+            )
+
+        if resp.status_code == 429:
+            raise RateLimitError("Лимит Intern AI исчерпан.")
+
+        if resp.status_code in (500, 502, 503):
+            raise ProviderError(f"Intern AI {resp.status_code}: {resp.text[:200]}")
+
+        if not resp.is_success:
+            raise ProviderError(f"Intern AI {resp.status_code}: {resp.text[:200]}")
+
+        # content может прийти null, не только "" — reasoning ушёл весь бюджет
+        # (thinking-режим есть у части моделей каталога, см. intern-s2/s1 выше).
+        return (resp.json()["choices"][0]["message"].get("content") or "").strip()
+
+
 # ── OpenRouter ────────────────────────────────────────────────────────────────
 
 class OpenRouterProvider(LLMProvider):
@@ -784,10 +829,11 @@ _PROVIDER_REGISTRY = {
     "mistral":      MistralProvider,
     "githubmodels": GitHubModelsProvider,
     "nim":          NIMProvider,
+    "internai":     InternAIProvider,
     "openrouter":   OpenRouterProvider,
 }
 _DEFAULT_ORDER = [
-    "gemini", "groq", "cloudflare", "cerebras", "mistral", "githubmodels", "nim", "openrouter",
+    "gemini", "groq", "cloudflare", "cerebras", "mistral", "githubmodels", "nim", "internai", "openrouter",
 ]
 
 
