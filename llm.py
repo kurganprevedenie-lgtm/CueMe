@@ -2294,8 +2294,24 @@ async def suggest_reply_variants(
         "ТЕКСТ: [сам ответ, без кавычек]\n"
         f"(повтори блок ===ВАРИАНТ=== ровно {n_variants} раз, ни больше ни меньше)"
     )
-    raw = await _ask(prompt, max_tokens=1400)
-    return _parse_variants(raw, n_variants)
+    # 1400 → 1800 (2026-09-23): с тех пор, как Groq (openai/gpt-oss-120b,
+    # reasoning-модель) стал основным провайдером, «Не получилось
+    # сгенерировать варианты» стало приходить БЕЗ единой ошибки в логах —
+    # LLM [Groq]: ok, но _parse_variants получал урезанный ответ (0 из
+    # n_variants блоков). Тот же класс проблемы, что уже описан в
+    # комментарии у GroqProvider._REASONING_BUFFER: часть бюджета уходит на
+    # внутренние рассуждения ДО финального текста; у контактов с богатой
+    # историей (есть winning_examples/data_signals в промпте) он длиннее
+    # среднего — риск урезания выше. Подняли запас.
+    raw = await _ask(prompt, max_tokens=1800)
+    variants = _parse_variants(raw, n_variants)
+    if len(variants) < n_variants:
+        log.warning(
+            "suggest_reply_variants: распарсено %d/%d вариантов — вероятно, "
+            "reasoning-модель урезала ответ. raw[:300]=%r",
+            len(variants), n_variants, raw[:300],
+        )
+    return variants
 
 
 # отключено — функция Переписать убрана из UI, заменена Новым диалогом
