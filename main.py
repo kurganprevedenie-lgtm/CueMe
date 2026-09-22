@@ -217,6 +217,24 @@ logging.basicConfig(level=logging.INFO)
 dp = Dispatcher(storage=MemoryStorage())
 
 
+# ВРЕМЕННЫЙ диагностический middleware (убрать после отладки) — логирует
+# СЫРЫЕ апдейты необычных типов целиком (всё, кроме message/callback_query,
+# которые и так шумят). Расследуем, почему deleted_business_messages не
+# долетает до handle_deleted_business_messages: нужно увидеть, приходит ли
+# апдейт от Telegram вообще, и если да — в каком виде.
+@dp.update.outer_middleware()
+async def _log_raw_update_diag(handler, event, data):
+    if event.event_type not in ("message", "callback_query"):
+        try:
+            logging.info(
+                "RAW UPDATE [%s]: %s",
+                event.event_type, event.model_dump_json(exclude_none=True)[:2000],
+            )
+        except Exception:
+            logging.exception("RAW UPDATE: не удалось сериализовать апдейт")
+    return await handler(event, data)
+
+
 @dp.errors()
 async def on_unhandled_error(event: ErrorEvent) -> bool:
     """Глобальная сетка на необработанные исключения в хендлерах. Без неё сбой
