@@ -106,8 +106,17 @@ ONBOARDING_JSON_POST_URL = os.getenv("ONBOARDING_JSON_POST_URL", "https://t.me/C
 # аномальные задержки/перегрузку на стороне Google под нагрузкой (см. llm.py:
 # GeminiProvider, инциденты 2026-09-22/23), Groq стабильнее по времени ответа.
 # Gemini остаётся в каскаде вторым — фолбэк, а не выключен совсем.
+#
+# 2026-09-28: живая проверка tools/check_keys.py показала три провайдера
+# ГАРАНТИРОВАННО нерабочими (не просто медленными — падают на 100% попыток):
+# cerebras (402 Payment Required), mistral (401 Invalid API Key) — оба убраны
+# из порядка, чинить нужно отдельно (оплата/новый ключ), возвращать в
+# LLM_PROVIDER_ORDER вручную, когда почините. internai — ConnectTimeout
+# (сервер вообще недоступен), а таймаут у него 90с — самый тяжёлый мёртвый
+# груз из всех, держать его даже последним в очереди означало бы иногда
+# ждать лишние 90 секунд впустую. Убран полностью, не просто сдвинут в конец.
 LLM_PROVIDER_ORDER = os.getenv(
-    "LLM_PROVIDER_ORDER", "groq,gemini,cloudflare,cerebras,mistral,githubmodels,nim,internai,openrouter"
+    "LLM_PROVIDER_ORDER", "groq,gemini,cloudflare,githubmodels,nim,openrouter"
 )
 
 # TTL кэша LLM-ответов (сек). Ключ контент-адресный (включает карточки стиля),

@@ -191,11 +191,21 @@ async def check_intern_ai(key: str) -> tuple[bool, str]:
 
 
 async def check_openrouter(key: str) -> tuple[bool, str]:
+    # 2026-09-28: живая диагностика падала AttributeError: 'NoneType' object
+    # has no attribute 'strip' — openrouter/free это self-updating роутер по
+    # ~24 бесплатным моделям (см. OpenRouterProvider выше), какая из них
+    # ответит на конкретный запрос — не гарантировано, и часть из них
+    # reasoning-модели (тот же класс, что GroqProvider._REASONING_BUFFER):
+    # тратят часть max_tokens на размышления ДО финального content, на
+    # малом бюджете content приходит null. Тут его не хватало (200, без
+    # запаса) — добавили тот же _REASONING_BUFFER, что и в проде
+    # (OpenRouterProvider.ask()), и .get(...) or "" вместо прямого
+    # индексирования — на случай, если content всё равно придёт null.
     url = OpenRouterProvider._URL
     payload = {
         "model": OpenRouterProvider._MODEL,
         "messages": [{"role": "user", "content": "Ответь одним словом: тест пройден?"}],
-        "max_tokens": 200,  # тоже reasoning-модель, см. комментарий в check_groq
+        "max_tokens": 200 + OpenRouterProvider._REASONING_BUFFER,
     }
     async with httpx.AsyncClient(timeout=30.0, trust_env=False) as client:
         resp = await client.post(
@@ -209,7 +219,9 @@ async def check_openrouter(key: str) -> tuple[bool, str]:
         )
     if not resp.is_success:
         return False, f"HTTP {resp.status_code} — {resp.text[:150]}"
-    text = resp.json()["choices"][0]["message"]["content"].strip()
+    text = (resp.json()["choices"][0]["message"].get("content") or "").strip()
+    if not text:
+        return False, "content пустой/null — вероятно, reasoning-модель роутера съела весь бюджет"
     return True, text
 
 
