@@ -250,8 +250,8 @@ async def _run_group(title: str, keys: list[str], checker) -> None:
 
 
 async def main() -> None:
-    await run_gemini_check()
     await _run_group("Groq", GROQ_API_KEYS, check_groq)
+    await run_gemini_check()
 
     print("\n=== Cloudflare Workers AI ===")
     if not (CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN):
