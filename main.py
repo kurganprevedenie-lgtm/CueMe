@@ -3638,6 +3638,8 @@ def _persist_business_message(
     contact_tg_id: str, chat_first_name: str | None, chat_last_name: str | None,
     chat_username: str | None, sender_username: str | None,
     photo_file_id: str | None = None,
+    video_file_id: str | None = None, video_note_file_id: str | None = None,
+    voice_file_id: str | None = None,
 ) -> tuple[int | None, tuple[str, str] | None]:
     """Синхронная DB-часть обработки business-сообщения: сохранение + резолв контакта
     + троттлинг refresh + сопоставление с подсказками CueMe (для исходящих).
@@ -3650,6 +3652,8 @@ def _persist_business_message(
         connection_id=conn_id, owner_user_id=owner_id, chat_ref=chat_ref,
         direction=direction, text=text, date=date, tg_message_id=tg_message_id,
         raw_meta=_msg_meta(text, is_voice), photo_file_id=photo_file_id,
+        video_file_id=video_file_id, video_note_file_id=video_note_file_id,
+        voice_file_id=voice_file_id,
     )
     if message_id is None:
         # Повторная доставка того же сообщения — не триггерим пересборку.
@@ -3734,6 +3738,26 @@ async def handle_business_message(event: Message, bot: Bot) -> None:
     # Самое большое разрешение — для просмотра в /export (см. tools/export.py).
     # event.caption уже попал в text через _message_text выше, если было.
     photo_file_id = event.photo[-1].file_id if event.photo else None
+    # То же самое для остальных типов медиа — см. save_business_message в
+    # storage.py и handle_deleted_business_messages ниже (пересылка владельцу
+    # при удалении собеседником). voice_file_id — сырое аудио, независимо от
+    # уже расшифрованного text (is_voice/_message_text выше).
+    video_file_id = event.video.file_id if event.video else None
+    video_note_file_id = event.video_note.file_id if event.video_note else None
+    voice_file_id = event.voice.file_id if event.voice else None
+
+    # ВРЕМЕННЫЙ диагностический лог (убрать после проверки) — расследуем,
+    # приходит ли вообще file_id по «исчезающим»/one-time-view фото и видео
+    # через Business API, и если да, чем такое сообщение отличается от
+    # обычного (Telegram официально это не документирует однозначно —
+    # обычным ботам в Bot API одноразовое медиа исторически может не
+    # отдаваться вовсе). Дампим ЦЕЛИКОМ raw-событие для любого photo/video —
+    # разово, руками сверим на тестовом «исчезающем» сообщении.
+    if event.photo or event.video:
+        try:
+            logging.info("RAW MEDIA MESSAGE: %s", event.model_dump_json(exclude_none=True)[:3000])
+        except Exception:
+            logging.exception("RAW MEDIA MESSAGE: не удалось сериализовать")
 
     # Синхронную DB-часть уводим в поток, чтобы не блокировать event loop.
     contact_id_for_rebuild, merge_notice = await asyncio.to_thread(
@@ -3745,6 +3769,8 @@ async def handle_business_message(event: Message, bot: Bot) -> None:
         chat_username=getattr(event.chat, "username", None),
         sender_username=event.from_user.username if event.from_user else None,
         photo_file_id=photo_file_id,
+        video_file_id=video_file_id, video_note_file_id=video_note_file_id,
+        voice_file_id=voice_file_id,
     )
 
     if contact_id_for_rebuild:
@@ -3814,13 +3840,18 @@ async def handle_deleted_business_messages(event: BusinessMessagesDeleted, bot: 
 
         text = row["text"]
         photo_file_id = row["photo_file_id"] if "photo_file_id" in row.keys() else None
+        video_file_id = row["video_file_id"] if "video_file_id" in row.keys() else None
+        video_note_file_id = row["video_note_file_id"] if "video_note_file_id" in row.keys() else None
+        voice_file_id = row["voice_file_id"] if "voice_file_id" in row.keys() else None
 
-        # Фото — пересылаем сам файл по сохранённому file_id (см.
-        # handle_business_message), с исходной подписью (если была) в
-        # caption, а не просто текстовое "фото удалено". file_id Telegram
-        # иногда отказывается отдавать (сообщение слишком старое, файл
-        # протух на серверах Telegram и т.п.) — тогда не молчим, откатываемся
-        # на обычное текстовое уведомление ниже.
+        # Фото/видео/кружок/голосовое — пересылаем сам файл по сохранённому
+        # file_id (см. handle_business_message), с исходной подписью/
+        # транскриптом (если был) в caption, а не просто текстовое "медиа
+        # удалено". file_id Telegram иногда отказывается отдавать (сообщение
+        # слишком старое, файл протух на серверах Telegram и т.п.) — тогда
+        # не молчим, откатываемся на обычное текстовое уведомление ниже.
+        # Ровно одно из полей может быть заполнено — сообщение бывает только
+        # одного медиа-типа сразу.
         if photo_file_id:
             caption = f"🗑 {name} удалил(а) фото" + (f":\n«{text}»" if text else "")
             try:
@@ -3830,6 +3861,40 @@ async def handle_deleted_business_messages(event: BusinessMessagesDeleted, bot: 
                 logging.exception(
                     "deleted_business_messages: не удалось переслать фото (file_id=%s) owner=%s — откат на текст",
                     photo_file_id, owner_id,
+                )
+        elif video_file_id:
+            caption = f"🗑 {name} удалил(а) видео" + (f":\n«{text}»" if text else "")
+            try:
+                await bot.send_video(int(owner_id), video_file_id, caption=caption[:1024])
+                continue
+            except Exception:
+                logging.exception(
+                    "deleted_business_messages: не удалось переслать видео (file_id=%s) owner=%s — откат на текст",
+                    video_file_id, owner_id,
+                )
+        elif video_note_file_id:
+            # video_note (кружок) НЕ поддерживает caption вообще (ограничение
+            # Bot API, не наше) — уведомление уходит ОТДЕЛЬНЫМ текстовым
+            # сообщением следом, тот же приём, что был в предыдущей версии
+            # медиа-кэша (см. историю коммитов) до отката.
+            try:
+                await bot.send_video_note(int(owner_id), video_note_file_id)
+                await bot.send_message(int(owner_id), f"🗑 {name} удалил(а) видеосообщение (кружок)")
+                continue
+            except Exception:
+                logging.exception(
+                    "deleted_business_messages: не удалось переслать кружок (file_id=%s) owner=%s — откат на текст",
+                    video_note_file_id, owner_id,
+                )
+        elif voice_file_id:
+            caption = f"🗑 {name} удалил(а) голосовое" + (f":\n«{text}»" if text else "")
+            try:
+                await bot.send_voice(int(owner_id), voice_file_id, caption=caption[:1024])
+                continue
+            except Exception:
+                logging.exception(
+                    "deleted_business_messages: не удалось переслать голосовое (file_id=%s) owner=%s — откат на текст",
+                    voice_file_id, owner_id,
                 )
 
         if text:

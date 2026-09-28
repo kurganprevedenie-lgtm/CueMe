@@ -414,6 +414,16 @@ def init_db() -> None:
         # сообщение уже сохранялось и раньше, просто file_id нигде не
         # оседал и был потерян навсегда.
         _add_column_if_missing(conn, "business_messages", "photo_file_id", "TEXT")
+        # То же самое, что photo_file_id выше, но для остальных типов медиа —
+        # обычное видео, видеосообщение-кружок, голосовое (main.py:
+        # handle_business_message/handle_deleted_business_messages: пересылка
+        # владельцу самого файла при удалении собеседником, не только текста/
+        # транскрипта). voice_file_id — сырое аудио ОТДЕЛЬНО от text (там уже
+        # лежит расшифровка Whisper, см. _message_text) — оба поля нужны
+        # одновременно: текст для карточек стиля, file_id для пересылки.
+        _add_column_if_missing(conn, "business_messages", "video_file_id", "TEXT")
+        _add_column_if_missing(conn, "business_messages", "video_note_file_id", "TEXT")
+        _add_column_if_missing(conn, "business_messages", "voice_file_id", "TEXT")
 
         # Индексы под горячие выборки (пересборка карточек, чтение истории)
         _create_index_if_missing(
@@ -2038,20 +2048,28 @@ def save_business_message(
     tg_message_id: int | None,
     raw_meta: dict,
     photo_file_id: str | None = None,
+    video_file_id: str | None = None,
+    video_note_file_id: str | None = None,
+    voice_file_id: str | None = None,
 ) -> int | None:
     """Сохраняет business-сообщение. Возвращает id вставленного ряда, или None,
     если это дубль (повторная доставка того же connection_id+chat_ref+tg_message_id) —
     id нужен вызывающему коду, чтобы привязать к сообщению результат сопоставления
     с подсказкой (см. suggestion_matches/mark_suggestion_matched).
-    photo_file_id — Telegram file_id самой большой версии фото (если сообщение
-    фото, с подписью или без), для просмотра в /export (см. tools/export.py)."""
+    photo_file_id/video_file_id/video_note_file_id/voice_file_id — Telegram
+    file_id соответствующего медиа (если сообщение им является), для
+    просмотра в /export (photo_file_id, см. tools/export.py) и для пересылки
+    владельцу при удалении собеседником (main.py:
+    handle_deleted_business_messages). voice_file_id — сырое аудио отдельно
+    от text (там расшифровка Whisper, см. main._message_text)."""
     with _conn() as conn:
         cur = conn.execute(
             """
             INSERT OR IGNORE INTO business_messages
                 (connection_id, owner_user_id, chat_ref, direction,
-                 text, date, tg_message_id, raw_meta, photo_file_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 text, date, tg_message_id, raw_meta, photo_file_id,
+                 video_file_id, video_note_file_id, voice_file_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 connection_id,
@@ -2063,6 +2081,9 @@ def save_business_message(
                 tg_message_id,
                 json.dumps(raw_meta, ensure_ascii=False),
                 photo_file_id,
+                video_file_id,
+                video_note_file_id,
+                voice_file_id,
             ),
         )
         return cur.lastrowid if cur.rowcount > 0 else None
