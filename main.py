@@ -167,6 +167,8 @@ from storage import (
     mark_bot_unblocked,
     is_legacy_kb_cleared,
     mark_legacy_kb_cleared,
+    get_users_without_deleted_messages_broadcast,
+    mark_deleted_messages_broadcast_sent,
     get_users_without_price_drop_broadcast,
     mark_price_drop_broadcast_sent,
     mark_date_trial_used,
@@ -1579,6 +1581,93 @@ async def cb_broadcast_price_drop_confirm(call: CallbackQuery, bot: Bot) -> None
 
 @dp.callback_query(F.data == "bcast:price_drop:cancel")
 async def cb_broadcast_price_drop_cancel(call: CallbackQuery) -> None:
+    await call.answer()
+    await call.message.edit_text("Отменено.")
+
+
+# ── /broadcast_deleted_messages — разовое объявление о показе удалённых ──────
+# сообщений (только админ, тот же паттерн, что /broadcast_price_drop выше).
+# Без кнопки — в отличие от price_drop (там кнопка вела на экран «Подписка»),
+# тут никуда конкретно не ведём.
+
+_DELETED_MESSAGES_BROADCAST_TEXT = (
+    "🗑 Теперь CueMe показывает удалённые сообщения\n\n"
+    "Если собеседник напишет тебе что-то и потом удалит — ты всё равно "
+    "увидишь, что это было (текст, фото, видео, голосовое). Работает "
+    "сразу, ничего включать не надо.\n\n"
+    "Бесплатно для всех ближайшие 3 дня, потом — только по Premium."
+)
+
+
+@dp.message(Command("broadcast_deleted_messages"))
+async def cmd_broadcast_deleted_messages(message: Message) -> None:
+    """Команду можно запускать повторно — каждый раз уходит только тем, кто
+    ещё не получал именно эту рассылку (deleted_messages_broadcast_sent),
+    т.е. новым юзерам с прошлого раза, а не всем заново."""
+    if not _is_admin(message.from_user.id):
+        return
+    users = get_users_without_deleted_messages_broadcast()
+    if not users:
+        await message.answer("Новых получателей нет — все, кто есть в базе, уже получили эту рассылку.")
+        return
+    await message.answer(
+        f"⚠️ Разослать объявление об удалённых сообщениях {len(users)} новым пользователям "
+        "(тем, кто ещё не получал эту рассылку)? Действие необратимо.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="✅ Да, разослать", callback_data="bcast:deleted_msgs:confirm"),
+            InlineKeyboardButton(text="❌ Отмена", callback_data="bcast:deleted_msgs:cancel"),
+        ]]),
+    )
+
+
+async def _run_broadcast_deleted_messages(bot: Bot, requester_id: int) -> None:
+    """Фон — не блокирует основной event loop. Задержка между отправками —
+    под лимиты Telegram Bot API (~30 сообщений/сек), тот же паттерн, что
+    _run_broadcast_price_drop. Только юзеры без deleted_messages_broadcast_sent —
+    успешная отправка и «заблокировал бота» помечаются сразу (второй раз
+    всё равно не уйдёт), обычная ошибка НЕ помечается — попробуем ещё раз
+    при следующем запуске команды."""
+    users = get_users_without_deleted_messages_broadcast()
+    sent = failed = blocked = 0
+
+    for u in users:
+        telegram_id = u["telegram_id"]
+        try:
+            await bot.send_message(int(telegram_id), _DELETED_MESSAGES_BROADCAST_TEXT)
+            sent += 1
+            mark_deleted_messages_broadcast_sent(telegram_id)
+        except TelegramForbiddenError:
+            mark_bot_blocked(telegram_id)
+            mark_deleted_messages_broadcast_sent(telegram_id)
+            blocked += 1
+        except Exception:
+            logging.exception("broadcast_deleted_messages: сбой для %s", telegram_id)
+            failed += 1
+        await asyncio.sleep(0.05)
+
+    try:
+        await bot.send_message(
+            requester_id,
+            f"✅ Рассылка об удалённых сообщениях завершена.\n"
+            f"Отправлено: {sent}\nЗаблокировали бота: {blocked}\nОшибок: {failed}"
+            + ("\n\nОшибки не помечены как отправленные — попадут в следующий запуск команды." if failed else ""),
+        )
+    except Exception:
+        logging.exception("broadcast_deleted_messages: не удалось отчитаться перед %s", requester_id)
+
+
+@dp.callback_query(F.data == "bcast:deleted_msgs:confirm")
+async def cb_broadcast_deleted_messages_confirm(call: CallbackQuery, bot: Bot) -> None:
+    if not _is_admin(call.from_user.id):
+        await call.answer()
+        return
+    await call.answer()
+    await call.message.edit_text("Рассылка началась в фоне — пришлю итоги, когда закончится.")
+    asyncio.create_task(_run_broadcast_deleted_messages(bot, call.from_user.id))
+
+
+@dp.callback_query(F.data == "bcast:deleted_msgs:cancel")
+async def cb_broadcast_deleted_messages_cancel(call: CallbackQuery) -> None:
     await call.answer()
     await call.message.edit_text("Отменено.")
 

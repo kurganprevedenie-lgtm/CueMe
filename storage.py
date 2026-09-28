@@ -424,6 +424,11 @@ def init_db() -> None:
         _add_column_if_missing(conn, "business_messages", "video_file_id", "TEXT")
         _add_column_if_missing(conn, "business_messages", "video_note_file_id", "TEXT")
         _add_column_if_missing(conn, "business_messages", "voice_file_id", "TEXT")
+        # Разовая рассылка про уведомления об удалённых сообщениях (main.py:
+        # /broadcast_deleted_messages) — тот же паттерн, что
+        # price_drop_broadcast_sent выше: повторный запуск уходит только
+        # тем, кто ещё не получал именно эту рассылку.
+        _add_column_if_missing(conn, "users", "deleted_messages_broadcast_sent", "INTEGER NOT NULL DEFAULT 0")
 
         # Индексы под горячие выборки (пересборка карточек, чтение истории)
         _create_index_if_missing(
@@ -524,6 +529,24 @@ def mark_price_drop_broadcast_sent(telegram_id: str) -> None:
     with _conn() as conn:
         conn.execute(
             "UPDATE users SET price_drop_broadcast_sent = 1 WHERE telegram_id = ?", (telegram_id,)
+        )
+
+
+def get_users_without_deleted_messages_broadcast() -> list[sqlite3.Row]:
+    """Юзеры, которым ещё НЕ уходила рассылка про уведомления об удалённых
+    сообщениях — повторный /broadcast_deleted_messages шлёт только им (новым
+    с прошлого раза), не всем заново. Тот же паттерн, что
+    get_users_without_price_drop_broadcast выше."""
+    with _conn() as conn:
+        return conn.execute(
+            "SELECT telegram_id FROM users WHERE deleted_messages_broadcast_sent = 0",
+        ).fetchall()
+
+
+def mark_deleted_messages_broadcast_sent(telegram_id: str) -> None:
+    with _conn() as conn:
+        conn.execute(
+            "UPDATE users SET deleted_messages_broadcast_sent = 1 WHERE telegram_id = ?", (telegram_id,)
         )
 
 
