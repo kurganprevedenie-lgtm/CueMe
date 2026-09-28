@@ -3813,6 +3813,25 @@ async def handle_deleted_business_messages(event: BusinessMessagesDeleted, bot: 
             continue
 
         text = row["text"]
+        photo_file_id = row["photo_file_id"] if "photo_file_id" in row.keys() else None
+
+        # Фото — пересылаем сам файл по сохранённому file_id (см.
+        # handle_business_message), с исходной подписью (если была) в
+        # caption, а не просто текстовое "фото удалено". file_id Telegram
+        # иногда отказывается отдавать (сообщение слишком старое, файл
+        # протух на серверах Telegram и т.п.) — тогда не молчим, откатываемся
+        # на обычное текстовое уведомление ниже.
+        if photo_file_id:
+            caption = f"🗑 {name} удалил(а) фото" + (f":\n«{text}»" if text else "")
+            try:
+                await bot.send_photo(int(owner_id), photo_file_id, caption=caption[:1024])
+                continue
+            except Exception:
+                logging.exception(
+                    "deleted_business_messages: не удалось переслать фото (file_id=%s) owner=%s — откат на текст",
+                    photo_file_id, owner_id,
+                )
+
         if text:
             notice = f"🗑 {name} удалил(а) сообщение:\n«{text}»"
         elif NOTIFY_DELETED_WITHOUT_TEXT:
