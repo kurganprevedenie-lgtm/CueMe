@@ -15,16 +15,7 @@ llm.py — обёртки над LLM-провайдерами с каскадн�
                   переключают на следующую модель ТОГО ЖЕ ключа — только
                   когда весь каскад моделей исчерпан на ключе, переходим к
                   следующему ключу.)
-  3. Cloudflare  (llama-3.3-70b, бесплатный тир, ~1300 запросов/день) — fallback 2
-  4. GitHub Models (gpt-4o-mini, бесплатный тир)          — fallback 3
-  5. NVIDIA NIM  (meta/llama-3.1-70b-instruct, бесплатный тир, НЕ проверено
-                  вживую — см. класс NIMProvider)          — fallback 4
-  6. OpenRouter  (openrouter/free, см. миграцию 2026-09 ниже) — fallback 5
-
-Cerebras/Mistral/Intern AI ИСКЛЮЧЕНЫ из дефолтного LLM_PROVIDER_ORDER —
-классы (CerebrasProvider/MistralProvider/InternAIProvider) остались в
-файле нетронутыми на случай отката, просто не в порядке по умолчанию, см.
-миграцию 2026-09-28 ниже.
+  3. OpenRouter  (openrouter/free, см. миграцию 2026-09 ниже) — fallback 2
 
 Миграция 2026-08: llama-3.3-70b-versatile отключён на Groq, gemini-2.5-flash
 отключён для новых ключей на Gemini, meta-llama/llama-3.3-70b-instruct:free
@@ -35,29 +26,23 @@ Cerebras/Mistral/Intern AI ИСКЛЮЧЕНЫ из дефолтного LLM_PROV
 тира (третий раз за историю проекта, что конкретную модель убирают из-под
 :free) — заменён на "openrouter/free", их официальный self-updating роутер
 по всем текущим бесплатным моделям сразу, чтобы больше не гоняться за
-очередной переименованной/убранной моделью вручную. В ТОТ ЖЕ день —
-живая проверка (tools/check_keys.py) на проде показала, что Cerebras тоже
-снял llama-3.3-70b с каталога моделей (404 "Model does not exist") —
-заменена на gpt-oss-120b (документирована как публично доступная). Mistral
-тоже перешёл на датированные названия моделей — mistral-small-latest на
-живом ключе давал 429 на первом же запросе при активном плане и целой
-месячной квоте (алиас, похоже, не резолвится нормально) — заменена на
-mistral-small-2603 (подтверждено вживую как существующая модель в лимитах
-аккаунта на organization limits, console.mistral.ai).
+очередной переименованной/убранной моделью вручную.
 
-Миграция 2026-09-28: живая проверка tools/check_keys.py нашла три
-ГАРАНТИРОВАННО мёртвых провайдера (не просто нестабильных — 100% отказ):
-Cerebras отдаёт 402 Payment Required (кончился баланс/план), Mistral —
-401 Invalid API Key (ключ невалиден), Intern AI — ConnectTimeout (сервер
-физически недоступен, а таймаут там 90с — самый тяжёлый мёртвый груз из
-всех). Все три убраны из LLM_PROVIDER_ORDER (не просто сдвинуты в конец —
-для Intern AI это значило бы иногда ждать лишние 90с впустую), классы в
-файле остались — вернуть в каскад после починки (оплата/новый ключ) можно
-одной правкой LLM_PROVIDER_ORDER в config.py/.env, без правки кода.
-
-Cloudflare/GitHub Models/NVIDIA NIM пропускаются автоматически, если их
-ключ(и) не заданы в .env (см. .env.example) — остальной каскад работает
-как раньше без них.
+Миграция 2026-09-28 (сузили каскад до Groq/Gemini/OpenRouter): живая
+проверка tools/check_keys.py нашла три ГАРАНТИРОВАННО мёртвых провайдера
+(не просто нестабильных — 100% отказ): Cerebras — 402 Payment Required
+(кончился баланс/план), Mistral — 401 Invalid API Key (ключ невалиден),
+Intern AI — ConnectTimeout (сервер физически недоступен, а таймаут там
+90с — самый тяжёлый мёртвый груз из всех). Cloudflare/GitHub Models/
+NVIDIA NIM вообще никогда не были настроены (0 ключей ни разу). Решили не
+держать шесть неиспользуемых интеграций ради гипотетического возврата —
+CloudflareProvider/CerebrasProvider/MistralProvider/GitHubModelsProvider/
+NIMProvider/InternAIProvider удалены из файла физически (не итерация
+промпта/подхода, которую защищает конвенция «не удалять, комментировать»,
+а интеграции с сервисами, которыми решили не пользоваться). Если
+понадобится вернуть кого-то из них — код есть в истории git (см. коммиты
+до 2026-09-28), проще восстановить оттуда, чем держать мёртвый код в
+файле «на всякий случай».
 
 Если все провайдеры недоступны — пробрасывается последнее исключение.
 
@@ -92,17 +77,10 @@ from abc import ABC, abstractmethod
 import httpx
 
 from config import (
-    CEREBRAS_API_KEY,
-    CLOUDFLARE_ACCOUNT_ID,
-    CLOUDFLARE_API_TOKEN,
     GEMINI_API_KEYS,
     GEMINI_PROXY,
-    GITHUB_MODELS_TOKEN,
     GROQ_API_KEYS,
     LLM_PROVIDER_ORDER,
-    INTERN_AI_API_KEY,
-    MISTRAL_API_KEYS,
-    NVIDIA_NIM_API_KEY,
     OPENROUTER_API_KEY,
     REPLY_STYLES,
     VISION_MODEL,
@@ -134,17 +112,17 @@ class ProviderError(RuntimeError):
 # "retry-after" (без разбора регистра), и сохраняем как есть, без интерпретации
 # значений. Живьём подтверждено (вебпоиск на момент добавления, 2026-09):
 # Groq отдаёт полный набор (x-ratelimit-limit-requests/-tokens,
-# x-ratelimit-remaining-requests/-tokens, x-ratelimit-reset-requests/-tokens);
-# Mistral отдаёт как минимум x-ratelimit-remaining. Gemini/Cloudflare/Cerebras/
-# GitHub Models/NVIDIA NIM/Intern AI/OpenRouter — либо не проверялись живьём,
-# либо не публикуют таких заголовков в доке; для них /apistatus падает на
-# локальный счётчик запросов/ошибок ниже, без выдуманных числовых лимитов.
+# x-ratelimit-remaining-requests/-tokens, x-ratelimit-reset-requests/-tokens).
+# Gemini/OpenRouter — либо не проверялись живьём, либо не публикуют таких
+# заголовков в доке; для них /apistatus падает на локальный счётчик
+# запросов/ошибок ниже, без выдуманных числовых лимитов.
 #
 # Статические дневные лимиты — ТОЛЬКО там, где уже задокументированы в этом
 # же файле (докстринг модуля выше) — не гадаем по непроверенным источникам.
-KNOWN_DAILY_LIMITS: dict[str, int] = {
-    "Cloudflare": 1300,  # см. докстринг модуля выше: "~1300 LLM-ответов/день"
-}
+# Сейчас пусто: единственная запись (Cloudflare, 1300/день) убрана вместе с
+# CloudflareProvider (миграция 2026-09-28, см. докстринг модуля) — структура
+# осталась для следующего провайдера с задокументированным дневным лимитом.
+KNOWN_DAILY_LIMITS: dict[str, int] = {}
 
 _STATS_WINDOW_SECONDS = 24 * 60 * 60
 
@@ -339,22 +317,6 @@ def _groq_keys_rotated() -> list[str]:
         return []
     start = _groq_key_cursor % len(keys)
     _groq_key_cursor = (start + 1) % len(keys)
-    return keys[start:] + keys[:start]
-
-
-# ── Мультиаккаунтинг Mistral: round-robin по нескольким ключам (та же
-# логика, что у Gemini/Groq выше) ────────────────────────────────────────────
-
-_mistral_key_cursor = 0
-
-
-def _mistral_keys_rotated() -> list[str]:
-    global _mistral_key_cursor
-    keys = MISTRAL_API_KEYS
-    if not keys:
-        return []
-    start = _mistral_key_cursor % len(keys)
-    _mistral_key_cursor = (start + 1) % len(keys)
     return keys[start:] + keys[:start]
 
 
@@ -727,278 +689,6 @@ class GeminiProvider(LLMProvider):
         raise last_exc
 
 
-# ── Cloudflare Workers AI (бесплатный тир, ~1300 запросов/день, OpenAI-формат) ─
-
-class CloudflareProvider(LLMProvider):
-    name = "Cloudflare"
-    _MODEL = "@cf/meta/llama-3.3-70b-instruct-fp8-fast"
-
-    @staticmethod
-    def _url() -> str:
-        return (
-            f"https://api.cloudflare.com/client/v4/accounts/"
-            f"{CLOUDFLARE_ACCOUNT_ID}/ai/v1/chat/completions"
-        )
-
-    async def ask(self, prompt: str, max_tokens: int) -> str:
-        if not (CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN):
-            raise ProviderError("CLOUDFLARE_ACCOUNT_ID/CLOUDFLARE_API_TOKEN не заданы")
-
-        async with httpx.AsyncClient(timeout=90.0, trust_env=False) as client:
-            resp = await _tracked_post(
-                self.name, CLOUDFLARE_API_TOKEN, client,
-                self._url(),
-                headers={"Authorization": f"Bearer {CLOUDFLARE_API_TOKEN}"},
-                json={
-                    "model": self._MODEL,
-                    "messages": [{"role": "user", "content": prompt}],
-                    "max_tokens": max_tokens,
-                },
-            )
-
-        if resp.status_code == 429:
-            raise RateLimitError("Лимит Cloudflare Workers AI исчерпан (10 000 нейронов/день).")
-
-        if resp.status_code in (500, 502, 503):
-            raise ProviderError(f"Cloudflare {resp.status_code}: {resp.text[:200]}")
-
-        if not resp.is_success:
-            raise ProviderError(f"Cloudflare {resp.status_code}: {resp.text[:200]}")
-
-        # content может прийти null, не только "" — reasoning ушёл весь бюджет.
-        return (resp.json()["choices"][0]["message"].get("content") or "").strip()
-
-
-# ── Cerebras (бесплатный тир, OpenAI-совместимый формат) ─────────────────────
-
-class CerebrasProvider(LLMProvider):
-    name = "Cerebras"
-    _URL   = "https://api.cerebras.ai/v1/chat/completions"
-    # llama-3.3-70b снята Cerebras с каталога (живая проверка на проде вернула
-    # 404 "Model does not exist", 2026-09) — gpt-oss-120b сейчас единственная
-    # модель, документированная как публично доступная (inference-docs.
-    # cerebras.ai/api-reference/models/public-models). НЕ проверено вживую на
-    # реальном ключе — прогнать tools/check_keys.py после деплоя.
-    _MODEL = "gpt-oss-120b"
-    # gpt-oss — та же reasoning-модель, что у Groq (см. _REASONING_BUFFER
-    # там): часть max_tokens уходит на рассуждения до финального content.
-    _REASONING_BUFFER = 900
-
-    async def ask(self, prompt: str, max_tokens: int) -> str:
-        if not CEREBRAS_API_KEY:
-            raise ProviderError("CEREBRAS_API_KEY не задан")
-
-        async with httpx.AsyncClient(timeout=90.0, trust_env=False) as client:
-            resp = await _tracked_post(
-                self.name, CEREBRAS_API_KEY, client,
-                self._URL,
-                headers={"Authorization": f"Bearer {CEREBRAS_API_KEY}"},
-                json={
-                    "model": self._MODEL,
-                    "messages": [{"role": "user", "content": prompt}],
-                    "max_tokens": max_tokens + self._REASONING_BUFFER,
-                },
-            )
-
-        if resp.status_code == 429:
-            raise RateLimitError("Лимит Cerebras исчерпан.")
-
-        if resp.status_code in (500, 502, 503):
-            raise ProviderError(f"Cerebras {resp.status_code}: {resp.text[:200]}")
-
-        if not resp.is_success:
-            raise ProviderError(f"Cerebras {resp.status_code}: {resp.text[:200]}")
-
-        # content может прийти null, не только "" — reasoning ушёл весь бюджет.
-        return (resp.json()["choices"][0]["message"].get("content") or "").strip()
-
-
-# ── Mistral (La Plateforme, бесплатный тир, OpenAI-совместимый формат) ───────
-
-class MistralProvider(LLMProvider):
-    name = "Mistral"
-    _URL   = "https://api.mistral.ai/v1/chat/completions"
-    # "mistral-small-latest" — живая проверка на проде (2026-09) вернула 429
-    # на первом же запросе при активном плане и не исчерпанной месячной
-    # квоте: алиас, похоже, не резолвится нормально после перехода Mistral
-    # на датированные названия моделей (organization limits в консоли
-    # показывают mistral-small-2603, а не mistral-small-latest вообще).
-    # Датированное имя подтверждено как присутствующее в лимитах аккаунта.
-    _MODEL = "mistral-small-2603"
-
-    async def _ask_with_key(self, prompt: str, max_tokens: int, key: str) -> str:
-        async with httpx.AsyncClient(timeout=90.0, trust_env=False) as client:
-            resp = await _tracked_post(
-                self.name, key, client,
-                self._URL,
-                headers={"Authorization": f"Bearer {key}"},
-                json={
-                    "model": self._MODEL,
-                    "messages": [{"role": "user", "content": prompt}],
-                    "max_tokens": max_tokens,
-                },
-            )
-
-        # Любой 4xx — проблема КОНКРЕТНОГО ключа (невалиден, нет доступа, лимит
-        # именно на нём), не сервиса в целом — есть смысл пробовать следующий
-        # ключ (та же логика, что у Groq/Gemini).
-        if 400 <= resp.status_code < 500:
-            raise RateLimitError(
-                f"Mistral ключ {_mask_key(key)}: HTTP {resp.status_code} — "
-                "невалиден, нет доступа или лимит."
-            )
-
-        if resp.status_code in (500, 502, 503):
-            raise ProviderError(f"Mistral {resp.status_code}: {resp.text[:200]}")
-
-        if not resp.is_success:
-            raise ProviderError(f"Mistral {resp.status_code}: {resp.text[:200]}")
-
-        # content может прийти null, не только "" — reasoning ушёл весь бюджет.
-        return (resp.json()["choices"][0]["message"].get("content") or "").strip()
-
-    async def ask(self, prompt: str, max_tokens: int) -> str:
-        """Перебирает ключи Mistral по кругу (мультиаккаунтинг), как Groq/Gemini."""
-        keys = _mistral_keys_rotated()
-        if not keys:
-            raise ProviderError("MISTRAL_API_KEY(S) не задан")
-
-        last_exc: Exception = RateLimitError("Ни один ключ Mistral не сработал.")
-        for i, key in enumerate(keys):
-            try:
-                return await self._ask_with_key(prompt, max_tokens, key)
-            except RateLimitError as e:
-                last_exc = e
-                if i + 1 < len(keys):
-                    log.warning("Mistral: %s — пробую следующий ключ (%d/%d)",
-                                e, i + 2, len(keys))
-                continue
-        raise last_exc
-
-
-# ── GitHub Models (бесплатный тир от GitHub-аккаунта, OpenAI-совместимый) ────
-
-class GitHubModelsProvider(LLMProvider):
-    name = "GitHubModels"
-    _URL   = "https://models.github.ai/inference/chat/completions"
-    _MODEL = "openai/gpt-4o-mini"
-
-    async def ask(self, prompt: str, max_tokens: int) -> str:
-        if not GITHUB_MODELS_TOKEN:
-            raise ProviderError("GITHUB_MODELS_TOKEN не задан")
-
-        async with httpx.AsyncClient(timeout=90.0, trust_env=False) as client:
-            resp = await _tracked_post(
-                self.name, GITHUB_MODELS_TOKEN, client,
-                self._URL,
-                headers={
-                    "Authorization": f"Bearer {GITHUB_MODELS_TOKEN}",
-                    "Accept": "application/vnd.github+json",
-                },
-                json={
-                    "model": self._MODEL,
-                    "messages": [{"role": "user", "content": prompt}],
-                    "max_tokens": max_tokens,
-                },
-            )
-
-        if resp.status_code == 429:
-            raise RateLimitError("Лимит GitHub Models исчерпан.")
-
-        if resp.status_code in (500, 502, 503):
-            raise ProviderError(f"GitHub Models {resp.status_code}: {resp.text[:200]}")
-
-        if not resp.is_success:
-            raise ProviderError(f"GitHub Models {resp.status_code}: {resp.text[:200]}")
-
-        # content может прийти null, не только "" — reasoning ушёл весь бюджет.
-        return (resp.json()["choices"][0]["message"].get("content") or "").strip()
-
-
-# ── NVIDIA NIM (build.nvidia.com, бесплатный тир, OpenAI-совместимый формат) ──
-
-class NIMProvider(LLMProvider):
-    name = "NVIDIA NIM"
-    _URL   = "https://integrate.api.nvidia.com/v1/chat/completions"
-    # Ключа на момент добавления провайдера ещё не было — модель НЕ проверена
-    # вживую на реальном ключе (тот же риск, что у OpenRouterProvider._MODEL
-    # выше) — прогнать через tools/check_keys.py перед тем, как полагаться на
-    # это в проде. meta/llama-3.1-70b-instruct — из каталога build.nvidia.com,
-    # входит в бесплатный тир на момент добавления.
-    _MODEL = "meta/llama-3.1-70b-instruct"
-
-    async def ask(self, prompt: str, max_tokens: int) -> str:
-        if not NVIDIA_NIM_API_KEY:
-            raise ProviderError("NVIDIA_NIM_API_KEY не задан")
-
-        async with httpx.AsyncClient(timeout=90.0, trust_env=False) as client:
-            resp = await _tracked_post(
-                self.name, NVIDIA_NIM_API_KEY, client,
-                self._URL,
-                headers={"Authorization": f"Bearer {NVIDIA_NIM_API_KEY}"},
-                json={
-                    "model": self._MODEL,
-                    "messages": [{"role": "user", "content": prompt}],
-                    "max_tokens": max_tokens,
-                },
-            )
-
-        if resp.status_code == 429:
-            raise RateLimitError("Лимит NVIDIA NIM исчерпан.")
-
-        if resp.status_code in (500, 502, 503):
-            raise ProviderError(f"NVIDIA NIM {resp.status_code}: {resp.text[:200]}")
-
-        if not resp.is_success:
-            raise ProviderError(f"NVIDIA NIM {resp.status_code}: {resp.text[:200]}")
-
-        # content может прийти null, не только "" — reasoning ушёл весь бюджет.
-        return (resp.json()["choices"][0]["message"].get("content") or "").strip()
-
-
-# ── Intern AI / InternLM (书生浦语, chat.intern-ai.org.cn, бесплатный тир,
-# OpenAI-совместимый формат) ──────────────────────────────────────────────────
-
-class InternAIProvider(LLMProvider):
-    name = "Intern AI"
-    _URL   = "https://chat.intern-ai.org.cn/api/v1/chat/completions"
-    # "intern-latest" — живой алиас на текущую рекомендованную модель (тот же
-    # принцип, что у gemini-flash-latest в GeminiProvider — не привязан к
-    # конкретной версии). Лимит по документации — 30 запросов/мин на юзера
-    # (токен), сверх каскада отдельно не троттлим — 429 уйдёт в RateLimitError
-    # и пойдёт следующий провайдер, как у всех остальных.
-    _MODEL = "intern-latest"
-
-    async def ask(self, prompt: str, max_tokens: int) -> str:
-        if not INTERN_AI_API_KEY:
-            raise ProviderError("INTERN_AI_API_KEY не задан")
-
-        async with httpx.AsyncClient(timeout=90.0, trust_env=False) as client:
-            resp = await _tracked_post(
-                self.name, INTERN_AI_API_KEY, client,
-                self._URL,
-                headers={"Authorization": f"Bearer {INTERN_AI_API_KEY}"},
-                json={
-                    "model": self._MODEL,
-                    "messages": [{"role": "user", "content": prompt}],
-                    "max_tokens": max_tokens,
-                },
-            )
-
-        if resp.status_code == 429:
-            raise RateLimitError("Лимит Intern AI исчерпан.")
-
-        if resp.status_code in (500, 502, 503):
-            raise ProviderError(f"Intern AI {resp.status_code}: {resp.text[:200]}")
-
-        if not resp.is_success:
-            raise ProviderError(f"Intern AI {resp.status_code}: {resp.text[:200]}")
-
-        # content может прийти null, не только "" — reasoning ушёл весь бюджет
-        # (thinking-режим есть у части моделей каталога, см. intern-s2/s1 выше).
-        return (resp.json()["choices"][0]["message"].get("content") or "").strip()
-
-
 # ── OpenRouter ────────────────────────────────────────────────────────────────
 
 class OpenRouterProvider(LLMProvider):
@@ -1057,17 +747,9 @@ class OpenRouterProvider(LLMProvider):
 _PROVIDER_REGISTRY = {
     "gemini":       GeminiProvider,
     "groq":         GroqProvider,
-    "cloudflare":   CloudflareProvider,
-    "cerebras":     CerebrasProvider,
-    "mistral":      MistralProvider,
-    "githubmodels": GitHubModelsProvider,
-    "nim":          NIMProvider,
-    "internai":     InternAIProvider,
     "openrouter":   OpenRouterProvider,
 }
-_DEFAULT_ORDER = [
-    "gemini", "groq", "cloudflare", "cerebras", "mistral", "githubmodels", "nim", "internai", "openrouter",
-]
+_DEFAULT_ORDER = ["groq", "gemini", "openrouter"]
 
 
 def _build_providers() -> list[LLMProvider]:

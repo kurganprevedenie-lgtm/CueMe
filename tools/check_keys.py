@@ -1,9 +1,13 @@
-"""Диагностика живости всех API-ключей (Gemini, Groq, Cloudflare, Cerebras,
-Mistral, GitHub Models, NVIDIA NIM, Intern AI, OpenRouter) без ротации —
-каждый ключ бьётся отдельным запросом, чтобы увидеть его реальный статус.
-Gemini/Groq/Mistral поддерживают несколько ключей (мультиаккаунтинг, см.
+"""Диагностика живости всех API-ключей (Gemini, Groq, OpenRouter) без
+ротации — каждый ключ бьётся отдельным запросом, чтобы увидеть его реальный
+статус. Gemini/Groq поддерживают несколько ключей (мультиаккаунтинг, см.
 config.py) — проверяется каждый ключ из списка по отдельности, не только
 первый.
+
+2026-09-28: Cerebras/Mistral/Cloudflare Workers AI/GitHub Models/NVIDIA
+NIM/Intern AI убраны из диагностики вместе с их провайдерами в llm.py (см.
+докстринг там) — первые три оказались гарантированно мёртвыми (402/401/
+ConnectTimeout), остальные три никогда не были настроены.
 
 Название модели для каждого провайдера читается ИЗ llm.py (Provider._MODEL),
 а не дублируется здесь строкой — раньше было дублирование, и правка модели в
@@ -11,8 +15,7 @@ llm.py (например миграция на новую модель посл�
 обслуживания) молча не долетала до этого скрипта: он продолжал проверять
 старую, уже мёртвую модель, и диагностика врала. Актуально только для
 провайдеров, у которых MODEL — не переменная запроса, а фиксированный
-атрибут класса (Cloudflare/Cerebras/Mistral/GitHub Models/NVIDIA NIM/
-Intern AI/OpenRouter) — Gemini/Groq модель тоже читают из своих
+атрибут класса (OpenRouter) — Gemini/Groq модель тоже читают из своих
 провайдеров ниже, для единообразия.
 
 Запуск на сервере: python3.13 -m tools.check_keys (или ./venv/bin/python -m
@@ -23,27 +26,14 @@ import asyncio
 import httpx
 
 from config import (
-    CEREBRAS_API_KEY,
-    CLOUDFLARE_ACCOUNT_ID,
-    CLOUDFLARE_API_TOKEN,
     GEMINI_API_KEYS,
     GEMINI_PROXY,
-    GITHUB_MODELS_TOKEN,
     GROQ_API_KEYS,
-    INTERN_AI_API_KEY,
-    MISTRAL_API_KEYS,
-    NVIDIA_NIM_API_KEY,
     OPENROUTER_API_KEY,
 )
 from llm import (
-    CerebrasProvider,
-    CloudflareProvider,
     GeminiProvider,
-    GitHubModelsProvider,
     GroqProvider,
-    InternAIProvider,
-    MistralProvider,
-    NIMProvider,
     OpenRouterProvider,
 )
 
@@ -92,101 +82,9 @@ async def check_groq(key: str) -> tuple[bool, str]:
         resp = await client.post(url, headers={"Authorization": f"Bearer {key}"}, json=payload)
     if not resp.is_success:
         return False, f"HTTP {resp.status_code} — {resp.text[:150]}"
-    text = resp.json()["choices"][0]["message"]["content"].strip()
-    return True, text
-
-
-async def check_cerebras(key: str) -> tuple[bool, str]:
-    url = CerebrasProvider._URL
-    payload = {
-        "model": CerebrasProvider._MODEL,
-        "messages": [{"role": "user", "content": "Ответь одним словом: тест пройден?"}],
-        "max_tokens": 200,  # gpt-oss тратит часть max_tokens на reasoning до финального content
-    }
-    async with httpx.AsyncClient(timeout=30.0, trust_env=False) as client:
-        resp = await client.post(url, headers={"Authorization": f"Bearer {key}"}, json=payload)
-    if not resp.is_success:
-        return False, f"HTTP {resp.status_code} — {resp.text[:150]}"
-    text = resp.json()["choices"][0]["message"]["content"].strip()
-    return True, text
-
-
-async def check_mistral(key: str) -> tuple[bool, str]:
-    url = MistralProvider._URL
-    payload = {
-        "model": MistralProvider._MODEL,
-        "messages": [{"role": "user", "content": "Ответь одним словом: тест пройден?"}],
-        "max_tokens": 20,
-    }
-    async with httpx.AsyncClient(timeout=30.0, trust_env=False) as client:
-        resp = await client.post(url, headers={"Authorization": f"Bearer {key}"}, json=payload)
-    if not resp.is_success:
-        return False, f"HTTP {resp.status_code} — {resp.text[:150]}"
-    text = resp.json()["choices"][0]["message"]["content"].strip()
-    return True, text
-
-
-async def check_cloudflare(account_id: str, token: str) -> tuple[bool, str]:
-    url = f"https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1/chat/completions"
-    payload = {
-        "model": CloudflareProvider._MODEL,
-        "messages": [{"role": "user", "content": "Ответь одним словом: тест пройден?"}],
-        "max_tokens": 20,
-    }
-    async with httpx.AsyncClient(timeout=30.0, trust_env=False) as client:
-        resp = await client.post(url, headers={"Authorization": f"Bearer {token}"}, json=payload)
-    if not resp.is_success:
-        return False, f"HTTP {resp.status_code} — {resp.text[:150]}"
-    text = resp.json()["choices"][0]["message"]["content"].strip()
-    return True, text
-
-
-async def check_github_models(token: str) -> tuple[bool, str]:
-    url = GitHubModelsProvider._URL
-    payload = {
-        "model": GitHubModelsProvider._MODEL,
-        "messages": [{"role": "user", "content": "Ответь одним словом: тест пройден?"}],
-        "max_tokens": 20,
-    }
-    async with httpx.AsyncClient(timeout=30.0, trust_env=False) as client:
-        resp = await client.post(
-            url,
-            headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"},
-            json=payload,
-        )
-    if not resp.is_success:
-        return False, f"HTTP {resp.status_code} — {resp.text[:150]}"
-    text = resp.json()["choices"][0]["message"]["content"].strip()
-    return True, text
-
-
-async def check_nim(key: str) -> tuple[bool, str]:
-    url = NIMProvider._URL
-    payload = {
-        "model": NIMProvider._MODEL,
-        "messages": [{"role": "user", "content": "Ответь одним словом: тест пройден?"}],
-        "max_tokens": 20,
-    }
-    async with httpx.AsyncClient(timeout=30.0, trust_env=False) as client:
-        resp = await client.post(url, headers={"Authorization": f"Bearer {key}"}, json=payload)
-    if not resp.is_success:
-        return False, f"HTTP {resp.status_code} — {resp.text[:150]}"
-    text = resp.json()["choices"][0]["message"]["content"].strip()
-    return True, text
-
-
-async def check_intern_ai(key: str) -> tuple[bool, str]:
-    url = InternAIProvider._URL
-    payload = {
-        "model": InternAIProvider._MODEL,
-        "messages": [{"role": "user", "content": "Ответь одним словом: тест пройден?"}],
-        "max_tokens": 20,
-    }
-    async with httpx.AsyncClient(timeout=30.0, trust_env=False) as client:
-        resp = await client.post(url, headers={"Authorization": f"Bearer {key}"}, json=payload)
-    if not resp.is_success:
-        return False, f"HTTP {resp.status_code} — {resp.text[:150]}"
-    text = resp.json()["choices"][0]["message"]["content"].strip()
+    text = (resp.json()["choices"][0]["message"].get("content") or "").strip()
+    if not text:
+        return False, "content пустой/null — вероятно, reasoning съел весь бюджет max_tokens"
     return True, text
 
 
@@ -264,24 +162,6 @@ async def _run_group(title: str, keys: list[str], checker) -> None:
 async def main() -> None:
     await _run_group("Groq", GROQ_API_KEYS, check_groq)
     await run_gemini_check()
-
-    print("\n=== Cloudflare Workers AI ===")
-    if not (CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN):
-        print("  (не задано — нужны оба CLOUDFLARE_ACCOUNT_ID и CLOUDFLARE_API_TOKEN)")
-    else:
-        try:
-            ok, detail = await check_cloudflare(CLOUDFLARE_ACCOUNT_ID, CLOUDFLARE_API_TOKEN)
-        except Exception as e:
-            ok, detail = False, f"исключение: {type(e).__name__}: {e}"
-        print(f"  {'OK' if ok else 'FAIL'} -> {detail!r}")
-
-    await _run_group("Cerebras", [CEREBRAS_API_KEY] if CEREBRAS_API_KEY else [], check_cerebras)
-    await _run_group("Mistral", MISTRAL_API_KEYS, check_mistral)
-    await _run_group(
-        "GitHub Models", [GITHUB_MODELS_TOKEN] if GITHUB_MODELS_TOKEN else [], check_github_models,
-    )
-    await _run_group("NVIDIA NIM", [NVIDIA_NIM_API_KEY] if NVIDIA_NIM_API_KEY else [], check_nim)
-    await _run_group("Intern AI", [INTERN_AI_API_KEY] if INTERN_AI_API_KEY else [], check_intern_ai)
     await _run_group("OpenRouter", [OPENROUTER_API_KEY] if OPENROUTER_API_KEY else [], check_openrouter)
 
 

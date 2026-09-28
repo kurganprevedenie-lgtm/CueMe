@@ -36,35 +36,11 @@ if not GEMINI_API_KEYS and GEMINI_API_KEY:
     GEMINI_API_KEYS = [GEMINI_API_KEY]
 # OpenRouter — llama-3.1-8b-instruct:free.
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
-# Cerebras — бесплатный тир, llama-3.3-70b, быстрый инференс. Опционален: не
-# задан — CerebrasProvider пропускается в каскаде без ошибки (см. llm.py).
-CEREBRAS_API_KEY = os.getenv("CEREBRAS_API_KEY")
-# Mistral (La Plateforme) — бесплатный тир. Тоже опционален, как Cerebras.
-MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY")
-# Мультиаккаунтинг Mistral (опционально): несколько ключей через запятую —
-# та же логика, что у GEMINI_API_KEYS/GROQ_API_KEYS выше, код перебирает их
-# по кругу. Помогает только если ключи из РАЗНЫХ аккаунтов Mistral. Если
-# MISTRAL_API_KEYS не задан — используется один MISTRAL_API_KEY.
-_mistral_keys_raw = os.getenv("MISTRAL_API_KEYS", "")
-MISTRAL_API_KEYS = [k.strip() for k in _mistral_keys_raw.split(",") if k.strip()]
-if not MISTRAL_API_KEYS and MISTRAL_API_KEY:
-    MISTRAL_API_KEYS = [MISTRAL_API_KEY]
-# Cloudflare Workers AI — бесплатный тир (~10 000 нейронов/день, ~1300 LLM-
-# ответов/день), нужны ОБА значения (account ID из дашборда Cloudflare + API
-# токен с правами Workers AI). Опционален, как Cerebras/Mistral.
-CLOUDFLARE_ACCOUNT_ID = os.getenv("CLOUDFLARE_ACCOUNT_ID")
-CLOUDFLARE_API_TOKEN  = os.getenv("CLOUDFLARE_API_TOKEN")
-# GitHub Models — бесплатный тир от обычного GitHub-аккаунта (Fine-grained
-# PAT с правом models:read). Опционален, как Cerebras/Mistral.
-GITHUB_MODELS_TOKEN = os.getenv("GITHUB_MODELS_TOKEN")
-# NVIDIA NIM (build.nvidia.com) — бесплатный тир, OpenAI-совместимый формат.
-# Опционален, как Cerebras/Mistral/GitHub Models — не задан, NIMProvider
-# пропускается в каскаде без ошибки (см. llm.py).
-NVIDIA_NIM_API_KEY = os.getenv("NVIDIA_NIM_API_KEY")
-# Intern AI / InternLM (书生浦语, chat.intern-ai.org.cn) — бесплатный тир,
-# OpenAI-совместимый формат, лимит 30 запросов/мин на юзера. Опционален, как
-# Cerebras/Mistral/GitHub Models/NVIDIA NIM (см. llm.py).
-INTERN_AI_API_KEY = os.getenv("INTERN_AI_API_KEY")
+# Cerebras/Mistral/Cloudflare Workers AI/GitHub Models/NVIDIA NIM/Intern AI —
+# убраны 2026-09-28: живая проверка tools/check_keys.py нашла первые три
+# гарантированно мёртвыми (Cerebras 402 Payment Required, Mistral 401
+# Invalid API Key, Intern AI ConnectTimeout — сервер недоступен), остальные
+# три вообще никогда не были настроены (0 ключей). См. докстринг llm.py.
 
 # telegram_id разработчика — кому доступны админ-команды (/provider, /users,
 # /export, /sources и т.п.), не должны быть открыты всем.
@@ -107,17 +83,12 @@ ONBOARDING_JSON_POST_URL = os.getenv("ONBOARDING_JSON_POST_URL", "https://t.me/C
 # GeminiProvider, инциденты 2026-09-22/23), Groq стабильнее по времени ответа.
 # Gemini остаётся в каскаде вторым — фолбэк, а не выключен совсем.
 #
-# 2026-09-28: живая проверка tools/check_keys.py показала три провайдера
-# ГАРАНТИРОВАННО нерабочими (не просто медленными — падают на 100% попыток):
-# cerebras (402 Payment Required), mistral (401 Invalid API Key) — оба убраны
-# из порядка, чинить нужно отдельно (оплата/новый ключ), возвращать в
-# LLM_PROVIDER_ORDER вручную, когда почините. internai — ConnectTimeout
-# (сервер вообще недоступен), а таймаут у него 90с — самый тяжёлый мёртвый
-# груз из всех, держать его даже последним в очереди означало бы иногда
-# ждать лишние 90 секунд впустую. Убран полностью, не просто сдвинут в конец.
-LLM_PROVIDER_ORDER = os.getenv(
-    "LLM_PROVIDER_ORDER", "groq,gemini,cloudflare,githubmodels,nim,openrouter"
-)
+# 2026-09-28: каскад сужен до Groq/Gemini/OpenRouter — Cerebras/Mistral/
+# Intern AI оказались гарантированно мёртвыми (402/401/ConnectTimeout,
+# tools/check_keys.py), Cloudflare/GitHub Models/NVIDIA NIM никогда не были
+# настроены. Классы этих шести провайдеров физически удалены из llm.py (не
+# просто выведены из порядка) — см. докстринг llm.py.
+LLM_PROVIDER_ORDER = os.getenv("LLM_PROVIDER_ORDER", "groq,gemini,openrouter")
 
 # TTL кэша LLM-ответов (сек). Ключ контент-адресный (включает карточки стиля),
 # поэтому смена карточек инвалидирует запись сама; TTL — страховка от разрастания.
