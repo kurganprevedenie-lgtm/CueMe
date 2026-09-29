@@ -97,6 +97,7 @@ from llm import (
     KNOWN_DAILY_LIMITS,
     live_coach_step,
     make_features_summary,
+    NEUTRAL_INTERACTION_PLACEHOLDER,
     sample_texts,
     set_forced_provider,
     suggest_reply_variants,
@@ -6464,11 +6465,10 @@ _LIVE_NEUTRAL_STYLE_PLACEHOLDER = (
 # просто ещё нет. Раньше в этом случае «Ответить за меня» упирался в тупик
 # («Не удалось сгенерировать анализ.») — теперь отвечаем нейтрально по
 # смыслу присланного сообщения, без домыслов о манере письма собеседника.
-_NEUTRAL_INTERACTION_PLACEHOLDER = (
-    "Данных о стиле переписки собеседника пока нет (это первое сообщение с "
-    "ним) — отвечай по смыслу присланного текста, без домыслов о его манере "
-    "письма. Как только накопится история, бот подстроится точнее."
-)
+# Сам текст перенесён в llm.py (NEUTRAL_INTERACTION_PLACEHOLDER) — там
+# suggest_reply_variants узнаёт его как «данных нет» и включает режим
+# холодного старта.
+_NEUTRAL_INTERACTION_PLACEHOLDER = NEUTRAL_INTERACTION_PLACEHOLDER
 
 LIVE_NOTES_SUMMARY_EVERY = 4  # раз в сколько сообщений показывать «что я уже понял»
 
