@@ -4169,27 +4169,38 @@ def business_connect_kb() -> InlineKeyboardMarkup:
     ])
 
 
-async def _send_business_connect_prompt(target: Message, text: str) -> None:
+def demo_teaser_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Использовать бота", callback_data="onb:show_connect")],
+    ])
+
+
+async def _send_business_connect_prompt(
+    target: Message, text: str, parse_mode: str | None = None,
+) -> None:
     """Инструкция по подключению Автоматизации чатов — со скриншотом, куда
     именно нажимать в настройках Telegram, если задан ONBOARDING_PHOTO_PATH/
-    ONBOARDING_PHOTO_FILE_ID (.env), иначе просто текст. Тот же приоритет
-    файл-на-диске → file_id → голый текст, что и в _send_start_menu — общий
-    хелпер, чтобы cb_onboarding_business и cmd_connect не дублировали его."""
+    ONBOARDING_PHOTO_FILE_ID (.env), иначе просто текст. Приоритет
+    файл-на-диске → file_id → голый текст. Общий хелпер для
+    cb_onboarding_business, cmd_connect и cb_onboarding_show_connect
+    (последнему нужен parse_mode="HTML" — в его тексте <blockquote>)."""
     photo_path = Path(ONBOARDING_PHOTO_PATH) if ONBOARDING_PHOTO_PATH else None
     if photo_path and photo_path.is_file():
         await target.answer_photo(
             photo=FSInputFile(photo_path),
             caption=text,
+            parse_mode=parse_mode,
             reply_markup=business_connect_kb(),
         )
     elif ONBOARDING_PHOTO_FILE_ID:
         await target.answer_photo(
             photo=ONBOARDING_PHOTO_FILE_ID,
             caption=text,
+            parse_mode=parse_mode,
             reply_markup=business_connect_kb(),
         )
     else:
-        await target.answer(text, reply_markup=business_connect_kb())
+        await target.answer(text, parse_mode=parse_mode, reply_markup=business_connect_kb())
 
 
 # ── Захват file_id фото-инструкции (только для админа) ───────────────────────
@@ -4212,44 +4223,53 @@ async def handle_photo(message: Message) -> None:
     )
 
 
+DEMO_TEASER_TEXT = (
+    f"👋 Привет! Я {APP_NAME} — помогу тебе в общении с противоположным полом. ;)\n\n"
+    "Тебе пишут:\n"
+    "«ты сегодня какой-то подозрительно долго не писал, случайно не "
+    "заскучал по мне? 😏»\n\n"
+    f"{APP_NAME} за секунды предлагает 3 варианта ответа — в твоём стиле:\n\n"
+    "😏 Флирт: «заскучал, и не просто так, а капец как. а ты?»\n\n"
+    "🙂 Дружески: «ахах, работы был капец просто, вот и пропал. но да, "
+    "соскучился, чего уж там»\n\n"
+    "😎 Уверенно: «заскучал, да. а что, хочешь это исправить?»\n\n"
+    "Плюс разбор собеседника, подсказки по тону и таймингу — всё "
+    "подстраивается под то, как пишешь именно ты и именно твой собеседник."
+)
+
+
 async def _send_start_menu(message: Message, telegram_id: str) -> None:
     if list_contacts(telegram_id):
         await _send_main_menu(message)
         return
 
-    me = await message.bot.get_me()
+    # Первый экран для нового юзера — демо-пример ответа, а не сразу
+    # инструкция по подключению: сначала показать, ЗАЧЕМ подключать.
+    # Инструкция (welcome_text + фото) переехала в cb_onboarding_show_connect
+    # — по тапу «Использовать бота» демо удаляется и на его месте появляется она.
+    await message.answer(DEMO_TEASER_TEXT, reply_markup=demo_teaser_kb())
+
+
+@dp.callback_query(F.data == "onb:show_connect")
+async def cb_onboarding_show_connect(call: CallbackQuery, bot: Bot) -> None:
+    await call.answer()
+    try:
+        await call.message.delete()
+    except Exception:
+        pass
+    me = await bot.get_me()
     welcome_text = (
-        "👋 Добро пожаловать в CueMe!\n\n"
         "<blockquote>❓ Подключить бота:\n"
         "1. Настройки → «Изменить» рядом с профилем\n"
         "2. Автоматизация чатов\n"
         f"3. Впиши @{me.username} и выбери меня\n"
         "4. Включи «Ответы на сообщения» и выбери чаты</blockquote>"
     )
-
-    # Единственное сообщение при первом /start — фото-инструкция крепится
-    # к нему caption'ом. Приоритет: 1) файл на диске сервера
-    # (ONBOARDING_PHOTO_PATH) — грузится в Telegram заново при каждой
-    # отправке; 2) file_id (уже загруженное ранее фото); 3) обычный текст,
-    # если ни одно из двух не задано. Больше НИЧЕГО следом не шлём —
+    # Фото-инструкция крепится caption'ом, приоритет файл на диске
+    # (ONBOARDING_PHOTO_PATH) → file_id → голый текст — см.
+    # _send_business_connect_prompt. Больше НИЧЕГО следом не шлём —
     # намеренно, чтобы не отвлекать от единственного действия (подключить).
-    photo_path = Path(ONBOARDING_PHOTO_PATH) if ONBOARDING_PHOTO_PATH else None
-    if photo_path and photo_path.is_file():
-        await message.answer_photo(
-            photo=FSInputFile(photo_path),
-            caption=welcome_text,
-            parse_mode="HTML",
-            reply_markup=business_connect_kb(),
-        )
-    elif ONBOARDING_PHOTO_FILE_ID:
-        await message.answer_photo(
-            photo=ONBOARDING_PHOTO_FILE_ID,
-            caption=welcome_text,
-            parse_mode="HTML",
-            reply_markup=business_connect_kb(),
-        )
-    else:
-        await message.answer(welcome_text, parse_mode="HTML", reply_markup=business_connect_kb())
+    await _send_business_connect_prompt(call.message, welcome_text, parse_mode="HTML")
 
 
 @dp.message(CommandStart())
