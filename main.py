@@ -4108,17 +4108,24 @@ def _quickstart_phrase_next_kb(target: str) -> InlineKeyboardMarkup:
     return _with_back_to_menu(b.as_markup())
 
 
-async def _send_quickstart_phrases(msg: Message, state: FSMContext, target: str) -> None:
+async def _quickstart_phrase_content(state: FSMContext, target: str) -> tuple[str, InlineKeyboardMarkup]:
     """Своя, изолированная от phrases:*, ветка — переиспользует только
     ДАННЫЕ (OPENERS_FOR_HER/HIM), не общий код _send_opener/cb_phrases_gender,
-    чтобы не задеть существующий путь «🎲 Готовые фразы для начала»."""
+    чтобы не задеть существующий путь «🎲 Готовые фразы для начала».
+    Возвращает текст+клавиатуру: первый показ шлёт новое сообщение
+    (_send_quickstart_phrases), «Другой вариант» редактирует то же."""
     items = OPENERS_FOR_HER if target == "her" else OPENERS_FOR_HIM
     phrase = await _pick_no_repeat(state, f"qs_opener_shown_{target}", items)
     intro = "Вот пара фраз для начала — сохрани, пригодятся:"
     if "[" in phrase:
         intro += " замени [то, что в скобках] на реальную деталь из анкеты."
     text = f"{intro}\n\n<code>{html.escape(phrase)}</code>\n\nПосле того как найдешь себе партнера возвращайся и пиши в 💬 Ответ с CueMe"
-    await msg.answer(text, parse_mode="HTML", reply_markup=_quickstart_phrase_next_kb(target))
+    return text, _quickstart_phrase_next_kb(target)
+
+
+async def _send_quickstart_phrases(msg: Message, state: FSMContext, target: str) -> None:
+    text, kb = await _quickstart_phrase_content(state, target)
+    await msg.answer(text, parse_mode="HTML", reply_markup=kb)
 
 
 @dp.callback_query(F.data.startswith("qsphr:"))
@@ -4132,7 +4139,15 @@ async def cb_quickstart_gender(call: CallbackQuery, state: FSMContext) -> None:
 async def cb_quickstart_phrase_next(call: CallbackQuery, state: FSMContext) -> None:
     target = call.data.split(":", 1)[1]
     await call.answer("Другой вариант")
-    await _send_quickstart_phrases(call.message, state, target)
+    text, kb = await _quickstart_phrase_content(state, target)
+    try:
+        await call.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+    except TelegramBadRequest as e:
+        # При исчерпании списка _pick_no_repeat начинает заново и может
+        # выпасть та же фраза, что уже на экране — Telegram отвечает
+        # «message is not modified»; это не ошибка, просто глотаем.
+        if "not modified" not in str(e):
+            raise
 
 
 # Выбор устройства (iPhone/Android/десктоп) убран — шаги подключения теперь
