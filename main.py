@@ -989,12 +989,15 @@ def _funnel_reminder_content(stage: str, telegram_id: str, bond_contact: sqlite3
         )
         return text, business_connect_kb()
 
+    # Тексты стадий 'trial'/'bond' — HTML (<b>), шлются с parse_mode="HTML"
+    # (_send_funnel_reminder). Текст 'connect' — plain, экранируется там же.
     if stage == _FUNNEL_STAGE_TRIAL:
         n = count_business_messages_for_owner(telegram_id)
-        seen_line = f" Уже накопилось {n} сообщений в потоке — есть на чём попробовать." if n > 0 else ""
+        seen_line = f"\n\nУже накопилось <b>{n} сообщений</b> в потоке — есть на чём проверить." if n > 0 else ""
         text = (
-            "Бот подключён и готов, а ты ещё не попробовал(-а) ни одного "
-            f"бесплатного ответа.{seen_line} Понравится — оформишь подписку, "
+            "🎁 Бот подключён и готов, осталось попробовать."
+            f"{seen_line}\n\n"
+            "Первый ответ — бесплатно. Понравится — оформишь подписку, "
             "не понравится — ничего не теряешь."
         )
         b = InlineKeyboardBuilder()
@@ -1002,13 +1005,16 @@ def _funnel_reminder_content(stage: str, telegram_id: str, bond_contact: sqlite3
         return text, b.as_markup()
 
     # stage == _FUNNEL_STAGE_BOND — bond_contact уже проверен вызывающим
-    # кодом на порог активности (get_best_active_contact_for_funnel)
-    name = bond_contact["display_name"] or "этим человеком"
+    # кодом на порог активности (get_best_active_contact_for_funnel).
+    # @username вместо display_name — имя не надо склонять («с Маша»).
+    username = bond_contact["username"] if "username" in bond_contact.keys() else None
+    handle = f"@{username}" if username else (bond_contact["display_name"] or "этим человеком")
     total = bond_contact["total"]
     text = (
-        f"У тебя с {name} уже {total} сообщений за последнее время — если "
-        "хочешь понять, что происходит на самом деле (нравишься ли, стоит "
-        "ли продолжать), можем разобрать переписку."
+        f"У тебя с <b>{html.escape(handle)}</b> уже <b>{total} сообщений</b> "
+        "за последнее время.\n\n"
+        "Если хочешь понять, что происходит на самом деле (нравишься ли, "
+        "стоит ли продолжать) — можем разобрать переписку."
     )
     b = InlineKeyboardBuilder()
     b.button(text="🔬 Разобрать переписку", callback_data=f"deepan:{bond_contact['contact_id']}")
@@ -1027,22 +1033,15 @@ async def _send_funnel_reminder(
         caption = f"{html.escape(text)}\n\n{await _connect_steps_blockquote(bot)}"
         await _send_business_connect_prompt_to(bot, chat_id, caption, parse_mode="HTML")
         return
-    await bot.send_message(chat_id, text, reply_markup=kb)
+    await bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=kb)
 
 
-def _premium_expiry_reminder_content(remaining: str, is_subscription: bool) -> tuple[str, InlineKeyboardMarkup | None]:
+def _premium_expiry_reminder_content(remaining: str) -> tuple[str, InlineKeyboardMarkup]:
     """Текст+кнопка напоминания об истечении Premium — вынесено из
     _check_premium_expiry_reminders, чтобы /test_reminders показывал ровно
-    то же, что уходит юзерам."""
-    if is_subscription:
-        # Stars-подписка «месяц» — автопродление, списывается Telegram-ом
-        # самим; мягкий текст, не призыв купить заново.
-        text = (
-            f"⏳ Подписка скоро продлится автоматически (через {remaining}) — "
-            "если хочешь отменить, это можно сделать в Telegram: "
-            "Настройки → Мои подписки."
-        )
-        return text, None
+    то же, что уходит юзерам. Мягкого варианта для Stars-подписки с
+    автопродлением больше нет — по просьбе убрано совсем, такие подписки
+    не напоминаем (см. _check_premium_expiry_reminders)."""
     text = f"⏳ Подписка заканчивается через {remaining} — продли, чтобы не потерять доступ."
     b = InlineKeyboardBuilder()
     b.button(text="👑 Подписка", callback_data="show_premium")
@@ -1081,7 +1080,9 @@ async def _check_premium_expiry_reminders(bot: Bot) -> None:
         if get_premium_expiry_reminder_until(telegram_id) == until:
             continue  # уже напоминали именно про этот срок
 
-        text, kb = _premium_expiry_reminder_content(_format_remaining(until - now), is_subscription)
+        if is_subscription:
+            continue  # Stars-подписка автопродлевается сама — не напоминаем
+        text, kb = _premium_expiry_reminder_content(_format_remaining(until - now))
 
         try:
             await bot.send_message(int(telegram_id), text, reply_markup=kb)
@@ -1216,23 +1217,17 @@ async def cmd_test_reminders(message: Message) -> None:
     # Воронка — через _send_funnel_reminder, тот же путь, что в фоновой
     # проверке (для 'connect' это фото-инструкция, а не голый текст).
     funnel_samples = [
-        ("1/5 · Воронка: не подключил автоматизацию", _FUNNEL_STAGE_CONNECT, None),
-        ("2/5 · Воронка: подключил, но не пробовал триал", _FUNNEL_STAGE_TRIAL, None),
-        (f"3/5 · Воронка: разбор активного контакта ({bond_note})", _FUNNEL_STAGE_BOND, bond_contact),
+        ("1/4 · Воронка: не подключил автоматизацию", _FUNNEL_STAGE_CONNECT, None),
+        ("2/4 · Воронка: подключил, но не пробовал триал", _FUNNEL_STAGE_TRIAL, None),
+        (f"3/4 · Воронка: разбор активного контакта ({bond_note})", _FUNNEL_STAGE_BOND, bond_contact),
     ]
     for title, stage, contact in funnel_samples:
         await message.answer(f"— {title} —")
         await _send_funnel_reminder(message.bot, message.chat.id, stage, telegram_id, contact)
 
-    expiry_samples = [
-        ("4/5 · Истечение Premium (разовая оплата)",
-         *_premium_expiry_reminder_content(_format_remaining(timedelta(hours=30)), False)),
-        ("5/5 · Истечение Premium (Stars-подписка с автопродлением)",
-         *_premium_expiry_reminder_content(_format_remaining(timedelta(hours=30)), True)),
-    ]
-    for title, text, kb in expiry_samples:
-        await message.answer(f"— {title} —")
-        await message.answer(text, reply_markup=kb)
+    await message.answer("— 4/4 · Истечение Premium —")
+    text, kb = _premium_expiry_reminder_content(_format_remaining(timedelta(hours=30)))
+    await message.answer(text, reply_markup=kb)
 
 
 async def _reconcile_promo_channel_premium(bot: Bot) -> None:

@@ -595,6 +595,7 @@ def get_best_active_contact_for_funnel(
             """
             SELECT bcr.contact_id AS contact_id,
                    c.display_name AS display_name,
+                   c.username AS username,
                    COUNT(*) AS total,
                    SUM(CASE WHEN bm.direction = 'in' THEN 1 ELSE 0 END) AS in_count,
                    MAX(bm.date) AS last_date
