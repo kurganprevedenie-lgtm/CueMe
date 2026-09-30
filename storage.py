@@ -5,7 +5,8 @@ import secrets
 import sqlite3
 import string
 import uuid
-from datetime import datetime, timezone
+from collections import Counter
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 DB_PATH = Path("bot.db")
@@ -254,6 +255,14 @@ def init_db() -> None:
         # ТОЛЬКО тем, кто ещё не получал именно эту рассылку (новым юзерам с
         # прошлого раза), а не всем заново. 0 (default) — ещё не отправляли.
         _add_column_if_missing(conn, "users", "price_drop_broadcast_sent", "INTEGER NOT NULL DEFAULT 0")
+        # Funnel-напоминания (main.py: _check_funnel_reminders) — на каком
+        # шаге воронки последний раз напоминали
+        # ('connect'|'trial'|'bond'|NULL), сколько раз подряд по этой же
+        # стадии, когда последний раз. Сбрасывается при премиуме и при
+        # смене стадии.
+        _add_column_if_missing(conn, "users", "funnel_reminder_stage", "TEXT")
+        _add_column_if_missing(conn, "users", "funnel_reminder_count", "INTEGER NOT NULL DEFAULT 0")
+        _add_column_if_missing(conn, "users", "funnel_reminder_sent_at", "TEXT")
         # Реферальная награда: до какого момента (UTC ISO) у пригласившего
         # активна полная Premium-подписка (имя колонки историческое — раньше
         # награда покрывала только «Анализ собеседника»). NULL = награды нет.
@@ -530,6 +539,101 @@ def mark_price_drop_broadcast_sent(telegram_id: str) -> None:
         conn.execute(
             "UPDATE users SET price_drop_broadcast_sent = 1 WHERE telegram_id = ?", (telegram_id,)
         )
+
+
+def get_users_for_funnel_scan() -> list[sqlite3.Row]:
+    """Все юзеры для ежедневного прохода funnel-напоминаний — Business-
+    подключение и премиум проверяются отдельно на каждого в main.py, как и
+    в _check_premium_expiry_reminders."""
+    with _conn() as conn:
+        return conn.execute(
+            "SELECT telegram_id, created_at, blocked_bot, "
+            "funnel_reminder_stage, funnel_reminder_count, funnel_reminder_sent_at "
+            "FROM users"
+        ).fetchall()
+
+
+def set_funnel_reminder_state(
+    telegram_id: str, stage: str | None, count: int, sent_at: str | None,
+) -> None:
+    with _conn() as conn:
+        conn.execute(
+            "UPDATE users SET funnel_reminder_stage = ?, funnel_reminder_count = ?, "
+            "funnel_reminder_sent_at = ? WHERE telegram_id = ?",
+            (stage, count, sent_at, telegram_id),
+        )
+
+
+def count_business_messages_for_owner(owner_user_id: str) -> int:
+    """Сколько сообщений уже накопилось в Business-потоке юзера — для
+    персонализации funnel-напоминания стадии 'trial' реальной цифрой."""
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) AS n FROM business_messages WHERE owner_user_id = ?",
+            (owner_user_id,),
+        ).fetchone()
+    return row["n"] if row else 0
+
+
+def get_best_active_contact_for_funnel(
+    owner_user_id: str, min_total: int = 12, min_in: int = 4, max_days_since_last: int = 14,
+) -> sqlite3.Row | None:
+    """Контакт с самой активной перепиской — для funnel-напоминания стадии
+    'bond' (использовал триал). Честный порог, без вердикта о качестве
+    отношений (факт, не оценка):
+    - min_total сообщений суммарно (не пустая переписка на 2 слова)
+    - min_in входящих от собеседника (не монолог юзера в один конец)
+    - последнее сообщение не старше max_days_since_last дней (не мёртвая
+      переписка)
+    Ни один контакт не проходит порог → None, стадия 'bond' для этого
+    юзера молчит (тишина лучше вранья про "связь", которой не видно).
+    bm.date и cutoff — оба ISO в UTC с "+00:00" (event.date.isoformat()),
+    поэтому строковое сравнение в HAVING корректно."""
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=max_days_since_last)).isoformat()
+    with _conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT bcr.contact_id AS contact_id,
+                   c.display_name AS display_name,
+                   COUNT(*) AS total,
+                   SUM(CASE WHEN bm.direction = 'in' THEN 1 ELSE 0 END) AS in_count,
+                   MAX(bm.date) AS last_date
+            FROM business_messages bm
+            JOIN business_chat_refs bcr
+                ON bm.chat_ref = bcr.chat_ref AND bm.owner_user_id = bcr.owner_user_id
+            JOIN contacts c ON c.id = bcr.contact_id
+            WHERE bm.owner_user_id = ?
+            GROUP BY bcr.contact_id
+            HAVING total >= ? AND in_count >= ? AND last_date >= ?
+            ORDER BY total DESC
+            LIMIT 1
+            """,
+            (owner_user_id, min_total, min_in, cutoff),
+        ).fetchall()
+    return rows[0] if rows else None
+
+
+def get_user_typical_active_hour_utc(owner_user_id: str) -> int | None:
+    """Самый частый час (UTC, 0-23) реальной активности юзера по его
+    business-сообщениям — прокси для часового пояса без явного его
+    хранения: у бота нет данных о часовом поясе, но есть факт, когда
+    человек реально пишет. None, если сообщений ещё нет (см. main.py —
+    там для этого случая дефолт "вечер по МСК"). Только direction='out' —
+    входящие показывают, когда пишет собеседник, а не сам юзер."""
+    with _conn() as conn:
+        rows = conn.execute(
+            "SELECT date FROM business_messages WHERE owner_user_id = ? AND direction = 'out'",
+            (owner_user_id,),
+        ).fetchall()
+    hours: list[int] = []
+    for r in rows:
+        try:
+            hours.append(datetime.fromisoformat(r["date"]).hour)
+        except (TypeError, ValueError):
+            continue
+    if not hours:
+        return None
+    return Counter(hours).most_common(1)[0][0]
 
 
 def get_users_without_deleted_messages_broadcast() -> list[sqlite3.Row]:

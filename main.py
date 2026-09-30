@@ -10,12 +10,13 @@ import json
 import logging
 import random
 import re
+import sqlite3
 import string
 import tempfile
 import time
 import uuid
 import zipfile
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 from aiohttp import web
@@ -171,6 +172,11 @@ from storage import (
     get_users_without_deleted_messages_broadcast,
     mark_deleted_messages_broadcast_sent,
     get_users_without_price_drop_broadcast,
+    get_users_for_funnel_scan,
+    set_funnel_reminder_state,
+    count_business_messages_for_owner,
+    get_best_active_contact_for_funnel,
+    get_user_typical_active_hour_utc,
     mark_price_drop_broadcast_sent,
     mark_date_trial_used,
     mark_referral_credited,
@@ -925,6 +931,90 @@ async def _notify_promo_premium_resumed(bot: Bot, telegram_id: str, until: datet
 _PREMIUM_EXPIRY_REMINDER_WINDOW = (timedelta(hours=24), timedelta(hours=48))
 
 
+# ── Funnel-напоминания для НЕ-премиум юзеров ──────────────────────────────────
+# Три стадии воронки: подключить автоматизацию → попробовать триал → у
+# активного контакта предложить разбор. Не чаще раза в день на юзера,
+# преимущественно вечером. См. _check_funnel_reminders.
+
+_FUNNEL_STAGE_CONNECT = "connect"
+_FUNNEL_STAGE_TRIAL   = "trial"
+_FUNNEL_STAGE_BOND    = "bond"
+
+# Растущие интервалы между напоминаниями ОДНОЙ И ТОЙ ЖЕ стадии — после
+# того как список исчерпан, дальше молчим по этой стадии (не спамить).
+# Отсчёт начинается заново только при смене стадии или после премиума.
+_FUNNEL_REMINDER_DELAYS = [timedelta(hours=6), timedelta(days=2), timedelta(days=5), timedelta(days=10)]
+
+# Нет данных о часовом поясе юзера — дефолт "вечер по МСК" (17:00-22:00
+# МСК = 14:00-19:00 UTC, Россия без перехода на летнее/зимнее время),
+# центр окна 16:30 UTC с разбросом ±150 минут покрывает весь диапазон.
+_FUNNEL_DEFAULT_CENTER_HOUR_UTC = 16.5
+_FUNNEL_DEFAULT_JITTER_MINUTES = 150
+# Если есть реальная история активности (business-сообщения) — целимся в
+# час, когда юзер обычно и правда пишет (см. get_user_typical_active_hour_utc),
+# с более узким разбросом, чтобы не уехать далеко от его настоящего вечера.
+_FUNNEL_KNOWN_HOUR_JITTER_MINUTES = 45
+
+
+def _funnel_target_window_start(telegram_id: str, today: date, base_hour_utc: float, jitter_minutes: int) -> datetime:
+    """Стабильный псевдослучайный момент отправки на СЕГОДНЯ для этого
+    юзера — свой у каждого, свой каждый день (хэш telegram_id+дата), но не
+    дёргается туда-сюда при повторных проверках в течение одного дня."""
+    seed = f"{telegram_id}:{today.isoformat()}"
+    h = int(hashlib.sha256(seed.encode()).hexdigest(), 16)
+    offset_minutes = (h % (2 * jitter_minutes + 1)) - jitter_minutes
+    base_minutes = int(base_hour_utc * 60) + offset_minutes
+    day_start = datetime(today.year, today.month, today.day, tzinfo=timezone.utc)
+    return day_start + timedelta(minutes=base_minutes)
+
+
+def _funnel_target_window_for_user(telegram_id: str, now: datetime) -> datetime:
+    known_hour = get_user_typical_active_hour_utc(telegram_id)
+    if known_hour is not None:
+        return _funnel_target_window_start(telegram_id, now.date(), float(known_hour), _FUNNEL_KNOWN_HOUR_JITTER_MINUTES)
+    return _funnel_target_window_start(telegram_id, now.date(), _FUNNEL_DEFAULT_CENTER_HOUR_UTC, _FUNNEL_DEFAULT_JITTER_MINUTES)
+
+
+_FUNNEL_BOND_MIN_TOTAL = 12
+_FUNNEL_BOND_MIN_IN = 4
+_FUNNEL_BOND_MAX_DAYS_SINCE_LAST = 14
+
+
+def _funnel_reminder_content(stage: str, telegram_id: str, bond_contact: sqlite3.Row | None = None) -> tuple[str, InlineKeyboardMarkup]:
+    if stage == _FUNNEL_STAGE_CONNECT:
+        text = (
+            f"Ты начал(-а) знакомство с {APP_NAME}, но бот ещё не подключён к твоим "
+            "чатам — без этого он не видит переписку и не может подсказывать "
+            "ответы. Подключается за минуту:"
+        )
+        return text, business_connect_kb()
+
+    if stage == _FUNNEL_STAGE_TRIAL:
+        n = count_business_messages_for_owner(telegram_id)
+        seen_line = f" Уже накопилось {n} сообщений в потоке — есть на чём попробовать." if n > 0 else ""
+        text = (
+            "Бот подключён и готов, а ты ещё не попробовал(-а) ни одного "
+            f"бесплатного ответа.{seen_line} Понравится — оформишь подписку, "
+            "не понравится — ничего не теряешь."
+        )
+        b = InlineKeyboardBuilder()
+        b.button(text=f"💬 Ответ с {APP_NAME}", callback_data="qs:yes")
+        return text, b.as_markup()
+
+    # stage == _FUNNEL_STAGE_BOND — bond_contact уже проверен вызывающим
+    # кодом на порог активности (get_best_active_contact_for_funnel)
+    name = bond_contact["display_name"] or "этим человеком"
+    total = bond_contact["total"]
+    text = (
+        f"У тебя с {name} уже {total} сообщений за последнее время — если "
+        "хочешь понять, что происходит на самом деле (нравишься ли, стоит "
+        "ли продолжать), можем разобрать переписку."
+    )
+    b = InlineKeyboardBuilder()
+    b.button(text="🔬 Разобрать переписку", callback_data=f"deepan:{bond_contact['contact_id']}")
+    return text, b.as_markup()
+
+
 async def _check_premium_expiry_reminders(bot: Bot) -> None:
     """Напоминание об окончании Premium — ровно один раз на конкретный срок
     истечения (until), окно 24-48ч до него (_PREMIUM_EXPIRY_REMINDER_WINDOW).
@@ -980,17 +1070,138 @@ async def _check_premium_expiry_reminders(bot: Bot) -> None:
         set_premium_expiry_reminder_until(telegram_id, until)
 
 
+async def _check_funnel_reminders(bot: Bot) -> None:
+    """Ежедневный (не чаще раза в день) проход по воронке для НЕ-премиум
+    юзеров, преимущественно вечером (см. _funnel_target_window_for_user):
+    - не подключил Business-автоматизацию → напомнить подключить
+    - подключил, но не пробовал триал → напомнить попробовать
+    - использовал триал И есть контакт с реально активной перепиской
+      (get_best_active_contact_for_funnel) → предложить разбор именно с
+      этим человеком; если ни один контакт не проходит порог — молчим
+    - премиум (любым способом) → пропускаем и сбрасываем цепочку;
+      напоминание об ИСТЕЧЕНИИ премиума — отдельный уже существующий
+      _check_premium_expiry_reminders, эта функция его не трогает.
+    Каденс — funnel_reminder_stage/count/sent_at: смена стадии или премиум
+    сбрасывают счётчик; после _FUNNEL_REMINDER_DELAYS напоминания по этой
+    стадии прекращаются. Вызывается часто (раз в 15 минут из
+    _reconcile_promo_channel_premium), но реально шлёт не чаще раза в день
+    на юзера — после отправки sent_at сдвигает due_at на дни вперёд.
+
+    _is_premium проверяется ПОСЛЕДНИМ, прямо перед отправкой, а не первым:
+    для не-премиум юзера он всегда доходит до bot.get_chat_member (кэш
+    всего PREMIUM_CACHE_TTL), и при проверке первым каждый проход раз в 15
+    минут дёргал бы Telegram API по всей базе. Дешёвые локальные проверки
+    (стадия/due_at/окно) отсекают почти всех раньше."""
+    now = datetime.now(timezone.utc)
+
+    for row in get_users_for_funnel_scan():
+        telegram_id = row["telegram_id"]
+        if row["blocked_bot"]:
+            continue
+
+        conn = get_latest_business_connection(telegram_id)
+        connected = bool(conn and conn["is_enabled"])
+        bond_contact = None
+
+        if not connected:
+            stage = _FUNNEL_STAGE_CONNECT
+            stage_started_raw = row["created_at"]
+        elif get_trial_used(telegram_id) == 0:
+            stage = _FUNNEL_STAGE_TRIAL
+            stage_started_raw = conn["created_at"]
+        else:
+            bond_contact = get_best_active_contact_for_funnel(
+                telegram_id,
+                min_total=_FUNNEL_BOND_MIN_TOTAL,
+                min_in=_FUNNEL_BOND_MIN_IN,
+                max_days_since_last=_FUNNEL_BOND_MAX_DAYS_SINCE_LAST,
+            )
+            if bond_contact is None:
+                if row["funnel_reminder_stage"] is not None:
+                    set_funnel_reminder_state(telegram_id, None, 0, None)
+                continue
+            stage = _FUNNEL_STAGE_BOND
+            stage_started_raw = conn["created_at"]
+
+        try:
+            stage_started_at = datetime.fromisoformat(stage_started_raw)
+        except (TypeError, ValueError):
+            continue
+
+        prev_stage = row["funnel_reminder_stage"]
+        count = row["funnel_reminder_count"] if prev_stage == stage else 0
+        if count >= len(_FUNNEL_REMINDER_DELAYS):
+            continue
+
+        if count == 0:
+            due_at = stage_started_at + _FUNNEL_REMINDER_DELAYS[0]
+        else:
+            sent_raw = row["funnel_reminder_sent_at"] if prev_stage == stage else None
+            try:
+                sent_at = datetime.fromisoformat(sent_raw) if sent_raw else None
+            except ValueError:
+                sent_at = None
+            due_at = (sent_at + _FUNNEL_REMINDER_DELAYS[count]) if sent_at else now
+
+        if now < due_at:
+            continue
+
+        # День наступил (due_at), но реально шлём только после сегодняшнего
+        # вечернего "окна" этого юзера — не раньше.
+        window_start = _funnel_target_window_for_user(telegram_id, now)
+        if now < window_start:
+            continue
+
+        if await _is_premium(bot, telegram_id):
+            if prev_stage is not None:
+                set_funnel_reminder_state(telegram_id, None, 0, None)
+            continue
+
+        text, kb = _funnel_reminder_content(stage, telegram_id, bond_contact)
+        try:
+            await bot.send_message(int(telegram_id), text, reply_markup=kb)
+        except TelegramForbiddenError:
+            mark_bot_blocked(telegram_id)
+            continue
+        except Exception:
+            logging.warning("funnel reminder failed: telegram_id=%s stage=%s", telegram_id, stage)
+            continue
+
+        set_funnel_reminder_state(telegram_id, stage, count + 1, now.isoformat())
+        await asyncio.sleep(0.05)  # тот же троттлинг, что в broadcast-функциях
+
+
 async def _reconcile_promo_channel_premium(bot: Bot) -> None:
-    """Единственный фоновый суточный таск в проекте (нет cron/APScheduler) —
-    все независимые суточные проверки живут в одном цикле, а не в отдельных
-    тасках: 1) подстраховка на случай пропущенного chat_member-события для
-    промо-Premium (проходит по всем юзерам с активным окном, явно
-    перепроверяет членство через bot.get_chat_member и ставит на паузу тех,
-    кто уже не подписан, а событие поймать не удалось); 2) напоминание об
-    истечении Premium (_check_premium_expiry_reminders). Запускается один
-    раз из main()."""
+    """Единственный фоновый цикл в проекте (нет cron/APScheduler). Раз в
+    FUNNEL_POLL_SECONDS (~15 минут) — только _check_funnel_reminders (ему
+    нужна частая проверка, чтобы поймать сегодняшнее вечернее окно юзера,
+    но сам он шлёт не чаще раза в день на юзера, см. докстринг). Раз в
+    сутки (аккумулируем тики) — остальные суточные проверки: 1) подстраховка
+    на случай пропущенного chat_member-события для промо-Premium (проходит
+    по всем юзерам с активным окном, явно перепроверяет членство через
+    bot.get_chat_member и ставит на паузу тех, кто уже не подписан, а
+    событие поймать не удалось); 2) напоминание об истечении Premium
+    (_check_premium_expiry_reminders) — им частая проверка не нужна.
+    Запускается один раз из main().
+
+    Было: while True: sleep(24h) → промо-сверка → напоминание об истечении.
+    Суточный каденс этих двух проверок сохранён (tick % ticks_per_day)."""
+    FUNNEL_POLL_SECONDS = 15 * 60
+    ticks_per_day = (24 * 60 * 60) // FUNNEL_POLL_SECONDS
+
+    tick = 0
     while True:
-        await asyncio.sleep(24 * 60 * 60)
+        await asyncio.sleep(FUNNEL_POLL_SECONDS)
+        tick += 1
+
+        try:
+            await _check_funnel_reminders(bot)
+        except Exception:
+            logging.exception("funnel reminder pass failed")
+
+        if tick % ticks_per_day != 0:
+            continue
+
         try:
             for telegram_id in get_users_with_active_promo_premium():
                 until = get_promo_channel_premium_until(telegram_id)
