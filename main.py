@@ -4111,6 +4111,29 @@ async def handle_business_message(event: Message, bot: Bot) -> None:
 
 NOTIFY_DELETED_WITHOUT_TEXT = True  # False — молча пропускать удаления без известного текста
 
+# Точечные исключения: (username владельца, username собеседника) без @, в
+# нижнем регистре — владелец НЕ получает уведомления об удалённых
+# сообщениях этого собеседника. Матчинг по username, не по id: если
+# кто-то из пары сменит username, исключение перестанет работать.
+DELETED_MESSAGES_EXCLUSIONS: set[tuple[str, str]] = {
+    ("furdokw", "lisik2038"),
+}
+
+
+async def _deleted_messages_excluded(bot: Bot, owner_id: str, contact_username: str | None) -> bool:
+    if not contact_username:
+        return False
+    contact_username = contact_username.lower()
+    owners = {o for o, c in DELETED_MESSAGES_EXCLUSIONS if c == contact_username}
+    if not owners:
+        return False  # дешёвый выход без запроса к Telegram API
+    try:
+        owner_chat = await bot.get_chat(int(owner_id))
+    except Exception:
+        logging.warning("deleted_business_messages: не удалось получить username владельца %s", owner_id)
+        return False
+    return bool(owner_chat.username) and owner_chat.username.lower() in owners
+
 
 @dp.deleted_business_messages()
 async def handle_deleted_business_messages(event: BusinessMessagesDeleted, bot: Bot) -> None:
@@ -4121,6 +4144,9 @@ async def handle_deleted_business_messages(event: BusinessMessagesDeleted, bot: 
         return
     owner_id = conn_row["owner_user_id"]
     chat_ref = _chat_ref(event.chat.id)
+
+    if await _deleted_messages_excluded(bot, owner_id, event.chat.username):
+        return
 
     contact_id = await asyncio.to_thread(get_contact_id_for_chat_ref, owner_id, chat_ref)
     contact = await asyncio.to_thread(get_contact_by_id, contact_id) if contact_id else None
