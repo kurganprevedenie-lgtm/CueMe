@@ -1015,6 +1015,25 @@ def _funnel_reminder_content(stage: str, telegram_id: str, bond_contact: sqlite3
     return text, b.as_markup()
 
 
+def _premium_expiry_reminder_content(remaining: str, is_subscription: bool) -> tuple[str, InlineKeyboardMarkup | None]:
+    """Текст+кнопка напоминания об истечении Premium — вынесено из
+    _check_premium_expiry_reminders, чтобы /test_reminders показывал ровно
+    то же, что уходит юзерам."""
+    if is_subscription:
+        # Stars-подписка «месяц» — автопродление, списывается Telegram-ом
+        # самим; мягкий текст, не призыв купить заново.
+        text = (
+            f"⏳ Подписка скоро продлится автоматически (через {remaining}) — "
+            "если хочешь отменить, это можно сделать в Telegram: "
+            "Настройки → Мои подписки."
+        )
+        return text, None
+    text = f"⏳ Подписка заканчивается через {remaining} — продли, чтобы не потерять доступ."
+    b = InlineKeyboardBuilder()
+    b.button(text="👑 Подписка", callback_data="show_premium")
+    return text, b.as_markup()
+
+
 async def _check_premium_expiry_reminders(bot: Bot) -> None:
     """Напоминание об окончании Premium — ровно один раз на конкретный срок
     истечения (until), окно 24-48ч до него (_PREMIUM_EXPIRY_REMINDER_WINDOW).
@@ -1047,21 +1066,7 @@ async def _check_premium_expiry_reminders(bot: Bot) -> None:
         if get_premium_expiry_reminder_until(telegram_id) == until:
             continue  # уже напоминали именно про этот срок
 
-        remaining = _format_remaining(until - now)
-        if is_subscription:
-            # Stars-подписка «месяц» — автопродление, списывается Telegram-ом
-            # самим; мягкий текст, не призыв купить заново.
-            text = (
-                f"⏳ Подписка скоро продлится автоматически (через {remaining}) — "
-                "если хочешь отменить, это можно сделать в Telegram: "
-                "Настройки → Мои подписки."
-            )
-            kb = None
-        else:
-            text = f"⏳ Подписка заканчивается через {remaining} — продли, чтобы не потерять доступ."
-            b = InlineKeyboardBuilder()
-            b.button(text="👑 Подписка", callback_data="show_premium")
-            kb = b.as_markup()
+        text, kb = _premium_expiry_reminder_content(_format_remaining(until - now), is_subscription)
 
         try:
             await bot.send_message(int(telegram_id), text, reply_markup=kb)
@@ -1169,6 +1174,44 @@ async def _check_funnel_reminders(bot: Bot) -> None:
 
         set_funnel_reminder_state(telegram_id, stage, count + 1, now.isoformat())
         await asyncio.sleep(0.05)  # тот же троттлинг, что в broadcast-функциях
+
+
+@dp.message(Command("test_reminders"))
+async def cmd_test_reminders(message: Message) -> None:
+    """Админу — все автоматические напоминания подряд, ровно в том виде, в
+    каком их получат юзеры (тексты берутся из тех же функций, что в
+    фоновых проверках). Ничего не пишет в БД: счётчики воронки и отметки
+    «уже напоминали» не трогаются."""
+    if not _is_admin(message.from_user.id):
+        return
+    telegram_id = str(message.from_user.id)
+
+    bond_contact = get_best_active_contact_for_funnel(
+        telegram_id,
+        min_total=_FUNNEL_BOND_MIN_TOTAL,
+        min_in=_FUNNEL_BOND_MIN_IN,
+        max_days_since_last=_FUNNEL_BOND_MAX_DAYS_SINCE_LAST,
+    )
+    bond_note = "реальный контакт из твоей переписки"
+    if bond_contact is None:
+        # Своего активного контакта нет — подставляем пример, кнопка
+        # «Разобрать переписку» в этом случае никуда не ведёт.
+        bond_contact = {"display_name": "Маша", "total": 27, "contact_id": 0}
+        bond_note = "пример — активного контакта у тебя нет, кнопка не сработает"
+
+    samples = [
+        ("1/5 · Воронка: не подключил автоматизацию", *_funnel_reminder_content(_FUNNEL_STAGE_CONNECT, telegram_id)),
+        ("2/5 · Воронка: подключил, но не пробовал триал", *_funnel_reminder_content(_FUNNEL_STAGE_TRIAL, telegram_id)),
+        (f"3/5 · Воронка: разбор активного контакта ({bond_note})",
+         *_funnel_reminder_content(_FUNNEL_STAGE_BOND, telegram_id, bond_contact)),
+        ("4/5 · Истечение Premium (разовая оплата)",
+         *_premium_expiry_reminder_content(_format_remaining(timedelta(hours=30)), False)),
+        ("5/5 · Истечение Premium (Stars-подписка с автопродлением)",
+         *_premium_expiry_reminder_content(_format_remaining(timedelta(hours=30)), True)),
+    ]
+    for title, text, kb in samples:
+        await message.answer(f"— {title} —")
+        await message.answer(text, reply_markup=kb)
 
 
 async def _reconcile_promo_channel_premium(bot: Bot) -> None:
