@@ -1015,6 +1015,21 @@ def _funnel_reminder_content(stage: str, telegram_id: str, bond_contact: sqlite3
     return text, b.as_markup()
 
 
+async def _send_funnel_reminder(
+    bot: Bot, chat_id: int, stage: str, telegram_id: str, bond_contact: sqlite3.Row | None = None,
+) -> None:
+    """Отправка напоминания воронки. Стадия 'connect' уходит в том же виде,
+    что экран подключения после демо (cb_onboarding_show_connect): фото-
+    инструкция + 4 шага в <blockquote>, только вместо приветствия сверху —
+    текст напоминания. Остальные стадии — обычный текст с кнопкой."""
+    text, kb = _funnel_reminder_content(stage, telegram_id, bond_contact)
+    if stage == _FUNNEL_STAGE_CONNECT:
+        caption = f"{html.escape(text)}\n\n{await _connect_steps_blockquote(bot)}"
+        await _send_business_connect_prompt_to(bot, chat_id, caption, parse_mode="HTML")
+        return
+    await bot.send_message(chat_id, text, reply_markup=kb)
+
+
 def _premium_expiry_reminder_content(remaining: str, is_subscription: bool) -> tuple[str, InlineKeyboardMarkup | None]:
     """Текст+кнопка напоминания об истечении Premium — вынесено из
     _check_premium_expiry_reminders, чтобы /test_reminders показывал ровно
@@ -1162,9 +1177,8 @@ async def _check_funnel_reminders(bot: Bot) -> None:
                 set_funnel_reminder_state(telegram_id, None, 0, None)
             continue
 
-        text, kb = _funnel_reminder_content(stage, telegram_id, bond_contact)
         try:
-            await bot.send_message(int(telegram_id), text, reply_markup=kb)
+            await _send_funnel_reminder(bot, int(telegram_id), stage, telegram_id, bond_contact)
         except TelegramForbiddenError:
             mark_bot_blocked(telegram_id)
             continue
@@ -1199,17 +1213,24 @@ async def cmd_test_reminders(message: Message) -> None:
         bond_contact = {"display_name": "Маша", "total": 27, "contact_id": 0}
         bond_note = "пример — активного контакта у тебя нет, кнопка не сработает"
 
-    samples = [
-        ("1/5 · Воронка: не подключил автоматизацию", *_funnel_reminder_content(_FUNNEL_STAGE_CONNECT, telegram_id)),
-        ("2/5 · Воронка: подключил, но не пробовал триал", *_funnel_reminder_content(_FUNNEL_STAGE_TRIAL, telegram_id)),
-        (f"3/5 · Воронка: разбор активного контакта ({bond_note})",
-         *_funnel_reminder_content(_FUNNEL_STAGE_BOND, telegram_id, bond_contact)),
+    # Воронка — через _send_funnel_reminder, тот же путь, что в фоновой
+    # проверке (для 'connect' это фото-инструкция, а не голый текст).
+    funnel_samples = [
+        ("1/5 · Воронка: не подключил автоматизацию", _FUNNEL_STAGE_CONNECT, None),
+        ("2/5 · Воронка: подключил, но не пробовал триал", _FUNNEL_STAGE_TRIAL, None),
+        (f"3/5 · Воронка: разбор активного контакта ({bond_note})", _FUNNEL_STAGE_BOND, bond_contact),
+    ]
+    for title, stage, contact in funnel_samples:
+        await message.answer(f"— {title} —")
+        await _send_funnel_reminder(message.bot, message.chat.id, stage, telegram_id, contact)
+
+    expiry_samples = [
         ("4/5 · Истечение Premium (разовая оплата)",
          *_premium_expiry_reminder_content(_format_remaining(timedelta(hours=30)), False)),
         ("5/5 · Истечение Premium (Stars-подписка с автопродлением)",
          *_premium_expiry_reminder_content(_format_remaining(timedelta(hours=30)), True)),
     ]
-    for title, text, kb in samples:
+    for title, text, kb in expiry_samples:
         await message.answer(f"— {title} —")
         await message.answer(text, reply_markup=kb)
 
@@ -4470,32 +4491,56 @@ def demo_teaser_kb() -> InlineKeyboardMarkup:
     ])
 
 
-async def _send_business_connect_prompt(
-    target: Message, text: str, parse_mode: str | None = None,
+async def _send_business_connect_prompt_to(
+    bot: Bot, chat_id: int, text: str, parse_mode: str | None = None,
 ) -> None:
     """Инструкция по подключению Автоматизации чатов — со скриншотом, куда
     именно нажимать в настройках Telegram, если задан ONBOARDING_PHOTO_PATH/
     ONBOARDING_PHOTO_FILE_ID (.env), иначе просто текст. Приоритет
-    файл-на-диске → file_id → голый текст. Общий хелпер для
-    cb_onboarding_business, cmd_connect и cb_onboarding_show_connect
-    (последнему нужен parse_mode="HTML" — в его тексте <blockquote>)."""
+    файл-на-диске → file_id → голый текст. Версия по chat_id — для фоновых
+    напоминаний (_send_funnel_reminder), где входящего Message нет;
+    _send_business_connect_prompt ниже — обёртка для хендлеров."""
     photo_path = Path(ONBOARDING_PHOTO_PATH) if ONBOARDING_PHOTO_PATH else None
     if photo_path and photo_path.is_file():
-        await target.answer_photo(
+        await bot.send_photo(
+            chat_id,
             photo=FSInputFile(photo_path),
             caption=text,
             parse_mode=parse_mode,
             reply_markup=business_connect_kb(),
         )
     elif ONBOARDING_PHOTO_FILE_ID:
-        await target.answer_photo(
+        await bot.send_photo(
+            chat_id,
             photo=ONBOARDING_PHOTO_FILE_ID,
             caption=text,
             parse_mode=parse_mode,
             reply_markup=business_connect_kb(),
         )
     else:
-        await target.answer(text, parse_mode=parse_mode, reply_markup=business_connect_kb())
+        await bot.send_message(chat_id, text, parse_mode=parse_mode, reply_markup=business_connect_kb())
+
+
+async def _send_business_connect_prompt(
+    target: Message, text: str, parse_mode: str | None = None,
+) -> None:
+    """Обёртка над _send_business_connect_prompt_to для хендлеров —
+    cb_onboarding_business, cmd_connect и cb_onboarding_show_connect
+    (последнему нужен parse_mode="HTML" — в его тексте <blockquote>)."""
+    await _send_business_connect_prompt_to(target.bot, target.chat.id, text, parse_mode)
+
+
+async def _connect_steps_blockquote(bot: Bot) -> str:
+    """4 шага подключения (HTML <blockquote>) — общий блок для экрана после
+    демо (cb_onboarding_show_connect) и funnel-напоминания стадии 'connect'."""
+    me = await bot.get_me()
+    return (
+        "<blockquote>❓ Подключить бота:\n"
+        "1. Настройки → «Изменить» рядом с профилем\n"
+        "2. Автоматизация чатов\n"
+        f"3. Впиши @{me.username} и выбери меня\n"
+        "4. Включи «Ответы на сообщения» и выбери чаты</blockquote>"
+    )
 
 
 # ── Захват file_id фото-инструкции (только для админа) ───────────────────────
@@ -4547,14 +4592,7 @@ async def cb_onboarding_show_connect(call: CallbackQuery, bot: Bot) -> None:
         await call.message.delete()
     except Exception:
         pass
-    me = await bot.get_me()
-    welcome_text = (
-        "<blockquote>❓ Подключить бота:\n"
-        "1. Настройки → «Изменить» рядом с профилем\n"
-        "2. Автоматизация чатов\n"
-        f"3. Впиши @{me.username} и выбери меня\n"
-        "4. Включи «Ответы на сообщения» и выбери чаты</blockquote>"
-    )
+    welcome_text = await _connect_steps_blockquote(bot)
     # Фото-инструкция крепится caption'ом, приоритет файл на диске
     # (ONBOARDING_PHOTO_PATH) → file_id → голый текст — см.
     # _send_business_connect_prompt. Больше НИЧЕГО следом не шлём —
