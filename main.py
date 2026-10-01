@@ -5080,10 +5080,26 @@ async def cmd_start(message: Message, state: FSMContext, bot: Bot) -> None:
     is_test_account = bool(username) and username.lower() in TEST_ACCOUNT_USERNAMES
     if is_new and ADMIN_GROUP_CHAT_ID and not is_test_account:
         who = f"@{username}" if username else f"id{telegram_id} (без username)"
-        try:
-            await bot.send_message(int(ADMIN_GROUP_CHAT_ID), f"🆕 Новый пользователь: {who}")
-        except Exception:
-            logging.warning("admin-group new-user notify failed: %s", who)
+        asyncio.create_task(_notify_admin_new_user(bot, telegram_id, who))
+
+
+# Было: «🆕 Новый пользователь» уходил в админ-группу сразу на /start — без
+# информации, дошёл ли юзер до главного шага. Теперь ждём
+# _NEW_USER_NOTIFY_DELAY и пишем заодно, подключил ли он Автоматизацию
+# чатов за это время. Задача живёт в памяти: если бот перезапустится в эти
+# минуты, уведомление по этому юзеру не уйдёт.
+_NEW_USER_NOTIFY_DELAY = 5 * 60
+
+
+async def _notify_admin_new_user(bot: Bot, telegram_id: str, who: str) -> None:
+    await asyncio.sleep(_NEW_USER_NOTIFY_DELAY)
+    try:
+        conn = await asyncio.to_thread(get_latest_business_connection, telegram_id)
+        connected = bool(conn and conn["is_enabled"])
+        status = "✅ Автоматизация подключена" if connected else "❌ Автоматизация выключена"
+        await bot.send_message(int(ADMIN_GROUP_CHAT_ID), f"🆕 Новый пользователь: {who}\n{status}")
+    except Exception:
+        logging.warning("admin-group new-user notify failed: %s", who)
 
 
 @dp.callback_query(F.data.in_({"gender:male", "gender:female"}))
