@@ -1318,6 +1318,9 @@ async def cmd_funnel_status(message: Message, bot: Bot) -> None:
             lines.append("Напоминаний по воронке ещё не было.")
         if plan["stage"] is None:
             lines.append(f"Дальше: ничего не уйдёт — {plan['skip']}.")
+        elif await _is_premium(bot, arg):
+            lines.append("Дальше: ничего не уйдёт — есть Premium (по воронке Premium-пользователям "
+                         "не напоминаем; цепочка сбросится в момент, когда подошёл бы срок).")
         else:
             lines.append(f"Следующее: «{_FUNNEL_STAGE_LABELS[plan['stage']]}», "
                          f"№{plan['count'] + 1} из {len(_FUNNEL_REMINDER_DELAYS)}")
@@ -1328,8 +1331,6 @@ async def cmd_funnel_status(message: Message, bot: Bot) -> None:
                 bc = plan["bond_contact"]
                 who = f"@{bc['username']}" if bc["username"] else (bc["display_name"] or "без имени")
                 lines.append(f"Контакт для разбора: {who}, {bc['total']} сообщений")
-            if await _is_premium(bot, arg):
-                lines.append("\n⚠️ У него Premium — в момент отправки будет пропущен, цепочка сбросится.")
         await message.answer("\n".join(lines))
         return
 
@@ -1337,8 +1338,14 @@ async def cmd_funnel_status(message: Message, bot: Bot) -> None:
     upcoming, skips = [], {}
     for row in rows:
         plan = _funnel_plan(row, now)
-        if plan["stage"] is None:
-            skips[plan["skip"]] = skips.get(plan["skip"], 0) + 1
+        skip = plan["skip"]
+        # Premium проверяем только у тех, кому что-то запланировано (у
+        # остальных и так ничего не уйдёт) — та же проверка, что
+        # _check_funnel_reminders делает в момент отправки.
+        if plan["stage"] is not None and await _is_premium(bot, row["telegram_id"]):
+            skip = "есть Premium"
+        if skip:
+            skips[skip] = skips.get(skip, 0) + 1
         else:
             upcoming.append((plan["send_at"], row["telegram_id"], plan))
     upcoming.sort(key=lambda x: x[0])
@@ -1357,8 +1364,7 @@ async def cmd_funnel_status(message: Message, bot: Bot) -> None:
     if skips:
         lines.append("Не получат ничего:")
         lines += [f"  • {reason}: {n}" for reason, n in sorted(skips.items(), key=lambda x: -x[1])]
-    lines += ["", "Premium здесь не учитывается — он проверяется в момент отправки, "
-              "такие пользователи будут пропущены. Подробно по одному: /funnel_status <telegram_id>"]
+    lines += ["", "Подробно по одному: /funnel_status <telegram_id>"]
     for chunk in _split_long_text("\n".join(lines)):
         await message.answer(chunk)
 
