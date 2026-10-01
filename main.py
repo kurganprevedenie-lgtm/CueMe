@@ -952,10 +952,25 @@ _FUNNEL_STAGE_CONNECT = "connect"
 _FUNNEL_STAGE_TRIAL   = "trial"
 _FUNNEL_STAGE_BOND    = "bond"
 
-# Растущие интервалы между напоминаниями ОДНОЙ И ТОЙ ЖЕ стадии — после
-# того как список исчерпан, дальше молчим по этой стадии (не спамить).
-# Отсчёт начинается заново только при смене стадии или после премиума.
-_FUNNEL_REMINDER_DELAYS = [timedelta(hours=6), timedelta(days=2), timedelta(days=5), timedelta(days=10)]
+# Было: растущие интервалы между напоминаниями одной стадии, после 4-го —
+# молчим по этой стадии. Заменено на ежедневный каденс без лимита.
+# _FUNNEL_REMINDER_DELAYS = [timedelta(hours=6), timedelta(days=2), timedelta(days=5), timedelta(days=10)]
+
+# Первое напоминание — через 6 часов после начала стадии (не сразу, дать
+# юзеру время). Дальше — РОВНО раз в день, без ограничения по количеству,
+# пока не сменится стадия (подключил/попробовал триал/стал премиумом) или
+# юзер не заблокирует бота. Лимита нет — сознательное решение (см.
+# обсуждение риска блокировок при таком каденсе).
+_FUNNEL_FIRST_DELAY = timedelta(hours=6)
+_FUNNEL_REPEAT_INTERVAL = timedelta(days=1)
+# «Раз в день» = в окне СЛЕДУЮЩЕГО дня. Буквальное «+24ч от прошлой
+# отправки» иногда пропускало день: окно каждый день сдвигается на ±150
+# мин, и если завтрашнее окно раньше сегодняшнего больше чем на свою
+# ширину (3ч), к моменту «+24ч» оно уже закончилось — переносилось на
+# послезавтра (~8% дней). Срок = +24ч минус этот запас: ближайшее окно
+# после него — всегда завтрашнее (сегодняшнее к тому времени уже
+# закрыто, завтрашнее начинается не раньше чем через 19ч после отправки).
+_FUNNEL_REPEAT_EARLY_SLACK = timedelta(hours=12)
 
 # Нет данных о часовом поясе юзера — дефолт "вечер по МСК" (17:00-22:00
 # МСК = 14:00-19:00 UTC, Россия без перехода на летнее/зимнее время),
@@ -1071,21 +1086,19 @@ def _funnel_plan(row, now: datetime) -> dict:
 
     prev_stage = row["funnel_reminder_stage"]
     count = row["funnel_reminder_count"] if prev_stage == stage else 0
+    # count больше не ограничивает число напоминаний (лимита нет) — только
+    # номер следующего, для аналитики и /funnel_status.
     plan["count"] = count
-    if count >= len(_FUNNEL_REMINDER_DELAYS):
-        plan["stage"] = None
-        plan["skip"] = f"все {len(_FUNNEL_REMINDER_DELAYS)} напоминания этой стадии уже отправлены"
-        return plan
 
     if count == 0:
-        due_at = stage_started_at + _FUNNEL_REMINDER_DELAYS[0]
+        due_at = stage_started_at + _FUNNEL_FIRST_DELAY
     else:
         sent_raw = row["funnel_reminder_sent_at"] if prev_stage == stage else None
         try:
             sent_at = datetime.fromisoformat(sent_raw) if sent_raw else None
         except ValueError:
             sent_at = None
-        due_at = (sent_at + _FUNNEL_REMINDER_DELAYS[count]) if sent_at else now
+        due_at = (sent_at + _FUNNEL_REPEAT_INTERVAL - _FUNNEL_REPEAT_EARLY_SLACK) if sent_at else now
     plan["due_at"] = due_at
 
     known_hour = get_user_typical_active_hour_utc(telegram_id)
@@ -1220,11 +1233,14 @@ async def _check_funnel_reminders(bot: Bot) -> None:
     - премиум (любым способом) → пропускаем и сбрасываем цепочку;
       напоминание об ИСТЕЧЕНИИ премиума — отдельный уже существующий
       _check_premium_expiry_reminders, эта функция его не трогает.
-    Каденс — funnel_reminder_stage/count/sent_at: смена стадии или премиум
-    сбрасывают счётчик; после _FUNNEL_REMINDER_DELAYS напоминания по этой
-    стадии прекращаются. Вызывается часто (раз в 15 минут из
-    _reconcile_promo_channel_premium), но реально шлёт не чаще раза в день
-    на юзера — после отправки sent_at сдвигает due_at на дни вперёд.
+    Каденс — funnel_reminder_stage/count/sent_at: первое через
+    _FUNNEL_FIRST_DELAY после начала стадии, дальше ежедневно без
+    ограничения по количеству, пока не сменится стадия (смена стадии или
+    премиум сбрасывают счётчик) или юзер не заблокирует бота. count —
+    только номер напоминания для аналитики. Вызывается часто (раз в 15
+    минут из _reconcile_promo_channel_premium), но реально шлёт не чаще
+    раза в день на юзера — после отправки sent_at сдвигает due_at на
+    следующий день.
 
     _is_premium проверяется ПОСЛЕДНИМ, прямо перед отправкой, а не первым:
     для не-премиум юзера он всегда доходит до bot.get_chat_member (кэш
@@ -1323,7 +1339,7 @@ async def cmd_funnel_status(message: Message, bot: Bot) -> None:
                          "не напоминаем; цепочка сбросится в момент, когда подошёл бы срок).")
         else:
             lines.append(f"Следующее: «{_FUNNEL_STAGE_LABELS[plan['stage']]}», "
-                         f"№{plan['count'] + 1} из {len(_FUNNEL_REMINDER_DELAYS)}")
+                         f"№{plan['count'] + 1} (дальше — раз в день, пока не сменится стадия)")
             lines.append(f"Срок наступает: {_funnel_fmt_msk(plan['due_at'])}")
             lines.append(f"Уйдёт: {_funnel_fmt_msk(plan['send_at'])}"
                          + (" (ближайший проход, до 15 минут)" if plan["send_at"] <= now else ""))
