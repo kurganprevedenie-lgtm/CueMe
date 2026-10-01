@@ -130,6 +130,7 @@ from storage import (
     create_deleted_reveal,
     get_deleted_reveal,
     mark_deleted_reveal_revealed,
+    get_unrevealed_deleted_reveals,
     get_contact_id_for_chat_ref,
     get_business_connections_history,
     get_contact_last_messages,
@@ -715,6 +716,7 @@ async def _credit_referral_if_pending(bot: Bot, referred_id: str) -> None:
         )
     except Exception:
         logging.warning("referral notify failed: referrer=%s", referrer_id)
+    await _offer_pending_reveals(bot, referrer_id)
 
 
 def _has_referral_premium(telegram_id: str) -> bool:
@@ -824,6 +826,7 @@ async def cb_promo_check(call: CallbackQuery, bot: Bot) -> None:
             f"🎉 С возвращением! Оставшееся время Premium возобновлено — до {_format_until(until)}.",
             reply_markup=_promo_back_kb(),
         )
+        await _offer_pending_reveals(bot, telegram_id)
         return
 
     if has_claimed_promo_reward(telegram_id):
@@ -838,6 +841,7 @@ async def cb_promo_check(call: CallbackQuery, bot: Bot) -> None:
         f"дня (до {_format_until(until)}).",
         reply_markup=_promo_back_kb(),
     )
+    await _offer_pending_reveals(bot, telegram_id)
 
 
 @dp.chat_member()
@@ -922,6 +926,7 @@ async def _notify_promo_reward_granted(bot: Bot, telegram_id: str, until: dateti
         await bot.send_message(int(telegram_id), text)
     except Exception:
         logging.warning("promo reward grant notify failed: telegram_id=%s", telegram_id)
+    await _offer_pending_reveals(bot, telegram_id)
 
 
 async def _notify_promo_premium_resumed(bot: Bot, telegram_id: str, until: datetime) -> None:
@@ -932,6 +937,7 @@ async def _notify_promo_premium_resumed(bot: Bot, telegram_id: str, until: datet
         await bot.send_message(int(telegram_id), text)
     except Exception:
         logging.warning("promo premium resume notify failed: telegram_id=%s", telegram_id)
+    await _offer_pending_reveals(bot, telegram_id)
 
 
 _PREMIUM_EXPIRY_REMINDER_WINDOW = (timedelta(hours=24), timedelta(hours=48))
@@ -1435,6 +1441,7 @@ async def process_stars_successful_payment(message: Message, bot: Bot) -> None:
     until_label = expires_at.strftime("%d.%m.%Y %H:%M UTC")
     extra = " Продлится автоматически, спишется ещё раз через 30 дней." if is_subscription else ""
     await message.answer(f"🎉 Готово! Premium активен до {until_label}.{extra}")
+    await _offer_pending_reveals(bot, telegram_id)
 
 
 # ── Tribute webhook (события оплаты приватного канала-пропуска) ─────────────
@@ -1582,6 +1589,7 @@ async def _handle_tribute_subscription_event(bot: Bot, event_name: str, payload:
         await bot.send_message(int(telegram_id), f"🎉 Оплата прошла! Premium активен до {until_label}.")
     except Exception:
         logging.warning("tribute: не удалось отправить подтверждение оплаты %s", telegram_id)
+    await _offer_pending_reveals(bot, telegram_id)
 
     # Безусловно — независимо от того, был ли уже Premium через другой
     # источник (реферал/промо/Stars) до этой оплаты. Именно этот шаг раньше
@@ -4382,7 +4390,11 @@ async def _send_deleted_content(bot: Bot, owner_id: str, name: str, row) -> None
 def _deleted_teaser_kb(reveal_id: int) -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     b.button(text="👀 Показать", callback_data=f"delrev:{reveal_id}")
-    b.button(text="👑 Оформить Premium", callback_data="show_premium")
+    # НЕ show_premium: тот редактирует текущее сообщение в экран подписки
+    # (edit=True) — тизер вместе с кнопкой «👀 Показать» затирался, и
+    # после оплаты вернуться к удалённому было не к чему. delrev_premium
+    # шлёт экран подписки НОВЫМ сообщением, тизер остаётся.
+    b.button(text="👑 Оформить Premium", callback_data="delrev_premium")
     b.adjust(1)
     return b.as_markup()
 
@@ -4476,16 +4488,73 @@ async def cb_deleted_reveal(call: CallbackQuery, bot: Bot) -> None:
         return
 
     await call.answer()
+    if not await _reveal_deleted(bot, telegram_id, reveal):
+        await call.message.answer("Не получилось достать это сообщение — его уже нет в базе.")
+    # Убираем кнопки с тизера — уже показано, повторно жать незачем.
+    try:
+        await call.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+
+
+async def _reveal_deleted(bot: Bot, telegram_id: str, reveal) -> int:
+    """Показывает содержимое одного скрытого удаления и помечает его
+    показанным. Возвращает, сколько сообщений удалось достать из базы."""
     shown = 0
     for row_id in json.loads(reveal["message_row_ids"]):
         row = await asyncio.to_thread(get_business_message_by_row_id, row_id)
         if row:
             await _send_deleted_content(bot, telegram_id, reveal["contact_label"], row)
             shown += 1
+    await asyncio.to_thread(mark_deleted_reveal_revealed, reveal["id"])
+    return shown
+
+
+@dp.callback_query(F.data == "delrev_premium")
+async def cb_deleted_reveal_premium(call: CallbackQuery, bot: Bot) -> None:
+    """Экран подписки с тизера удалённого — НОВЫМ сообщением (edit=False),
+    чтобы тизер с кнопкой «👀 Показать» не затёрся (см. _deleted_teaser_kb)."""
+    await call.answer()
+    await _show_premium_screen(call.message, bot, str(call.from_user.id), edit=False)
+
+
+async def _offer_pending_reveals(bot: Bot, telegram_id: str) -> None:
+    """Подстраховка на случай, если тизер с кнопкой «👀 Показать» потерялся
+    (затёрт, удалён, ушёл далеко вверх): как только у юзера появился
+    Premium — сами предлагаем показать всё, что было скрыто. Вызывается из
+    всех мест выдачи Premium (промо-канал, Stars, Tribute, реферал) и с
+    экрана «👑 Подписка», если Premium уже активен. Молча ничего не делает,
+    если скрытого нет или Premium всё-таки не активен."""
+    try:
+        pending = await asyncio.to_thread(get_unrevealed_deleted_reveals, telegram_id)
+        if not pending or not await _is_premium(bot, telegram_id):
+            return
+        count = sum(len(json.loads(r["message_row_ids"])) for r in pending)
+        b = InlineKeyboardBuilder()
+        b.button(text="👀 Показать", callback_data="delrev_all")
+        await bot.send_message(
+            int(telegram_id),
+            f"🔓 Premium активен — теперь можно посмотреть удалённые сообщения, "
+            f"которые были скрыты ({count}).",
+            reply_markup=b.as_markup(),
+        )
+    except Exception:
+        logging.exception("offer pending reveals failed: telegram_id=%s", telegram_id)
+
+
+@dp.callback_query(F.data == "delrev_all")
+async def cb_deleted_reveal_all(call: CallbackQuery, bot: Bot) -> None:
+    telegram_id = str(call.from_user.id)
+    if not await _is_premium(bot, telegram_id):
+        await call.answer("🔒 Удалённое доступно только с Premium.", show_alert=True)
+        return
+    await call.answer()
+    pending = await asyncio.to_thread(get_unrevealed_deleted_reveals, telegram_id)
+    shown = 0
+    for reveal in pending:
+        shown += await _reveal_deleted(bot, telegram_id, reveal)
     if not shown:
-        await call.message.answer("Не получилось достать это сообщение — его уже нет в базе.")
-    await asyncio.to_thread(mark_deleted_reveal_revealed, reveal_id)
-    # Убираем кнопки с тизера — уже показано, повторно жать незачем.
+        await call.message.answer("Скрытых удалённых сообщений больше нет — всё уже показано.")
     try:
         await call.message.edit_reply_markup(reply_markup=None)
     except Exception:
@@ -7865,6 +7934,7 @@ async def _premium_status_text(bot: Bot, telegram_id: str) -> str:
 async def cmd_premium(message: Message, bot: Bot) -> None:
     text = await _premium_status_text(bot, str(message.from_user.id))
     await message.answer(text, reply_markup=paywall_kb())
+    await _offer_pending_reveals(bot, str(message.from_user.id))
 
 
 async def _show_premium_screen(target: Message, bot: Bot, telegram_id: str, edit: bool = False) -> None:
@@ -7873,6 +7943,9 @@ async def _show_premium_screen(target: Message, bot: Bot, telegram_id: str, edit
         await target.edit_text(text, reply_markup=premium_menu_kb())
     else:
         await target.answer(text, reply_markup=premium_menu_kb())
+    # Premium уже активен, а скрытые удалённые не показаны (тизер мог
+    # потеряться) — предложить показать (сама функция проверит и то, и другое).
+    await _offer_pending_reveals(bot, telegram_id)
 
 
 @dp.callback_query(F.data == "show_premium")

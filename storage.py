@@ -2174,6 +2174,17 @@ def get_deleted_reveal(reveal_id: int) -> sqlite3.Row | None:
         return conn.execute("SELECT * FROM deleted_reveals WHERE id = ?", (reveal_id,)).fetchone()
 
 
+def get_unrevealed_deleted_reveals(owner_user_id: str) -> list[sqlite3.Row]:
+    """Ещё не показанные скрытые удаления юзера — для подстраховки на случай,
+    если сам тизер с кнопкой «👀 Показать» потерялся (main.py:
+    _offer_pending_reveals)."""
+    with _conn() as conn:
+        return conn.execute(
+            "SELECT * FROM deleted_reveals WHERE owner_user_id = ? AND revealed_at IS NULL ORDER BY id",
+            (owner_user_id,),
+        ).fetchall()
+
+
 def mark_deleted_reveal_revealed(reveal_id: int) -> None:
     with _conn() as conn:
         conn.execute("UPDATE deleted_reveals SET revealed_at = ? WHERE id = ?", (_now(), reveal_id))
