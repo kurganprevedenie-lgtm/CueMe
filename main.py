@@ -171,6 +171,8 @@ from storage import (
     mark_legacy_kb_cleared,
     get_users_without_deleted_messages_broadcast,
     mark_deleted_messages_broadcast_sent,
+    get_users_without_deleted_paywall_broadcast,
+    mark_deleted_paywall_broadcast_sent,
     get_users_without_price_drop_broadcast,
     get_users_for_funnel_scan,
     set_funnel_reminder_state,
@@ -1939,6 +1941,93 @@ async def cb_broadcast_deleted_messages_confirm(call: CallbackQuery, bot: Bot) -
 
 @dp.callback_query(F.data == "bcast:deleted_msgs:cancel")
 async def cb_broadcast_deleted_messages_cancel(call: CallbackQuery) -> None:
+    await call.answer()
+    await call.message.edit_text("Отменено.")
+
+
+# ── /broadcast_deleted_paywall — «удалённые сообщения теперь только по ──────
+# Premium» (только админ, тот же паттерн, что /broadcast_deleted_messages).
+# Уходит только юзерам БЕЗ Premium (проверка _is_premium на отправке) —
+# премиум-юзеров пропускаем и НЕ помечаем: если позже потеряют Premium,
+# повторный запуск команды до них дойдёт. Сама функция для не-премиум
+# отключена в handle_deleted_business_messages.
+
+_DELETED_PAYWALL_BROADCAST_TEXT = (
+    "🗑 Уведомления об удалённых сообщениях больше недоступны\n\n"
+    "Бесплатный период закончился — теперь эта функция работает только "
+    "с Premium. Если хочешь снова видеть, что собеседник удалил (текст, "
+    "фото, видео, голосовые), — оформи подписку 👇"
+)
+
+
+@dp.message(Command("broadcast_deleted_paywall"))
+async def cmd_broadcast_deleted_paywall(message: Message) -> None:
+    if not _is_admin(message.from_user.id):
+        return
+    users = get_users_without_deleted_paywall_broadcast()
+    if not users:
+        await message.answer("Новых получателей нет — все, кто есть в базе, уже получили эту рассылку.")
+        return
+    await message.answer(
+        f"⚠️ Разослать уведомление «удалённые сообщения только по Premium»? "
+        f"Кандидатов: {len(users)} — пользователи с Premium будут пропущены "
+        "при отправке. Действие необратимо.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="✅ Да, разослать", callback_data="bcast:deleted_paywall:confirm"),
+            InlineKeyboardButton(text="❌ Отмена", callback_data="bcast:deleted_paywall:cancel"),
+        ]]),
+    )
+
+
+async def _run_broadcast_deleted_paywall(bot: Bot, requester_id: int) -> None:
+    """Фон, задержка между отправками и пометки — как в
+    _run_broadcast_deleted_messages. Обычная ошибка не помечается —
+    попадёт в следующий запуск команды."""
+    users = get_users_without_deleted_paywall_broadcast()
+    sent = failed = blocked = skipped_premium = 0
+
+    for u in users:
+        telegram_id = u["telegram_id"]
+        if await _is_premium(bot, telegram_id):
+            skipped_premium += 1
+            continue
+        try:
+            await bot.send_message(int(telegram_id), _DELETED_PAYWALL_BROADCAST_TEXT, reply_markup=_price_drop_kb())
+            sent += 1
+            mark_deleted_paywall_broadcast_sent(telegram_id)
+        except TelegramForbiddenError:
+            mark_bot_blocked(telegram_id)
+            mark_deleted_paywall_broadcast_sent(telegram_id)
+            blocked += 1
+        except Exception:
+            logging.exception("broadcast_deleted_paywall: сбой для %s", telegram_id)
+            failed += 1
+        await asyncio.sleep(0.05)
+
+    try:
+        await bot.send_message(
+            requester_id,
+            f"✅ Рассылка «удалённые сообщения только по Premium» завершена.\n"
+            f"Отправлено: {sent}\nПропущено (есть Premium): {skipped_premium}\n"
+            f"Заблокировали бота: {blocked}\nОшибок: {failed}"
+            + ("\n\nОшибки не помечены как отправленные — попадут в следующий запуск команды." if failed else ""),
+        )
+    except Exception:
+        logging.exception("broadcast_deleted_paywall: не удалось отчитаться перед %s", requester_id)
+
+
+@dp.callback_query(F.data == "bcast:deleted_paywall:confirm")
+async def cb_broadcast_deleted_paywall_confirm(call: CallbackQuery, bot: Bot) -> None:
+    if not _is_admin(call.from_user.id):
+        await call.answer()
+        return
+    await call.answer()
+    await call.message.edit_text("Рассылка началась в фоне — пришлю итоги, когда закончится.")
+    asyncio.create_task(_run_broadcast_deleted_paywall(bot, call.from_user.id))
+
+
+@dp.callback_query(F.data == "bcast:deleted_paywall:cancel")
+async def cb_broadcast_deleted_paywall_cancel(call: CallbackQuery) -> None:
     await call.answer()
     await call.message.edit_text("Отменено.")
 
@@ -4206,6 +4295,11 @@ async def handle_deleted_business_messages(event: BusinessMessagesDeleted, bot: 
     chat_ref = _chat_ref(event.chat.id)
 
     if await _deleted_messages_excluded(bot, owner_id, event.chat.username):
+        return
+
+    # Функция только по Premium (бесплатный период закончился, см.
+    # /broadcast_deleted_paywall) — не-премиум молча ничего не получают.
+    if not await _is_premium(bot, owner_id):
         return
 
     contact_id = await asyncio.to_thread(get_contact_id_for_chat_ref, owner_id, chat_ref)
