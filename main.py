@@ -980,11 +980,117 @@ def _funnel_target_window_start(telegram_id: str, today: date, base_hour_utc: fl
     return day_start + timedelta(minutes=base_minutes)
 
 
-def _funnel_target_window_for_user(telegram_id: str, now: datetime) -> datetime:
-    known_hour = get_user_typical_active_hour_utc(telegram_id)
+# Было: _funnel_target_window_for_user(telegram_id, now) → начало окна на
+# СЕГОДНЯ, условие отправки «now >= начало окна» — без конца окна. Две
+# проблемы: 1) срок (due_at), наступивший поздно вечером/ночью, слал
+# напоминание сразу, в любое время суток (due 23:50 UTC = 02:50 МСК);
+# 2) окно у юзера с активным часом около полуночи UTC вычислялось на
+# СЛЕДУЮЩИЕ сутки (base_minutes > 24ч), и «сегодняшнее» окно никогда не
+# наступало — такие юзеры не получали напоминаний вообще. Теперь у окна
+# есть ширина _FUNNEL_WINDOW_WIDTH, а попадание проверяется по окнам
+# соседних дат (вчера/сегодня/завтра), а не только «сегодня».
+#
+# def _funnel_target_window_for_user(telegram_id: str, now: datetime) -> datetime:
+#     known_hour = get_user_typical_active_hour_utc(telegram_id)
+#     if known_hour is not None:
+#         return _funnel_target_window_start(telegram_id, now.date(), float(known_hour), _FUNNEL_KNOWN_HOUR_JITTER_MINUTES)
+#     return _funnel_target_window_start(telegram_id, now.date(), _FUNNEL_DEFAULT_CENTER_HOUR_UTC, _FUNNEL_DEFAULT_JITTER_MINUTES)
+
+# Ширина окна отправки: проход раз в 15 минут гарантированно попадёт внутрь,
+# запас — на случай перезапуска/простоя бота в момент начала окна.
+_FUNNEL_WINDOW_WIDTH = timedelta(hours=3)
+
+
+def _funnel_window_start_on(telegram_id: str, day: date, known_hour: int | None) -> datetime:
     if known_hour is not None:
-        return _funnel_target_window_start(telegram_id, now.date(), float(known_hour), _FUNNEL_KNOWN_HOUR_JITTER_MINUTES)
-    return _funnel_target_window_start(telegram_id, now.date(), _FUNNEL_DEFAULT_CENTER_HOUR_UTC, _FUNNEL_DEFAULT_JITTER_MINUTES)
+        return _funnel_target_window_start(telegram_id, day, float(known_hour), _FUNNEL_KNOWN_HOUR_JITTER_MINUTES)
+    return _funnel_target_window_start(telegram_id, day, _FUNNEL_DEFAULT_CENTER_HOUR_UTC, _FUNNEL_DEFAULT_JITTER_MINUTES)
+
+
+def _funnel_next_send_at(telegram_id: str, earliest: datetime, known_hour: int | None) -> datetime:
+    """Самый ранний момент >= earliest, попадающий в окно отправки юзера
+    [начало окна; начало + _FUNNEL_WINDOW_WIDTH). Если earliest уже внутри
+    окна — вернёт сам earliest (= «можно слать прямо сейчас»). Общая
+    функция и для реальной отправки (_check_funnel_reminders), и для
+    админского прогноза (/funnel_status) — чтобы прогноз не расходился с
+    тем, что реально уйдёт."""
+    candidates = []
+    for offset in range(-1, 3):
+        start = _funnel_window_start_on(telegram_id, earliest.date() + timedelta(days=offset), known_hour)
+        if start + _FUNNEL_WINDOW_WIDTH > earliest:
+            candidates.append(max(start, earliest))
+    return min(candidates)
+
+
+def _funnel_plan(row, now: datetime) -> dict:
+    """Что воронка собирается сделать с юзером — без отправки и без
+    проверки Premium (она дорогая, см. _check_funnel_reminders). Ключи:
+    stage (None — напоминать нечего), skip (почему ничего не шлём, текстом
+    для админа), count (какое по счёту напоминание этой стадии будет
+    следующим, с 0), due_at (когда наступает срок), send_at (когда реально
+    уйдёт — первый момент окна не раньше срока), reset (нужно ли сбросить
+    сохранённую цепочку), bond_contact."""
+    telegram_id = row["telegram_id"]
+    plan = {"stage": None, "skip": None, "count": 0, "due_at": None, "send_at": None,
+            "reset": False, "bond_contact": None}
+    if row["blocked_bot"]:
+        plan["skip"] = "заблокировал бота"
+        return plan
+
+    conn = get_latest_business_connection(telegram_id)
+    connected = bool(conn and conn["is_enabled"])
+
+    if not connected:
+        stage = _FUNNEL_STAGE_CONNECT
+        stage_started_raw = row["created_at"]
+    elif get_trial_used(telegram_id) == 0:
+        stage = _FUNNEL_STAGE_TRIAL
+        stage_started_raw = conn["created_at"]
+    else:
+        bond_contact = get_best_active_contact_for_funnel(
+            telegram_id,
+            min_total=_FUNNEL_BOND_MIN_TOTAL,
+            min_in=_FUNNEL_BOND_MIN_IN,
+            max_days_since_last=_FUNNEL_BOND_MAX_DAYS_SINCE_LAST,
+        )
+        if bond_contact is None:
+            plan["skip"] = "попробовал бесплатные ответы, но нет активной переписки для разбора"
+            plan["reset"] = row["funnel_reminder_stage"] is not None
+            return plan
+        stage = _FUNNEL_STAGE_BOND
+        stage_started_raw = conn["created_at"]
+        plan["bond_contact"] = bond_contact
+
+    plan["stage"] = stage
+    try:
+        stage_started_at = datetime.fromisoformat(stage_started_raw)
+    except (TypeError, ValueError):
+        plan["stage"] = None
+        plan["skip"] = "битая дата начала стадии"
+        return plan
+
+    prev_stage = row["funnel_reminder_stage"]
+    count = row["funnel_reminder_count"] if prev_stage == stage else 0
+    plan["count"] = count
+    if count >= len(_FUNNEL_REMINDER_DELAYS):
+        plan["stage"] = None
+        plan["skip"] = f"все {len(_FUNNEL_REMINDER_DELAYS)} напоминания этой стадии уже отправлены"
+        return plan
+
+    if count == 0:
+        due_at = stage_started_at + _FUNNEL_REMINDER_DELAYS[0]
+    else:
+        sent_raw = row["funnel_reminder_sent_at"] if prev_stage == stage else None
+        try:
+            sent_at = datetime.fromisoformat(sent_raw) if sent_raw else None
+        except ValueError:
+            sent_at = None
+        due_at = (sent_at + _FUNNEL_REMINDER_DELAYS[count]) if sent_at else now
+    plan["due_at"] = due_at
+
+    known_hour = get_user_typical_active_hour_utc(telegram_id)
+    plan["send_at"] = _funnel_next_send_at(telegram_id, max(due_at, now), known_hour)
+    return plan
 
 
 _FUNNEL_BOND_MIN_TOTAL = 12
@@ -1105,7 +1211,7 @@ async def _check_premium_expiry_reminders(bot: Bot) -> None:
 
 async def _check_funnel_reminders(bot: Bot) -> None:
     """Ежедневный (не чаще раза в день) проход по воронке для НЕ-премиум
-    юзеров, преимущественно вечером (см. _funnel_target_window_for_user):
+    юзеров, преимущественно вечером (см. _funnel_next_send_at):
     - не подключил Business-автоматизацию → напомнить подключить
     - подключил, но не пробовал триал → напомнить попробовать
     - использовал триал И есть контакт с реально активной перепиской
@@ -1129,69 +1235,25 @@ async def _check_funnel_reminders(bot: Bot) -> None:
 
     for row in get_users_for_funnel_scan():
         telegram_id = row["telegram_id"]
-        if row["blocked_bot"]:
+        plan = _funnel_plan(row, now)
+        if plan["reset"]:
+            set_funnel_reminder_state(telegram_id, None, 0, None)
+        stage = plan["stage"]
+        if stage is None:
             continue
 
-        conn = get_latest_business_connection(telegram_id)
-        connected = bool(conn and conn["is_enabled"])
-        bond_contact = None
-
-        if not connected:
-            stage = _FUNNEL_STAGE_CONNECT
-            stage_started_raw = row["created_at"]
-        elif get_trial_used(telegram_id) == 0:
-            stage = _FUNNEL_STAGE_TRIAL
-            stage_started_raw = conn["created_at"]
-        else:
-            bond_contact = get_best_active_contact_for_funnel(
-                telegram_id,
-                min_total=_FUNNEL_BOND_MIN_TOTAL,
-                min_in=_FUNNEL_BOND_MIN_IN,
-                max_days_since_last=_FUNNEL_BOND_MAX_DAYS_SINCE_LAST,
-            )
-            if bond_contact is None:
-                if row["funnel_reminder_stage"] is not None:
-                    set_funnel_reminder_state(telegram_id, None, 0, None)
-                continue
-            stage = _FUNNEL_STAGE_BOND
-            stage_started_raw = conn["created_at"]
-
-        try:
-            stage_started_at = datetime.fromisoformat(stage_started_raw)
-        except (TypeError, ValueError):
-            continue
-
-        prev_stage = row["funnel_reminder_stage"]
-        count = row["funnel_reminder_count"] if prev_stage == stage else 0
-        if count >= len(_FUNNEL_REMINDER_DELAYS):
-            continue
-
-        if count == 0:
-            due_at = stage_started_at + _FUNNEL_REMINDER_DELAYS[0]
-        else:
-            sent_raw = row["funnel_reminder_sent_at"] if prev_stage == stage else None
-            try:
-                sent_at = datetime.fromisoformat(sent_raw) if sent_raw else None
-            except ValueError:
-                sent_at = None
-            due_at = (sent_at + _FUNNEL_REMINDER_DELAYS[count]) if sent_at else now
-
-        if now < due_at:
-            continue
-
-        # День наступил (due_at), но реально шлём только после сегодняшнего
-        # вечернего "окна" этого юзера — не раньше.
-        window_start = _funnel_target_window_for_user(telegram_id, now)
-        if now < window_start:
+        # Шлём, только если срок наступил И сейчас внутри окна отправки
+        # юзера (send_at == now — «можно прямо сейчас», см. _funnel_next_send_at).
+        if plan["send_at"] > now:
             continue
 
         if await _is_premium(bot, telegram_id):
-            if prev_stage is not None:
+            if row["funnel_reminder_stage"] is not None:
                 set_funnel_reminder_state(telegram_id, None, 0, None)
             continue
 
         try:
-            await _send_funnel_reminder(bot, int(telegram_id), stage, telegram_id, bond_contact)
+            await _send_funnel_reminder(bot, int(telegram_id), stage, telegram_id, plan["bond_contact"])
         except TelegramForbiddenError:
             mark_bot_blocked(telegram_id)
             continue
@@ -1199,8 +1261,106 @@ async def _check_funnel_reminders(bot: Bot) -> None:
             logging.warning("funnel reminder failed: telegram_id=%s stage=%s", telegram_id, stage)
             continue
 
-        set_funnel_reminder_state(telegram_id, stage, count + 1, now.isoformat())
+        set_funnel_reminder_state(telegram_id, stage, plan["count"] + 1, now.isoformat())
         await asyncio.sleep(0.05)  # тот же троттлинг, что в broadcast-функциях
+
+
+_FUNNEL_STAGE_LABELS = {
+    _FUNNEL_STAGE_CONNECT: "подключить бота",
+    _FUNNEL_STAGE_TRIAL: "попробовать бесплатный ответ",
+    _FUNNEL_STAGE_BOND: "разбор активной переписки",
+}
+_MSK = timezone(timedelta(hours=3))
+
+
+def _funnel_fmt_msk(dt: datetime) -> str:
+    return dt.astimezone(_MSK).strftime("%d.%m %H:%M МСК")
+
+
+async def _funnel_user_label(bot: Bot, telegram_id: str) -> str:
+    try:
+        chat = await bot.get_chat(int(telegram_id))
+        if chat.username:
+            return f"@{chat.username} ({telegram_id})"
+    except Exception:
+        pass
+    return telegram_id
+
+
+@dp.message(Command("funnel_status"))
+async def cmd_funnel_status(message: Message, bot: Bot) -> None:
+    """Админу — прогноз напоминаний воронки: кому, что и когда уйдёт.
+    Считает тем же _funnel_plan, что и реальная отправка
+    (_check_funnel_reminders), ничего не шлёт и не пишет в БД.
+    /funnel_status — ближайшие отправки по всем; /funnel_status <telegram_id>
+    — подробно по одному юзеру (с проверкой Premium)."""
+    if not _is_admin(message.from_user.id):
+        return
+    now = datetime.now(timezone.utc)
+    parts = (message.text or "").split(maxsplit=1)
+    arg = parts[1].strip().lstrip("@") if len(parts) == 2 else ""
+
+    if arg:
+        row = next((r for r in get_users_for_funnel_scan() if r["telegram_id"] == arg), None)
+        if row is None:
+            await message.answer(f"Пользователя с telegram_id {arg} нет в базе. Нужен именно числовой id (см. /users).")
+            return
+        plan = _funnel_plan(row, now)
+        lines = [f"👤 {await _funnel_user_label(bot, arg)}", ""]
+        sent_before = row["funnel_reminder_sent_at"]
+        if row["funnel_reminder_stage"]:
+            lines.append(
+                f"Последнее напоминание: «{_FUNNEL_STAGE_LABELS.get(row['funnel_reminder_stage'], row['funnel_reminder_stage'])}», "
+                f"№{row['funnel_reminder_count']}"
+                + (f", {_funnel_fmt_msk(datetime.fromisoformat(sent_before))}" if sent_before else "")
+            )
+        else:
+            lines.append("Напоминаний по воронке ещё не было.")
+        if plan["stage"] is None:
+            lines.append(f"Дальше: ничего не уйдёт — {plan['skip']}.")
+        else:
+            lines.append(f"Следующее: «{_FUNNEL_STAGE_LABELS[plan['stage']]}», "
+                         f"№{plan['count'] + 1} из {len(_FUNNEL_REMINDER_DELAYS)}")
+            lines.append(f"Срок наступает: {_funnel_fmt_msk(plan['due_at'])}")
+            lines.append(f"Уйдёт: {_funnel_fmt_msk(plan['send_at'])}"
+                         + (" (ближайший проход, до 15 минут)" if plan["send_at"] <= now else ""))
+            if plan["bond_contact"] is not None:
+                bc = plan["bond_contact"]
+                who = f"@{bc['username']}" if bc["username"] else (bc["display_name"] or "без имени")
+                lines.append(f"Контакт для разбора: {who}, {bc['total']} сообщений")
+            if await _is_premium(bot, arg):
+                lines.append("\n⚠️ У него Premium — в момент отправки будет пропущен, цепочка сбросится.")
+        await message.answer("\n".join(lines))
+        return
+
+    rows = get_users_for_funnel_scan()
+    upcoming, skips = [], {}
+    for row in rows:
+        plan = _funnel_plan(row, now)
+        if plan["stage"] is None:
+            skips[plan["skip"]] = skips.get(plan["skip"], 0) + 1
+        else:
+            upcoming.append((plan["send_at"], row["telegram_id"], plan))
+    upcoming.sort(key=lambda x: x[0])
+
+    horizon = now + timedelta(hours=48)
+    soon = [u for u in upcoming if u[0] <= horizon]
+    lines = [f"📬 Напоминания воронки — ближайшие 48 часов: {len(soon)}", ""]
+    for send_at, tid, plan in soon[:40]:
+        when = "сейчас" if send_at <= now else _funnel_fmt_msk(send_at)
+        lines.append(f"{when} — {await _funnel_user_label(bot, tid)}: "
+                     f"«{_FUNNEL_STAGE_LABELS[plan['stage']]}» №{plan['count'] + 1}")
+    if len(soon) > 40:
+        lines.append(f"… и ещё {len(soon) - 40}")
+    later = len(upcoming) - len(soon)
+    lines += ["", f"Позже 48 часов запланировано: {later}"]
+    if skips:
+        lines.append("Не получат ничего:")
+        lines += [f"  • {reason}: {n}" for reason, n in sorted(skips.items(), key=lambda x: -x[1])]
+    lines += ["", "Premium здесь не учитывается — он проверяется в момент отправки, "
+              "такие пользователи будут пропущены. Подробно по одному: /funnel_status <telegram_id>"]
+    for chunk in _split_long_text("\n".join(lines)):
+        await message.answer(chunk)
 
 
 @dp.message(Command("test_reminders"))
