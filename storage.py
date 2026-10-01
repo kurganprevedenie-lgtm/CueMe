@@ -197,6 +197,20 @@ def init_db() -> None:
                 UNIQUE(subscription_id, period_id)
             );
 
+            -- Скрытые от не-премиум удалённые сообщения (main.py:
+            -- handle_deleted_business_messages → тизер «@user удалил(а)
+            -- сообщение» с кнопкой «👀 Показать»). Хранит не сам текст, а
+            -- id строк business_messages (там уже всё есть) — по кнопке
+            -- после оформления Premium показываем ровно то, что было скрыто.
+            CREATE TABLE IF NOT EXISTS deleted_reveals (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                owner_user_id   TEXT NOT NULL,
+                contact_label   TEXT NOT NULL,   -- как подписать: @username или имя
+                message_row_ids TEXT NOT NULL,   -- JSON-список business_messages.id
+                created_at      TEXT NOT NULL,
+                revealed_at     TEXT
+            );
+
             -- Каждый вариант ответа, который бот РЕАЛЬНО показал пользователю
             -- (после генерации, до отправки — считаем и неиспользованные, нужно
             -- для % использования). contact_id может быть NULL (скриншот без
@@ -2138,6 +2152,31 @@ def get_business_message_by_tg_id(
             """,
             (connection_id, chat_ref, tg_message_id),
         ).fetchone()
+
+
+def get_business_message_by_row_id(row_id: int) -> sqlite3.Row | None:
+    with _conn() as conn:
+        return conn.execute("SELECT * FROM business_messages WHERE id = ?", (row_id,)).fetchone()
+
+
+def create_deleted_reveal(owner_user_id: str, contact_label: str, message_row_ids: list[int]) -> int:
+    with _conn() as conn:
+        cur = conn.execute(
+            "INSERT INTO deleted_reveals (owner_user_id, contact_label, message_row_ids, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            (owner_user_id, contact_label, json.dumps(message_row_ids), _now()),
+        )
+        return cur.lastrowid
+
+
+def get_deleted_reveal(reveal_id: int) -> sqlite3.Row | None:
+    with _conn() as conn:
+        return conn.execute("SELECT * FROM deleted_reveals WHERE id = ?", (reveal_id,)).fetchone()
+
+
+def mark_deleted_reveal_revealed(reveal_id: int) -> None:
+    with _conn() as conn:
+        conn.execute("UPDATE deleted_reveals SET revealed_at = ? WHERE id = ?", (_now(), reveal_id))
 
 
 def get_latest_business_connection(owner_user_id: str) -> sqlite3.Row | None:

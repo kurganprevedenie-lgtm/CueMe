@@ -126,6 +126,10 @@ from storage import (
     get_biz_messages_for_contact,
     get_business_connection,
     get_business_message_by_tg_id,
+    get_business_message_by_row_id,
+    create_deleted_reveal,
+    get_deleted_reveal,
+    mark_deleted_reveal_revealed,
     get_contact_id_for_chat_ref,
     get_business_connections_history,
     get_contact_last_messages,
@@ -1953,10 +1957,11 @@ async def cb_broadcast_deleted_messages_cancel(call: CallbackQuery) -> None:
 # отключена в handle_deleted_business_messages.
 
 _DELETED_PAYWALL_BROADCAST_TEXT = (
-    "🗑 Уведомления об удалённых сообщениях больше недоступны\n\n"
-    "Бесплатный период закончился — теперь эта функция работает только "
-    "с Premium. Если хочешь снова видеть, что собеседник удалил (текст, "
-    "фото, видео, голосовые), — оформи подписку 👇"
+    "🗑 Удалённые сообщения теперь только с Premium\n\n"
+    "Бесплатный период закончился. Я по-прежнему сообщу, когда собеседник "
+    "что-то удалит, но само содержимое (текст, фото, видео, голосовые) "
+    "открывается только с Premium. Оформишь подписку — сможешь посмотреть "
+    "и то, что удалили до этого 👇"
 )
 
 
@@ -4284,6 +4289,113 @@ async def _deleted_messages_excluded(bot: Bot, owner_id: str, contact_username: 
     return bool(owner_chat.username) and owner_chat.username.lower() in owners
 
 
+def _has_deleted_content(row) -> bool:
+    """Есть ли что показать по удалённому сообщению: текст или медиа по
+    file_id. Строки без того и другого (стикер и т.п.) — только «текст
+    недоступен», в тизер для не-премиум их не берём: после оплаты показать
+    по ним было бы нечего."""
+    if row["text"]:
+        return True
+    return any(
+        k in row.keys() and row[k]
+        for k in ("photo_file_id", "video_file_id", "video_note_file_id", "voice_file_id")
+    )
+
+
+async def _send_deleted_content(bot: Bot, owner_id: str, name: str, row) -> None:
+    """Содержимое одного удалённого входящего сообщения владельцу — общий код
+    для Premium-юзеров (сразу при удалении) и для кнопки «👀 Показать» на
+    тизере (cb_deleted_reveal), чтобы после оплаты показывалось ровно то
+    же, что видят премиум-юзеры."""
+    text = row["text"]
+    photo_file_id = row["photo_file_id"] if "photo_file_id" in row.keys() else None
+    video_file_id = row["video_file_id"] if "video_file_id" in row.keys() else None
+    video_note_file_id = row["video_note_file_id"] if "video_note_file_id" in row.keys() else None
+    voice_file_id = row["voice_file_id"] if "voice_file_id" in row.keys() else None
+
+    # Фото/видео/кружок/голосовое — пересылаем сам файл по сохранённому
+    # file_id (см. handle_business_message), с исходной подписью/
+    # транскриптом (если был) в caption, а не просто текстовое "медиа
+    # удалено". file_id Telegram иногда отказывается отдавать (сообщение
+    # слишком старое, файл протух на серверах Telegram и т.п.) — тогда
+    # не молчим, откатываемся на обычное текстовое уведомление ниже.
+    # Ровно одно из полей может быть заполнено — сообщение бывает только
+    # одного медиа-типа сразу.
+    if photo_file_id:
+        caption = f"🗑 {name} удалил(а) фото" + (f":\n«{text}»" if text else "")
+        try:
+            await bot.send_photo(int(owner_id), photo_file_id, caption=caption[:1024])
+            return
+        except Exception:
+            logging.exception(
+                "deleted_business_messages: не удалось переслать фото (file_id=%s) owner=%s — откат на текст",
+                photo_file_id, owner_id,
+            )
+    elif video_file_id:
+        caption = f"🗑 {name} удалил(а) видео" + (f":\n«{text}»" if text else "")
+        try:
+            await bot.send_video(int(owner_id), video_file_id, caption=caption[:1024])
+            return
+        except Exception:
+            logging.exception(
+                "deleted_business_messages: не удалось переслать видео (file_id=%s) owner=%s — откат на текст",
+                video_file_id, owner_id,
+            )
+    elif video_note_file_id:
+        # video_note (кружок) НЕ поддерживает caption вообще (ограничение
+        # Bot API, не наше) — уведомление уходит ОТДЕЛЬНЫМ текстовым
+        # сообщением следом, тот же приём, что был в предыдущей версии
+        # медиа-кэша (см. историю коммитов) до отката.
+        try:
+            await bot.send_video_note(int(owner_id), video_note_file_id)
+            await bot.send_message(int(owner_id), f"🗑 {name} удалил(а) видеосообщение (кружок)")
+            return
+        except Exception:
+            logging.exception(
+                "deleted_business_messages: не удалось переслать кружок (file_id=%s) owner=%s — откат на текст",
+                video_note_file_id, owner_id,
+            )
+    elif voice_file_id:
+        caption = f"🗑 {name} удалил(а) голосовое" + (f":\n«{text}»" if text else "")
+        try:
+            await bot.send_voice(int(owner_id), voice_file_id, caption=caption[:1024])
+            return
+        except Exception:
+            logging.exception(
+                "deleted_business_messages: не удалось переслать голосовое (file_id=%s) owner=%s — откат на текст",
+                voice_file_id, owner_id,
+            )
+
+    if text:
+        notice = f"🗑 {name} удалил(а) сообщение:\n«{text}»"
+    elif NOTIFY_DELETED_WITHOUT_TEXT:
+        notice = f"🗑 {name} удалил(а) сообщение (текст недоступен)"
+    else:
+        return
+
+    try:
+        await bot.send_message(int(owner_id), notice)
+    except Exception:
+        logging.exception("deleted_business_messages: не удалось уведомить owner=%s", owner_id)
+
+
+def _deleted_teaser_kb(reveal_id: int) -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    b.button(text="👀 Показать", callback_data=f"delrev:{reveal_id}")
+    b.button(text="👑 Оформить Premium", callback_data="show_premium")
+    b.adjust(1)
+    return b.as_markup()
+
+
+def _deleted_teaser_text(label: str, count: int) -> str:
+    what = "сообщение" if count == 1 else f"сообщения ({count})"
+    return (
+        f"🗑 {label} удалил(а) {what}\n\n"
+        "🔒 Чтобы посмотреть, что там было, — оформи Premium. После оплаты "
+        "нажми «👀 Показать» — откроется именно это удалённое."
+    )
+
+
 @dp.deleted_business_messages()
 async def handle_deleted_business_messages(event: BusinessMessagesDeleted, bot: Bot) -> None:
     conn_id = event.business_connection_id
@@ -4297,98 +4409,87 @@ async def handle_deleted_business_messages(event: BusinessMessagesDeleted, bot: 
     if await _deleted_messages_excluded(bot, owner_id, event.chat.username):
         return
 
-    # Функция только по Premium (бесплатный период закончился, см.
-    # /broadcast_deleted_paywall) — не-премиум молча ничего не получают.
-    if not await _is_premium(bot, owner_id):
-        return
-
     contact_id = await asyncio.to_thread(get_contact_id_for_chat_ref, owner_id, chat_ref)
     contact = await asyncio.to_thread(get_contact_by_id, contact_id) if contact_id else None
     name = _contact_name(contact) if contact else "Собеседник"
 
+    # Реагируем ТОЛЬКО на удаление ВХОДЯЩИХ (direction тот же принцип,
+    # что в handle_business_message: "in" = прислал собеседник, не
+    # владелец). Если строки нет вообще — направление НЕИЗВЕСТНО, и
+    # молчим: рисковать написать юзеру "собеседник удалил", когда на
+    # самом деле он сам удалил своё же сообщение, хуже, чем пропустить
+    # уведомление (NOTIFY_DELETED_WITHOUT_TEXT относится только к
+    # случаю "точно входящее, но текста нет" — сообщение БЕЗ текста/
+    # caption, не к "сообщения нет в базе вовсе").
+    rows = []
     for tg_message_id in event.message_ids:
         row = await asyncio.to_thread(get_business_message_by_tg_id, conn_id, chat_ref, tg_message_id)
-        # Реагируем ТОЛЬКО на удаление ВХОДЯЩИХ (direction тот же принцип,
-        # что в handle_business_message: "in" = прислал собеседник, не
-        # владелец). Если строки нет вообще — направление НЕИЗВЕСТНО, и
-        # молчим: рисковать написать юзеру "собеседник удалил", когда на
-        # самом деле он сам удалил своё же сообщение, хуже, чем пропустить
-        # уведомление (NOTIFY_DELETED_WITHOUT_TEXT относится только к
-        # случаю "точно входящее, но текста нет" — сообщение БЕЗ текста/
-        # caption, не к "сообщения нет в базе вовсе").
-        if not row or row["direction"] != "in":
-            continue
+        if row and row["direction"] == "in":
+            rows.append(row)
+    if not rows:
+        return
 
-        text = row["text"]
-        photo_file_id = row["photo_file_id"] if "photo_file_id" in row.keys() else None
-        video_file_id = row["video_file_id"] if "video_file_id" in row.keys() else None
-        video_note_file_id = row["video_note_file_id"] if "video_note_file_id" in row.keys() else None
-        voice_file_id = row["voice_file_id"] if "voice_file_id" in row.keys() else None
+    if await _is_premium(bot, owner_id):
+        for row in rows:
+            await _send_deleted_content(bot, owner_id, name, row)
+        return
 
-        # Фото/видео/кружок/голосовое — пересылаем сам файл по сохранённому
-        # file_id (см. handle_business_message), с исходной подписью/
-        # транскриптом (если был) в caption, а не просто текстовое "медиа
-        # удалено". file_id Telegram иногда отказывается отдавать (сообщение
-        # слишком старое, файл протух на серверах Telegram и т.п.) — тогда
-        # не молчим, откатываемся на обычное текстовое уведомление ниже.
-        # Ровно одно из полей может быть заполнено — сообщение бывает только
-        # одного медиа-типа сразу.
-        if photo_file_id:
-            caption = f"🗑 {name} удалил(а) фото" + (f":\n«{text}»" if text else "")
-            try:
-                await bot.send_photo(int(owner_id), photo_file_id, caption=caption[:1024])
-                continue
-            except Exception:
-                logging.exception(
-                    "deleted_business_messages: не удалось переслать фото (file_id=%s) owner=%s — откат на текст",
-                    photo_file_id, owner_id,
-                )
-        elif video_file_id:
-            caption = f"🗑 {name} удалил(а) видео" + (f":\n«{text}»" if text else "")
-            try:
-                await bot.send_video(int(owner_id), video_file_id, caption=caption[:1024])
-                continue
-            except Exception:
-                logging.exception(
-                    "deleted_business_messages: не удалось переслать видео (file_id=%s) owner=%s — откат на текст",
-                    video_file_id, owner_id,
-                )
-        elif video_note_file_id:
-            # video_note (кружок) НЕ поддерживает caption вообще (ограничение
-            # Bot API, не наше) — уведомление уходит ОТДЕЛЬНЫМ текстовым
-            # сообщением следом, тот же приём, что был в предыдущей версии
-            # медиа-кэша (см. историю коммитов) до отката.
-            try:
-                await bot.send_video_note(int(owner_id), video_note_file_id)
-                await bot.send_message(int(owner_id), f"🗑 {name} удалил(а) видеосообщение (кружок)")
-                continue
-            except Exception:
-                logging.exception(
-                    "deleted_business_messages: не удалось переслать кружок (file_id=%s) owner=%s — откат на текст",
-                    video_note_file_id, owner_id,
-                )
-        elif voice_file_id:
-            caption = f"🗑 {name} удалил(а) голосовое" + (f":\n«{text}»" if text else "")
-            try:
-                await bot.send_voice(int(owner_id), voice_file_id, caption=caption[:1024])
-                continue
-            except Exception:
-                logging.exception(
-                    "deleted_business_messages: не удалось переслать голосовое (file_id=%s) owner=%s — откат на текст",
-                    voice_file_id, owner_id,
-                )
+    # Без Premium (бесплатный период закончился, см. /broadcast_deleted_paywall)
+    # содержимое не показываем — только тизер: КТО удалил (@username, если
+    # есть, иначе имя контакта) и сколько. Одно сообщение на событие, даже
+    # если удалено сразу несколько. Id строк запоминаем в deleted_reveals —
+    # после оплаты кнопка «👀 Показать» откроет ровно их.
+    revealable = [r for r in rows if _has_deleted_content(r)]
+    if not revealable:
+        return
+    label = f"@{event.chat.username}" if event.chat.username else name
+    reveal_id = await asyncio.to_thread(
+        create_deleted_reveal, owner_id, label, [r["id"] for r in revealable],
+    )
+    try:
+        await bot.send_message(
+            int(owner_id), _deleted_teaser_text(label, len(revealable)),
+            reply_markup=_deleted_teaser_kb(reveal_id),
+        )
+    except Exception:
+        logging.exception("deleted_business_messages: не удалось отправить тизер owner=%s", owner_id)
 
-        if text:
-            notice = f"🗑 {name} удалил(а) сообщение:\n«{text}»"
-        elif NOTIFY_DELETED_WITHOUT_TEXT:
-            notice = f"🗑 {name} удалил(а) сообщение (текст недоступен)"
-        else:
-            continue
 
-        try:
-            await bot.send_message(int(owner_id), notice)
-        except Exception:
-            logging.exception("deleted_business_messages: не удалось уведомить owner=%s", owner_id)
+@dp.callback_query(F.data.startswith("delrev:"))
+async def cb_deleted_reveal(call: CallbackQuery, bot: Bot) -> None:
+    telegram_id = str(call.from_user.id)
+    try:
+        reveal_id = int(call.data.split(":", 1)[1])
+    except ValueError:
+        await call.answer()
+        return
+    reveal = await asyncio.to_thread(get_deleted_reveal, reveal_id)
+    if not reveal or reveal["owner_user_id"] != telegram_id:
+        await call.answer("Не нашёл это сообщение.", show_alert=True)
+        return
+
+    if not await _is_premium(bot, telegram_id):
+        await call.answer(
+            "🔒 Удалённое доступно только с Premium — оформи подписку и нажми «👀 Показать» ещё раз.",
+            show_alert=True,
+        )
+        return
+
+    await call.answer()
+    shown = 0
+    for row_id in json.loads(reveal["message_row_ids"]):
+        row = await asyncio.to_thread(get_business_message_by_row_id, row_id)
+        if row:
+            await _send_deleted_content(bot, telegram_id, reveal["contact_label"], row)
+            shown += 1
+    if not shown:
+        await call.message.answer("Не получилось достать это сообщение — его уже нет в базе.")
+    await asyncio.to_thread(mark_deleted_reveal_revealed, reveal_id)
+    # Убираем кнопки с тизера — уже показано, повторно жать незачем.
+    try:
+        await call.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
 
 
 # ── /start ────────────────────────────────────────────────────────────────────
