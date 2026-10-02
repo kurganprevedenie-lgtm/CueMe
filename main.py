@@ -5477,6 +5477,9 @@ async def _collect_users_data(bot: Bot) -> tuple[list[dict], dict]:
         "with_ref_premium": 0, "blocked": 0, "automation_off": 0, "inactive": 0,
         "premium_now": 0, "used_reply": 0, "used_screenshot": 0, "used_live": 0,
         "used_deep_analysis": 0, "active_7d": 0, "subscribed_channel": 0,
+        "trial_used": 0,
+        "by_source": {},
+        "premium_by_source": {},
     }
 
     for u in users:
@@ -5488,6 +5491,19 @@ async def _collect_users_data(bot: Bot) -> tuple[list[dict], dict]:
             totals["with_gender"] += 1
         if contacts:
             totals["with_contact"] += 1
+
+        source_label = _SOURCE_LABELS.get(u["acquisition_source"], "не указан")
+        trial_used_flag = bool(u["trial_used"])
+        if trial_used_flag:
+            totals["trial_used"] += 1
+        source_bucket = totals["by_source"].setdefault(
+            source_label, {"total": 0, "connected": 0, "trial_used": 0, "premium": 0}
+        )
+        source_bucket["total"] += 1
+        if contacts:
+            source_bucket["connected"] += 1
+        if trial_used_flag:
+            source_bucket["trial_used"] += 1
 
         # Контактов может быть больше, чем реально накопленных переписок —
         # контакт создаётся уже от одного исходящего business-сообщения,
@@ -5561,6 +5577,10 @@ async def _collect_users_data(bot: Bot) -> tuple[list[dict], dict]:
         if is_premium_now:
             premium_source, premium_until, premium_is_subscription = _premium_expiry_info(tid)
             totals["premium_now"] += 1
+            source_bucket["premium"] += 1
+            totals["premium_by_source"][premium_source] = (
+                totals["premium_by_source"].get(premium_source, 0) + 1
+            )
             if premium_source == "referral":
                 totals["with_ref_premium"] += 1
         else:
@@ -5603,14 +5623,13 @@ async def _collect_users_data(bot: Bot) -> tuple[list[dict], dict]:
         if active_7d:
             totals["active_7d"] += 1
 
-        trial_used_flag = bool(u["trial_used"])
         connected = bool(latest_conn) and not automation_off
 
         rows.append({
             "username": who,
             "telegram_id": tid,
             "gender": _GENDER_LABELS.get(u["gender"], "?"),
-            "source": _SOURCE_LABELS.get(u["acquisition_source"], "не указан"),
+            "source": source_label,
             "funnel_stage": _funnel_stage(connected, trial_used_flag, is_premium_now),
             "signup_week": _csv_dt(u["created_at"], "%G-W%V"),
             "contacts_count": len(contacts),
@@ -5841,6 +5860,112 @@ _USERS_SORT_FIELDS = [
 ]
 
 
+def _pct(n: int, d: int) -> int:
+    return round(n / d * 100) if d else 0
+
+
+def _bar_row(label: str, value: int, total: int, *, tone: str = "neutral", note: str = "") -> str:
+    pct = _pct(value, total)
+    note_html = f' <span class="bar-note">{html.escape(note)}</span>' if note else ""
+    return f"""<div class="bar-row">
+  <div class="bar-head"><span>{html.escape(label)}</span><span class="bar-num">{value} <span class="bar-pct">({pct}%)</span></span></div>
+  <div class="bar-track"><div class="bar-fill bar-{tone}" style="width:{pct}%"></div></div>{note_html}
+</div>"""
+
+
+def _build_users_dashboard_html(rows: list[dict], totals: dict) -> str:
+    """Агрегированный срез НАД карточками по юзерам (воронка, источники,
+    Premium-по-оплате, использование фич, здоровье базы) — отвечает на
+    вопрос "всё ли в порядке с ботом", который список карточек не покрывает."""
+    total = totals["total"]
+
+    funnel_steps = [
+        ("🚀 Старт", total, None),
+        ("🔌 Подключили автоматизацию", totals["with_contact"], total),
+        ("🧪 Воспользовались триалом", totals["trial_used"], totals["with_contact"]),
+        ("👑 Купили Premium", totals["premium_now"], totals["trial_used"]),
+    ]
+    funnel_html = []
+    for i, (label, value, prev) in enumerate(funnel_steps):
+        of_total = _pct(value, total)
+        step_conv = f' <span class="funnel-conv">из них {_pct(value, prev)}% с прошлого шага</span>' if prev else ""
+        funnel_html.append(f"""<div class="funnel-step">
+  <div class="funnel-label">{html.escape(label)}</div>
+  <div class="funnel-value">{value}</div>
+  <div class="funnel-sub">{of_total}% от всех{step_conv}</div>
+</div>""")
+        if i < len(funnel_steps) - 1:
+            funnel_html.append('<div class="funnel-arrow">→</div>')
+
+    channel_rows = []
+    for label, b in sorted(totals["by_source"].items(), key=lambda kv: -kv[1]["total"]):
+        conv = _pct(b["premium"], b["total"])
+        tone = "good" if conv >= 5 else ("warn" if conv > 0 else "bad")
+        channel_rows.append(f"""<tr>
+  <td>{html.escape(label)}</td>
+  <td>{b['total']} <span class="muted">({_pct(b['total'], total)}%)</span></td>
+  <td>{b['connected']} <span class="muted">({_pct(b['connected'], b['total'])}%)</span></td>
+  <td>{b['trial_used']} <span class="muted">({_pct(b['trial_used'], b['total'])}%)</span></td>
+  <td>{b['premium']}</td>
+  <td><span class="chip chip-{tone}">{conv}%</span></td>
+</tr>""")
+
+    premium_source_rows = []
+    for key, count in sorted(totals["premium_by_source"].items(), key=lambda kv: -kv[1]):
+        label = _PREMIUM_SOURCE_LABELS.get(key, key)
+        premium_source_rows.append(_bar_row(label, count, totals["premium_now"] or 1, tone="good"))
+
+    feature_rows = "".join([
+        _bar_row("«Ответить за меня»", totals["used_reply"], total, tone="good"),
+        _bar_row("«По скриншоту»", totals["used_screenshot"], total, tone="good"),
+        _bar_row("Live-диалог", totals["used_live"], total, tone="good"),
+        _bar_row(
+            "Анализ собеседника", totals["used_deep_analysis"], total, tone="bad",
+            note="флагманская платная фича — если тут почти 0, стоит разбираться, почему" if totals["used_deep_analysis"] <= total * 0.02 else "",
+        ),
+    ])
+
+    health_rows = "".join([
+        _bar_row("Активны за 7 дней", totals["active_7d"], total, tone="good"),
+        _bar_row("Заблокировали бота", totals["blocked"], total, tone="bad"),
+        _bar_row("Отключили автоматизацию", totals["automation_off"], total, tone="bad"),
+        _bar_row(f"Неактивны >{_INACTIVE_AFTER_DAYS} дн.", totals["inactive"], total, tone="warn"),
+    ])
+
+    return f"""<section class="dash">
+  <h2>📈 Воронка</h2>
+  <div class="funnel-row">{"".join(funnel_html)}</div>
+</section>
+
+<section class="dash">
+  <h2>📡 Источники — объём и конверсия</h2>
+  <div class="table-wrap"><table class="channel-table">
+    <thead><tr>
+      <th>Источник</th><th>Пришло</th><th>Подключили</th><th>Триал</th><th>Premium</th><th>Конверсия</th>
+    </tr></thead>
+    <tbody>{"".join(channel_rows)}</tbody>
+  </table></div>
+</section>
+
+<div class="dash-cols">
+  <section class="dash dash-col">
+    <h2>👑 Premium — по источнику оплаты</h2>
+    <div class="dash-sub">Всего сейчас: <b>{totals['premium_now']}</b> ({_pct(totals['premium_now'], total)}% от всех)</div>
+    {"".join(premium_source_rows) or '<div class="muted">Пока ни у кого нет Premium</div>'}
+  </section>
+  <section class="dash dash-col">
+    <h2>🧩 Используют фичи</h2>
+    {feature_rows}
+  </section>
+</div>
+
+<section class="dash">
+  <h2>❤️ Здоровье базы</h2>
+  {health_rows}
+</section>
+"""
+
+
 def _build_users_html(rows: list[dict], totals: dict) -> bytes:
     """Самостоятельный HTML-файл (инлайн <style>/<script>, без внешних
     зависимостей и без CDN — открывается и работает офлайн) — карточки,
@@ -5943,6 +6068,7 @@ def _build_users_html(rows: list[dict], totals: dict) -> bytes:
     )
 
     generated_at = datetime.now(timezone.utc).strftime("%d.%m.%Y %H:%M UTC")
+    dashboard_html = _build_users_dashboard_html(rows, totals)
     doc = f"""<!DOCTYPE html>
 <html lang="ru">
 <head>
@@ -5966,6 +6092,44 @@ def _build_users_html(rows: list[dict], totals: dict) -> bytes:
     padding: 12px 16px; margin: 12px 0 16px; font-size: 14px;
   }}
   .summary b {{ color: #111; }}
+
+  .dash {{
+    background: #fff; border: 1px solid #e1e4e8; border-radius: 14px;
+    padding: 16px 18px; margin-bottom: 14px;
+  }}
+  .dash h2 {{ font-size: 16px; margin: 0 0 12px; }}
+  .dash-sub {{ font-size: 14px; color: #6b7280; margin-bottom: 10px; }}
+  .dash-cols {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 14px; margin-bottom: 14px; }}
+  .dash-col h2 {{ margin-bottom: 10px; }}
+  .muted {{ color: #6b7280; font-size: 13px; }}
+  .funnel-row {{ display: flex; flex-wrap: wrap; align-items: center; gap: 4px; }}
+  .funnel-step {{ background: #f4f5f7; border-radius: 12px; padding: 10px 14px; min-width: 150px; flex: 1; }}
+  .funnel-label {{ font-size: 13px; color: #6b7280; margin-bottom: 4px; }}
+  .funnel-value {{ font-size: 22px; font-weight: 700; }}
+  .funnel-sub {{ font-size: 12px; color: #6b7280; margin-top: 2px; }}
+  .funnel-conv {{ color: #1a7f37; }}
+  .funnel-arrow {{ font-size: 18px; color: #c2c8d0; padding: 0 4px; }}
+  .table-wrap {{ overflow-x: auto; }}
+  .channel-table {{ width: 100%; border-collapse: collapse; font-size: 14px; white-space: nowrap; }}
+  .channel-table th {{ text-align: left; color: #6b7280; font-weight: 600; font-size: 13px; padding: 6px 10px; border-bottom: 2px solid #f0f1f3; }}
+  .channel-table td {{ padding: 8px 10px; border-bottom: 1px solid #f0f1f3; }}
+  .chip {{ display: inline-block; padding: 3px 10px; border-radius: 999px; font-weight: 700; font-size: 13px; }}
+  .chip-good {{ background: #d9f2df; color: #1a7f37; }}
+  .chip-warn {{ background: #fef3c7; color: #92400e; }}
+  .chip-bad {{ background: #fee4e2; color: #b42318; }}
+  .bar-row {{ margin-bottom: 12px; }}
+  .bar-row:last-child {{ margin-bottom: 0; }}
+  .bar-head {{ display: flex; justify-content: space-between; font-size: 14px; margin-bottom: 4px; }}
+  .bar-num {{ font-weight: 700; }}
+  .bar-pct {{ font-weight: 400; color: #6b7280; }}
+  .bar-track {{ background: #f0f1f3; border-radius: 999px; height: 8px; overflow: hidden; }}
+  .bar-fill {{ height: 100%; border-radius: 999px; }}
+  .bar-good {{ background: #1a7f37; }}
+  .bar-warn {{ background: #d97706; }}
+  .bar-bad {{ background: #c2272d; }}
+  .bar-neutral {{ background: #6b7280; }}
+  .bar-note {{ font-size: 12px; color: #92400e; }}
+  .roster-heading {{ font-size: 17px; margin: 4px 0 10px; }}
 
   .search-box {{
     display: block; width: 100%; padding: 14px 16px; font-size: 17px;
@@ -6045,13 +6209,11 @@ def _build_users_html(rows: list[dict], totals: dict) -> bytes:
 </head>
 <body>
 <h1>👥 Пользователи CueMe</h1>
-<div class="meta">Сформировано {generated_at} · всего {totals['total']} · показано <b id="visibleCount">{totals['total']}</b></div>
-<div class="summary">
-  <span>Premium сейчас: <b>{totals['premium_now']}</b></span>
-  <span>Подписаны на канал: <b>{totals['subscribed_channel']}</b></span>
-  <span>С контактом: <b>{totals['with_contact']}</b></span>
-  <span>Активны за 7 дней: <b>{totals['active_7d']}</b></span>
-</div>
+<div class="meta">Сформировано {generated_at} · всего {totals['total']}</div>
+
+{dashboard_html}
+
+<h2 class="roster-heading">📋 Все пользователи <span class="muted">(показано <b id="visibleCount">{totals['total']}</b> из {totals['total']})</span></h2>
 
 <input type="text" class="search-box" id="searchBox" placeholder="🔍 Поиск по имени или username…">
 
