@@ -1968,7 +1968,7 @@ async def cb_broadcast_invite_cancel(call: CallbackQuery) -> None:
 # снижена по умолчанию (см. config.py: STAR_PRICE_MONTH).
 
 _PRICE_DROP_TEXT = (
-    "Привет! Мы снизили цену Premium — было 300 ₽/мес, теперь 150 ₽/мес "
+    "Привет! Мы снизили цену Premium — было 300 ₽/мес, теперь 199 ₽/мес "
     "для новых пользователей. Успей, пока действует новая цена 👇"
 )
 
