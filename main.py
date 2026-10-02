@@ -5603,11 +5603,16 @@ async def _collect_users_data(bot: Bot) -> tuple[list[dict], dict]:
         if active_7d:
             totals["active_7d"] += 1
 
+        trial_used_flag = bool(u["trial_used"])
+        connected = bool(latest_conn) and not automation_off
+
         rows.append({
             "username": who,
             "telegram_id": tid,
             "gender": _GENDER_LABELS.get(u["gender"], "?"),
             "source": _SOURCE_LABELS.get(u["acquisition_source"], "не указан"),
+            "funnel_stage": _funnel_stage(connected, trial_used_flag, is_premium_now),
+            "signup_week": _csv_dt(u["created_at"], "%G-W%V"),
             "contacts_count": len(contacts),
             "messages_count": msg_count,
             "blocked": is_blocked,
@@ -5700,14 +5705,25 @@ async def _collect_users_data(bot: Bot) -> tuple[list[dict], dict]:
 # же ключам, служебные поля с "_" в выгрузку не идут.
 _USERS_CSV_COLUMNS = [
     "username", "telegram_id", "gender", "source",
+    "funnel_stage", "signup_week",
     "contacts_count", "messages_count", "blocked", "automation_off",
     "signup_date", "days_since_signup", "last_action_at", "last_incoming_at",
     "days_since_last_active", "active_last_7d",
     "uses_reply", "uses_screenshot", "uses_live",
-    "used_deep_analysis", "has_style_card",
-    "is_premium_now", "premium_source", "premium_until", "premium_remaining",
+    "used_deep_analysis",
+    "is_premium_now", "premium_source", "premium_until",
     "premium_auto_renew", "trial_used", "referrals_made",
 ]
+
+
+def _funnel_stage(connected: bool, trial_used_flag: bool, is_premium_now: bool) -> str:
+    if is_premium_now:
+        return "3_premium"
+    if trial_used_flag:
+        return "2_триал"
+    if connected:
+        return "1_подключил_автоматизацию"
+    return "0_старт"
 
 
 def _fmt_ru_date(value: str) -> str:
