@@ -241,9 +241,9 @@ PROMO_CHANNEL_USERNAME = os.getenv("PROMO_CHANNEL_USERNAME", "@CueMee")
 # членство в приватном канале-пропуске: своё независимое окно Premium
 # (users.stars_premium_until). День/неделя — разовая покупка, месяц — нативная
 # Stars-подписка с автопродлением (см. STARS_SUBSCRIPTION_PERIOD).
-STAR_PRICE_DAY = int(os.getenv("STAR_PRICE_DAY", "15"))
-STAR_PRICE_WEEK = int(os.getenv("STAR_PRICE_WEEK", "60"))
-STAR_PRICE_MONTH = int(os.getenv("STAR_PRICE_MONTH", "88"))
+STAR_PRICE_DAY = int(os.getenv("STAR_PRICE_DAY", "25"))
+STAR_PRICE_WEEK = int(os.getenv("STAR_PRICE_WEEK", "100"))
+STAR_PRICE_MONTH = int(os.getenv("STAR_PRICE_MONTH", "150"))
 # Telegram Stars поддерживает РОВНО одно значение периода подписки — 30 дней.
 STARS_SUBSCRIPTION_PERIOD = 2592000
 
