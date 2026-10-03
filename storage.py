@@ -455,6 +455,14 @@ def init_db() -> None:
         # Разовая рассылка «удалённые сообщения теперь только по Premium»
         # (main.py: /broadcast_deleted_paywall) — тот же паттерн.
         _add_column_if_missing(conn, "users", "deleted_paywall_broadcast_sent", "INTEGER NOT NULL DEFAULT 0")
+        # Бонусные попытки к базовому бесплатному лимиту (FREE_TRIAL_REQUESTS/1/1)
+        # — замена рефералки/промо-канала, раньше выдававших временное окно
+        # полного Premium (deep_analysis_free_until/promo_channel_premium_until
+        # выше). Суммируются из обоих источников (подписка на канал разово,
+        # рефералка за каждого друга) — не нужно помнить, откуда взялся бонус.
+        _add_column_if_missing(conn, "users", "reply_trial_bonus", "INTEGER NOT NULL DEFAULT 0")
+        _add_column_if_missing(conn, "users", "analysis_trial_bonus", "INTEGER NOT NULL DEFAULT 0")
+        _add_column_if_missing(conn, "users", "date_trial_bonus", "INTEGER NOT NULL DEFAULT 0")
 
         # Индексы под горячие выборки (пересборка карточек, чтение истории)
         _create_index_if_missing(
@@ -717,37 +725,125 @@ def increment_trial_used(telegram_id: str) -> None:
         )
 
 
-def get_analysis_trial_used(telegram_id: str) -> bool:
-    """Использован ли одноразовый бесплатный пробник «Анализ собеседника»
-    (отдельно от users.trial_used — счётчика «Ответ с CueMe»)."""
+# get_analysis_trial_used/get_date_trial_used — было флагом 0/1 (одна
+# бесплатная попытка на весь аккаунт), заменено на счётчик использований
+# (get_analysis_trial_count/get_date_trial_count), т.к. лимит теперь
+# "1 + бонус" (см. REFERRAL_*_BONUS/PROMO_CHANNEL_*_BONUS в config.py) —
+# колонки те же (тип уже был INTEGER), просто другая семантика значения.
+# Оставлено закомментированным на случай отката.
+# def get_analysis_trial_used(telegram_id: str) -> bool:
+#     with _conn() as conn:
+#         row = conn.execute(
+#             "SELECT analysis_trial_used FROM users WHERE telegram_id = ?", (telegram_id,)
+#         ).fetchone()
+#     return bool(row["analysis_trial_used"]) if row else False
+
+
+def get_analysis_trial_count(telegram_id: str) -> int:
+    """Сколько раз уже использован бесплатный «Анализ собеседника» (база —
+    1 попытка, + бонус за рефералку/промо-канал, см. get_analysis_trial_bonus)."""
     with _conn() as conn:
         row = conn.execute(
             "SELECT analysis_trial_used FROM users WHERE telegram_id = ?", (telegram_id,)
         ).fetchone()
-    return bool(row["analysis_trial_used"]) if row else False
+    return row["analysis_trial_used"] if row else 0
 
 
 def mark_analysis_trial_used(telegram_id: str) -> None:
     with _conn() as conn:
         conn.execute(
-            "UPDATE users SET analysis_trial_used = 1 WHERE telegram_id = ?", (telegram_id,)
+            "UPDATE users SET analysis_trial_used = analysis_trial_used + 1 WHERE telegram_id = ?",
+            (telegram_id,),
         )
 
 
-def get_date_trial_used(telegram_id: str) -> bool:
-    """Использован ли одноразовый бесплатный пробник «Идеальное свидание»."""
+# def get_date_trial_used(telegram_id: str) -> bool:
+#     with _conn() as conn:
+#         row = conn.execute(
+#             "SELECT date_trial_used FROM users WHERE telegram_id = ?", (telegram_id,)
+#         ).fetchone()
+#     return bool(row["date_trial_used"]) if row else False
+
+
+def get_date_trial_count(telegram_id: str) -> int:
+    """Сколько раз уже использовано бесплатное «Идеальное свидание» (база —
+    1 попытка, + бонус за рефералку/промо-канал, см. get_date_trial_bonus)."""
     with _conn() as conn:
         row = conn.execute(
             "SELECT date_trial_used FROM users WHERE telegram_id = ?", (telegram_id,)
         ).fetchone()
-    return bool(row["date_trial_used"]) if row else False
+    return row["date_trial_used"] if row else 0
 
 
 def mark_date_trial_used(telegram_id: str) -> None:
     with _conn() as conn:
         conn.execute(
-            "UPDATE users SET date_trial_used = 1 WHERE telegram_id = ?", (telegram_id,)
+            "UPDATE users SET date_trial_used = date_trial_used + 1 WHERE telegram_id = ?",
+            (telegram_id,),
         )
+
+
+# Бонусные попытки (рефералка/промо-канал) — суммируются поверх базового
+# бесплатного лимита (FREE_TRIAL_REQUESTS/1/1), не дают полный Premium (как
+# было раньше через deep_analysis_free_until/promo_channel_premium_until).
+def add_reply_trial_bonus(telegram_id: str, amount: int) -> None:
+    with _conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO users (telegram_id, my_id, created_at, reply_trial_bonus)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(telegram_id) DO UPDATE SET reply_trial_bonus = reply_trial_bonus + excluded.reply_trial_bonus
+            """,
+            (telegram_id, f"user{telegram_id}", _now(), amount),
+        )
+
+
+def get_reply_trial_bonus(telegram_id: str) -> int:
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT reply_trial_bonus FROM users WHERE telegram_id = ?", (telegram_id,)
+        ).fetchone()
+    return row["reply_trial_bonus"] if row else 0
+
+
+def add_analysis_trial_bonus(telegram_id: str, amount: int) -> None:
+    with _conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO users (telegram_id, my_id, created_at, analysis_trial_bonus)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(telegram_id) DO UPDATE SET analysis_trial_bonus = analysis_trial_bonus + excluded.analysis_trial_bonus
+            """,
+            (telegram_id, f"user{telegram_id}", _now(), amount),
+        )
+
+
+def get_analysis_trial_bonus(telegram_id: str) -> int:
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT analysis_trial_bonus FROM users WHERE telegram_id = ?", (telegram_id,)
+        ).fetchone()
+    return row["analysis_trial_bonus"] if row else 0
+
+
+def add_date_trial_bonus(telegram_id: str, amount: int) -> None:
+    with _conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO users (telegram_id, my_id, created_at, date_trial_bonus)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(telegram_id) DO UPDATE SET date_trial_bonus = date_trial_bonus + excluded.date_trial_bonus
+            """,
+            (telegram_id, f"user{telegram_id}", _now(), amount),
+        )
+
+
+def get_date_trial_bonus(telegram_id: str) -> int:
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT date_trial_bonus FROM users WHERE telegram_id = ?", (telegram_id,)
+        ).fetchone()
+    return row["date_trial_bonus"] if row else 0
 
 
 def get_gender(telegram_id: str) -> str | None:
@@ -1496,6 +1592,24 @@ def set_promo_channel_reward(telegram_id: str, until: datetime) -> None:
                 promo_channel_reward_claimed = 1
             """,
             (telegram_id, f"user{telegram_id}", _now(), until.isoformat()),
+        )
+
+
+def mark_promo_reward_claimed(telegram_id: str) -> None:
+    """Ставит разовый anti-abuse claimed-флаг БЕЗ окна until — промо-награда
+    теперь выдаёт бонус попытками (см. main.py: add_reply_trial_bonus и
+    соседние), а не временное окно полного Premium, поэтому
+    promo_channel_premium_until больше не нужен при выдаче. Старая
+    set_promo_channel_reward (выше) не удалена физически, просто больше не
+    вызывается."""
+    with _conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO users (telegram_id, my_id, created_at, promo_channel_reward_claimed)
+            VALUES (?, ?, ?, 1)
+            ON CONFLICT(telegram_id) DO UPDATE SET promo_channel_reward_claimed = 1
+            """,
+            (telegram_id, f"user{telegram_id}", _now()),
         )
 
 

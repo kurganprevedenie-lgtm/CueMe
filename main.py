@@ -65,9 +65,13 @@ from config import (
     OPENERS_FOR_HER,
     OPENERS_FOR_HIM,
     PROMO_CHANNEL_USERNAME,
-    PROMO_CHANNEL_REWARD_DAYS,
+    PROMO_CHANNEL_REPLY_BONUS,
+    PROMO_CHANNEL_ANALYSIS_BONUS,
+    PROMO_CHANNEL_DATE_BONUS,
     REBUILD_THRESHOLD,
-    REFERRAL_REWARD_DAYS,
+    REFERRAL_REPLY_BONUS,
+    REFERRAL_ANALYSIS_BONUS,
+    REFERRAL_DATE_BONUS,
     REFRESH_SAMPLES_EVERY_N,
     REVIVE_QUESTIONS,
     SAMPLE_SIZE,
@@ -137,8 +141,14 @@ from storage import (
     get_recent_unmatched_suggestions,
     get_latest_business_connection,
     get_contact_by_id,
-    get_analysis_trial_used,
-    get_date_trial_used,
+    get_analysis_trial_count,
+    get_date_trial_count,
+    add_reply_trial_bonus,
+    get_reply_trial_bonus,
+    add_analysis_trial_bonus,
+    get_analysis_trial_bonus,
+    add_date_trial_bonus,
+    get_date_trial_bonus,
     get_deep_analysis,
     get_acquisition_source,
     get_deep_analysis_free_until,
@@ -216,6 +226,7 @@ from storage import (
     set_deep_analysis_free_until,
     set_gender,
     set_promo_channel_reward,
+    mark_promo_reward_claimed,
     set_stars_premium_until,
     has_claimed_promo_reward,
     set_llm_cache,
@@ -512,19 +523,25 @@ _premium_cache: dict[str, tuple[bool, float]] = {}  # telegram_id -> (is_premium
 async def _is_premium(bot: Bot, telegram_id: str) -> bool:
     """Проверяет членство в PREMIUM_CHANNEL_ID с кэшем на PREMIUM_CACHE_TTL сек,
     чтобы не дёргать Telegram API на каждое сообщение. Пока PREMIUM_CHANNEL_ID
-    не настроен — всегда False (только бесплатные попытки). Реферальная
-    награда (_has_referral_premium), награда за подписку на промо-канал
-    (_has_promo_channel_premium), оплата Telegram Stars (_has_stars_premium)
-    и оплата Tribute, ПОДТВЕРЖДЁННАЯ вебхуком (_has_tribute_webhook_premium)
-    дают полный Premium без похода в Telegram API — авторитетно само событие
-    оплаты, а не факт членства в канале (который может отставать/не
-    сработать на стороне Tribute, см. handle_tribute_webhook). Живая проверка
-    членства ниже остаётся фолбэком — для юзеров, оплативших ДО того, как
-    появился вебхук (тогда tribute_premium_until ещё не заполнен)."""
-    if _has_referral_premium(telegram_id):
-        return True
-    if _has_promo_channel_premium(telegram_id):
-        return True
+    не настроен — всегда False (только бесплатные попытки). Оплата Telegram
+    Stars (_has_stars_premium) и оплата Tribute, ПОДТВЕРЖДЁННАЯ вебхуком
+    (_has_tribute_webhook_premium) дают полный Premium без похода в Telegram
+    API — авторитетно само событие оплаты, а не факт членства в канале
+    (который может отставать/не сработать на стороне Tribute, см.
+    handle_tribute_webhook). Живая проверка членства ниже остаётся
+    фолбэком — для юзеров, оплативших ДО того, как появился вебхук (тогда
+    tribute_premium_until ещё не заполнен).
+
+    Реферальная награда и награда за подписку на промо-канал раньше тоже
+    были источниками полного Premium здесь (_has_referral_premium/
+    _has_promo_channel_premium) — заменены 2026-10 на бонусные попытки к
+    трём конкретным фичам (см. REFERRAL_*_BONUS/PROMO_CHANNEL_*_BONUS в
+    config.py, _has_quota/_run_deep_analysis/_run_ideal_date ниже), больше
+    не дают полный доступ. Функции-проверки не удалены физически."""
+    # if _has_referral_premium(telegram_id):
+    #     return True
+    # if _has_promo_channel_premium(telegram_id):
+    #     return True
     if _has_stars_premium(telegram_id):
         return True
     if _has_tribute_webhook_premium(telegram_id):
@@ -598,10 +615,12 @@ async def _send_paywall(target: Message, text: str, edit: bool = False) -> None:
 
 
 async def _has_quota(bot: Bot, telegram_id: str) -> bool:
-    """Есть ли доступ к генерации: premium или остались бесплатные попытки. Без списания."""
+    """Есть ли доступ к генерации: premium или остались бесплатные попытки
+    (базовый лимит FREE_TRIAL_REQUESTS + бонус за рефералку/промо-канал,
+    см. add_reply_trial_bonus). Без списания."""
     if await _is_premium(bot, telegram_id):
         return True
-    return get_trial_used(telegram_id) < FREE_TRIAL_REQUESTS
+    return get_trial_used(telegram_id) < FREE_TRIAL_REQUESTS + get_reply_trial_bonus(telegram_id)
 
 
 async def _quota_gate(bot: Bot, target: Message, telegram_id: str, edit: bool = False) -> bool:
@@ -673,8 +692,11 @@ async def _charge_feature_trial_if_needed(bot: Bot, telegram_id: str, mark_trial
 
 
 # ── Реферальная программа ─────────────────────────────────────────────────────
-# Пригласивший получает REFERRAL_REWARD_DAYS дней полной Premium-подписки за
-# КАЖДОГО друга. Два независимых пути привести друга:
+# Пригласивший получает бонусные попытки (REFERRAL_REPLY_BONUS/
+# REFERRAL_ANALYSIS_BONUS/REFERRAL_DATE_BONUS) за КАЖДОГО друга — раньше
+# это были REFERRAL_REWARD_DAYS дней полной Premium-подписки, заменено
+# 2026-10 на бонус к трём конкретным фичам (см. _is_premium/_has_quota/
+# _run_deep_analysis/_run_ideal_date). Два независимых пути привести друга:
 # 1) реферальная ССЫЛКА (/start ref<CODE>, см. cmd_start) — засчитывается и
 #    начисляется МГНОВЕННО при первом /start приглашённого, без требования
 #    Premium или подключения Автоматизации чатов — только сам факт /start.
@@ -693,43 +715,47 @@ async def _credit_referral_if_pending(bot: Bot, referred_id: str) -> None:
     зачтённого друга просто no-op (get_pending_referral вернёт None). Вызывается
     из двух мест: сразу из cmd_start (реферальная ссылка — мгновенно) и из
     business-connect/JSON-import (страховка для /redeem-кода — там начисление
-    ждёт реального первого контакта). Каждый новый друг НАКАПЛИВАЕТ
-    награду — REFERRAL_REWARD_DAYS прибавляются к уже активному окну (если
-    оно ещё не истекло), а не перезаписывают его с текущего момента.
-    Идемпотентно: credited-флаг + PRIMARY KEY(referred_id) не дают начислить
-    дважды за одного и того же друга."""
+    ждёт реального первого контакта). Каждый новый друг НАКАПЛИВАЕТ бонус —
+    add_* всегда прибавляет к уже начисленному, без верхнего предела (как и
+    раньше было с днями полного Premium). Идемпотентно: credited-флаг +
+    PRIMARY KEY(referred_id) не дают начислить дважды за одного и того же
+    друга."""
     referrer_id = get_pending_referral(referred_id)
     if not referrer_id:
         return
-    now = datetime.now(timezone.utc)
-    current_until = get_deep_analysis_free_until(referrer_id)
-    base = current_until if current_until and current_until > now else now
-    until = base + timedelta(days=REFERRAL_REWARD_DAYS)
-    set_deep_analysis_free_until(referrer_id, until)
+    add_reply_trial_bonus(referrer_id, REFERRAL_REPLY_BONUS)
+    add_analysis_trial_bonus(referrer_id, REFERRAL_ANALYSIS_BONUS)
+    add_date_trial_bonus(referrer_id, REFERRAL_DATE_BONUS)
     mark_referral_credited(referred_id)
     try:
         await bot.send_message(
             int(referrer_id),
             "🎉 Твой друг начал пользоваться CueMe! Держи подарок — "
-            f"+{REFERRAL_REWARD_DAYS} дня Premium подписки "
-            f"(до {until.strftime('%d.%m.%Y %H:%M UTC')}).",
+            f"+{REFERRAL_REPLY_BONUS} «Ответить за меня», "
+            f"+{REFERRAL_ANALYSIS_BONUS} «Анализ собеседника», "
+            f"+{REFERRAL_DATE_BONUS} «Идеальное свидание».",
         )
     except Exception:
         logging.warning("referral notify failed: referrer=%s", referrer_id)
     await _offer_pending_reveals(bot, referrer_id)
 
 
-def _has_referral_premium(telegram_id: str) -> bool:
-    """Активно ли реферальное окно полной Premium-подписки."""
-    until = get_deep_analysis_free_until(telegram_id)
-    return bool(until and until > datetime.now(timezone.utc))
-
-
-def _has_promo_channel_premium(telegram_id: str) -> bool:
-    """Активно ли окно Premium за подписку на промо-канал (PROMO_CHANNEL_USERNAME —
-    ПУБЛИЧНЫЙ канал, не путать с приватным PREMIUM_CHANNEL_ID/Tribute)."""
-    until = get_promo_channel_premium_until(telegram_id)
-    return bool(until and until > datetime.now(timezone.utc))
+# _has_referral_premium/_has_promo_channel_premium — раньше участвовали в
+# _is_premium как источники полного Premium (временное окно по until),
+# заменены 2026-10 на бонус попытками (см. _credit_referral_if_pending/
+# cb_promo_check/on_promo_channel_membership_change) — больше ниоткуда не
+# вызываются, оставлены закомментированными на случай отката.
+# def _has_referral_premium(telegram_id: str) -> bool:
+#     """Активно ли реферальное окно полной Premium-подписки."""
+#     until = get_deep_analysis_free_until(telegram_id)
+#     return bool(until and until > datetime.now(timezone.utc))
+#
+#
+# def _has_promo_channel_premium(telegram_id: str) -> bool:
+#     """Активно ли окно Premium за подписку на промо-канал (PROMO_CHANNEL_USERNAME —
+#     ПУБЛИЧНЫЙ канал, не путать с приватным PREMIUM_CHANNEL_ID/Tribute)."""
+#     until = get_promo_channel_premium_until(telegram_id)
+#     return bool(until and until > datetime.now(timezone.utc))
 
 
 def _has_stars_premium(telegram_id: str) -> bool:
@@ -789,8 +815,10 @@ async def cb_promo_offer(call: CallbackQuery) -> None:
         return
     await call.message.edit_text(
         f"Подпишись на {PROMO_CHANNEL_USERNAME} и получи "
-        f"{PROMO_CHANNEL_REWARD_DAYS} дня Premium бесплатно. Проверяем автоматически, "
-        "но если через пару минут ничего не пришло — жми «✅ Я подписался».",
+        f"+{PROMO_CHANNEL_REPLY_BONUS} «Ответить за меня», "
+        f"+{PROMO_CHANNEL_ANALYSIS_BONUS} «Анализ собеседника», "
+        f"+{PROMO_CHANNEL_DATE_BONUS} «Идеальное свидание» бесплатно. Проверяем "
+        "автоматически, но если через пару минут ничего не пришло — жми «✅ Я подписался».",
         reply_markup=_promo_offer_kb(),
     )
 
@@ -817,28 +845,20 @@ async def cb_promo_check(call: CallbackQuery, bot: Bot) -> None:
         await call.answer("Не вижу подписки — проверь и попробуй снова", show_alert=True)
         return
 
-    remaining_seconds, _ = get_promo_channel_pause(telegram_id)
-    if remaining_seconds:
-        until = datetime.now(timezone.utc) + timedelta(seconds=remaining_seconds)
-        resume_promo_channel_premium(telegram_id, until)
-        await call.answer()
-        await call.message.edit_text(
-            f"🎉 С возвращением! Оставшееся время Premium возобновлено — до {_format_until(until)}.",
-            reply_markup=_promo_back_kb(),
-        )
-        await _offer_pending_reveals(bot, telegram_id)
-        return
-
     if has_claimed_promo_reward(telegram_id):
         await call.answer("Уже получено раньше", show_alert=True)
         return
 
-    until = datetime.now(timezone.utc) + timedelta(days=PROMO_CHANNEL_REWARD_DAYS)
-    set_promo_channel_reward(telegram_id, until)
+    add_reply_trial_bonus(telegram_id, PROMO_CHANNEL_REPLY_BONUS)
+    add_analysis_trial_bonus(telegram_id, PROMO_CHANNEL_ANALYSIS_BONUS)
+    add_date_trial_bonus(telegram_id, PROMO_CHANNEL_DATE_BONUS)
+    mark_promo_reward_claimed(telegram_id)
     await call.answer()
     await call.message.edit_text(
-        f"✅ Готово! Ты подписан(а), Premium активен на {PROMO_CHANNEL_REWARD_DAYS} "
-        f"дня (до {_format_until(until)}).",
+        f"✅ Готово! Ты подписан(а) — держи подарок: "
+        f"+{PROMO_CHANNEL_REPLY_BONUS} «Ответить за меня», "
+        f"+{PROMO_CHANNEL_ANALYSIS_BONUS} «Анализ собеседника», "
+        f"+{PROMO_CHANNEL_DATE_BONUS} «Идеальное свидание».",
         reply_markup=_promo_back_kb(),
     )
     await _offer_pending_reveals(bot, telegram_id)
@@ -847,19 +867,18 @@ async def cb_promo_check(call: CallbackQuery, bot: Bot) -> None:
 @dp.chat_member()
 async def on_promo_channel_membership_change(event: ChatMemberUpdated, bot: Bot) -> None:
     """Автоматическая проверка подписки на промо-канал (PROMO_CHANNEL_USERNAME) —
-    основной путь, плюс суточная сверка на случай пропущенного апдейта
-    (_reconcile_promo_channel_premium, но она только приостанавливает —
-    новую награду не выдаёт) и ручная кнопка «✅ Я подписался» (cb_promo_check)
-    как подстраховка. Требует прав администратора бота в этом канале —
-    иначе chat_member-апдейты по нему не приходят. При is_member=True —
-    три случая:
-    1) юзер на паузе (был Premium, отписался, теперь снова подписан) —
-       возобновляем с сохранённого остатка, БЕЗ новой выдачи награды;
-    2) награда уже выдавалась когда-либо (claimed=True, паузы нет) — второй
-       раз не даём (has_claimed_promo_reward — разовый anti-abuse флаг), тихо;
-    3) первая выдача — начисляем PROMO_CHANNEL_REWARD_DAYS, ставим claimed,
-       уведомляем НОВЫМ сообщением (не правкой экрана «Подписка» — юзер к
-       этому моменту мог уйти в другой раздел меню)."""
+    основной путь, плюс ручная кнопка «✅ Я подписался» (cb_promo_check) как
+    подстраховка на случай, если это chat_member-событие не пришло. Требует
+    прав администратора бота в этом канале — иначе апдейты по нему не
+    приходят.
+
+    Награда теперь — разовый бонус попытками (не окно полного Premium), так
+    что при is_member=False тут больше нечего делать: отписка не отбирает
+    уже выданный бонус (было иначе, пока награда была time-based окном —
+    см. комментарий у pause_promo_channel_premium/resume_promo_channel_premium).
+    При is_member=True — выдаём бонус РОВНО ОДИН РАЗ (has_claimed_promo_reward —
+    разовый anti-abuse флаг), уведомляем НОВЫМ сообщением (не правкой экрана
+    «Подписка» — юзер к этому моменту мог уйти в другой раздел меню)."""
     channel_username = PROMO_CHANNEL_USERNAME.lstrip("@").lower()
     if (event.chat.username or "").lower() != channel_username:
         return
@@ -871,28 +890,16 @@ async def on_promo_channel_membership_change(event: ChatMemberUpdated, bot: Bot)
         return
 
     if not is_member:
-        until = get_promo_channel_premium_until(telegram_id)
-        if not until:
-            return
-        remaining = (until - datetime.now(timezone.utc)).total_seconds()
-        if remaining > 0:
-            pause_promo_channel_premium(telegram_id, int(remaining))
-            await _notify_promo_premium_paused(bot, telegram_id)
-        return
-
-    remaining_seconds, _ = get_promo_channel_pause(telegram_id)
-    if remaining_seconds:
-        until = datetime.now(timezone.utc) + timedelta(seconds=remaining_seconds)
-        resume_promo_channel_premium(telegram_id, until)
-        await _notify_promo_premium_resumed(bot, telegram_id, until)
         return
 
     if has_claimed_promo_reward(telegram_id):
         return
 
-    until = datetime.now(timezone.utc) + timedelta(days=PROMO_CHANNEL_REWARD_DAYS)
-    set_promo_channel_reward(telegram_id, until)
-    await _notify_promo_reward_granted(bot, telegram_id, until)
+    add_reply_trial_bonus(telegram_id, PROMO_CHANNEL_REPLY_BONUS)
+    add_analysis_trial_bonus(telegram_id, PROMO_CHANNEL_ANALYSIS_BONUS)
+    add_date_trial_bonus(telegram_id, PROMO_CHANNEL_DATE_BONUS)
+    mark_promo_reward_claimed(telegram_id)
+    await _notify_promo_reward_granted(bot, telegram_id)
 
 
 _PROMO_PAUSED_TEXT = (
@@ -900,27 +907,36 @@ _PROMO_PAUSED_TEXT = (
     "приостановили ваш пробный Premium-период. Чтобы возобновить его — "
     "подпишитесь обратно, и оставшееся время вернётся."
 )
+# ^ больше не используется (см. _notify_promo_premium_paused ниже) — оставлен
+# как есть вместе с функцией, которая его показывала, на случай отката.
 
 
-async def _notify_promo_premium_paused(bot: Bot, telegram_id: str) -> None:
-    """Уведомляет юзера о приостановке промо-Premium из-за отписки от канала.
-    Молча глотает ошибку отправки (юзер мог заблокировать бота) — постановка
-    на паузу уже применена и не зависит от того, дошло ли уведомление."""
-    try:
-        await bot.send_message(int(telegram_id), _PROMO_PAUSED_TEXT)
-    except Exception:
-        logging.warning("promo premium pause notify failed: telegram_id=%s", telegram_id)
+# _notify_promo_premium_paused/_notify_promo_premium_resumed — были
+# актуальны для time-based окна Premium (пауза на отписку/возобновление на
+# повторную подписку); с переходом на разовый бонус попытками (2026-10)
+# отписка/подписка больше не паузит и не возобновляет уже выданный бонус,
+# см. on_promo_channel_membership_change выше. Не удалены физически.
+# async def _notify_promo_premium_paused(bot: Bot, telegram_id: str) -> None:
+#     """Уведомляет юзера о приостановке промо-Premium из-за отписки от канала.
+#     Молча глотает ошибку отправки (юзер мог заблокировать бота) — постановка
+#     на паузу уже применена и не зависит от того, дошло ли уведомление."""
+#     try:
+#         await bot.send_message(int(telegram_id), _PROMO_PAUSED_TEXT)
+#     except Exception:
+#         logging.warning("promo premium pause notify failed: telegram_id=%s", telegram_id)
 
 
-async def _notify_promo_reward_granted(bot: Bot, telegram_id: str, until: datetime) -> None:
-    """Уведомляет о ПЕРВОЙ выдаче промо-Premium после автоматически
+async def _notify_promo_reward_granted(bot: Bot, telegram_id: str) -> None:
+    """Уведомляет о ПЕРВОЙ выдаче промо-награды после автоматически
     подтверждённой подписки — отдельным НОВЫМ сообщением (не правкой экрана
     «Подписка»: асинхронное событие, юзер мог уже уйти в другой раздел
     меню). Молча глотает ошибку отправки — награда уже начислена
     независимо от того, дошло ли уведомление."""
     text = (
-        f"✅ Готово! Ты подписан(а), Premium активен на {PROMO_CHANNEL_REWARD_DAYS} "
-        f"дня (до {_format_until(until)})."
+        f"✅ Готово! Ты подписан(а) — держи подарок: "
+        f"+{PROMO_CHANNEL_REPLY_BONUS} «Ответить за меня», "
+        f"+{PROMO_CHANNEL_ANALYSIS_BONUS} «Анализ собеседника», "
+        f"+{PROMO_CHANNEL_DATE_BONUS} «Идеальное свидание»."
     )
     try:
         await bot.send_message(int(telegram_id), text)
@@ -929,15 +945,15 @@ async def _notify_promo_reward_granted(bot: Bot, telegram_id: str, until: dateti
     await _offer_pending_reveals(bot, telegram_id)
 
 
-async def _notify_promo_premium_resumed(bot: Bot, telegram_id: str, until: datetime) -> None:
-    """Уведомляет о возобновлении промо-Premium после повторной подписки
-    (юзер был на паузе) — тоже отдельное новое сообщение."""
-    text = f"🎉 С возвращением! Оставшееся время Premium возобновлено — до {_format_until(until)}."
-    try:
-        await bot.send_message(int(telegram_id), text)
-    except Exception:
-        logging.warning("promo premium resume notify failed: telegram_id=%s", telegram_id)
-    await _offer_pending_reveals(bot, telegram_id)
+# async def _notify_promo_premium_resumed(bot: Bot, telegram_id: str, until: datetime) -> None:
+#     """Уведомляет о возобновлении промо-Premium после повторной подписки
+#     (юзер был на паузе) — тоже отдельное новое сообщение."""
+#     text = f"🎉 С возвращением! Оставшееся время Premium возобновлено — до {_format_until(until)}."
+#     try:
+#         await bot.send_message(int(telegram_id), text)
+#     except Exception:
+#         logging.warning("promo premium resume notify failed: telegram_id=%s", telegram_id)
+#     await _offer_pending_reveals(bot, telegram_id)
 
 
 _PREMIUM_EXPIRY_REMINDER_WINDOW = (timedelta(hours=24), timedelta(hours=48))
@@ -1455,24 +1471,26 @@ async def _reconcile_promo_channel_premium(bot: Bot) -> None:
         if tick % ticks_per_day != 0:
             continue
 
-        try:
-            for telegram_id in get_users_with_active_promo_premium():
-                until = get_promo_channel_premium_until(telegram_id)
-                if not until or until <= datetime.now(timezone.utc):
-                    continue
-                try:
-                    member = await bot.get_chat_member(PROMO_CHANNEL_USERNAME, int(telegram_id))
-                    subscribed = member.status in ("member", "administrator", "creator")
-                except Exception:
-                    continue
-                if subscribed:
-                    continue
-                remaining = (until - datetime.now(timezone.utc)).total_seconds()
-                if remaining > 0:
-                    pause_promo_channel_premium(telegram_id, int(remaining))
-                    await _notify_promo_premium_paused(bot, telegram_id)
-        except Exception:
-            logging.exception("promo channel reconciliation pass failed")
+        # Суточная сверка промо-Premium (pause на отписку по until-окну) — была
+        # актуальна для time-based окна Premium; с переходом на бонус-попытки
+        # (2026-10) отписка/подписка больше не паузит и не возобновляет уже
+        # выданный бонус, сверять нечего. Закомментировано, не удалено.
+        # try:
+        #     for telegram_id in get_users_with_active_promo_premium():
+        #         until = get_promo_channel_premium_until(telegram_id)
+        #         if not until or until <= datetime.now(timezone.utc):
+        #             continue
+        #         try:
+        #             member = await bot.get_chat_member(PROMO_CHANNEL_USERNAME, int(telegram_id))
+        #             subscribed = member.status in ("member", "administrator", "creator")
+        #         except Exception:
+        #             continue
+        #         if subscribed:
+        #             continue
+        #         remaining = (until - datetime.now(timezone.utc)).total_seconds()
+        #         if remaining > 0:
+        #             pause_promo_channel_premium(telegram_id, int(remaining))
+        #             await _notify_promo_premium_paused(bot, telegram_id)
 
         try:
             await _check_premium_expiry_reminders(bot)
@@ -1845,18 +1863,13 @@ async def _invite_text(bot: Bot, telegram_id: str) -> tuple[str, str]:
     count = count_successful_referrals(telegram_id)
     link = await _referral_link(bot, code)
 
-    if _has_referral_premium(telegram_id):
-        until = get_deep_analysis_free_until(telegram_id)
-        reward_line = f"✅ Premium подписка (по рефералам) активна до {until.strftime('%d.%m.%Y %H:%M UTC')}\n"
-    else:
-        reward_line = ""
-
     text = (
         "🎁 Пригласи друга\n\n"
-        f"👥 Приведено друзей: {count}\n"
-        f"{reward_line}\n"
-        f"Пригласи друга по ссылке — получи {REFERRAL_REWARD_DAYS} дня Premium "
-        "сразу, как только он запустит бота. Без ограничений по количеству друзей:\n\n"
+        f"👥 Приведено друзей: {count}\n\n"
+        f"Пригласи друга по ссылке — получи +{REFERRAL_REPLY_BONUS} «Ответить за "
+        f"меня», +{REFERRAL_ANALYSIS_BONUS} «Анализ собеседника», "
+        f"+{REFERRAL_DATE_BONUS} «Идеальное свидание» сразу, как только он запустит "
+        "бота. Без ограничений по количеству друзей:\n\n"
         f"{link}"
     )
     return text, link
@@ -2374,10 +2387,14 @@ async def cmd_myref(message: Message) -> None:
     count = count_successful_referrals(telegram_id)
     lines = ["🎁 Награда за рефералов:\n"]
 
-    if _has_referral_premium(telegram_id):
-        until = get_deep_analysis_free_until(telegram_id)
-        until_str = until.strftime("%d.%m.%Y %H:%M UTC")
-        lines.append(f"✅ Premium подписка — активна до {until_str}")
+    reply_bonus = get_reply_trial_bonus(telegram_id)
+    analysis_bonus = get_analysis_trial_bonus(telegram_id)
+    date_bonus = get_date_trial_bonus(telegram_id)
+    if reply_bonus or analysis_bonus or date_bonus:
+        lines.append(
+            f"✅ Бонусные попытки: +{reply_bonus} «Ответить за меня», "
+            f"+{analysis_bonus} «Анализ собеседника», +{date_bonus} «Идеальное свидание»"
+        )
     else:
         lines.append("⏳ Активной награды нет — пригласи друга через /invite")
 
@@ -3832,8 +3849,9 @@ async def _run_deep_analysis(
     # только в этом случае под полным результатом добавляется CTA-строка к
     # подписке (deep_analysis_free_trial_result_kb), см. п.2 конверсии.
     is_premium = await _is_premium(bot, telegram_id)
-    trial_used_before = get_analysis_trial_used(telegram_id)
-    full_access = is_premium or not trial_used_before
+    analysis_used = get_analysis_trial_count(telegram_id)
+    analysis_limit = 1 + get_analysis_trial_bonus(telegram_id)
+    full_access = is_premium or analysis_used < analysis_limit
     is_free_trial_result = full_access and not is_premium
 
     contact = get_contact_by_id(contact_id)
@@ -4098,8 +4116,9 @@ async def _run_ideal_date(
     # «Видимый» пейволл вместо блокировки на входе — см. коммент у
     # _run_deep_analysis, та же схема: full_access решает рендер, не вход.
     is_premium = await _is_premium(bot, telegram_id)
-    trial_used_before = get_date_trial_used(telegram_id)
-    full_access = is_premium or not trial_used_before
+    date_used = get_date_trial_count(telegram_id)
+    date_limit = 1 + get_date_trial_bonus(telegram_id)
+    full_access = is_premium or date_used < date_limit
     is_free_trial_result = full_access and not is_premium
 
     contact = get_contact_by_id(contact_id)
@@ -8128,7 +8147,8 @@ async def _show_help(message: Message, edit: bool = False) -> None:
         "<b>💐 Идеальное свидание</b> (кнопка в меню) — идея свидания и подарков под человека\n\n"
         "<b>👑 Подписка</b> (кнопка в меню) — статус подписки + "
         f"🎁 Пригласить друга (/invite) — получить свой код, за друга по коду дадим "
-        f"{REFERRAL_REWARD_DAYS} дня Premium подписки\n\n"
+        f"+{REFERRAL_REPLY_BONUS} «Ответить за меня», +{REFERRAL_ANALYSIS_BONUS} "
+        f"«Анализ собеседника», +{REFERRAL_DATE_BONUS} «Идеальное свидание»\n\n"
         "<b>⚙️ Аккаунт</b>\n"
         "/contacts — список загруженных чатов\n"
         "/connect — как подключить Автоматизацию чатов (живой поток переписки)\n"
@@ -8207,25 +8227,30 @@ def _premium_expiry_info(telegram_id: str) -> tuple[str, datetime | None, bool]:
     точка правды и для текста, и для экспорта.
 
     Порядок проверки — тот же приоритет, что уже использует _is_premium
-    (реферал → промо-канал → Stars → Tribute-вебхук → членство в канале
-    Tribute): источник "tribute" с until=None возвращается, только если
-    НИКАКОГО активного окна нет вообще — это ПОДРАЗУМЕВАЕТ, что
-    _is_premium(telegram_id) уже True (иначе Premium вообще нет, вызывать
-    не нужно), а значит юзер состоит в канале, просто дата окончания
-    неизвестна (оплатил ДО появления Tribute-вебхука — see
-    tribute_premium_until). Если вебхук подтверждал оплату — until известен
-    и "tribute" возвращается с реальной датой. is_subscription — True
-    только для Stars-тарифа "месяц" (нативная подписка с автопродлением),
-    иначе False."""
+    (Stars → Tribute-вебхук → членство в канале Tribute): источник "tribute"
+    с until=None возвращается, только если НИКАКОГО активного окна нет
+    вообще — это ПОДРАЗУМЕВАЕТ, что _is_premium(telegram_id) уже True
+    (иначе Premium вообще нет, вызывать не нужно), а значит юзер состоит в
+    канале, просто дата окончания неизвестна (оплатил ДО появления
+    Tribute-вебхука — see tribute_premium_until). Если вебхук подтверждал
+    оплату — until известен и "tribute" возвращается с реальной датой.
+    is_subscription — True только для Stars-тарифа "месяц" (нативная
+    подписка с автопродлением), иначе False.
+
+    Источники "referral"/"promo_channel" раньше тоже были веткой здесь —
+    убраны 2026-10 вместе с _has_referral_premium/_has_promo_channel_premium
+    из _is_premium (замена на бонус попытками, см. комментарий там): они
+    никогда не вернутся, т.к. эта функция вызывается только когда
+    _is_premium уже True. Не удалены физически."""
     now = datetime.now(timezone.utc)
 
-    until = get_deep_analysis_free_until(telegram_id)
-    if until and until > now:
-        return "referral", until, False
-
-    until = get_promo_channel_premium_until(telegram_id)
-    if until and until > now:
-        return "promo_channel", until, False
+    # until = get_deep_analysis_free_until(telegram_id)
+    # if until and until > now:
+    #     return "referral", until, False
+    #
+    # until = get_promo_channel_premium_until(telegram_id)
+    # if until and until > now:
+    #     return "promo_channel", until, False
 
     until = get_stars_premium_until(telegram_id)
     if until and until > now:
@@ -8245,16 +8270,18 @@ def _premium_expiry_line(telegram_id: str) -> str:
     now = datetime.now(timezone.utc)
     source, until, is_subscription = _premium_expiry_info(telegram_id)
 
-    if source == "referral":
-        return (
-            f"🎁 Реферальная награда — действует до {_format_until(until)} "
-            f"(осталось {_format_remaining(until - now)})."
-        )
-    if source == "promo_channel":
-        return (
-            f"📢 Награда за подписку на канал — действует до {_format_until(until)} "
-            f"(осталось {_format_remaining(until - now)})."
-        )
+    # "referral"/"promo_channel" никогда не вернутся из _premium_expiry_info
+    # (см. комментарий там) — ветки оставлены закомментированными.
+    # if source == "referral":
+    #     return (
+    #         f"🎁 Реферальная награда — действует до {_format_until(until)} "
+    #         f"(осталось {_format_remaining(until - now)})."
+    #     )
+    # if source == "promo_channel":
+    #     return (
+    #         f"📢 Награда за подписку на канал — действует до {_format_until(until)} "
+    #         f"(осталось {_format_remaining(until - now)})."
+    #     )
     if source == "stars":
         if is_subscription:
             return (

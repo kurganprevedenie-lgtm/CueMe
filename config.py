@@ -204,18 +204,38 @@ TRIBUTE_CHANNEL_ID = os.getenv("TRIBUTE_CHANNEL_ID", "")
 # Сколько бесплатных генераций (Ответить за меня/По скриншоту) даём
 # до пейволла. Остальные функции (анализ собеседника и т.п.) только по подписке.
 FREE_TRIAL_REQUESTS = int(os.getenv("FREE_TRIAL_REQUESTS", "5"))
+
+# Бонусные попытки к трём фичам (Ответить за меня/Анализ собеседника/
+# Идеальное свидание) — начисляются поверх базового бесплатного лимита
+# (FREE_TRIAL_REQUESTS/1/1) за рефералку и за подписку на промо-канал.
+# Заменяют REFERRAL_REWARD_DAYS/PROMO_CHANNEL_REWARD_DAYS (см. ниже) —
+# раньше оба источника давали временное окно ПОЛНОГО Premium, теперь дают
+# ограниченный набор попыток, не трогая платную подписку (Stars/Tribute,
+# та остаётся полностью безлимитной).
+PROMO_CHANNEL_REPLY_BONUS = int(os.getenv("PROMO_CHANNEL_REPLY_BONUS", "15"))
+PROMO_CHANNEL_ANALYSIS_BONUS = int(os.getenv("PROMO_CHANNEL_ANALYSIS_BONUS", "3"))
+PROMO_CHANNEL_DATE_BONUS = int(os.getenv("PROMO_CHANNEL_DATE_BONUS", "3"))
+REFERRAL_REPLY_BONUS = int(os.getenv("REFERRAL_REPLY_BONUS", "15"))
+REFERRAL_ANALYSIS_BONUS = int(os.getenv("REFERRAL_ANALYSIS_BONUS", "3"))
+REFERRAL_DATE_BONUS = int(os.getenv("REFERRAL_DATE_BONUS", "3"))
+
 # Кэш проверки членства в канале (сек) — не дёргать Telegram API на каждое сообщение.
 PREMIUM_CACHE_TTL = int(os.getenv("PREMIUM_CACHE_TTL", "300"))
-# Реферальная награда: сколько дней безлимитного «Анализа собеседника» получает
-# пригласивший, когда его друг реально начинает пользоваться ботом.
-REFERRAL_REWARD_DAYS = int(os.getenv("REFERRAL_REWARD_DAYS", "3"))
+# Реферальная награда: сколько дней безлимитного «Анализа собеседника» получал
+# пригласивший, когда его друг реально начинал пользоваться ботом — заменено
+# 2026-10 на бонус попытками (REFERRAL_REPLY_BONUS/REFERRAL_ANALYSIS_BONUS/
+# REFERRAL_DATE_BONUS выше), не на дни полного Premium. Не удалено физически —
+# на случай отката.
+# REFERRAL_REWARD_DAYS = int(os.getenv("REFERRAL_REWARD_DAYS", "3"))
 
 # Третий способ получить временный Premium — подписка на ПУБЛИЧНЫЙ промо-канал.
 # ЭТО НЕ PREMIUM_CHANNEL_ID (тот — приватный канал-пропуск Tribute, платный,
 # отдельная механика) — разные каналы, разная логика проверки, не путать.
 # Награда даётся ОДИН раз за всё время (see promo_channel_reward_claimed в БД).
 PROMO_CHANNEL_USERNAME = os.getenv("PROMO_CHANNEL_USERNAME", "@CueMee")
-PROMO_CHANNEL_REWARD_DAYS = int(os.getenv("PROMO_CHANNEL_REWARD_DAYS", "3"))
+# Заменено 2026-10 на бонус попытками (PROMO_CHANNEL_*_BONUS выше), не на дни
+# полного Premium — см. пояснение у REFERRAL_REWARD_DAYS. Не удалено физически.
+# PROMO_CHANNEL_REWARD_DAYS = int(os.getenv("PROMO_CHANNEL_REWARD_DAYS", "3"))
 
 # Второй способ оплаты — Telegram Stars (XTR), параллельно Tribute, НЕ через
 # членство в приватном канале-пропуске: своё независимое окно Premium
