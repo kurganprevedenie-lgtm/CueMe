@@ -4946,10 +4946,12 @@ def business_connect_kb() -> InlineKeyboardMarkup:
     ])
 
 
-def demo_teaser_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Использовать бота", callback_data="onb:show_connect")],
-    ])
+# demo_teaser_kb — клавиатура под убранным демо-тизером, см. комментарий у
+# DEMO_TEASER_TEXT ниже. Не удалена физически.
+# def demo_teaser_kb() -> InlineKeyboardMarkup:
+#     return InlineKeyboardMarkup(inline_keyboard=[
+#         [InlineKeyboardButton(text="Использовать бота", callback_data="onb:show_connect")],
+#     ])
 
 
 async def _send_business_connect_prompt_to(
@@ -5024,14 +5026,20 @@ async def handle_photo(message: Message) -> None:
     )
 
 
-DEMO_TEASER_TEXT = (
-    f"👋 Привет! Я <b>{APP_NAME}</b> — подскажу, что ответить в переписке.\n\n"
-    "Тебе пишут:\n"
-    "<blockquote>«ты сегодня какой-то подозрительно долго не писал, случайно "
-    "не заскучал по мне? 😏»</blockquote>\n\n"
-    f"{APP_NAME} за секунды предложит ответ в твоём стиле:\n"
-    "<blockquote>«заскучал, да. а что, хочешь это исправить?)))»</blockquote>"
-)
+# DEMO_TEASER_TEXT/demo_teaser_kb/cb_onboarding_show_connect — убраны по
+# прямому запросу: первый экран для нового юзера был демо-примером ответа
+# с кнопкой «Использовать бота», сначала показывал ЗАЧЕМ подключать и
+# только по тапу вёл к инструкции подключения. Теперь _send_start_menu
+# сразу ведёт на инструкцию подключения (тот же текст/фото, что раньше
+# показывались после тапа) — лишний экран убран. Не удалено физически.
+# DEMO_TEASER_TEXT = (
+#     f"👋 Привет! Я <b>{APP_NAME}</b> — подскажу, что ответить в переписке.\n\n"
+#     "Тебе пишут:\n"
+#     "<blockquote>«ты сегодня какой-то подозрительно долго не писал, случайно "
+#     "не заскучал по мне? 😏»</blockquote>\n\n"
+#     f"{APP_NAME} за секунды предложит ответ в твоём стиле:\n"
+#     "<blockquote>«заскучал, да. а что, хочешь это исправить?)))»</blockquote>"
+# )
 
 
 async def _send_start_menu(message: Message, telegram_id: str) -> None:
@@ -5039,26 +5047,26 @@ async def _send_start_menu(message: Message, telegram_id: str) -> None:
         await _send_main_menu(message)
         return
 
-    # Первый экран для нового юзера — демо-пример ответа, а не сразу
-    # инструкция по подключению: сначала показать, ЗАЧЕМ подключать.
-    # Инструкция (welcome_text + фото) переехала в cb_onboarding_show_connect
-    # — по тапу «Использовать бота» демо удаляется и на его месте появляется она.
-    await message.answer(DEMO_TEASER_TEXT, parse_mode="HTML", reply_markup=demo_teaser_kb())
+    # Демо-тизер убран — сразу показываем инструкцию по подключению
+    # (раньше была за тапом «Использовать бота», см. комментарий у
+    # DEMO_TEASER_TEXT выше).
+    welcome_text = await _connect_steps_blockquote(message.bot)
+    await _send_business_connect_prompt(message, welcome_text, parse_mode="HTML")
 
 
-@dp.callback_query(F.data == "onb:show_connect")
-async def cb_onboarding_show_connect(call: CallbackQuery, bot: Bot) -> None:
-    await call.answer()
-    try:
-        await call.message.delete()
-    except Exception:
-        pass
-    welcome_text = await _connect_steps_blockquote(bot)
-    # Фото-инструкция крепится caption'ом, приоритет файл на диске
-    # (ONBOARDING_PHOTO_PATH) → file_id → голый текст — см.
-    # _send_business_connect_prompt. Больше НИЧЕГО следом не шлём —
-    # намеренно, чтобы не отвлекать от единственного действия (подключить).
-    await _send_business_connect_prompt(call.message, welcome_text, parse_mode="HTML")
+# @dp.callback_query(F.data == "onb:show_connect")
+# async def cb_onboarding_show_connect(call: CallbackQuery, bot: Bot) -> None:
+#     await call.answer()
+#     try:
+#         await call.message.delete()
+#     except Exception:
+#         pass
+#     welcome_text = await _connect_steps_blockquote(bot)
+#     # Фото-инструкция крепится caption'ом, приоритет файл на диске
+#     # (ONBOARDING_PHOTO_PATH) → file_id → голый текст — см.
+#     # _send_business_connect_prompt. Больше НИЧЕГО следом не шлём —
+#     # намеренно, чтобы не отвлекать от единственного действия (подключить).
+#     await _send_business_connect_prompt(call.message, welcome_text, parse_mode="HTML")
 
 
 @dp.message(CommandStart())
