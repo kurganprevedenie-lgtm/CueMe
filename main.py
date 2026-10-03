@@ -61,6 +61,8 @@ from config import (
     LLM_CACHE_TTL_SEC,
     ONBOARDING_PHOTO_FILE_ID,
     ONBOARDING_PHOTO_PATH,
+    MAIN_MENU_LOGO_FILE_ID,
+    MAIN_MENU_LOGO_PATH,
     ONBOARDING_JSON_POST_URL,
     OPENERS_FOR_HER,
     OPENERS_FOR_HIM,
@@ -2448,7 +2450,11 @@ async def _send_main_menu(target: Message, edit: bool = False) -> None:
     """Экран главного меню — общий для /menu, кнопки «⬅️ Вернуться в меню»
     под результатами генерации и возврата «⬅️ Назад» из «👑 Подписка».
     edit=True (Назад из Подписки) — редактирует ТО ЖЕ сообщение (та же
-    механика, что и у самой Подписки). edit=False — новое сообщение.
+    механика, что и у самой Подписки). edit=False — новое сообщение, с
+    логотипом (MAIN_MENU_LOGO_*), если он настроен. Для edit=True логотипа
+    нет намеренно: edit_text не может превратить текстовое сообщение в фото.
+    Обратное тоже нельзя — поэтому кнопки, которые редактируют меню на
+    месте, сначала подменяют фото-меню текстовым (_menu_screen_target).
 
     target.chat.id — telegram_id юзера в обоих случаях (личный чат с ботом,
     chat.id == user id даже когда target это call.message, чей from_user —
@@ -2474,7 +2480,40 @@ async def _send_main_menu(target: Message, edit: bool = False) -> None:
     if edit:
         await target.edit_text(_MAIN_MENU_TEXT, reply_markup=main_menu_kb())
     else:
-        await target.answer(_MAIN_MENU_TEXT, reply_markup=main_menu_kb())
+        # Логотип — только для НОВОГО сообщения (edit_text не может превратить
+        # текст в фото, см. коммент у функции). Тот же приоритет путей, что и
+        # у онбординг-фото: файл на диске → file_id → голый текст.
+        photo_path = Path(MAIN_MENU_LOGO_PATH) if MAIN_MENU_LOGO_PATH else None
+        if photo_path and photo_path.is_file():
+            await target.answer_photo(
+                photo=FSInputFile(photo_path),
+                caption=_MAIN_MENU_TEXT,
+                reply_markup=main_menu_kb(),
+            )
+        elif MAIN_MENU_LOGO_FILE_ID:
+            await target.answer_photo(
+                photo=MAIN_MENU_LOGO_FILE_ID,
+                caption=_MAIN_MENU_TEXT,
+                reply_markup=main_menu_kb(),
+            )
+        else:
+            await target.answer(_MAIN_MENU_TEXT, reply_markup=main_menu_kb())
+
+
+async def _menu_screen_target(msg: Message) -> Message:
+    """Экраны, открываемые из главного меню на месте (Подписка, Анализ,
+    Свидание, Поддержка), редактируют сообщение через edit_text — на
+    фото-меню (с логотипом) это падает: фото нельзя превратить в текст.
+    Тогда вместо фото-меню ставим текстовое сообщение-заглушку и
+    возвращаем его — дальше экран редактирует уже его, как раньше."""
+    if not msg.photo:
+        return msg
+    placeholder = await msg.answer(_PROGRESS_FRAMES[0])
+    try:
+        await msg.delete()
+    except Exception:
+        logging.warning("menu photo delete failed: chat=%s", msg.chat.id)
+    return placeholder
 
 
 @dp.message(Command("menu"))
@@ -2495,11 +2534,11 @@ async def cb_main_menu_action(call: CallbackQuery, state: FSMContext, bot: Bot) 
     if action == "unified":
         await _start_unified_reply(call.message, state)
     elif action == "deep":
-        await _show_deep_analysis(call.message, bot, telegram_id, edit=True)
+        await _show_deep_analysis(await _menu_screen_target(call.message), bot, telegram_id, edit=True)
     elif action == "date":
-        await _show_ideal_date(call.message, bot, telegram_id, edit=True)
+        await _show_ideal_date(await _menu_screen_target(call.message), bot, telegram_id, edit=True)
     elif action == "support":
-        await _show_help(call.message, edit=True)
+        await _show_help(await _menu_screen_target(call.message), edit=True)
 
 
 _BACK_TO_MENU_BUTTON = InlineKeyboardButton(text="⬅️ Вернуться в меню", callback_data="back_to_menu")
@@ -8364,7 +8403,7 @@ async def cb_show_premium(call: CallbackQuery, bot: Bot) -> None:
     """Тоже служит «⬅️ Назад» из «👥 Реферальная система» в «👑 Подписка» —
     редактирует то же сообщение (invite_kb() ведёт сюда же)."""
     await call.answer()
-    await _show_premium_screen(call.message, bot, str(call.from_user.id), edit=True)
+    await _show_premium_screen(await _menu_screen_target(call.message), bot, str(call.from_user.id), edit=True)
 
 
 @dp.callback_query(F.data == "show_invite")

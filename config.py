@@ -72,6 +72,12 @@ TEST_ACCOUNT_USERNAMES = {u.strip().lstrip("@").lower() for u in _test_usernames
 ONBOARDING_PHOTO_PATH = os.getenv("ONBOARDING_PHOTO_PATH", "")
 ONBOARDING_PHOTO_FILE_ID = os.getenv("ONBOARDING_PHOTO_FILE_ID", "")
 
+# Логотип над главным меню (только когда меню шлётся НОВЫМ сообщением, см.
+# main.py: _send_main_menu). Те же два способа и тот же приоритет, что у
+# ONBOARDING_PHOTO_* выше: файл на сервере → file_id → без картинки.
+MAIN_MENU_LOGO_PATH = os.getenv("MAIN_MENU_LOGO_PATH", "")
+MAIN_MENU_LOGO_FILE_ID = os.getenv("MAIN_MENU_LOGO_FILE_ID", "")
+
 # Ссылка на пост в канале с инструкцией по JSON-экспорту (кнопка под подсказкой
 # «начни диалог или экспортируй JSON», когда у юзера ещё нет ни одного контакта).
 # Пока отдельного поста нет — ведёт на канал целиком.
