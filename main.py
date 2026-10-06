@@ -47,7 +47,6 @@ from config import (
     APP_NAME,
     BOT_TOKEN,
     FIRST_BUILD_THRESHOLD,
-    FREE_TRIAL_REQUESTS,
     GEMINI_API_KEY,
     GROQ_API_KEY,
     OPENROUTER_API_KEY,
@@ -617,19 +616,82 @@ async def _send_paywall(target: Message, text: str, edit: bool = False) -> None:
 
 
 async def _has_quota(bot: Bot, telegram_id: str) -> bool:
-    """Есть ли доступ к генерации: premium или остались бесплатные попытки
-    (базовый лимит FREE_TRIAL_REQUESTS + бонус за рефералку/промо-канал,
-    см. add_reply_trial_bonus). Без списания."""
+    """Есть ли доступ к генерации: premium или остались бесплатные попытки.
+    Базового лимита больше нет (был FREE_TRIAL_REQUESTS=5 безусловно) — весь
+    лимит это бонус за подписку на промо-канал/рефералку
+    (add_reply_trial_bonus). Без списания."""
     if await _is_premium(bot, telegram_id):
         return True
-    return get_trial_used(telegram_id) < FREE_TRIAL_REQUESTS + get_reply_trial_bonus(telegram_id)
+    return get_reply_trial_bonus(telegram_id) > get_trial_used(telegram_id)
 
 
-async def _quota_gate(bot: Bot, target: Message, telegram_id: str, edit: bool = False) -> bool:
-    """Проверка доступа БЕЗ списания. Если попытки кончились — показывает пейволл.
-    Списание делает _charge_trial_if_needed уже ПОСЛЕ успешной генерации."""
+def _never_unlocked(telegram_id: str, is_premium: bool) -> bool:
+    """Юзер ни разу не открывал бесплатный пул (ни подпиской на промо-канал,
+    ни рефералкой) — только ему показывается экран-гейт «подпишись на
+    канал». Кто пул уже открывал и потратил — видит обычный пейволл."""
+    if is_premium:
+        return False
+    return not (
+        get_reply_trial_bonus(telegram_id)
+        or get_analysis_trial_bonus(telegram_id)
+        or get_date_trial_bonus(telegram_id)
+    )
+
+
+# Что повторить после разблокировки для «Ответить за меня»/live-диалога —
+# у них, в отличие от анализа/свидания, нет результата в кэше до гейта
+# (гейт стоит ДО вызова LLM), поэтому на «👀 Показать» запрос честно
+# повторяется заново. Один слот на юзера (последнее заблокированное
+# действие), в памяти — после рестарта бота «Показать» попросит прислать
+# сообщение ещё раз.
+_pending_unlock: dict[int, dict] = {}
+
+_UNLOCK_GATE_FIRST_LINE = {
+    "reply": "Ответ готов, жду тебя 👀",
+    "analysis": "Анализ готов, жду тебя 👀",
+    "date": "Идея готова, жду тебя 👀",
+}
+
+
+def _unlock_gate_text(kind: str) -> str:
+    return (
+        f"{_UNLOCK_GATE_FIRST_LINE[kind]}\n\n"
+        f"Подпишись на {PROMO_CHANNEL_USERNAME} — и сразу открываешь:\n"
+        f"💬 {PROMO_CHANNEL_REPLY_BONUS} раз «Ответить за меня»\n"
+        f"🔬 {PROMO_CHANNEL_ANALYSIS_BONUS} «Анализа собеседника»\n"
+        f"💡 {PROMO_CHANNEL_DATE_BONUS} «Идеальных свидания»\n\n"
+        "Бесплатно. Один тап — и всё твоё."
+    )
+
+
+def _unlock_gate_kb(kind: str, ref: int | str) -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    b.button(text="📢 Открыть канал", url=f"https://t.me/{PROMO_CHANNEL_USERNAME.lstrip('@')}")
+    b.button(text="✅ Я подписался", callback_data=f"unlock:check:{kind}:{ref}")
+    b.button(text="⬅️ Назад", callback_data="sub:to_menu")
+    b.adjust(1)
+    return b.as_markup()
+
+
+async def _quota_gate(
+    bot: Bot, target: Message, telegram_id: str, edit: bool = False,
+    replay: dict | None = None,
+) -> bool:
+    """Проверка доступа БЕЗ списания. Если попытки кончились — пейволл.
+    Списание делает _charge_trial_if_needed уже ПОСЛЕ успешной генерации.
+    Юзеру, который пул ещё ни разу не открывал (_never_unlocked), вместо
+    пейволла — экран «подпишись на канал»; replay — что повторить после
+    разблокировки (см. cb_unlock_reveal)."""
     if await _has_quota(bot, telegram_id):
         return True
+    if _never_unlocked(telegram_id, is_premium=False):
+        if replay:
+            _pending_unlock[int(telegram_id)] = replay
+        else:
+            _pending_unlock.pop(int(telegram_id), None)
+        text, kb = _unlock_gate_text("reply"), _unlock_gate_kb("reply", 0)
+        await (target.edit_text(text, reply_markup=kb) if edit else target.answer(text, reply_markup=kb))
+        return False
     await _send_paywall(
         target,
         "Бесплатные попытки закончились — но, похоже, тебе заходит 😏 Дальше — "
@@ -864,6 +926,106 @@ async def cb_promo_check(call: CallbackQuery, bot: Bot) -> None:
         reply_markup=_promo_back_kb(),
     )
     await _offer_pending_reveals(bot, telegram_id)
+
+
+# ── Экран-гейт «подпишись на канал» (первая попытка любой из трёх фич) ───────
+# См. _quota_gate/_run_deep_analysis/_run_ideal_date — там он показывается,
+# здесь обрабатываются его кнопки. kind — reply|analysis|date, ref — contact_id
+# для analysis/date (для reply не нужен: что повторить, лежит в _pending_unlock).
+
+_UNLOCK_REVEAL_BUTTON = {
+    "reply": "👀 Показать ответ",
+    "analysis": "👀 Показать анализ",
+    "date": "👀 Показать идею",
+}
+
+
+@dp.callback_query(F.data.startswith("unlock:check:"))
+async def cb_unlock_check(call: CallbackQuery, bot: Bot) -> None:
+    """Та же реальная проверка подписки, что в cb_promo_check. Бонус —
+    только если промо-награду ещё не получали (has_claimed_promo_reward):
+    повторное нажатие или подписка, уже засчитанная автоматически
+    (on_promo_channel_membership_change), второй раз ничего не начисляют."""
+    _, _, kind, ref = call.data.split(":", 3)
+    telegram_id = str(call.from_user.id)
+
+    try:
+        member = await bot.get_chat_member(PROMO_CHANNEL_USERNAME, int(telegram_id))
+        subscribed = member.status in ("member", "administrator", "creator")
+    except Exception:
+        logging.exception("unlock check failed for %s", telegram_id)
+        subscribed = False
+    if not subscribed:
+        await call.answer("Не вижу подписки — проверь и попробуй снова", show_alert=True)
+        return
+
+    if not has_claimed_promo_reward(telegram_id):
+        add_reply_trial_bonus(telegram_id, PROMO_CHANNEL_REPLY_BONUS)
+        add_analysis_trial_bonus(telegram_id, PROMO_CHANNEL_ANALYSIS_BONUS)
+        add_date_trial_bonus(telegram_id, PROMO_CHANNEL_DATE_BONUS)
+        mark_promo_reward_claimed(telegram_id)
+
+    reply_left = max(0, get_reply_trial_bonus(telegram_id) - get_trial_used(telegram_id))
+    analysis_left = max(0, get_analysis_trial_bonus(telegram_id) - get_analysis_trial_count(telegram_id))
+    date_left = max(0, get_date_trial_bonus(telegram_id) - get_date_trial_count(telegram_id))
+
+    b = InlineKeyboardBuilder()
+    b.button(text=_UNLOCK_REVEAL_BUTTON.get(kind, "👀 Показать"), callback_data=f"unlock:reveal:{kind}:{ref}")
+    await call.answer()
+    await call.message.edit_text(
+        f"Готово ✅ Разблокировано: {reply_left} / {analysis_left} / {date_left}.",
+        reply_markup=b.as_markup(),
+    )
+
+
+@dp.callback_query(F.data.startswith("unlock:reveal:"))
+async def cb_unlock_reveal(call: CallbackQuery, state: FSMContext, bot: Bot) -> None:
+    """Анализ/свидание — уже посчитаны и лежат в кэше, просто рендерим заново
+    (теперь full_access=True). «Ответить за меня»/live — до гейта вызова LLM
+    не было, поэтому честно повторяем тот же запрос (_pending_unlock)."""
+    _, _, kind, ref = call.data.split(":", 3)
+    user_id = call.from_user.id
+    telegram_id = str(user_id)
+    await call.answer()
+
+    if kind == "analysis":
+        await _run_deep_analysis(bot, call.message, telegram_id, int(ref), edit=True)
+        return
+    if kind == "date":
+        await _run_ideal_date(bot, call.message, telegram_id, int(ref), edit=True)
+        return
+
+    replay = _pending_unlock.pop(user_id, None)
+    if not replay:
+        await call.message.edit_text("Готово ✅ Пришли сообщение ещё раз — теперь отвечу.")
+        return
+    try:
+        await call.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+
+    stale = "Контекст устарел — начни заново через «💬 Ответ с CueMe»."
+    if replay["kind"] == "reply_incoming":
+        if not (await state.get_data()).get("style_card"):
+            await call.message.answer(stale)
+            return
+        await _process_reply_incoming(call.message, state, bot, replay["incoming"], user_id)
+    elif replay["kind"] == "live_incoming":
+        await _process_live_incoming(call.message, state, bot, replay["incoming"], user_id)
+    else:
+        ctx = _get_action(user_id, replay["action_id"])
+        if not ctx:
+            await call.message.answer(stale)
+            return
+        if replay["kind"] == "variants":
+            await _run_variants_generation(
+                call.message, ctx, user_id, bot, replay["action_id"], state,
+                force_fresh=replay["force_fresh"],
+            )
+        else:
+            await _run_live_coach_step(
+                call.message, ctx, user_id, bot, replay["action_id"], force_fresh=replay["force_fresh"],
+            )
 
 
 @dp.chat_member()
@@ -1146,7 +1308,8 @@ def _funnel_reminder_content(stage: str, telegram_id: str, bond_contact: sqlite3
         text = (
             "🎁 Бот подключён и готов, осталось попробовать."
             f"{seen_line}\n\n"
-            "Первый ответ — бесплатно. Понравится — оформишь подписку, "
+            f"Подпишись на {PROMO_CHANNEL_USERNAME} — и первые {PROMO_CHANNEL_REPLY_BONUS} "
+            "ответов бесплатно. Понравится — оформишь подписку, "
             "не понравится — ничего не теряешь."
         )
         b = InlineKeyboardBuilder()
@@ -3889,7 +4052,8 @@ async def _run_deep_analysis(
     # подписке (deep_analysis_free_trial_result_kb), см. п.2 конверсии.
     is_premium = await _is_premium(bot, telegram_id)
     analysis_used = get_analysis_trial_count(telegram_id)
-    analysis_limit = 1 + get_analysis_trial_bonus(telegram_id)
+    # Базовой бесплатной попытки больше нет (было "1 +") — только бонус.
+    analysis_limit = get_analysis_trial_bonus(telegram_id)
     full_access = is_premium or analysis_used < analysis_limit
     is_free_trial_result = full_access and not is_premium
 
@@ -3931,6 +4095,15 @@ async def _run_deep_analysis(
     synthesis = data["synthesis_text"]
     advice = data["advice_text"]
     message_text = data["message_text"]
+
+    if not full_access and _never_unlocked(telegram_id, is_premium):
+        # Пул ещё ни разу не открывался — вместо тизера экран «подпишись на
+        # канал»; анализ уже посчитан и лежит в кэше, «👀 Показать» после
+        # подписки достанет его без нового вызова LLM.
+        await progress_msg.edit_text(
+            _unlock_gate_text("analysis"), reply_markup=_unlock_gate_kb("analysis", contact_id),
+        )
+        return
 
     if not full_access:
         # Пробник уже потрачен, Premium нет — «видимый» пейволл: первые 2
@@ -4156,7 +4329,8 @@ async def _run_ideal_date(
     # _run_deep_analysis, та же схема: full_access решает рендер, не вход.
     is_premium = await _is_premium(bot, telegram_id)
     date_used = get_date_trial_count(telegram_id)
-    date_limit = 1 + get_date_trial_bonus(telegram_id)
+    # Базовой бесплатной попытки больше нет (было "1 +") — только бонус.
+    date_limit = get_date_trial_bonus(telegram_id)
     full_access = is_premium or date_used < date_limit
     is_free_trial_result = full_access and not is_premium
 
@@ -4188,6 +4362,13 @@ async def _run_ideal_date(
             f"Пока маловато сообщений от {name}, чтобы зацепиться за что-то "
             f"конкретное — нужно хотя бы {IDEAL_DATE_MIN_MSGS} его сообщений "
             "(JSON-экспорт или накопление через Автоматизацию чатов)."
+        )
+        return
+
+    if not full_access and _never_unlocked(telegram_id, is_premium):
+        # См. то же место в _run_deep_analysis — идея уже в кэше.
+        await progress_msg.edit_text(
+            _unlock_gate_text("date"), reply_markup=_unlock_gate_kb("date", contact_id),
         )
         return
 
@@ -7411,7 +7592,8 @@ async def _run_variants_generation(
     progress_msg: Message | None = None
     if variants is None:
         # Реальный вызов LLM — здесь и только здесь гейт + списание.
-        if not await _quota_gate(bot, target, str(telegram_id)):
+        replay = {"kind": "variants", "action_id": action_id, "force_fresh": force_fresh}
+        if not await _quota_gate(bot, target, str(telegram_id), replay=replay):
             return
         prev = ctx.get("variants") if force_fresh else None
         # kind всегда "reply" — "screenshot" убран вместе с функцией
@@ -7512,7 +7694,8 @@ async def _process_reply_incoming(
     # Выйти из режима — любая кнопка меню (handle_menu_button сбрасывает state).
 
     contact_id = data.get("contact_id")
-    if not await _quota_gate(bot, message, telegram_id, edit=edit):
+    replay = {"kind": "reply_incoming", "incoming": incoming}
+    if not await _quota_gate(bot, message, telegram_id, edit=edit, replay=replay):
         return
 
     # «Разбор переписки» (_send_reply_analysis) здесь отключён намеренно:
@@ -7737,7 +7920,8 @@ async def _process_live_incoming(
     # Состояние НЕ сбрасываем — можно форвардить сообщения одно за другим без
     # повторного нажатия кнопки. Выйти из режима — любая кнопка меню.
 
-    if not await _quota_gate(bot, message, telegram_id):
+    replay = {"kind": "live_incoming", "incoming": incoming}
+    if not await _quota_gate(bot, message, telegram_id, replay=replay):
         return
 
     contact_id = data.get("contact_id")
@@ -7806,8 +7990,9 @@ async def _run_live_coach_step(
     running_notes = ctx.get("running_notes") or ""
     gender = get_gender(str(telegram_id))
 
+    replay = {"kind": "live_step", "action_id": action_id, "force_fresh": force_fresh}
     if force_fresh:
-        if not await _quota_gate(bot, target, str(telegram_id)):
+        if not await _quota_gate(bot, target, str(telegram_id), replay=replay):
             return
         # «Другие варианты» без выхода из диалога — БЕЗ анимации, ответ
         # показываем сразу по готовности LLM (по явному запросу), результат
@@ -7864,7 +8049,7 @@ async def _run_live_coach_step(
     # редактировать — поэтому новое сообщение, не edit.
     progress_msg: Message | None = None
     if variants is None:
-        if not await _quota_gate(bot, target, str(telegram_id)):
+        if not await _quota_gate(bot, target, str(telegram_id), replay=replay):
             return
         progress_msg = await target.answer(_PROGRESS_FRAMES[0])
         try:
@@ -8255,8 +8440,9 @@ async def _show_help(message: Message, edit: bool = False) -> None:
         "<b>🎬 Остальное</b>\n"
         "/start — начало работы\n"
         "/help — это сообщение\n\n"
-        f"💎 {FREE_TRIAL_REQUESTS} бесплатных попыток на ответ, "
-        "дальше и остальные функции — по подписке. Статус — /premium."
+        f"💎 Подпишись на {PROMO_CHANNEL_USERNAME} — бесплатно откроешь "
+        f"{PROMO_CHANNEL_REPLY_BONUS} ответов, {PROMO_CHANNEL_ANALYSIS_BONUS} анализа и "
+        f"{PROMO_CHANNEL_DATE_BONUS} идеи свидания; дальше — по подписке. Статус — /premium."
     )
     if edit:
         await message.edit_text(text, parse_mode="HTML", reply_markup=help_kb())
@@ -8407,24 +8593,43 @@ async def _premium_status_text(bot: Bot, telegram_id: str) -> str:
         expiry_line = _premium_expiry_line(telegram_id)
         return f"👑 Подписка:\n\n✅ Активна — весь функционал CueMe без ограничений.\n\n{expiry_line}"
 
-    used = get_trial_used(telegram_id)
-    left = max(0, FREE_TRIAL_REQUESTS - used)
-    if left == 0:
-        return (
-            "👑 Подписка:\n\n"
-            "❌ Не активна\n\n"
-            "⏳ Бесплатные попытки закончились — но, похоже, тебе заходит 😏\n"
-            "Дальше по подписке — весь функционал плюс полный разбор собеседника с подарками.\n\n"
-            "Чтобы получить БЕСПЛАТНУЮ подписку перейдите в раздел 🎁 Пригласи друга\n\n"
-            "Оплатили, но бот не видит подписку? Подождите пару минут и снова наберите /premium."
-        )
-    return (
-        "👑 Подписка:\n\n"
-        "❌ Не активна\n\n"
-        f"⏳ Бесплатных попыток осталось: {left} из {FREE_TRIAL_REQUESTS} \n\n"
-        "Чтобы получить БЕСПЛАТНУЮ подписку перейдите в раздел 🎁 Пригласи друга\n\n"
+    # Было «осталось N из FREE_TRIAL_REQUESTS» + «БЕСПЛАТНУЮ подписку — за
+    # друга»: базового лимита больше нет, а друг теперь даёт попытки, не
+    # подписку — оба утверждения стали неверными.
+    footer = (
+        f"Ещё попытки — за каждого друга: +{REFERRAL_REPLY_BONUS} / "
+        f"+{REFERRAL_ANALYSIS_BONUS} / +{REFERRAL_DATE_BONUS}, раздел 👥 Реферальная система.\n\n"
         "Оплатили, но бот не видит подписку? Подождите пару минут и снова наберите /premium."
     )
+    if _never_unlocked(telegram_id, is_premium=False):
+        claim_line = (
+            ""
+            if has_claimed_promo_reward(telegram_id)
+            else (
+                f"🎁 Подпишись на {PROMO_CHANNEL_USERNAME} — и бесплатно откроешь "
+                f"{PROMO_CHANNEL_REPLY_BONUS} «Ответить за меня», "
+                f"{PROMO_CHANNEL_ANALYSIS_BONUS} «Анализа собеседника», "
+                f"{PROMO_CHANNEL_DATE_BONUS} «Идеальных свидания».\n\n"
+            )
+        )
+        return f"👑 Подписка:\n\n❌ Не активна\n\n{claim_line}{footer}"
+
+    reply_left = max(0, get_reply_trial_bonus(telegram_id) - get_trial_used(telegram_id))
+    analysis_left = max(0, get_analysis_trial_bonus(telegram_id) - get_analysis_trial_count(telegram_id))
+    date_left = max(0, get_date_trial_bonus(telegram_id) - get_date_trial_count(telegram_id))
+    if not (reply_left or analysis_left or date_left):
+        left_block = (
+            "⏳ Бесплатные попытки закончились — но, похоже, тебе заходит 😏\n"
+            "Дальше по подписке — весь функционал без ограничений.\n\n"
+        )
+    else:
+        left_block = (
+            "⏳ Осталось бесплатно:\n"
+            f"💬 «Ответить за меня» — {reply_left}\n"
+            f"🔬 «Анализ собеседника» — {analysis_left}\n"
+            f"💡 «Идеальное свидание» — {date_left}\n\n"
+        )
+    return f"👑 Подписка:\n\n❌ Не активна\n\n{left_block}{footer}"
 
 
 @dp.message(Command("premium"))
