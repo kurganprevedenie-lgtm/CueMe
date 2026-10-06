@@ -23,7 +23,7 @@ from aiohttp import web
 
 from aiogram import BaseMiddleware, Bot, Dispatcher, F
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
-from aiogram.filters import Command, CommandStart
+from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -6548,16 +6548,56 @@ async def cmd_suggestion_stats(message: Message, bot: Bot) -> None:
         await message.answer("\n".join(lines))
 
 
-# ── /export — выгрузка переписок юзера в .zip (только для админа) ───────────
+# ── /export [@username | id] — выгрузка переписок юзера в .zip (только админ) ─
 # Обходит отсутствие SSH-доступа к серверу: файл прилетает прямо в Telegram.
+# Без аргумента — список кнопок по всем юзерам; с аргументом — сразу архив
+# нужного юзера.
+
+# username юзеров в БД не хранится (см. _resolve_username) — поиск по @name
+# резолвит всех через bot.get_chat, параллельно, но не больше стольких
+# запросов разом, чтобы не упереться в лимиты Telegram API.
+_EXPORT_RESOLVE_CONCURRENCY = 10
+
+
+async def _find_user_by_username(bot: Bot, users: list, username: str) -> str | None:
+    """telegram_id юзера бота с таким username (без @, без учёта регистра) или None."""
+    target = username.lstrip("@").lower()
+    sem = asyncio.Semaphore(_EXPORT_RESOLVE_CONCURRENCY)
+
+    async def resolve(tid: str) -> tuple[str, str]:
+        async with sem:
+            return tid, await _resolve_username(bot, tid)
+
+    resolved = await asyncio.gather(*(resolve(u["telegram_id"]) for u in users))
+    for tid, who in resolved:
+        if who.startswith("@") and who[1:].lower() == target:
+            return tid
+    return None
+
 
 @dp.message(Command("export"))
-async def cmd_export(message: Message, bot: Bot) -> None:
+async def cmd_export(message: Message, bot: Bot, command: CommandObject) -> None:
+    """/export — кнопки по всем юзерам; /export @username или /export <id> —
+    сразу архив этого юзера."""
     if not _is_admin(message.from_user.id):
         return
     users = list_all_users()
     if not users:
         await message.answer("Пользователей пока нет.")
+        return
+
+    arg = (command.args or "").strip()
+    if arg:
+        if arg.isdigit():
+            telegram_id = arg if any(u["telegram_id"] == arg for u in users) else None
+            not_found = f"Юзер с id {arg} не найден среди пользователей бота."
+        else:
+            telegram_id = await _find_user_by_username(bot, users, arg)
+            not_found = f"Юзер @{arg.lstrip('@')} не найден среди пользователей бота."
+        if not telegram_id:
+            await message.answer(not_found)
+            return
+        await _send_user_export(message, bot, telegram_id)
         return
 
     b = InlineKeyboardBuilder()
@@ -6576,6 +6616,13 @@ async def cb_export_user(call: CallbackQuery, bot: Bot) -> None:
         return
     telegram_id = call.data.split(":", 1)[1]
     await call.answer()
+    await _send_user_export(call.message, bot, telegram_id)
+
+
+async def _send_user_export(message: Message, bot: Bot, telegram_id: str) -> None:
+    """Собирает .zip со всеми переписками юзера (json/txt/html) и шлёт
+    ответом на message. Общая для кнопки (cb_export_user) и /export с
+    аргументом (cmd_export); админ-проверка — у вызывающих."""
     who = await _resolve_username(bot, telegram_id)
 
     contacts = list_contacts(telegram_id)
@@ -6614,12 +6661,12 @@ async def cb_export_user(call: CallbackQuery, bot: Bot) -> None:
             added += 1
 
     if added == 0:
-        await call.message.answer(f"У {who} нет сохранённых переписок с сообщениями.")
+        await message.answer(f"У {who} нет сохранённых переписок с сообщениями.")
         return
 
     buf.seek(0)
     filename = f"export_{who.lstrip('@')}.zip"
-    await call.message.answer_document(
+    await message.answer_document(
         BufferedInputFile(buf.read(), filename=filename),
         caption=f"{who} — {added} перепис{'ка' if added == 1 else 'ки' if added < 5 else 'ок'}",
     )
