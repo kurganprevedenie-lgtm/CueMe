@@ -212,6 +212,7 @@ from storage import (
     referral_counts_by_user,
     save_business_message,
     claim_saved_ephemeral,
+    update_business_message_text,
     save_deep_analysis,
     save_ideal_date,
     save_interaction_card,
@@ -4710,6 +4711,15 @@ _EPHEMERAL_FILENAME = {
 }
 
 
+def _premium_only_teaser_kb() -> InlineKeyboardMarkup:
+    """Кнопка под тизерами Premium-фич (исчезающие, изменённые сообщения).
+    delrev_premium, а не show_premium: тот отредактировал бы сам тизер в
+    экран подписки, этот шлёт экран подписки отдельным сообщением."""
+    b = InlineKeyboardBuilder()
+    b.button(text="👑 Оформить Premium", callback_data="delrev_premium")
+    return b.as_markup()
+
+
 def _ephemeral_media(reply: Message) -> tuple[str, str] | None:
     """(тип, file_id) исчезающего медиа в сообщении или None. Признак
     исчезающего — has_protected_content: у обычного медиа его нет, так что
@@ -4738,9 +4748,6 @@ async def _save_ephemeral_reply_media(
         return
     kind, file_id = found
 
-    if not await asyncio.to_thread(claim_saved_ephemeral, conn_id, chat_ref, reply.message_id):
-        return
-
     # Как обычное медиа — чтобы подхватили /export и пересылка при удалении.
     # Если строка с этим tg_message_id уже есть, save_business_message
     # просто вернёт None (уникальный ключ), дубля не будет.
@@ -4754,6 +4761,27 @@ async def _save_ephemeral_reply_media(
 
     contact_id = await asyncio.to_thread(get_contact_id_for_chat_ref, owner_id, chat_ref)
     contact = await asyncio.to_thread(get_contact_by_id, contact_id) if contact_id else None
+
+    # Premium-фича (как и удалённые сообщения). Без Premium — тизер, копию
+    # НЕ помечаем сохранённой: оформив Premium, можно ответить на то же
+    # сообщение ещё раз, и копия придёт (если файл ещё не исчез).
+    if not await _is_premium(bot, owner_id):
+        who = _contact_name(contact) if contact else "Собеседник"
+        try:
+            await bot.send_message(
+                int(owner_id),
+                f"💾 {who} прислал(а) {_EPHEMERAL_KIND_LABEL[kind]}\n\n"
+                "🔒 Сохранять копии исчезающих — с Premium. Оформи и ответь на "
+                "это сообщение ещё раз, пока оно не исчезло.",
+                reply_markup=_premium_only_teaser_kb(),
+            )
+        except Exception:
+            logging.warning("ephemeral: не удалось отправить тизер owner=%s", owner_id)
+        return
+
+    if not await asyncio.to_thread(claim_saved_ephemeral, conn_id, chat_ref, reply.message_id):
+        return
+
     name = _contact_name(contact) if contact else "собеседника"
     caption = f"💾 Сохранил {_EPHEMERAL_KIND_LABEL[kind]} от {name}"
 
@@ -4782,6 +4810,74 @@ async def _save_ephemeral_reply_media(
             await bot.send_message(int(owner_id), caption)
     except Exception:
         logging.exception("ephemeral: не удалось отправить копию %s owner=%s", kind, owner_id)
+
+
+# ── Изменённые собеседником сообщения ─────────────────────────────────────────
+# Старая версия берётся из business_messages (там уже лежит текст каждого
+# сообщения), новая — из события правки. Если старой версии в базе нет
+# (сообщение пришло до подключения бота) — молчим: сказать «было» нечего.
+# Правки самого владельца не присылаем, но текст в базе обновляем и для
+# них — карточки стиля должны видеть итоговую версию.
+
+_EDIT_QUOTE_LIMIT = 1800  # «Было» + «Стало» вместе должны влезть в 4096
+
+
+def _edit_quote(text: str | None) -> str:
+    if not text:
+        return "(без текста)"
+    text = text if len(text) <= _EDIT_QUOTE_LIMIT else text[:_EDIT_QUOTE_LIMIT] + "…"
+    return f"«{text}»"
+
+
+@dp.edited_business_message()
+async def handle_edited_business_message(event: Message, bot: Bot) -> None:
+    conn_id = event.business_connection_id
+    if not conn_id or not event.from_user:
+        return
+    conn_row = await asyncio.to_thread(get_business_connection, conn_id)
+    if not conn_row:
+        return
+    owner_id = conn_row["owner_user_id"]
+    chat_ref = _chat_ref(event.chat.id)
+
+    new_text = event.text or event.caption
+    if not new_text:
+        return
+    row = await asyncio.to_thread(get_business_message_by_tg_id, conn_id, chat_ref, event.message_id)
+    if not row:
+        return
+    old_text = row["text"]
+    if old_text == new_text:
+        return  # правка без смены текста (например, подгрузилось превью ссылки)
+    await asyncio.to_thread(update_business_message_text, row["id"], new_text)
+
+    if str(event.from_user.id) == owner_id or row["direction"] != "in":
+        return
+    if await _deleted_messages_excluded(bot, owner_id, event.chat.username):
+        return
+
+    contact_id = await asyncio.to_thread(get_contact_id_for_chat_ref, owner_id, chat_ref)
+    contact = await asyncio.to_thread(get_contact_by_id, contact_id) if contact_id else None
+    name = _contact_name(contact) if contact else "Собеседник"
+
+    try:
+        if await _is_premium(bot, owner_id):
+            await bot.send_message(
+                int(owner_id),
+                f"✏️ {name} изменил(а) сообщение\n\n"
+                f"Было: {_edit_quote(old_text)}\n"
+                f"Стало: {_edit_quote(new_text)}",
+            )
+        else:
+            label = f"@{event.chat.username}" if event.chat.username else name
+            await bot.send_message(
+                int(owner_id),
+                f"✏️ {label} изменил(а) сообщение\n\n"
+                "🔒 Что было написано до правки — видно с Premium.",
+                reply_markup=_premium_only_teaser_kb(),
+            )
+    except Exception:
+        logging.exception("edited_business_message: не удалось уведомить owner=%s", owner_id)
 
 
 # ── Удаление business-сообщений собеседником ───────────────────────────────────
@@ -8532,8 +8628,10 @@ async def _show_help(message: Message, edit: bool = False) -> None:
         "/deep_analysis — совместимость, как писать этому человеку, стиль и "
         "флаги, готовое сообщение\n\n"
         "<b>💐 Идеальное свидание</b> (кнопка в меню) — идея свидания и подарков под человека\n\n"
-        "<b>💾 Исчезающие медиа</b> — чтобы сохранить исчезающее фото/видео/кружок/"
-        "голосовое, ответь на него — бот пришлёт копию сюда\n\n"
+        "<b>💾 Исчезающие медиа</b> (Premium) — чтобы сохранить исчезающее фото/видео/"
+        "кружок/голосовое, ответь на него — бот пришлёт копию сюда\n\n"
+        "<b>✏️ Изменённые сообщения</b> (Premium) — если собеседник исправил "
+        "сообщение, пришлю, что было и что стало\n\n"
         "<b>👑 Подписка</b> (кнопка в меню) — статус подписки + "
         f"🎁 Пригласить друга (/invite) — получить свой код, за друга по коду дадим "
         f"+{REFERRAL_REPLY_BONUS} «Ответить за меня», +{REFERRAL_ANALYSIS_BONUS} "

@@ -2284,6 +2284,14 @@ def get_business_message_by_row_id(row_id: int) -> sqlite3.Row | None:
         return conn.execute("SELECT * FROM business_messages WHERE id = ?", (row_id,)).fetchone()
 
 
+def update_business_message_text(row_id: int, text: str) -> None:
+    """Новый текст после правки сообщения (main.py:
+    handle_edited_business_message) — следующая правка сравнивается уже с
+    ним, и карточки стиля берут актуальную версию."""
+    with _conn() as conn:
+        conn.execute("UPDATE business_messages SET text = ? WHERE id = ?", (text, row_id))
+
+
 def claim_saved_ephemeral(connection_id: str, chat_ref: str, tg_message_id: int) -> bool:
     """Помечает исчезающее медиа как сохранённое. True — первый раз (надо
     отправить копию), False — уже сохраняли раньше. Атомарно, через PRIMARY
