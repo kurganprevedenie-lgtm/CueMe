@@ -4460,9 +4460,7 @@ async def handle_business_connection(event: BusinessConnection, bot: Bot) -> Non
             # и того же сообщения.
             await bot.send_message(
                 event.user.id,
-                "✅ Готово, бот подключён! CueMe готов помогать тебе в переписках )\n\n"
-                "💾 Чтобы сохранить исчезающее фото/видео/кружок/голосовое, ответь "
-                "на него — бот пришлёт копию сюда.",
+                "✅ Готово, бот подключён! CueMe готов помогать тебе в переписках )",
                 reply_markup=ReplyKeyboardRemove(),
             )
         except TelegramForbiddenError:
