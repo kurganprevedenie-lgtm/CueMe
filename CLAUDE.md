@@ -161,6 +161,9 @@ deep_analysis(contact_id PK, compatibility_text, howto_text,
 -- но фича «Анализ своего стиля» убрана — код её больше не пишет/не читает.
 events(id PK AUTO, ts, user_telegram_id, event_type, meta)  -- продуктовая
        -- аналитика: record_event / count_events / event_funnel (storage.py)
+saved_ephemeral(connection_id, chat_ref, tg_message_id, saved_at,
+                PRIMARY KEY (connection_id, chat_ref, tg_message_id))
+       -- исчезающие медиа, уже присланные владельцу копией (без дублей)
 ```
 
 ## Файлы проекта
@@ -192,6 +195,15 @@ events(id PK AUTO, ts, user_telegram_id, event_type, meta)  -- продукто�
 - allowed_updates включает: message, callback_query, business_connection,
   business_message, edited_business_message, deleted_business_messages
 - Secretary Mode включён в BotFather (мини-апп)
+- **Исчезающие медиа** (view-once / с таймером: фото, видео, кружок, голосовое):
+  само такое сообщение бот не получает. Когда ВЛАДЕЛЕЦ отвечает на него, оно
+  приходит внутри `reply_to_message` с рабочим file_id и
+  `has_protected_content=true` (у обычного медиа поля нет) — проверено вживую
+  2026-10-08. `_save_ephemeral_reply_media` (main.py) сразу скачивает файл и
+  шлёт владельцу копию байтами (не по file_id), дубли — через таблицу
+  `saved_ephemeral`, копия пишется и в business_messages (для /export и
+  пересылки при удалении). Ограничение: только по ответу владельца, без
+  ответа бот про такое сообщение не узнаёт. Не за пейволлом.
 
 ## Живой профиль (пересборка по накоплению)
 

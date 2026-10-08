@@ -211,6 +211,7 @@ from storage import (
     mark_suggestion_matched,
     referral_counts_by_user,
     save_business_message,
+    claim_saved_ephemeral,
     save_deep_analysis,
     save_ideal_date,
     save_interaction_card,
@@ -4453,7 +4454,9 @@ async def handle_business_connection(event: BusinessConnection, bot: Bot) -> Non
             # и того же сообщения.
             await bot.send_message(
                 event.user.id,
-                "✅ Готово, бот подключён! CueMe готов помогать тебе в переписках )",
+                "✅ Готово, бот подключён! CueMe готов помогать тебе в переписках )\n\n"
+                "💾 Чтобы сохранить исчезающее фото/видео/кружок/голосовое, ответь "
+                "на него — бот пришлёт копию сюда.",
                 reply_markup=ReplyKeyboardRemove(),
             )
         except TelegramForbiddenError:
@@ -4629,28 +4632,26 @@ async def handle_business_message(event: Message, bot: Bot) -> None:
     video_note_file_id = event.video_note.file_id if event.video_note else None
     voice_file_id = event.voice.file_id if event.voice else None
 
-    # ВРЕМЕННЫЙ диагностический лог (убрать после проверки) — расследуем,
-    # приходит ли вообще file_id по «исчезающим»/one-time-view фото и видео
-    # через Business API, и если да, чем такое сообщение отличается от
-    # обычного (Telegram официально это не документирует однозначно —
-    # обычным ботам в Bot API одноразовое медиа исторически может не
-    # отдаваться вовсе). Дампим ЦЕЛИКОМ raw-событие для любого photo/video —
-    # разово, руками сверим на тестовом «исчезающем» сообщении.
-    if event.photo or event.video:
-        try:
-            logging.info("RAW MEDIA MESSAGE: %s", event.model_dump_json(exclude_none=True)[:3000])
-        except Exception:
-            logging.exception("RAW MEDIA MESSAGE: не удалось сериализовать")
-
-    # ВРЕМЕННЫЙ диагностический лог (убрать после проверки) — гипотеза: само
-    # исчезающее медиа бот не получает, но когда владелец ОТВЕЧАЕТ на него,
-    # оно приходит внутри reply_to_message. Проверяем, есть ли там file_id.
-    reply = event.reply_to_message
-    if reply and (reply.photo or reply.video or reply.video_note or reply.voice or reply.audio or reply.document):
-        try:
-            logging.info("RAW REPLY MEDIA: %s", reply.model_dump_json(exclude_none=True)[:3000])
-        except Exception:
-            logging.exception("RAW REPLY MEDIA: не удалось сериализовать")
+    # Временные диагностические логи RAW MEDIA MESSAGE / RAW REPLY MEDIA —
+    # выясняли, получает ли бот исчезающее медиа. Итог проверки (2026-10-08):
+    # само исчезающее сообщение не приходит вообще, но когда владелец на него
+    # отвечает, оно приходит внутри reply_to_message с рабочим file_id и
+    # has_protected_content=true (у обычного медиа этого поля нет) — на этом
+    # построен _save_ephemeral_reply_media ниже. Логи писали полный дамп
+    # чужой переписки в journal, поэтому выключены; не удалены — на случай,
+    # если Telegram поменяет поведение и придётся проверять заново.
+    # if event.photo or event.video:
+    #     try:
+    #         logging.info("RAW MEDIA MESSAGE: %s", event.model_dump_json(exclude_none=True)[:3000])
+    #     except Exception:
+    #         logging.exception("RAW MEDIA MESSAGE: не удалось сериализовать")
+    #
+    # reply = event.reply_to_message
+    # if reply and (reply.photo or reply.video or reply.video_note or reply.voice or reply.audio or reply.document):
+    #     try:
+    #         logging.info("RAW REPLY MEDIA: %s", reply.model_dump_json(exclude_none=True)[:3000])
+    #     except Exception:
+    #         logging.exception("RAW REPLY MEDIA: не удалось сериализовать")
 
     # Синхронную DB-часть уводим в поток, чтобы не блокировать event loop.
     contact_id_for_rebuild, merge_notice = await asyncio.to_thread(
@@ -4684,6 +4685,103 @@ async def handle_business_message(event: Message, bot: Bot) -> None:
             )
         except Exception:
             logging.exception("не удалось отправить уведомление об автослиянии контакта")
+
+    if direction == "out" and event.reply_to_message:
+        try:
+            await _save_ephemeral_reply_media(bot, event.reply_to_message, conn_id, owner_id, chat_ref)
+        except Exception:
+            logging.exception("ephemeral: сбой обработки ответа owner=%s", owner_id)
+
+
+# ── Исчезающие медиа (view-once / с таймером) ─────────────────────────────────
+# Само такое сообщение бот через Business API не получает. Но когда ВЛАДЕЛЕЦ
+# отвечает на него, оно целиком приходит внутри reply_to_message — с file_id
+# и has_protected_content=true (проверено вживую 2026-10-08 на фото, видео,
+# кружке и голосовом). Ловим это и шлём владельцу копию в чат с ботом.
+# Ограничение: работает ТОЛЬКО по ответу владельца — без ответа бот про
+# такое сообщение не узнаёт вообще.
+
+_EPHEMERAL_KIND_LABEL = {
+    "photo": "исчезающее фото", "video": "исчезающее видео",
+    "video_note": "исчезающий кружок", "voice": "исчезающее голосовое",
+}
+_EPHEMERAL_FILENAME = {
+    "photo": "photo.jpg", "video": "video.mp4", "video_note": "video_note.mp4", "voice": "voice.ogg",
+}
+
+
+def _ephemeral_media(reply: Message) -> tuple[str, str] | None:
+    """(тип, file_id) исчезающего медиа в сообщении или None. Признак
+    исчезающего — has_protected_content: у обычного медиа его нет, так что
+    ответ на обычное фото копию не присылает."""
+    if not reply.has_protected_content:
+        return None
+    if reply.photo:
+        return "photo", reply.photo[-1].file_id
+    for kind in ("video", "video_note", "voice"):
+        media = getattr(reply, kind, None)
+        if media:
+            return kind, media.file_id
+    return None
+
+
+async def _save_ephemeral_reply_media(
+    bot: Bot, reply: Message, conn_id: str, owner_id: str, chat_ref: str,
+) -> None:
+    """Владелец ответил на сообщение — если это исчезающее медиа
+    собеседника, скачиваем сразу (file_id такого медиа может быстро
+    перестать работать) и шлём копию байтами, не по file_id."""
+    if not reply.from_user or str(reply.from_user.id) == owner_id:
+        return
+    found = _ephemeral_media(reply)
+    if not found:
+        return
+    kind, file_id = found
+
+    if not await asyncio.to_thread(claim_saved_ephemeral, conn_id, chat_ref, reply.message_id):
+        return
+
+    # Как обычное медиа — чтобы подхватили /export и пересылка при удалении.
+    # Если строка с этим tg_message_id уже есть, save_business_message
+    # просто вернёт None (уникальный ключ), дубля не будет.
+    await asyncio.to_thread(
+        save_business_message,
+        connection_id=conn_id, owner_user_id=owner_id, chat_ref=chat_ref, direction="in",
+        text=reply.caption, date=reply.date.isoformat(), tg_message_id=reply.message_id,
+        raw_meta={"ephemeral": True},
+        **{f"{kind}_file_id": file_id},
+    )
+
+    contact_id = await asyncio.to_thread(get_contact_id_for_chat_ref, owner_id, chat_ref)
+    contact = await asyncio.to_thread(get_contact_by_id, contact_id) if contact_id else None
+    name = _contact_name(contact) if contact else "собеседника"
+    caption = f"💾 Сохранил {_EPHEMERAL_KIND_LABEL[kind]} от {name}"
+
+    try:
+        data = (await bot.download(file_id)).read()
+    except Exception:
+        logging.exception("ephemeral: не удалось скачать %s owner=%s", kind, owner_id)
+        try:
+            await bot.send_message(int(owner_id), "Не удалось сохранить, файл уже недоступен")
+        except Exception:
+            logging.warning("ephemeral: не удалось отправить сообщение о сбое owner=%s", owner_id)
+        return
+
+    file = BufferedInputFile(data, filename=_EPHEMERAL_FILENAME[kind])
+    try:
+        if kind == "photo":
+            await bot.send_photo(int(owner_id), file, caption=caption)
+        elif kind == "video":
+            await bot.send_video(int(owner_id), file, caption=caption)
+        elif kind == "voice":
+            await bot.send_voice(int(owner_id), file, caption=caption)
+        else:
+            # У кружка подписи нет вообще — текст отдельным сообщением следом,
+            # как в _send_deleted_content.
+            await bot.send_video_note(int(owner_id), file)
+            await bot.send_message(int(owner_id), caption)
+    except Exception:
+        logging.exception("ephemeral: не удалось отправить копию %s owner=%s", kind, owner_id)
 
 
 # ── Удаление business-сообщений собеседником ───────────────────────────────────
@@ -8434,6 +8532,8 @@ async def _show_help(message: Message, edit: bool = False) -> None:
         "/deep_analysis — совместимость, как писать этому человеку, стиль и "
         "флаги, готовое сообщение\n\n"
         "<b>💐 Идеальное свидание</b> (кнопка в меню) — идея свидания и подарков под человека\n\n"
+        "<b>💾 Исчезающие медиа</b> — чтобы сохранить исчезающее фото/видео/кружок/"
+        "голосовое, ответь на него — бот пришлёт копию сюда\n\n"
         "<b>👑 Подписка</b> (кнопка в меню) — статус подписки + "
         f"🎁 Пригласить друга (/invite) — получить свой код, за друга по коду дадим "
         f"+{REFERRAL_REPLY_BONUS} «Ответить за меня», +{REFERRAL_ANALYSIS_BONUS} "

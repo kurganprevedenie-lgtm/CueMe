@@ -211,6 +211,17 @@ def init_db() -> None:
                 revealed_at     TEXT
             );
 
+            -- Исчезающие медиа собеседника, уже отправленные владельцу копией
+            -- (main.py: _save_ephemeral_reply_media) — чтобы второй ответ
+            -- на то же сообщение не прислал дубликат.
+            CREATE TABLE IF NOT EXISTS saved_ephemeral (
+                connection_id TEXT NOT NULL,
+                chat_ref      TEXT NOT NULL,
+                tg_message_id INTEGER NOT NULL,
+                saved_at      TEXT NOT NULL,
+                PRIMARY KEY (connection_id, chat_ref, tg_message_id)
+            );
+
             -- Каждый вариант ответа, который бот РЕАЛЬНО показал пользователю
             -- (после генерации, до отправки — считаем и неиспользованные, нужно
             -- для % использования). contact_id может быть NULL (скриншот без
@@ -2271,6 +2282,19 @@ def get_business_message_by_tg_id(
 def get_business_message_by_row_id(row_id: int) -> sqlite3.Row | None:
     with _conn() as conn:
         return conn.execute("SELECT * FROM business_messages WHERE id = ?", (row_id,)).fetchone()
+
+
+def claim_saved_ephemeral(connection_id: str, chat_ref: str, tg_message_id: int) -> bool:
+    """Помечает исчезающее медиа как сохранённое. True — первый раз (надо
+    отправить копию), False — уже сохраняли раньше. Атомарно, через PRIMARY
+    KEY: два почти одновременных ответа на одно сообщение не пришлют две копии."""
+    with _conn() as conn:
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO saved_ephemeral (connection_id, chat_ref, tg_message_id, saved_at) "
+            "VALUES (?, ?, ?, ?)",
+            (connection_id, chat_ref, tg_message_id, _now()),
+        )
+        return cur.rowcount == 1
 
 
 def create_deleted_reveal(owner_user_id: str, contact_label: str, message_row_ids: list[int]) -> int:
