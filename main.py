@@ -51,6 +51,7 @@ from config import (
     GROQ_API_KEY,
     OPENROUTER_API_KEY,
     PREMIUM_CACHE_TTL,
+    CHURN_HOURS,
     PREMIUM_CHANNEL_ID,
     PREMIUM_SUBSCRIBE_URL,
     TRIBUTE_API_KEY,
@@ -164,6 +165,10 @@ from storage import (
     resume_promo_channel_premium,
     get_ideal_date,
     get_last_event_time,
+    set_last_action,
+    get_last_gate_event,
+    gate_events_by_user,
+    gate_check_fail_without_ok,
     get_last_incoming_message_time,
     get_latest_star_payment,
     get_llm_cache,
@@ -679,6 +684,21 @@ def _unlock_gate_kb(kind: str, ref: int | str) -> InlineKeyboardMarkup:
     return b.as_markup()
 
 
+async def _record_gate_event(telegram_id: str, event_type: str, kind: str) -> None:
+    """События экрана-гейта для «Где уходят» в /users: gate_shown /
+    gate_check_ok / gate_check_fail / gate_reveal, meta — reply|analysis|date.
+    То же событие подряд (повторное нажатие на тот же экран) не пишется.
+    («Открыть канал» — url-кнопка, Telegram боту о нажатии не сообщает,
+    поэтому gate_open_click не пишется.)"""
+    try:
+        last = await asyncio.to_thread(get_last_gate_event, telegram_id)
+        if last and last["event_type"] == event_type and last["meta"] == kind:
+            return
+        await asyncio.to_thread(record_event, telegram_id, event_type, kind)
+    except Exception:
+        logging.exception("gate event: не удалось записать %s", event_type)
+
+
 async def _quota_gate(
     bot: Bot, target: Message, telegram_id: str, edit: bool = False,
     replay: dict | None = None,
@@ -697,6 +717,7 @@ async def _quota_gate(
             _pending_unlock.pop(int(telegram_id), None)
         text, kb = _unlock_gate_text("reply"), _unlock_gate_kb("reply", 0)
         await (target.edit_text(text, reply_markup=kb) if edit else target.answer(text, reply_markup=kb))
+        await _record_gate_event(telegram_id, "gate_shown", "reply")
         return False
     await _send_paywall(
         target,
@@ -962,8 +983,10 @@ async def cb_unlock_check(call: CallbackQuery, bot: Bot) -> None:
         logging.exception("unlock check failed for %s", telegram_id)
         subscribed = False
     if not subscribed:
+        await _record_gate_event(telegram_id, "gate_check_fail", kind)
         await call.answer("Не вижу подписки — проверь и попробуй снова", show_alert=True)
         return
+    await _record_gate_event(telegram_id, "gate_check_ok", kind)
 
     if not has_claimed_promo_reward(telegram_id):
         add_reply_trial_bonus(telegram_id, PROMO_CHANNEL_REPLY_BONUS)
@@ -993,6 +1016,7 @@ async def cb_unlock_reveal(call: CallbackQuery, state: FSMContext, bot: Bot) -> 
     user_id = call.from_user.id
     telegram_id = str(user_id)
     await call.answer()
+    await _record_gate_event(telegram_id, "gate_reveal", kind)
 
     if kind == "analysis":
         await _run_deep_analysis(bot, call.message, telegram_id, int(ref), edit=True)
@@ -2909,6 +2933,124 @@ class GenderGateMiddleware(BaseMiddleware):
         return None
 
 
+# ── Последнее действие юзера (для «Где уходят» в /users) ─────────────────────
+# Пишется на КАЖДОЕ сообщение/нажатие в чате с ботом (не business_message —
+# это сообщения собеседников, а не действия юзера). Админские команды и
+# кнопки не пишем, чтобы не засорять. Регистрируется раньше
+# GenderGateMiddleware — действие фиксируется, даже если тот перехватит
+# событие и покажет выбор пола.
+
+_ADMIN_COMMANDS = {
+    "users", "export", "provider", "apistatus", "sources", "inspect",
+    "suggestion_stats", "funnel_status", "test_reminders", "broadcast_admin",
+    "broadcast_deleted_messages", "broadcast_deleted_paywall",
+    "broadcast_invite", "broadcast_price_drop",
+}
+_ADMIN_CALLBACK_PREFIXES = ("bcast:", "export:")
+
+
+def _message_action(message: Message) -> str | None:
+    text = message.text or ""
+    if text.startswith("/"):
+        cmd = text.split()[0].split("@")[0][1:].lower()
+        return None if cmd in _ADMIN_COMMANDS else f"cmd:/{cmd}"
+    if message.photo:
+        return "photo"
+    if message.voice:
+        return "voice"
+    if message.document:
+        return "document"
+    if message.video or message.video_note:
+        return "video"
+    return "text" if (text or message.caption) else "other"
+
+
+class LastActionMiddleware(BaseMiddleware):
+    async def __call__(self, handler, event, data):
+        user = data.get("event_from_user")
+        if user is not None and not user.is_bot:
+            if isinstance(event, CallbackQuery):
+                action = event.data or ""
+                if action.startswith(_ADMIN_CALLBACK_PREFIXES):
+                    action = None
+            else:
+                action = _message_action(event)
+            if action:
+                try:
+                    await asyncio.to_thread(set_last_action, str(user.id), action[:200])
+                except Exception:
+                    logging.exception("last_action: не удалось записать")
+        return await handler(event, data)
+
+
+# Человекочитаемые названия для /users. Точное совпадение — сначала, потом
+# префиксы (у части callback_data в конце id контакта/действия). Неизвестное
+# показывается как есть.
+_ACTION_LABELS: dict[str, str] = {
+    "cmd:/start": "🚀 /start", "cmd:/menu": "📋 /menu", "cmd:/help": "❓ /help",
+    "cmd:/premium": "👑 /premium", "cmd:/connect": "🔌 /connect", "cmd:/reply": "💬 /reply",
+    "cmd:/invite": "👥 /invite", "cmd:/redeem": "🎟 /redeem", "cmd:/myref": "👥 /myref",
+    "cmd:/contacts": "📋 /contacts", "cmd:/progress": "⏳ /progress", "cmd:/gender": "🙋 /gender",
+    "cmd:/deep_analysis": "🔬 /deep_analysis", "cmd:/rebuild": "🔄 /rebuild",
+    "cmd:/delete": "🗑 /delete", "cmd:/wipe": "🗑 /wipe",
+    "text": "✍️ Прислал текст", "photo": "🖼 Прислал фото", "voice": "🎙 Прислал голосовое",
+    "document": "📎 Прислал файл", "video": "🎬 Прислал видео", "other": "📦 Прислал что-то другое",
+    "mm:unified": "💬 Ответ с CueMe (меню)", "mm:deep": "🔬 Анализ собеседника (меню)",
+    "mm:date": "💡 Идеальное свидание (меню)", "mm:support": "🆘 Помощь (меню)",
+    "watch:menu": "🗑 Удалённые сообщения (меню)", "watch:locked": "🔒 Удалённые сообщения: под замком",
+    "show_premium": "👑 Подписка", "show_invite": "👥 Реферальная система",
+    "sub:to_menu": "⬅️ Назад", "back_to_menu": "⬅️ Вернуться в меню",
+    "stars_menu": "⭐ Оплатить Stars", "stars_back": "⬅️ Назад из Stars",
+    "stars_buy:day": "⭐ Купить день", "stars_buy:week": "⭐ Купить неделю",
+    "stars_buy:month": "⭐ Купить месяц",
+    "promo:offer": "📢 Подписаться на канал (из Подписки)", "promo:check": "✅ Я подписался (из Подписки)",
+    "gender:male": "🙋‍♂️ Выбрал пол: парень", "gender:female": "🙋‍♀️ Выбрал пол: девушка",
+    "src:friend": "📍 Источник: друг", "src:instagram": "📍 Источник: Instagram",
+    "src:tiktok": "📍 Источник: TikTok", "src:youtube": "📍 Источник: YouTube",
+    "src:tgchat": "📍 Источник: Telegram-чат", "src:other": "📍 Источник: другое",
+    "qs:yes": "💬 Попробовать ответ (напоминание)", "qs:no": "🙅 Не сейчас (напоминание)",
+    "qsphr:her": "🎲 Фразы для неё", "qsphr:him": "🎲 Фразы для него",
+    "live:coach": "🎯 Живой коучинг", "live:phrases": "🎲 Готовые фразы",
+    "phrases:her": "🎲 Фразы для неё", "phrases:him": "🎲 Фразы для него",
+    "revive_next": "🔄 Другой вопрос", "unified_contact:new": "➕ Новый собеседник",
+    "unified_reply_restart": "👥 Ответ для другого собеседника",
+    "delrev_premium": "👑 Premium с тизера удалённых", "delrev_all": "👀 Показать все удалённые",
+    "delall": "🗑 Удалить все данные", "delallyes": "🗑 Удалить все данные: да",
+    "delno": "↩️ Удаление: отмена", "wipeno": "↩️ Очистка: отмена",
+}
+_ACTION_LABEL_PREFIXES: tuple[tuple[str, str], ...] = (
+    ("unlock:check:", "✅ Я подписался (гейт)"),
+    ("unlock:reveal:", "👀 Показать после подписки (гейт)"),
+    ("watch:toggle:", "🗑 Переключил настройку удалённых"),
+    ("deepan_refresh:", "🔄 Обновить анализ"),
+    ("deepan:", "🔬 Анализ собеседника: выбрал контакт"),
+    ("idealdate_refresh:", "🔄 Другая идея свидания"),
+    ("idealdate:", "💡 Идеальное свидание: выбрал контакт"),
+    ("unified_contact:", "💬 Ответ с CueMe: выбрал контакт"),
+    ("reply:", "💬 Ответить: выбрал контакт"),
+    ("mystyle:", "🎯 Мой стиль: выбрал контакт"),
+    ("setup:", "⚙️ Настройка контакта"),
+    ("varregen:", "🔄 Другие варианты ответа"),
+    ("liveregen:", "🔄 Другие варианты (живой диалог)"),
+    ("qsphr_next:", "🔄 Другая фраза"), ("phrase_next:", "🔄 Другая фраза"),
+    ("delrev:", "👀 Показать удалённое"), ("del:", "🗑 Удалить контакт"),
+    ("delyes:", "🗑 Удалить контакт: да"), ("wipeyes:", "🗑 Очистка: да"),
+)
+
+
+def _action_label(raw: str | None) -> str:
+    if not raw:
+        return "—"
+    if raw in _ACTION_LABELS:
+        return _ACTION_LABELS[raw]
+    for prefix, label in _ACTION_LABEL_PREFIXES:
+        if raw.startswith(prefix):
+            return label
+    return raw
+
+
+dp.message.outer_middleware(LastActionMiddleware())
+dp.callback_query.outer_middleware(LastActionMiddleware())
 dp.message.outer_middleware(GenderGateMiddleware())
 dp.callback_query.outer_middleware(GenderGateMiddleware())
 
@@ -4110,6 +4252,7 @@ async def _run_deep_analysis(
         await progress_msg.edit_text(
             _unlock_gate_text("analysis"), reply_markup=_unlock_gate_kb("analysis", contact_id),
         )
+        await _record_gate_event(telegram_id, "gate_shown", "analysis")
         return
 
     if not full_access:
@@ -4377,6 +4520,7 @@ async def _run_ideal_date(
         await progress_msg.edit_text(
             _unlock_gate_text("date"), reply_markup=_unlock_gate_kb("date", contact_id),
         )
+        await _record_gate_event(telegram_id, "gate_shown", "date")
         return
 
     if not full_access:
@@ -5930,6 +6074,8 @@ async def _collect_users_data(bot: Bot) -> tuple[list[dict], dict]:
     deep_analysis_users = users_with_deep_analysis()
     style_card_users = users_with_style_card()
     referrals_by_user = referral_counts_by_user()
+    gate_by_user, gate_tracking_start = gate_events_by_user()
+    gate_fail_no_ok = gate_check_fail_without_ok()
 
     rows: list[dict] = []
     totals = {
@@ -5987,7 +6133,12 @@ async def _collect_users_data(bot: Bot) -> tuple[list[dict], dict]:
         if automation_off:
             totals["automation_off"] += 1
 
-        last_action_raw = get_last_event_time(tid)
+        # Точное время последнего действия в боте (LastActionMiddleware) — если
+        # его ещё нет (юзер ничего не делал с момента появления колонки),
+        # приблизительный бэкафилл: последнее событие из events (/start,
+        # генерации, оплаты) — как и было здесь раньше. Само действие в таком
+        # случае неизвестно ("—"), см. last_action ниже.
+        last_action_raw = u["last_action_at"] or get_last_event_time(tid)
         last_incoming_raw = get_last_incoming_message_time(tid)
         # "Последняя активность" для отсева неактивных — позже из двух
         # сигналов (сам что-то сделал ИЛИ ему написали).
@@ -6121,9 +6272,66 @@ async def _collect_users_data(bot: Bot) -> tuple[list[dict], dict]:
             "_last_incoming_label": _relative_label(last_incoming_raw, now),
             "_last_incoming_msk": _fmt_msk(last_incoming_raw),
             "_is_subscribed_channel": is_subscribed_channel,
+            **_gate_and_churn_fields(
+                u, tid, last_action_raw, now, is_premium_now,
+                gate_by_user.get(tid, set()), gate_tracking_start, tid in gate_fail_no_ok,
+            ),
         })
 
+    totals["gate_tracking_start"] = gate_tracking_start
     return rows, totals
+
+
+def _hours_since(iso_str: str | None, now: datetime) -> int | None:
+    if not iso_str:
+        return None
+    try:
+        dt = datetime.fromisoformat(iso_str)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return int((now - dt).total_seconds() // 3600)
+
+
+_GATE_STATUS_UNKNOWN = "—"
+
+
+def _gate_and_churn_fields(
+    u, tid: str, last_action_raw: str | None, now: datetime, is_premium_now: bool,
+    gate_events: set[str], gate_tracking_start: str | None, gate_fail_no_ok: bool,
+) -> dict:
+    """Поля «Где уходят» для строки юзера в /users (CSV + дашборд).
+
+    gate_status: «не видел» / «видел, не открыл» / «нажал подписался, не
+    подписан» / «разблокировал». Пока события гейта не пишутся вообще, или
+    юзер последний раз был в боте ДО их появления — «—»: видел ли он гейт
+    раньше, неизвестно, а «не видел» было бы неправдой.
+    _churned — без Premium и без открытого пула, неактивен дольше CHURN_HOURS."""
+    unlocked = is_premium_now or bool(
+        u["reply_trial_bonus"] or u["analysis_trial_bonus"] or u["date_trial_bonus"]
+    )
+    shown = "gate_shown" in gate_events
+    if not shown:
+        tracked = gate_tracking_start is not None and (last_action_raw or "") >= gate_tracking_start
+        gate_status = "не видел" if tracked else _GATE_STATUS_UNKNOWN
+    elif unlocked:
+        gate_status = "разблокировал"
+    elif gate_fail_no_ok:
+        gate_status = "нажал подписался, не подписан"
+    else:
+        gate_status = "видел, не открыл"
+
+    hours = _hours_since(last_action_raw, now)
+    churned = not unlocked and (hours is None or hours >= CHURN_HOURS)
+    return {
+        "last_action": _action_label(u["last_action"]),
+        "hours_since_last_action": hours if hours is not None else "—",
+        "gate_status": gate_status,
+        "_gate_events": gate_events,
+        "_unlocked": unlocked,
+        "_churned": churned,
+    }
 
 
 # _build_users_report — раньше рендерила /users как кучу текстовых сообщений
@@ -6184,9 +6392,10 @@ async def _collect_users_data(bot: Bot) -> tuple[list[dict], dict]:
 # же ключам, служебные поля с "_" в выгрузку не идут.
 _USERS_CSV_COLUMNS = [
     "username", "telegram_id", "gender", "source",
-    "funnel_stage", "signup_week",
+    "funnel_stage", "gate_status", "signup_week",
     "contacts_count", "messages_count", "blocked", "automation_off",
-    "signup_date", "days_since_signup", "last_action_at", "last_incoming_at",
+    "signup_date", "days_since_signup",
+    "last_action", "last_action_at", "hours_since_last_action", "last_incoming_at",
     "days_since_last_active", "active_last_7d",
     "uses_reply", "uses_screenshot", "uses_live",
     "used_deep_analysis",
@@ -6423,7 +6632,127 @@ def _build_users_dashboard_html(rows: list[dict], totals: dict) -> str:
   <h2>❤️ Здоровье базы</h2>
   {health_rows}
 </section>
+
+{_build_churn_dashboard_html(rows, totals)}
 """
+
+
+_GATE_MIN_SAMPLE = 30  # меньше показавших гейт — выводы по нему рано делать
+_CHURN_TOP_ACTIONS = 10
+
+
+def _build_churn_dashboard_html(rows: list[dict], totals: dict) -> str:
+    """Блок «Где уходят»: воронка экрана-гейта «подпишись на канал», сколько
+    ушло на нём и до него, и последнее действие у ушедших — чтобы по цифрам
+    решить, оставлять ли обязательную подписку. События гейта и последнее
+    действие копятся только с момента их появления — до этого «—»."""
+    if not totals.get("gate_tracking_start"):
+        return """<section class="dash">
+  <h2>🚪 Где уходят</h2>
+  <div class="muted">Данных ещё нет: события экрана подписки начали записываться только
+  сейчас — блок заполнится, когда юзеры начнут на него попадать.</div>
+</section>"""
+
+    def has(r, ev):
+        return ev in r["_gate_events"]
+
+    shown = [r for r in rows if has(r, "gate_shown")]
+    pressed = [r for r in shown if has(r, "gate_check_ok") or has(r, "gate_check_fail")]
+    ok = [r for r in shown if has(r, "gate_check_ok")]
+    revealed = [r for r in shown if has(r, "gate_reveal")]
+    fail_no_sub = [r for r in shown if r["gate_status"] == "нажал подписался, не подписан"]
+    m = len(shown)
+    low_sample = (
+        f'<div class="bar-note">мало данных, выводы рано делать (показали меньше {_GATE_MIN_SAMPLE} юзерам)</div>'
+        if m < _GATE_MIN_SAMPLE else ""
+    )
+
+    steps = [
+        ("🚪 Показали экран подписки", len(shown), None),
+        ("✅ Нажали «Я подписался»", len(pressed), len(shown)),
+        ("📢 Подписка подтверждена", len(ok), len(pressed)),
+        ("👀 Нажали «Показать»", len(revealed), len(ok)),
+    ]
+    funnel = []
+    for i, (label, value, prev) in enumerate(steps):
+        conv = (
+            f' <span class="funnel-conv">{_pct(value, prev)}% с прошлого шага · {_pct(value, m)}% от показавших</span>'
+            if prev is not None else ""
+        )
+        funnel.append(f"""<div class="funnel-step">
+  <div class="funnel-label">{html.escape(label)}</div>
+  <div class="funnel-value">{value}</div>
+  <div class="funnel-sub">{conv}</div>
+</div>""")
+        if i < len(steps) - 1:
+            funnel.append('<div class="funnel-arrow">→</div>')
+
+    gone_on_gate = [r for r in shown if r["_churned"]]
+    churned = [r for r in rows if r["_churned"]]
+    not_seen_locked = [r for r in rows if r["gate_status"] == "не видел" and not r["_unlocked"]]
+    gone_before = [r for r in not_seen_locked if r["_churned"]]
+    unknown = sum(1 for r in rows if r["gate_status"] == _GATE_STATUS_UNKNOWN)
+
+    by_action: dict[str, int] = {}
+    for r in churned:
+        by_action[r["last_action"]] = by_action.get(r["last_action"], 0) + 1
+    top = sorted(by_action.items(), key=lambda kv: -kv[1])
+    action_rows = [
+        f"<tr><td>{html.escape(label)}</td><td>{n}</td><td>{_pct(n, len(churned))}%</td></tr>"
+        for label, n in top[:_CHURN_TOP_ACTIONS]
+    ]
+    rest = sum(n for _, n in top[_CHURN_TOP_ACTIONS:])
+    if rest:
+        action_rows.append(f"<tr><td>остальное</td><td>{rest}</td><td>{_pct(rest, len(churned))}%</td></tr>")
+    actions_html = (
+        f"""<div class="table-wrap"><table class="channel-table">
+    <thead><tr><th>Последнее действие</th><th>Юзеров</th><th>% от ушедших</th></tr></thead>
+    <tbody>{"".join(action_rows)}</tbody>
+  </table></div>
+  <div class="muted">«—» — действие неизвестно: юзер ничего не делал с момента, как действия начали записываться.</div>"""
+        if churned else '<div class="muted">Пока никто не ушёл.</div>'
+    )
+
+    compare = "".join([
+        _bar_row(
+            "Ушли, не дойдя до экрана подписки", len(gone_before), len(not_seen_locked), tone="warn",
+            note=f"из {len(not_seen_locked)} без Premium и без открытых попыток, кто экран не видел",
+        ),
+        _bar_row(
+            "Ушли на экране подписки", len(gone_on_gate), m, tone="bad",
+            note=f"из {m} увидевших",
+        ),
+    ])
+    unknown_note = (
+        f'<div class="muted">Без данных о гейте: {unknown} — последний раз были в боте до того, как это начали записывать.</div>'
+        if unknown else ""
+    )
+
+    return f"""<section class="dash">
+  <h2>🚪 Где уходят — экран «подпишись на канал»</h2>
+  <div class="funnel-row">{"".join(funnel)}</div>
+  <div class="dash-sub" style="margin-top:10px">Нажали «Я подписался», но не подписались: <b>{len(fail_no_sub)}</b></div>
+  {low_sample}
+</section>
+
+<section class="dash">
+  <h2>🚪 Ушли на экране подписки</h2>
+  <div class="funnel-value">{len(gone_on_gate)} из {m} ({_pct(len(gone_on_gate), m)}%)</div>
+  <div class="dash-sub">увидели экран, не открыли попытки и не заходили в бот больше {CHURN_HOURS} ч.</div>
+  {low_sample}
+</section>
+
+<section class="dash">
+  <h2>⚖️ До экрана подписки или на нём</h2>
+  {compare}
+  {unknown_note}
+</section>
+
+<section class="dash">
+  <h2>🔚 Последнее действие у ушедших</h2>
+  <div class="dash-sub">Без Premium и открытых попыток, в боте не были больше {CHURN_HOURS} ч. Всего: <b>{len(churned)}</b></div>
+  {actions_html}
+</section>"""
 
 
 def _build_users_html(rows: list[dict], totals: dict) -> bytes:

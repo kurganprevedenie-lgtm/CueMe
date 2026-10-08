@@ -231,6 +231,9 @@ REFERRAL_DATE_BONUS = int(os.getenv("REFERRAL_DATE_BONUS", "3"))
 
 # Кэш проверки членства в канале (сек) — не дёргать Telegram API на каждое сообщение.
 PREMIUM_CACHE_TTL = int(os.getenv("PREMIUM_CACHE_TTL", "300"))
+# Через сколько часов без действий в боте юзер считается «ушедшим» в блоке
+# «Где уходят» отчёта /users (main.py: _build_users_dashboard_html).
+CHURN_HOURS = int(os.getenv("CHURN_HOURS", "24"))
 # Реферальная награда: сколько дней безлимитного «Анализа собеседника» получал
 # пригласивший, когда его друг реально начинал пользоваться ботом — заменено
 # 2026-10 на бонус попытками (REFERRAL_REPLY_BONUS/REFERRAL_ANALYSIS_BONUS/

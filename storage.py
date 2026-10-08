@@ -480,6 +480,12 @@ def init_db() -> None:
         _add_column_if_missing(conn, "users", "watch_deleted", "INTEGER NOT NULL DEFAULT 1")
         _add_column_if_missing(conn, "users", "watch_edited", "INTEGER NOT NULL DEFAULT 1")
         _add_column_if_missing(conn, "users", "watch_ephemeral", "INTEGER NOT NULL DEFAULT 1")
+        # Последнее действие юзера В БОТЕ (кнопка/команда/сообщение боту, не
+        # сообщения собеседников) — пишет LastActionMiddleware в main.py, для
+        # блока «Где уходят» в /users. NULL — с момента появления колонки
+        # юзер ничего не делал (история до этого не восстанавливается).
+        _add_column_if_missing(conn, "users", "last_action", "TEXT")
+        _add_column_if_missing(conn, "users", "last_action_at", "TEXT")
 
         # Индексы под горячие выборки (пересборка карточек, чтение истории)
         _create_index_if_missing(
@@ -528,7 +534,8 @@ def list_all_users() -> list[sqlite3.Row]:
         return conn.execute(
             "SELECT telegram_id, gender, created_at, trial_used, "
             "deep_analysis_free_until, promo_channel_premium_until, "
-            "acquisition_source, blocked_bot "
+            "acquisition_source, blocked_bot, last_action, last_action_at, "
+            "reply_trial_bonus, analysis_trial_bonus, date_trial_bonus "
             "FROM users ORDER BY created_at"
         ).fetchall()
 
@@ -2035,6 +2042,63 @@ def referral_counts_by_user() -> dict[str, int]:
             "WHERE credited = 1 GROUP BY referrer_telegram_id"
         ).fetchall()
     return {r["tid"]: r["n"] for r in rows}
+
+
+def set_last_action(telegram_id: str, action: str) -> None:
+    """Одна UPDATE на действие (LastActionMiddleware). Строки users может ещё
+    не быть (самый первый /start до upsert_user) — тогда просто 0 строк,
+    следующее действие запишется уже нормально."""
+    with _conn() as conn:
+        conn.execute(
+            "UPDATE users SET last_action = ?, last_action_at = ? WHERE telegram_id = ?",
+            (action, _now(), telegram_id),
+        )
+
+
+def get_last_gate_event(telegram_id: str) -> sqlite3.Row | None:
+    """Последнее событие гейта юзера (gate_*) — чтобы не писать одно и то же
+    событие дважды подряд при повторных нажатиях на тот же экран."""
+    with _conn() as conn:
+        return conn.execute(
+            "SELECT event_type, meta FROM events WHERE user_telegram_id = ? "
+            "AND event_type LIKE 'gate\\_%' ESCAPE '\\' ORDER BY id DESC LIMIT 1",
+            (telegram_id,),
+        ).fetchone()
+
+
+def gate_events_by_user() -> tuple[dict[str, set[str]], str | None]:
+    """({telegram_id: {gate_shown, gate_check_ok, ...}}, ts самого первого
+    gate-события вообще). Второе — с какого момента события гейта вообще
+    пишутся: про юзеров, неактивных с тех пор, сказать «гейт не видел»
+    нельзя, история до этого момента неизвестна."""
+    with _conn() as conn:
+        rows = conn.execute(
+            "SELECT user_telegram_id AS tid, event_type, MIN(ts) AS first_ts FROM events "
+            "WHERE event_type LIKE 'gate\\_%' ESCAPE '\\' AND user_telegram_id IS NOT NULL "
+            "GROUP BY user_telegram_id, event_type"
+        ).fetchall()
+    out: dict[str, set[str]] = {}
+    first: str | None = None
+    for r in rows:
+        out.setdefault(r["tid"], set()).add(r["event_type"])
+        if first is None or r["first_ts"] < first:
+            first = r["first_ts"]
+    return out, first
+
+
+def gate_check_fail_without_ok() -> set[str]:
+    """Кто нажимал «Я подписался» без подписки и ПОСЛЕ этого ни разу не
+    получил подтверждение — порядок важен, поэтому отдельным запросом."""
+    with _conn() as conn:
+        rows = conn.execute(
+            "SELECT f.tid FROM ("
+            "  SELECT user_telegram_id AS tid, MIN(ts) AS first_fail FROM events "
+            "  WHERE event_type = 'gate_check_fail' AND user_telegram_id IS NOT NULL "
+            "  GROUP BY user_telegram_id"
+            ") f WHERE NOT EXISTS (SELECT 1 FROM events o WHERE o.user_telegram_id = f.tid "
+            "AND o.event_type = 'gate_check_ok' AND o.ts >= f.first_fail)"
+        ).fetchall()
+    return {r["tid"] for r in rows}
 
 
 def get_last_event_time(telegram_id: str) -> str | None:

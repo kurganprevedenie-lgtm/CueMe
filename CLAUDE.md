@@ -135,7 +135,17 @@ LLM вызывается лениво — только при запросе п�
 
 ```
 users(telegram_id PK, my_id, created_at, auto_mode, auto_contact_id,
-      last_style_rebuild_count, trial_used, gender)
+      last_style_rebuild_count, trial_used, gender,
+      reply_trial_bonus, analysis_trial_bonus, date_trial_bonus,
+      watch_deleted, watch_edited, watch_ephemeral,
+      last_action, last_action_at)
+      -- last_action: последнее действие юзера В БОТЕ (callback_data как есть
+      -- или "cmd:/start"/"text"/"photo"/"voice"/"document"/"video"),
+      -- last_action_at — его время (ISO). Пишет LastActionMiddleware в
+      -- main.py (outer на message/callback_query; не business_message, не
+      -- админские команды/кнопки). Названия для отчёта — _ACTION_LABELS.
+      -- Копится с 2026-10-08; до этого NULL (в /users — "—", время — из
+      -- последнего события events как приблизительный бэкафилл).
       -- gender: 'male' | 'female' | NULL, спрашивается в самом начале
       -- (GenderGateMiddleware в main.py блокирует всё взаимодействие, пока не
       -- выбран); нужен для согласования рода в промптах (llm.py: _gender_note)
@@ -161,6 +171,13 @@ deep_analysis(contact_id PK, compatibility_text, howto_text,
 -- но фича «Анализ своего стиля» убрана — код её больше не пишет/не читает.
 events(id PK AUTO, ts, user_telegram_id, event_type, meta)  -- продуктовая
        -- аналитика: record_event / count_events / event_funnel (storage.py)
+       -- event_type: start, gen_reply_variants, gen_live, gen_live_regen,
+       -- stars_payment, tribute_payment; экран-гейт «подпишись на канал»
+       -- (meta = reply|analysis|date, одно и то же подряд не дублируется,
+       -- _record_gate_event): gate_shown, gate_check_ok, gate_check_fail,
+       -- gate_reveal. Нажатие «📢 Открыть канал» не пишется — url-кнопка,
+       -- Telegram о ней боту не сообщает. Всё это — блок «Где уходят» в
+       -- /users (_build_churn_dashboard_html), порог ухода — CHURN_HOURS.
 saved_ephemeral(connection_id, chat_ref, tg_message_id, saved_at,
                 PRIMARY KEY (connection_id, chat_ref, tg_message_id))
        -- исчезающие медиа, уже присланные владельцу копией (без дублей)
@@ -242,11 +259,14 @@ Tribute (10% комиссия, без вебхука на нашей сторо�
 Помимо приватного канала-пропуска есть отдельный **открытый** канал с
 новостями/обновлениями CueMe — чисто маркетинг, к гейтингу отношения не имеет.
 
-Модель доступа — жёсткий пейволл с триалом по числу запросов:
-- `FREE_TRIAL_REQUESTS` (по умолчанию 5) бесплатных генераций на **Переписать /
-  Ответить за меня / По скриншоту** суммарно — считается один раз на новый
-  черновик/входящее/скриншот (не на «Перегенерировать»/«Другой стиль» внутри
-  того же захода). Счётчик — `users.trial_used`.
+Модель доступа — жёсткий гейт (с 2026-10, `FREE_TRIAL_REQUESTS` закомментирован):
+- Безусловных бесплатных попыток нет. Первая попытка «Ответить за меня» /
+  «Анализ собеседника» / «Идеальное свидание» у юзера, ни разу не
+  открывавшего пул (`_never_unlocked`), ведёт на экран «подпишись на
+  @CueMee» (callback'и `unlock:check:<kind>:<ref>` / `unlock:reveal:...`).
+  Подписка (разово) или каждый приведённый друг дают пул 15/3/3
+  (`*_trial_bonus`), после исчерпания — обычный пейволл. Счётчики
+  использования — `trial_used`, `analysis_trial_used`, `date_trial_used`.
 - Загрузка JSON-экспорта — только по подписке (гейт `_require_premium()` в
   `cb_onboarding_json` и `handle_document`), без триала. Сам парсинг
   локальный и без LLM, но включение фичи всё равно платное.
