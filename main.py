@@ -4642,6 +4642,16 @@ async def handle_business_message(event: Message, bot: Bot) -> None:
         except Exception:
             logging.exception("RAW MEDIA MESSAGE: не удалось сериализовать")
 
+    # ВРЕМЕННЫЙ диагностический лог (убрать после проверки) — гипотеза: само
+    # исчезающее медиа бот не получает, но когда владелец ОТВЕЧАЕТ на него,
+    # оно приходит внутри reply_to_message. Проверяем, есть ли там file_id.
+    reply = event.reply_to_message
+    if reply and (reply.photo or reply.video or reply.video_note or reply.voice or reply.audio or reply.document):
+        try:
+            logging.info("RAW REPLY MEDIA: %s", reply.model_dump_json(exclude_none=True)[:3000])
+        except Exception:
+            logging.exception("RAW REPLY MEDIA: не удалось сериализовать")
+
     # Синхронную DB-часть уводим в поток, чтобы не блокировать event loop.
     contact_id_for_rebuild, merge_notice = await asyncio.to_thread(
         _persist_business_message,
