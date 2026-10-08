@@ -213,6 +213,9 @@ from storage import (
     save_business_message,
     claim_saved_ephemeral,
     update_business_message_text,
+    get_watch_setting,
+    toggle_watch_setting,
+    WATCH_SETTINGS,
     save_deep_analysis,
     save_ideal_date,
     save_interaction_card,
@@ -310,6 +313,7 @@ BTN_DATE          = "💐 Идеальное свидание"
 # оставлена закомментированной ниже — на случай отката.
 # BTN_MORE          = "⚙️ Ещё"
 BTN_SUBSCRIPTION  = "👑 Подписка"
+BTN_WATCH         = "🗑 Удалённые сообщения"
 # BTN_HELP («❓ Помощь», /help — полный список команд) НЕ на главном меню —
 # доступна только командой /help. BTN_SUPPORT ниже — пятая кнопка главного
 # меню (тоже «Помощь», разные эмодзи) — ведёт туда же (_show_help), с
@@ -2594,7 +2598,7 @@ _MAIN_MENU_TEXT = (
 
 
 def main_menu_kb() -> InlineKeyboardMarkup:
-    """Главное меню — 5 пунктов, той же вёрстки/механики, что «Подписка»
+    """Главное меню — 6 пунктов, той же вёрстки/механики, что «Подписка»
     (premium_menu_kb): inline-кнопки на одном сообщении, редактируемом при
     переходах. «👑 Подписка» ведёт в уже существующую edit-in-place иерархию
     (callback_data="show_premium" — тот же, что и «⬅️ Назад» из Реферальной
@@ -2605,6 +2609,7 @@ def main_menu_kb() -> InlineKeyboardMarkup:
     b.button(text=BTN_UNIFIED, callback_data="mm:unified")
     b.button(text=BTN_DEEP, callback_data="mm:deep")
     b.button(text=BTN_DATE, callback_data="mm:date")
+    b.button(text=BTN_WATCH, callback_data="watch:menu")
     b.button(text=BTN_SUBSCRIPTION, callback_data="show_premium")
     b.button(text=BTN_SUPPORT, callback_data="mm:support")
     b.adjust(1)
@@ -4758,6 +4763,8 @@ async def _save_ephemeral_reply_media(
         raw_meta={"ephemeral": True},
         **{f"{kind}_file_id": file_id},
     )
+    if not await asyncio.to_thread(get_watch_setting, owner_id, "watch_ephemeral"):
+        return  # выключено в «🗑 Удалённые сообщения»
 
     contact_id = await asyncio.to_thread(get_contact_id_for_chat_ref, owner_id, chat_ref)
     contact = await asyncio.to_thread(get_contact_by_id, contact_id) if contact_id else None
@@ -4853,6 +4860,8 @@ async def handle_edited_business_message(event: Message, bot: Bot) -> None:
 
     if str(event.from_user.id) == owner_id or row["direction"] != "in":
         return
+    if not await asyncio.to_thread(get_watch_setting, owner_id, "watch_edited"):
+        return  # выключено в «🗑 Удалённые сообщения»
     if await _deleted_messages_excluded(bot, owner_id, event.chat.username):
         return
 
@@ -5042,6 +5051,8 @@ async def handle_deleted_business_messages(event: BusinessMessagesDeleted, bot: 
         return
     owner_id = conn_row["owner_user_id"]
     chat_ref = _chat_ref(event.chat.id)
+    if not await asyncio.to_thread(get_watch_setting, owner_id, "watch_deleted"):
+        return  # выключено в «🗑 Удалённые сообщения»
 
     if await _deleted_messages_excluded(bot, owner_id, event.chat.username):
         return
@@ -8877,6 +8888,73 @@ async def cb_sub_to_main_menu(call: CallbackQuery) -> None:
     """«⬅️ Назад» с экрана «👑 Подписка» — в главное меню, тем же сообщением."""
     await call.answer()
     await _send_main_menu(call.message, edit=True)
+
+
+# ── 🗑 Удалённые сообщения — настройки трёх Premium-функций слежки ──────────
+# Все три по умолчанию включены. Без Premium экран виден, но переключатели
+# заблокированы (тап — подсказка про Premium), а сами функции присылают
+# только тизеры. Проверки настроек — в handle_deleted_business_messages,
+# handle_edited_business_message и _save_ephemeral_reply_media.
+
+_WATCH_ITEMS = (
+    ("watch_deleted", "Удалённые сообщения"),
+    ("watch_edited", "Изменённые сообщения"),
+    ("watch_ephemeral", "Сохранение исчезающих (с таймером)"),
+)
+
+_WATCH_TEXT = (
+    "🗑 Удалённые сообщения\n\n"
+    "Что присылать тебе из переписок:\n"
+    "• удалённые собеседником сообщения\n"
+    "• изменённые — что было и что стало\n"
+    "• исчезающие фото, видео, кружки и голосовые — ответь на такое "
+    "сообщение, и я пришлю копию\n\n"
+    "Нажми на пункт, чтобы включить или выключить."
+)
+
+
+def _watch_kb(telegram_id: str, is_premium: bool) -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    for key, label in _WATCH_ITEMS:
+        if is_premium:
+            mark = "✅" if get_watch_setting(telegram_id, key) else "❌"
+            b.button(text=f"{mark} {label}", callback_data=f"watch:toggle:{key}")
+        else:
+            b.button(text=f"🔒 {label}", callback_data="watch:locked")
+    if not is_premium:
+        b.button(text="👑 Оформить Premium", callback_data="show_premium")
+    b.button(text="⬅️ Назад", callback_data="sub:to_menu")
+    b.adjust(1)
+    return b.as_markup()
+
+
+async def _show_watch_screen(target: Message, bot: Bot, telegram_id: str) -> None:
+    is_premium = await _is_premium(bot, telegram_id)
+    text = _WATCH_TEXT if is_premium else f"{_WATCH_TEXT}\n\n🔒 Доступно с Premium."
+    await target.edit_text(text, reply_markup=_watch_kb(telegram_id, is_premium))
+
+
+@dp.callback_query(F.data == "watch:menu")
+async def cb_watch_menu(call: CallbackQuery, bot: Bot) -> None:
+    await call.answer()
+    await _show_watch_screen(await _menu_screen_target(call.message), bot, str(call.from_user.id))
+
+
+@dp.callback_query(F.data == "watch:locked")
+async def cb_watch_locked(call: CallbackQuery) -> None:
+    await call.answer("Настройки доступны с Premium", show_alert=True)
+
+
+@dp.callback_query(F.data.startswith("watch:toggle:"))
+async def cb_watch_toggle(call: CallbackQuery, bot: Bot) -> None:
+    telegram_id = str(call.from_user.id)
+    key = call.data.split(":", 2)[2]
+    if key not in WATCH_SETTINGS or not await _is_premium(bot, telegram_id):
+        await call.answer("Настройки доступны с Premium", show_alert=True)
+        return
+    enabled = await asyncio.to_thread(toggle_watch_setting, telegram_id, key)
+    await call.answer("Включено" if enabled else "Выключено")
+    await _show_watch_screen(call.message, bot, telegram_id)
 
 
 # ── /delete — удалить данные (152-ФЗ) ────────────────────────────────────────

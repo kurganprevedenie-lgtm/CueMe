@@ -474,6 +474,12 @@ def init_db() -> None:
         _add_column_if_missing(conn, "users", "reply_trial_bonus", "INTEGER NOT NULL DEFAULT 0")
         _add_column_if_missing(conn, "users", "analysis_trial_bonus", "INTEGER NOT NULL DEFAULT 0")
         _add_column_if_missing(conn, "users", "date_trial_bonus", "INTEGER NOT NULL DEFAULT 0")
+        # Настройки раздела «🗑 Удалённые сообщения» (main.py: _watch_settings_*)
+        # — присылать ли удалённые/изменённые собеседником и сохранять ли
+        # исчезающие медиа. 1 = включено, по умолчанию всё включено.
+        _add_column_if_missing(conn, "users", "watch_deleted", "INTEGER NOT NULL DEFAULT 1")
+        _add_column_if_missing(conn, "users", "watch_edited", "INTEGER NOT NULL DEFAULT 1")
+        _add_column_if_missing(conn, "users", "watch_ephemeral", "INTEGER NOT NULL DEFAULT 1")
 
         # Индексы под горячие выборки (пересборка карточек, чтение истории)
         _create_index_if_missing(
@@ -2282,6 +2288,31 @@ def get_business_message_by_tg_id(
 def get_business_message_by_row_id(row_id: int) -> sqlite3.Row | None:
     with _conn() as conn:
         return conn.execute("SELECT * FROM business_messages WHERE id = ?", (row_id,)).fetchone()
+
+
+WATCH_SETTINGS = ("watch_deleted", "watch_edited", "watch_ephemeral")
+
+
+def get_watch_setting(telegram_id: str, key: str) -> bool:
+    """Включена ли настройка раздела «Удалённые сообщения». Нет строки
+    users — считаем включённой (тот же дефолт, что у колонки)."""
+    assert key in WATCH_SETTINGS
+    with _conn() as conn:
+        row = conn.execute(f"SELECT {key} FROM users WHERE telegram_id = ?", (telegram_id,)).fetchone()
+    return bool(row[key]) if row else True
+
+
+def toggle_watch_setting(telegram_id: str, key: str) -> bool:
+    """Переключает настройку, возвращает новое значение."""
+    assert key in WATCH_SETTINGS
+    with _conn() as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO users (telegram_id, my_id, created_at) VALUES (?, ?, ?)",
+            (telegram_id, f"user{telegram_id}", _now()),
+        )
+        conn.execute(f"UPDATE users SET {key} = 1 - {key} WHERE telegram_id = ?", (telegram_id,))
+        row = conn.execute(f"SELECT {key} FROM users WHERE telegram_id = ?", (telegram_id,)).fetchone()
+    return bool(row[key])
 
 
 def update_business_message_text(row_id: int, text: str) -> None:
