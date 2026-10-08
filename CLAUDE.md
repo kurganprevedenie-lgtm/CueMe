@@ -204,7 +204,9 @@ saved_ephemeral(connection_id, chat_ref, tg_message_id, saved_at,
 
 ## Business API
 
-- `@dp.business_connection()` — upsert в business_connections
+- `@dp.business_connection()` — upsert в business_connections; «✅ Готово, бот
+  подключён!» с конфетти (`CONNECT_EFFECT_ID`, фолбэк без эффекта) — только при
+  переходе «не было активного подключения → включено», не на смену прав
 - `@dp.business_message()` — direction по sender_id, chat_ref = sha256(chat_id)[:16],
   запись в business_messages, триггер _maybe_rebuild через asyncio.create_task
 - Матчинг контакта: `f"user{str(event.from_user.id)}"` == `original_from_id` из contacts

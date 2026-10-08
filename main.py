@@ -63,6 +63,7 @@ from config import (
     ONBOARDING_PHOTO_PATH,
     MAIN_MENU_LOGO_FILE_ID,
     MAIN_MENU_LOGO_PATH,
+    CONNECT_EFFECT_ID,
     ONBOARDING_JSON_POST_URL,
     OPENERS_FOR_HER,
     OPENERS_FOR_HIM,
@@ -4578,6 +4579,11 @@ async def cb_ideal_date_contact(call: CallbackQuery, bot: Bot) -> None:
 
 @dp.business_connection()
 async def handle_business_connection(event: BusinessConnection, bot: Bot) -> None:
+    # Апдейт приходит не только при подключении, но и при смене прав —
+    # подтверждение шлём только при переходе «не было активного подключения →
+    # включено» (раньше слалось на каждый такой апдейт и дублировалось).
+    prev = get_business_connection(event.id)
+    just_connected = event.is_enabled and not (prev and prev["is_enabled"])
     upsert_business_connection(
         connection_id=event.id,
         owner_user_id=str(event.user.id),
@@ -4594,7 +4600,22 @@ async def handle_business_connection(event: BusinessConnection, bot: Bot) -> Non
         # UPDATE по несуществующей строке (молчаливый no-op), а сам юзер
         # до ответа останется невидим в /users.
         upsert_user(owner_id, f"user{owner_id}")
-        try:
+        # Было: то же сообщение без эффекта, на КАЖДЫЙ апдейт с is_enabled
+        # (дублировалось при смене прав). Теперь — только при подключении и
+        # с конфетти (CONNECT_EFFECT_ID); если эффект не принят — без него.
+        # try:
+        #     await bot.send_message(
+        #         event.user.id,
+        #         "✅ Готово, бот подключён! CueMe готов помогать тебе в переписках )",
+        #         reply_markup=ReplyKeyboardRemove(),
+        #     )
+        # except TelegramForbiddenError:
+        #     mark_bot_blocked(owner_id)
+        #     return
+        # except Exception:
+        #     logging.warning("business-connect notify failed: owner=%s", event.user.id)
+        # await asyncio.sleep(3)
+        if just_connected:
             # reply_markup=ReplyKeyboardRemove() — main_kb() (persistent
             # reply-клавиатура) убрана совсем, эта отправка на всякий случай
             # снимает её, если у юзера она ещё видна с более ранней версии
@@ -4602,17 +4623,22 @@ async def handle_business_connection(event: BusinessConnection, bot: Bot) -> Non
             # (_maybe_prompt_source ниже) — а вот всё ПОСЛЕ него (источник →
             # пол → квикстарт → «кому бы написал») остаётся правками одного
             # и того же сообщения.
-            await bot.send_message(
-                event.user.id,
-                "✅ Готово, бот подключён! CueMe готов помогать тебе в переписках )",
-                reply_markup=ReplyKeyboardRemove(),
-            )
-        except TelegramForbiddenError:
-            mark_bot_blocked(owner_id)
-            return
-        except Exception:
-            logging.warning("business-connect notify failed: owner=%s", event.user.id)
-        await asyncio.sleep(3)
+            text = "✅ Готово, бот подключён! CueMe готов помогать тебе в переписках )"
+            try:
+                try:
+                    await bot.send_message(
+                        event.user.id, text, reply_markup=ReplyKeyboardRemove(),
+                        message_effect_id=CONNECT_EFFECT_ID or None,
+                    )
+                except TelegramBadRequest as e:
+                    logging.warning("business-connect: эффект не принят (%s), шлю без него", e)
+                    await bot.send_message(event.user.id, text, reply_markup=ReplyKeyboardRemove())
+            except TelegramForbiddenError:
+                mark_bot_blocked(owner_id)
+                return
+            except Exception:
+                logging.warning("business-connect notify failed: owner=%s", event.user.id)
+            await asyncio.sleep(3)
         # Пол спрашиваем не сразу, а из cb_source_select — ПОСЛЕ того как юзер
         # реально ответит на вопрос про источник (последовательно, не хором).
         await _maybe_prompt_source(bot, owner_id)

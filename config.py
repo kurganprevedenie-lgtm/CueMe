@@ -78,6 +78,12 @@ ONBOARDING_PHOTO_FILE_ID = os.getenv("ONBOARDING_PHOTO_FILE_ID", "")
 MAIN_MENU_LOGO_PATH = os.getenv("MAIN_MENU_LOGO_PATH", "")
 MAIN_MENU_LOGO_FILE_ID = os.getenv("MAIN_MENU_LOGO_FILE_ID", "")
 
+# Анимация (message effect) на сообщении «бот подключён» — main.py:
+# handle_business_connection. Работает только в личных чатах. Сейчас 🎉
+# конфетти; другие эффекты: 🔥 5104841245755180586, ❤️ 5159385139981059251,
+# 👍 5107584321108051014, 👎 5104858069142078462, 💩 5046589136895476101.
+CONNECT_EFFECT_ID = os.getenv("CONNECT_EFFECT_ID", "5046509860389126442")
+
 # Ссылка на пост в канале с инструкцией по JSON-экспорту (кнопка под подсказкой
 # «начни диалог или экспортируй JSON», когда у юзера ещё нет ни одного контакта).
 # Пока отдельного поста нет — ведёт на канал целиком.
