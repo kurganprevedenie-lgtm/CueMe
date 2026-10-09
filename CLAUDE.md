@@ -124,6 +124,14 @@ LLM вызывается лениво — только при запросе п�
   истории git, если понадобится. gpt-oss — reasoning-
   модели, тратят часть `max_tokens` на рассуждения до ответа — у
   GroqProvider/OpenRouterProvider в `llm.py` есть `_REASONING_BUFFER`.
+  «Ответ с CueMe» (варианты + живой диалог, `_ask(..., fast=True)`) — у Groq
+  `reasoning_effort=VARIANTS_REASONING_EFFORT` (low), буфер
+  `VARIANTS_REASONING_BUFFER` (300) и таймаут `VARIANTS_GROQ_TIMEOUT` (20 с):
+  скорость важнее глубины, а меньше токенов — реже 429 по токенному лимиту
+  Groq. Анализ/свидание не затронуты. Откат — `VARIANTS_REASONING_EFFORT=""`.
+  Прогресс-бар (`with_progress_animation`) отдаёт результат сразу по ответу
+  LLM (не раньше 1.2 с), кадры раз в 0.8 с в фоне — раньше ждал границы
+  3-секундного круга. Сравнить качество до/после: `python3 -m tools.ab_variants`.
   Vision (скриншоты) — отдельно, Groq/Gemini (см. `VISION_MODEL` в config.py)
 - HTTP: **httpx** с `trust_env=False` (обход SOCKS-прокси)
 - Хранилище: **SQLite** (bot.db)
