@@ -9290,7 +9290,7 @@ async def _premium_status_text(bot: Bot, telegram_id: str) -> str:
         "❌ Подписка не активна\n\n"
         f"{offer}"
         f"Ещё попытки — за каждого друга: +{REFERRAL_REPLY_BONUS} / "
-        f"+{REFERRAL_ANALYSIS_BONUS} / +{REFERRAL_DATE_BONUS}, раздел 👥 Реферальная система.\n\n"
+        f"+{REFERRAL_ANALYSIS_BONUS} / +{REFERRAL_DATE_BONUS} — жми «👥 Реферальная система».\n\n"
         "Оплатили, но бот не видит подписку? Подождите пару минут и снова наберите /premium."
     )
 
