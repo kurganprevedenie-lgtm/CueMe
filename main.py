@@ -463,34 +463,88 @@ _REPLY_PROGRESS_CYCLE_SECONDS = 3.0  # Ответ с CueMe, первая ген�
 _PROGRESS_FRAME_COUNT = 10  # кадров в одном круге — при 3с круге кадр идёт каждые 0.3с
 
 
-async def _run_progress_cycle(bot: Bot, chat_id: int, message_id: int, cycle_seconds: float) -> None:
-    """Один полный круг анимации ровно cycle_seconds секунд, _PROGRESS_FRAME_COUNT
-    кадров равномерно внутри него — короче круг, быстрее сменяются кадры."""
-    frame_interval = cycle_seconds / _PROGRESS_FRAME_COUNT
-    for frame in _PROGRESS_FRAMES[:_PROGRESS_FRAME_COUNT]:
-        try:
-            await bot.edit_message_text(frame, chat_id=chat_id, message_id=message_id)
-        except Exception:
-            pass  # гонки/rate limit одного кадра — не роняем задачу анимации
-        await asyncio.sleep(frame_interval)
+# Было: _run_progress_cycle + with_progress_animation, отдававшая результат
+# ТОЛЬКО на границе целого круга (cycle_seconds), с правкой кадра каждые
+# cycle_seconds/10 = 0.3 с через await. Каждая правка — сетевой запрос к
+# Telegram, поэтому «3-секундный» круг на деле длился дольше (замер: при
+# правке за 0.25 с ответ LLM за 0.8 с показывался через 5.7 с), а частые
+# правки упираются в лимиты Telegram. Заменено 2026-10-09 (см. ниже).
+# Оставлено для отката.
+# async def _run_progress_cycle(bot: Bot, chat_id: int, message_id: int, cycle_seconds: float) -> None:
+#     """Один полный круг анимации ровно cycle_seconds секунд, _PROGRESS_FRAME_COUNT
+#     кадров равномерно внутри него — короче круг, быстрее сменяются кадры."""
+#     frame_interval = cycle_seconds / _PROGRESS_FRAME_COUNT
+#     for frame in _PROGRESS_FRAMES[:_PROGRESS_FRAME_COUNT]:
+#         try:
+#             await bot.edit_message_text(frame, chat_id=chat_id, message_id=message_id)
+#         except Exception:
+#             pass  # гонки/rate limit одного кадра — не роняем задачу анимации
+#         await asyncio.sleep(frame_interval)
+#
+#
+# async def with_progress_animation(
+#     bot: Bot, chat_id: int, message_id: int, coro, cycle_seconds: float = _PROGRESS_CYCLE_SECONDS,
+# ):
+#     """Крутит анимацию на message_id ЦЕЛЫМИ cycle_seconds-секундными кругами,
+#     пока выполняется coro (реальный вызов LLM) — результат отдаётся ТОЛЬКО на
+#     границе круга, никогда раньше. Если LLM ответила быстрее — юзер всё
+#     равно видит анимацию весь текущий круг; если LLM не успела — крутим ещё
+#     один круг целиком и снова проверяем на его границе. Исключение из coro
+#     пробрасывается вызывающему коду сразу по завершении того круга, на
+#     котором coro упала, — тот сам решает, как отредактировать message_id в
+#     сообщение об ошибке."""
+#     task = asyncio.ensure_future(coro)
+#     while True:
+#         await _run_progress_cycle(bot, chat_id, message_id, cycle_seconds)
+#         if task.done():
+#             return task.result()  # исключение из coro пробрасывается здесь же
+
+
+_PROGRESS_MIN_SHOW_SECONDS = 1.2  # не раньше — иначе анимация успевает только мигнуть
+_PROGRESS_MIN_EDIT_INTERVAL = 0.8  # не чаще раза в столько секунд (лимиты Telegram)
 
 
 async def with_progress_animation(
     bot: Bot, chat_id: int, message_id: int, coro, cycle_seconds: float = _PROGRESS_CYCLE_SECONDS,
 ):
-    """Крутит анимацию на message_id ЦЕЛЫМИ cycle_seconds-секундными кругами,
-    пока выполняется coro (реальный вызов LLM) — результат отдаётся ТОЛЬКО на
-    границе круга, никогда раньше. Если LLM ответила быстрее — юзер всё
-    равно видит анимацию весь текущий круг; если LLM не успела — крутим ещё
-    один круг целиком и снова проверяем на его границе. Исключение из coro
-    пробрасывается вызывающему коду сразу по завершении того круга, на
-    котором coro упала, — тот сам решает, как отредактировать message_id в
-    сообщение об ошибке."""
+    """Крутит анимацию на message_id, пока выполняется coro (реальный вызов
+    LLM), и отдаёт результат СРАЗУ, как только coro готова — но не раньше
+    _PROGRESS_MIN_SHOW_SECONDS от старта. Кадр меняется раз в
+    max(cycle_seconds / кадров, _PROGRESS_MIN_EDIT_INTERVAL) секунд (то есть
+    cycle_seconds задаёт уже только скорость смены кадров), правка идёт в
+    фоне и не задерживает ожидание; новая не стартует, пока не закончилась
+    предыдущая. Перед возвратом незаконченная правка дожидается (не дольше
+    секунды), чтобы запоздавший кадр не перезаписал уже показанный
+    результат. Исключение из coro пробрасывается вызывающему коду."""
     task = asyncio.ensure_future(coro)
-    while True:
-        await _run_progress_cycle(bot, chat_id, message_id, cycle_seconds)
-        if task.done():
-            return task.result()  # исключение из coro пробрасывается здесь же
+    started = time.monotonic()
+    interval = max(cycle_seconds / _PROGRESS_FRAME_COUNT, _PROGRESS_MIN_EDIT_INTERVAL)
+    frame_i = 0
+    edit_task: asyncio.Task | None = None
+
+    async def _edit(frame: str) -> None:
+        try:
+            await bot.edit_message_text(frame, chat_id=chat_id, message_id=message_id)
+        except Exception:
+            pass  # гонки/лимит одного кадра — не роняем анимацию
+
+    try:
+        while True:
+            done, _ = await asyncio.wait({task}, timeout=interval)
+            if done:
+                remaining = _PROGRESS_MIN_SHOW_SECONDS - (time.monotonic() - started)
+                if remaining > 0:
+                    await asyncio.sleep(remaining)
+                return task.result()
+            if edit_task is None or edit_task.done():
+                frame_i = (frame_i + 1) % _PROGRESS_FRAME_COUNT
+                edit_task = asyncio.create_task(_edit(_PROGRESS_FRAMES[frame_i]))
+    finally:
+        if edit_task is not None and not edit_task.done():
+            try:
+                await asyncio.wait_for(edit_task, timeout=1.0)
+            except Exception:
+                pass
 
 
 # ВРЕМЕННЫЕ замеры скорости «Ответа с CueMe» (2026-10-09, убрать после
