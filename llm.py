@@ -85,7 +85,8 @@ from config import (
     OPENROUTER_API_KEY,
     REPLY_STYLES,
     VARIANTS_GEMINI_MODELS,
-    VARIANTS_GROQ_MODEL,
+    VARIANTS_GROQ_COOLDOWN,
+    VARIANTS_GROQ_MODELS,
     VARIANTS_GROQ_TIMEOUT,
     VARIANTS_REASONING_BUFFER,
     VARIANTS_REASONING_EFFORT,
@@ -232,6 +233,52 @@ _llm_attempt: contextvars.ContextVar[list] = contextvars.ContextVar("llm_attempt
 # рассуждения, таймаут) — выставляет _ask(..., fast=True), читает
 # GroqProvider._ask_with_key. Остальные провайдеры их не видят и не меняются.
 _llm_fast: contextvars.ContextVar[bool] = contextvars.ContextVar("llm_fast", default=False)
+# Какая модель Groq ответила на fast-вызов («Groq 120b» / «Groq 20b») —
+# выставляет GroqProvider.ask, читает _ask для счётчика _variants_served.
+_llm_served_by: contextvars.ContextVar[str | None] = contextvars.ContextVar("llm_served_by", default=None)
+
+# «Ответ с CueMe»: сколько запросов обслужил каждый (Groq 120b / Groq 20b /
+# Gemini / OpenRouter), с рестарта — для /apistatus.
+_variants_served: dict[str, int] = {}
+# Модель Groq → до какого момента (time.time()) её пропускаем: у неё все
+# ключи вернули 429. In-memory, с рестарта.
+_groq_model_cooldown: dict[str, float] = {}
+_GROQ_COOLDOWN_MAX = 15 * 60
+
+
+def _groq_model_label(model: str) -> str:
+    return "Groq " + model.rsplit("-", 1)[-1] if model.startswith("openai/gpt-oss-") else f"Groq {model}"
+
+
+def get_variants_served() -> dict[str, int]:
+    return dict(_variants_served)
+
+
+def get_groq_model_cooldowns() -> dict[str, int]:
+    """Модель → сколько секунд ещё в кулдауне (только активные)."""
+    now = time.time()
+    return {m: int(t - now) for m, t in _groq_model_cooldown.items() if t > now}
+
+
+_RETRY_IN_RE = re.compile(r"try again in\s+((?:\d+(?:\.\d+)?(?:ms|h|m|s))+)", re.IGNORECASE)
+
+
+def _groq_retry_after(resp: "httpx.Response") -> float | None:
+    """Через сколько секунд Groq обещает снять 429: заголовок retry-after или
+    «Please try again in 6m5.184s» из текста ошибки (TPD/TPM). None — не сказал."""
+    ra = resp.headers.get("retry-after")
+    if ra:
+        try:
+            return float(ra)
+        except ValueError:
+            pass
+    m = _RETRY_IN_RE.search(resp.text or "")
+    if not m:
+        return None
+    total = 0.0
+    for num, unit in re.findall(r"(\d+(?:\.\d+)?)(ms|h|m|s)", m.group(1)):
+        total += float(num) * {"ms": 0.001, "s": 1, "m": 60, "h": 3600}[unit]
+    return total or None
 
 
 def _log_llm_timing(provider: str, key: str, outcome: str, t0: float) -> None:
@@ -505,16 +552,18 @@ class GroqProvider(LLMProvider):
     # отдельно проверяет пустой content и идёт к следующему провайдеру.
     _REASONING_BUFFER = 900
 
-    async def _ask_with_key(self, prompt: str, max_tokens: int, key: str) -> str:
+    async def _ask_with_key(self, prompt: str, max_tokens: int, key: str, model: str | None = None) -> str:
         # Было: всегда timeout=90, буфер _REASONING_BUFFER, без
         # reasoning_effort. Для «Ответа с CueMe» (_ask(..., fast=True)) —
         # reasoning_effort из VARIANTS_REASONING_EFFORT, меньший буфер и
         # таймаут: скорость важнее глубины, и меньше токенов — реже 429 по
         # токенному лимиту (см. config.py). Пустой effort — прежнее поведение.
         fast = _llm_fast.get() and bool(VARIANTS_REASONING_EFFORT)
-        # Модель для «Ответа с CueMe» — VARIANTS_GROQ_MODEL (своя, отдельно
-        # от reasoning_effort, чтобы откатывать независимо).
-        model = VARIANTS_GROQ_MODEL if (_llm_fast.get() and VARIANTS_GROQ_MODEL) else self._MODEL
+        # Модель: для «Ответа с CueMe» её выбирает ask() по каскаду
+        # VARIANTS_GROQ_MODELS и передаёт сюда; иначе — основная _MODEL.
+        # (Было: model = VARIANTS_GROQ_MODEL if fast else self._MODEL —
+        # одна модель для fast всегда, см. config.py.)
+        model = model or self._MODEL
         payload = {
             "model": model,
             "messages": [{"role": "user", "content": prompt}],
@@ -535,10 +584,15 @@ class GroqProvider(LLMProvider):
         # ключ (та же логика, что у Gemini). Раньше на 429 ещё и спали 65с —
         # с появлением fallback/ротации это не нужно.
         if 400 <= resp.status_code < 500:
-            raise RateLimitError(
+            err = RateLimitError(
                 f"Groq ключ {_mask_key(key)}: HTTP {resp.status_code} — "
                 "невалиден, нет доступа или лимит."
             )
+            # Для каскада моделей: 429 = лимит именно этой модели на ключе,
+            # прочие 4xx (403 и т.п.) — проблема ключа, не модели.
+            err.status = resp.status_code
+            err.retry_after = _groq_retry_after(resp) if resp.status_code == 429 else None
+            raise err
 
         if resp.status_code in (500, 502, 503):
             raise ProviderError(f"Groq {resp.status_code}: {resp.text[:200]}")
@@ -550,10 +604,13 @@ class GroqProvider(LLMProvider):
         return (resp.json()["choices"][0]["message"].get("content") or "").strip()
 
     async def ask(self, prompt: str, max_tokens: int) -> str:
-        """Перебирает ключи Groq по кругу (мультиаккаунтинг), как GeminiProvider."""
+        """Перебирает ключи Groq по кругу (мультиаккаунтинг), как GeminiProvider.
+        Для «Ответа с CueMe» (fast) — каскад моделей, см. _ask_fast_cascade."""
         keys = _groq_keys_rotated()
         if not keys:
             raise ProviderError("GROQ_API_KEY(S) не задан")
+        if _llm_fast.get() and VARIANTS_GROQ_MODELS:
+            return await self._ask_fast_cascade(prompt, max_tokens, keys)
 
         last_exc: Exception = RateLimitError("Ни один ключ Groq не сработал.")
         for i, key in enumerate(keys):
@@ -565,6 +622,44 @@ class GroqProvider(LLMProvider):
                     log.warning("Groq: %s — пробую следующий ключ (%d/%d)",
                                 e, i + 2, len(keys))
                 continue
+        raise last_exc
+
+
+    async def _ask_fast_cascade(self, prompt: str, max_tokens: int, keys: list[str]) -> str:
+        """Модели VARIANTS_GROQ_MODELS по порядку (по качеству), на каждой — все
+        ключи. Все ключи модели вернули 429 — кулдаун модели (сколько сказал
+        Groq, иначе VARIANTS_GROQ_COOLDOWN, не больше 15 мин) и сразу
+        следующая модель. 5xx/таймаут — как раньше, наружу (к Gemini)."""
+        last_exc: Exception = RateLimitError("Ни одна модель/ключ Groq не сработали.")
+        for mi, model in enumerate(VARIANTS_GROQ_MODELS):
+            left = _groq_model_cooldown.get(model, 0) - time.time()
+            if left > 0:
+                log.warning("Groq: %s в кулдауне ещё %d с — пропускаю", model, left)
+                continue
+            all_429, retry_afters = True, []
+            for key in keys:
+                t0 = time.monotonic()
+                try:
+                    result = await self._ask_with_key(prompt, max_tokens, key, model)
+                except RateLimitError as e:
+                    last_exc = e
+                    if getattr(e, "status", None) == 429:
+                        if getattr(e, "retry_after", None):
+                            retry_afters.append(e.retry_after)
+                    else:
+                        all_429 = False
+                    continue
+                label = _groq_model_label(model)
+                _llm_served_by.set(label)
+                log.info("Groq fast: ответила %s за %.0f мс", model, (time.monotonic() - t0) * 1000)
+                return result
+            nxt = VARIANTS_GROQ_MODELS[mi + 1] if mi + 1 < len(VARIANTS_GROQ_MODELS) else "Gemini"
+            if all_429:
+                cooldown = min(min(retry_afters) if retry_afters else VARIANTS_GROQ_COOLDOWN, _GROQ_COOLDOWN_MAX)
+                _groq_model_cooldown[model] = time.time() + cooldown
+                log.warning("Groq: у %s все ключи на 429 — кулдаун %d с, перехожу к %s", model, cooldown, nxt)
+            else:
+                log.warning("Groq: %s не ответила ни на одном ключе — перехожу к %s", model, nxt)
         raise last_exc
 
 
@@ -913,6 +1008,7 @@ async def _ask(
     VARIANTS_* в config.py (см. GroqProvider._ask_with_key)."""
     _llm_call_tag.set(tag or "-")
     _llm_fast.set(fast)
+    _llm_served_by.set(None)
     _llm_attempt.set([0])
     last_exc: Exception = RuntimeError("Нет доступных LLM-провайдеров")
     chain = _ordered_providers()
@@ -938,6 +1034,9 @@ async def _ask(
             _record_stat(provider.name, "ok", elapsed)
             tag = "" if (not _forced and provider is chain[0]) else " (fallback)"
             log.info("LLM [%s]: ok за %.0f мс%s", provider.name, elapsed, tag)
+            if fast:
+                served = _llm_served_by.get() or provider.name
+                _variants_served[served] = _variants_served.get(served, 0) + 1
             return result
         except RateLimitError as e:
             elapsed = (time.monotonic() - t0) * 1000

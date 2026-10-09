@@ -88,6 +88,8 @@ from config import (
 )
 from features import detect_reply_situation, extract_features, stage_hint, totals_from_summary, winning_messages
 from llm import (
+    get_variants_served,
+    get_groq_model_cooldowns,
     # ILLEGIBLE_MARKER, extract_chat_from_image, screenshot_variants — были
     # нужны только функции «скриншот переписки → ответ», убранной целиком
     # (см. пометки у Screenshot/handle_unified_input/секции «Ответить по
@@ -7741,6 +7743,15 @@ async def cmd_apistatus(message: Message) -> None:
     if not _is_admin(message.from_user.id):
         return
     text = "📡 Статус API по ключам (с рестарта бота):\n\n" + _format_apistatus(get_provider_stats_snapshot())
+    served = get_variants_served()
+    cooldowns = get_groq_model_cooldowns()
+    if served or cooldowns:
+        lines = ["\n\n<b>«Ответ с CueMe» — кто ответил</b>"]
+        for name, n in sorted(served.items(), key=lambda kv: -kv[1]):
+            lines.append(f"  {html.escape(name)}: {n}")
+        for model, left in cooldowns.items():
+            lines.append(f"  ⏸ {html.escape(model)}: в кулдауне ещё {left} с")
+        text += "\n".join(lines)
     await _answer_long(message, text, parse_mode="HTML")
 
 

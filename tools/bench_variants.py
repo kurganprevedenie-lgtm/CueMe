@@ -65,13 +65,28 @@ async def capture_prompt(text: str) -> str:
     return box["prompt"], box["max_tokens"]
 
 
-class Groq20b(llm.GroqProvider):
-    _MODEL = "openai/gpt-oss-20b"
-
-
-async def groq(provider_cls, fast: bool, prompt: str, max_tokens: int) -> str:
+async def groq(models: list[str] | None, fast: bool, prompt: str, max_tokens: int,
+               cooldown_120b: bool = False) -> str:
+    """models — список моделей для fast-каскада (None — как в config.py).
+    cooldown_120b — сымитировать, что 120b в кулдауне (все ключи на 429)."""
     llm._llm_fast.set(fast)
-    return await provider_cls().ask(prompt, max_tokens)
+    llm._llm_served_by.set(None)
+    saved = llm.VARIANTS_GROQ_MODELS
+    if models is not None:
+        llm.VARIANTS_GROQ_MODELS = models
+    if cooldown_120b:
+        llm._groq_model_cooldown["openai/gpt-oss-120b"] = time.time() + 3600
+    try:
+        out = await llm.GroqProvider().ask(prompt, max_tokens)
+    finally:
+        llm.VARIANTS_GROQ_MODELS = saved
+        if cooldown_120b:
+            llm._groq_model_cooldown.pop("openai/gpt-oss-120b", None)
+    SERVED.append(llm._llm_served_by.get())
+    return out
+
+
+SERVED: list = []
 
 
 async def gemini(model: str, prompt: str, max_tokens: int) -> str:
@@ -86,9 +101,11 @@ async def gemini(model: str, prompt: str, max_tokens: int) -> str:
 
 
 CANDIDATES = [
-    ("Groq 120b (как было)", lambda p, m: groq(llm.GroqProvider, False, p, m)),
-    ("Groq 120b low", lambda p, m: groq(llm.GroqProvider, True, p, m)),
-    ("Groq 20b low", lambda p, m: groq(Groq20b, True, p, m)),
+    ("Groq 120b (как было)", lambda p, m: groq(None, False, p, m)),
+    ("Groq 120b low", lambda p, m: groq(["openai/gpt-oss-120b"], True, p, m)),
+    ("Groq 20b low", lambda p, m: groq(["openai/gpt-oss-20b"], True, p, m)),
+    ("Groq каскад 120b→20b", lambda p, m: groq(None, True, p, m)),
+    ("Groq каскад, 120b в кулдауне", lambda p, m: groq(None, True, p, m, cooldown_120b=True)),
     ("Gemini 3.1 Flash Lite", lambda p, m: gemini("gemini-3.1-flash-lite", p, m)),
     ("Gemini 3.5 Flash Lite", lambda p, m: gemini("gemini-3.5-flash-lite", p, m)),
     ("Gemma 4 26B (для сравнения)", lambda p, m: gemini("gemma-4-26b-a4b-it", p, m)),
@@ -103,11 +120,14 @@ async def main() -> None:
         rows = []
         for (prompt, mt), text in zip(prompts, INPUTS):
             t0 = time.monotonic()
+            SERVED.clear()
             try:
                 raw = await asyncio.wait_for(call(prompt, mt), timeout=60)
                 dt = time.monotonic() - t0
                 parsed = llm._parse_variants(raw, 3) if raw.strip() else []
                 status = "ok" if len(parsed) == 3 else ("пусто" if not raw.strip() else f"распарсено {len(parsed)}/3")
+                if SERVED and SERVED[-1]:
+                    status += f" ({SERVED[-1]})"
             except Exception as e:
                 dt, parsed, status = time.monotonic() - t0, [], f"{type(e).__name__}: {str(e)[:60]}"
             rows.append((text, dt, status, parsed))
@@ -117,7 +137,7 @@ async def main() -> None:
     print("\n\n=== ИТОГ ===")
     print(f"{'кандидат':30} {'ок':>4} {'пусто/битых':>12} {'медиана':>8} {'худшее':>7}")
     for name, rows in results.items():
-        ok = [r for r in rows if r[2] == "ok"]
+        ok = [r for r in rows if r[2].startswith("ok")]
         times = [r[1] for r in ok]
         med = f"{statistics.median(times):.1f} с" if times else "—"
         worst = f"{max(times):.1f} с" if times else "—"
