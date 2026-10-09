@@ -84,6 +84,9 @@ from config import (
     LLM_PROVIDER_ORDER,
     OPENROUTER_API_KEY,
     REPLY_STYLES,
+    VARIANTS_GROQ_TIMEOUT,
+    VARIANTS_REASONING_BUFFER,
+    VARIANTS_REASONING_EFFORT,
     VISION_MODEL,
 )
 # initiative_axis/interest_signal_a/response_speed_axis были нужны только
@@ -223,6 +226,10 @@ async def _tracked_post(
 # через всех провайдеров.
 _llm_call_tag: contextvars.ContextVar[str] = contextvars.ContextVar("llm_call_tag", default="-")
 _llm_attempt: contextvars.ContextVar[list] = contextvars.ContextVar("llm_attempt", default=[0])
+# Опции конкретного вызова для Groq (reasoning_effort, запас токенов под
+# рассуждения, таймаут) — выставляет _ask(..., fast=True), читает
+# GroqProvider._ask_with_key. Остальные провайдеры их не видят и не меняются.
+_llm_fast: contextvars.ContextVar[bool] = contextvars.ContextVar("llm_fast", default=False)
 
 
 def _log_llm_timing(provider: str, key: str, outcome: str, t0: float) -> None:
@@ -497,16 +504,25 @@ class GroqProvider(LLMProvider):
     _REASONING_BUFFER = 900
 
     async def _ask_with_key(self, prompt: str, max_tokens: int, key: str) -> str:
-        async with httpx.AsyncClient(timeout=90.0, trust_env=False) as client:
+        # Было: всегда timeout=90, буфер _REASONING_BUFFER, без
+        # reasoning_effort. Для «Ответа с CueMe» (_ask(..., fast=True)) —
+        # reasoning_effort из VARIANTS_REASONING_EFFORT, меньший буфер и
+        # таймаут: скорость важнее глубины, и меньше токенов — реже 429 по
+        # токенному лимиту (см. config.py). Пустой effort — прежнее поведение.
+        fast = _llm_fast.get() and bool(VARIANTS_REASONING_EFFORT)
+        payload = {
+            "model": self._MODEL,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": max_tokens + (VARIANTS_REASONING_BUFFER if fast else self._REASONING_BUFFER),
+        }
+        if fast:
+            payload["reasoning_effort"] = VARIANTS_REASONING_EFFORT
+        async with httpx.AsyncClient(timeout=VARIANTS_GROQ_TIMEOUT if fast else 90.0, trust_env=False) as client:
             resp = await _tracked_post(
                 self.name, key, client,
                 self._URL,
                 headers={"Authorization": f"Bearer {key}"},
-                json={
-                    "model": self._MODEL,
-                    "messages": [{"role": "user", "content": prompt}],
-                    "max_tokens": max_tokens + self._REASONING_BUFFER,
-                },
+                json=payload,
             )
 
         # Любой 4xx — проблема КОНКРЕТНОГО ключа (невалиден, нет доступа, лимит
@@ -867,12 +883,16 @@ def get_provider_stats() -> dict:
     return out
 
 
-async def _ask(prompt: str, max_tokens: int = 1024, tag: str | None = None) -> str:
+async def _ask(
+    prompt: str, max_tokens: int = 1024, tag: str | None = None, fast: bool = False,
+) -> str:
     """Пробует провайдеров по цепочке. Пробрасывает ошибку только если все упали.
     Логирует по каждой попытке: провайдер, исход, тип ошибки, время ответа.
-    tag — что генерируем (для временных замеров LLM-TIMING, см. _log_llm_timing)."""
-    if tag:
-        _llm_call_tag.set(tag)
+    tag — что генерируем (для замеров LLM-TIMING, см. _log_llm_timing).
+    fast=True — «Ответ с CueMe»: у Groq reasoning_effort/буфер/таймаут из
+    VARIANTS_* в config.py (см. GroqProvider._ask_with_key)."""
+    _llm_call_tag.set(tag or "-")
+    _llm_fast.set(fast)
     _llm_attempt.set([0])
     last_exc: Exception = RuntimeError("Нет доступных LLM-провайдеров")
     chain = _ordered_providers()
@@ -2087,7 +2107,7 @@ async def suggest_reply_variants(
     # внутренние рассуждения ДО финального текста; у контактов с богатой
     # историей (есть winning_examples/data_signals в промпте) он длиннее
     # среднего — риск урезания выше. Подняли запас.
-    raw = await _ask(prompt, max_tokens=1800, tag="variants")
+    raw = await _ask(prompt, max_tokens=1800, tag="variants", fast=True)
     variants = _parse_variants(raw, n_variants)
     if len(variants) < n_variants:
         log.warning(
@@ -2452,7 +2472,7 @@ async def live_coach_step(
         "Затем — обновлённые заметки целиком (старые дословно + новая строка "
         "в конце, или без изменений, если добавить нечего)."
     )
-    raw = await _ask(prompt, max_tokens=1700, tag="live")
+    raw = await _ask(prompt, max_tokens=1700, tag="live", fast=True)
     return _parse_live_step(raw, n_variants, running_notes or "")
 
 

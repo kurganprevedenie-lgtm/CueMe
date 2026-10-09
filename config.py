@@ -102,6 +102,20 @@ ONBOARDING_JSON_POST_URL = os.getenv("ONBOARDING_JSON_POST_URL", "https://t.me/C
 # просто выведены из порядка) — см. докстринг llm.py.
 LLM_PROVIDER_ORDER = os.getenv("LLM_PROVIDER_ORDER", "groq,gemini,openrouter")
 
+# «Ответ с CueMe» (варианты ответа + живой диалог) — скорость важнее глубины
+# рассуждений: Groq (gpt-oss) получает reasoning_effort и меньший запас
+# токенов под рассуждения, чем остальные вызовы (_REASONING_BUFFER=900).
+# Меньше токенов — быстрее ответ и реже 429 по токенному лимиту Groq (из-за
+# него вызовы уходили на Gemini с медианой ~28 с). Анализ собеседника и
+# идеальное свидание это НЕ трогает. Откат — VARIANTS_REASONING_EFFORT=""
+# (тогда и буфер, и таймаут возвращаются к обычным).
+VARIANTS_REASONING_EFFORT = os.getenv("VARIANTS_REASONING_EFFORT", "low")
+VARIANTS_REASONING_BUFFER = int(os.getenv("VARIANTS_REASONING_BUFFER", "300"))
+# Таймаут одного запроса к Groq для этих вызовов (обычный — 90 с): при
+# зависании быстрее уходим к запасному провайдеру. Groq за сутки ни разу не
+# отвечал дольше ~7.5 с, так что 20 с успешные ответы не режет.
+VARIANTS_GROQ_TIMEOUT = float(os.getenv("VARIANTS_GROQ_TIMEOUT", "20"))
+
 # TTL кэша LLM-ответов (сек). Ключ контент-адресный (включает карточки стиля),
 # поэтому смена карточек инвалидирует запись сама; TTL — страховка от разрастания.
 LLM_CACHE_TTL_SEC = int(os.getenv("LLM_CACHE_TTL_SEC", str(7 * 24 * 3600)))  # 7 дней
