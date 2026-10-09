@@ -214,6 +214,16 @@ def init_db() -> None:
             -- Исчезающие медиа собеседника, уже отправленные владельцу копией
             -- (main.py: _save_ephemeral_reply_media) — чтобы второй ответ
             -- на то же сообщение не прислал дубликат.
+            -- Что повторить после «👀 Показать» на экране «подпишись на канал»
+            -- (main.py: _quota_gate / cb_unlock_reveal). Раньше лежало только в
+            -- памяти процесса и терялось при каждом перезапуске бота — юзер
+            -- подписывался и получал «пришли ещё раз» вместо ответа.
+            CREATE TABLE IF NOT EXISTS pending_unlock (
+                user_telegram_id TEXT PRIMARY KEY,
+                payload          TEXT NOT NULL,   -- JSON: kind + входящее + снимок диалога
+                created_at       TEXT NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS saved_ephemeral (
                 connection_id TEXT NOT NULL,
                 chat_ref      TEXT NOT NULL,
@@ -2385,6 +2395,36 @@ def update_business_message_text(row_id: int, text: str) -> None:
     ним, и карточки стиля берут актуальную версию."""
     with _conn() as conn:
         conn.execute("UPDATE business_messages SET text = ? WHERE id = ?", (text, row_id))
+
+
+def save_pending_unlock(telegram_id: str, payload: dict) -> None:
+    with _conn() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO pending_unlock (user_telegram_id, payload, created_at) VALUES (?, ?, ?)",
+            (telegram_id, json.dumps(payload, ensure_ascii=False, default=str), _now()),
+        )
+
+
+def get_pending_unlock(telegram_id: str, max_age_hours: int = 24) -> dict | None:
+    """Сохранённый контекст гейта или None (нет / старше max_age_hours)."""
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT payload, created_at FROM pending_unlock WHERE user_telegram_id = ?", (telegram_id,)
+        ).fetchone()
+    if not row:
+        return None
+    try:
+        created = datetime.fromisoformat(row["created_at"])
+        if datetime.now(timezone.utc) - created > timedelta(hours=max_age_hours):
+            return None
+        return json.loads(row["payload"])
+    except (ValueError, TypeError):
+        return None
+
+
+def delete_pending_unlock(telegram_id: str) -> None:
+    with _conn() as conn:
+        conn.execute("DELETE FROM pending_unlock WHERE user_telegram_id = ?", (telegram_id,))
 
 
 def claim_saved_ephemeral(connection_id: str, chat_ref: str, tg_message_id: int) -> bool:

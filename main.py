@@ -1,4 +1,5 @@
 import asyncio
+import contextvars
 import csv
 import difflib
 import hashlib
@@ -219,6 +220,9 @@ from storage import (
     referral_counts_by_user,
     save_business_message,
     claim_saved_ephemeral,
+    save_pending_unlock,
+    get_pending_unlock,
+    delete_pending_unlock,
     update_business_message_text,
     get_watch_setting,
     toggle_watch_setting,
@@ -730,7 +734,25 @@ def _never_unlocked(telegram_id: str, is_premium: bool) -> bool:
 # повторяется заново. Один слот на юзера (последнее заблокированное
 # действие), в памяти — после рестарта бота «Показать» попросит прислать
 # сообщение ещё раз.
-_pending_unlock: dict[int, dict] = {}
+# Было: _pending_unlock: dict[int, dict] = {} — только в памяти процесса,
+# терялось при каждом перезапуске (автодеплой перезапускает бота на каждый
+# пуш), и юзер после подписки получал «пришли ещё раз» вместо ответа.
+# Теперь — таблица pending_unlock (save/get/delete_pending_unlock), со
+# снимком диалога на момент гейта. Оставлено для отката.
+# _pending_unlock: dict[int, dict] = {}
+
+# Исход генерации для «👀 Показать» после подписки (cb_unlock_reveal): функции
+# генерации отмечают, чем кончилось (ok / rate_limit / llm_error / empty /
+# stale / no_data / no_quota) — по нему решаем, показать ли «Попробовать ещё
+# раз», и пишем gate_reveal_ok / gate_reveal_failed. Вне reveal — None, и
+# _note_outcome ничего не делает.
+_gen_outcome: contextvars.ContextVar[dict | None] = contextvars.ContextVar("gen_outcome", default=None)
+
+
+def _note_outcome(status: str) -> None:
+    box = _gen_outcome.get()
+    if box is not None and "status" not in box:
+        box["status"] = status
 
 _UNLOCK_GATE_FIRST_LINE = {
     "reply": "Ответ готов, жду тебя 👀",
@@ -785,11 +807,12 @@ async def _quota_gate(
     разблокировки (см. cb_unlock_reveal)."""
     if await _has_quota(bot, telegram_id):
         return True
+    _note_outcome("no_quota")
     if _never_unlocked(telegram_id, is_premium=False):
         if replay:
-            _pending_unlock[int(telegram_id)] = replay
+            await asyncio.to_thread(save_pending_unlock, telegram_id, replay)
         else:
-            _pending_unlock.pop(int(telegram_id), None)
+            await asyncio.to_thread(delete_pending_unlock, telegram_id)
         text, kb = _unlock_gate_text("reply"), _unlock_gate_kb("reply", 0)
         await (target.edit_text(text, reply_markup=kb) if edit else target.answer(text, reply_markup=kb))
         await _record_gate_event(telegram_id, "gate_shown", "reply")
@@ -1082,55 +1105,165 @@ async def cb_unlock_check(call: CallbackQuery, bot: Bot) -> None:
     )
 
 
-@dp.callback_query(F.data.startswith("unlock:reveal:"))
-async def cb_unlock_reveal(call: CallbackQuery, state: FSMContext, bot: Bot) -> None:
-    """Анализ/свидание — уже посчитаны и лежат в кэше, просто рендерим заново
-    (теперь full_access=True). «Ответить за меня»/live — до гейта вызова LLM
-    не было, поэтому честно повторяем тот же запрос (_pending_unlock)."""
-    _, _, kind, ref = call.data.split(":", 3)
+# cb_unlock_reveal — старая версия (до 2026-10-10): контекст «Ответить за
+# меня» брала из памяти процесса (_pending_unlock) — после перезапуска его не
+# было, юзер видел «пришли ещё раз»; при ошибке генерации кнопки повтора не
+# было (сообщение с «👀 Показать» уже переписано), а аналитика видела только
+# нажатие, не результат. Заменена версией ниже. Оставлено для отката.
+# @dp.callback_query(F.data.startswith("unlock:reveal:"))
+# async def cb_unlock_reveal(call: CallbackQuery, state: FSMContext, bot: Bot) -> None:
+#     """Анализ/свидание — уже посчитаны и лежат в кэше, просто рендерим заново
+#     (теперь full_access=True). «Ответить за меня»/live — до гейта вызова LLM
+#     не было, поэтому честно повторяем тот же запрос (_pending_unlock)."""
+#     _, _, kind, ref = call.data.split(":", 3)
+#     user_id = call.from_user.id
+#     telegram_id = str(user_id)
+#     await call.answer()
+#     await _record_gate_event(telegram_id, "gate_reveal", kind)
+#
+#     if kind == "analysis":
+#         await _run_deep_analysis(bot, call.message, telegram_id, int(ref), edit=True)
+#         return
+#     if kind == "date":
+#         await _run_ideal_date(bot, call.message, telegram_id, int(ref), edit=True)
+#         return
+#
+#     replay = _pending_unlock.pop(user_id, None)
+#     if not replay:
+#         await call.message.edit_text("Готово ✅ Пришли сообщение ещё раз — теперь отвечу.")
+#         return
+#     try:
+#         await call.message.edit_reply_markup(reply_markup=None)
+#     except Exception:
+#         pass
+#
+#     stale = "Контекст устарел — начни заново через «💬 Ответ с CueMe»."
+#     if replay["kind"] == "reply_incoming":
+#         if not (await state.get_data()).get("style_card"):
+#             await call.message.answer(stale)
+#             return
+#         await _process_reply_incoming(call.message, state, bot, replay["incoming"], user_id)
+#     elif replay["kind"] == "live_incoming":
+#         await _process_live_incoming(call.message, state, bot, replay["incoming"], user_id)
+#     else:
+#         ctx = _get_action(user_id, replay["action_id"])
+#         if not ctx:
+#             await call.message.answer(stale)
+#             return
+#         if replay["kind"] == "variants":
+#             await _run_variants_generation(
+#                 call.message, ctx, user_id, bot, replay["action_id"], state,
+#                 force_fresh=replay["force_fresh"],
+#             )
+#         else:
+#             await _run_live_coach_step(
+#                 call.message, ctx, user_id, bot, replay["action_id"], force_fresh=replay["force_fresh"],
+#             )
+
+
+_REVEAL_RETRY_STATUSES = {"rate_limit", "llm_error", "empty", "unknown"}
+
+
+async def _do_unlock_reveal(call: CallbackQuery, state: FSMContext, bot: Bot, kind: str, ref: str) -> str | None:
+    """Показывает разблокированный результат. Возвращает статус, если он
+    известен заранее (context_lost), иначе None — тогда статус отметит сама
+    функция генерации через _note_outcome."""
     user_id = call.from_user.id
     telegram_id = str(user_id)
-    await call.answer()
-    await _record_gate_event(telegram_id, "gate_reveal", kind)
-
     if kind == "analysis":
         await _run_deep_analysis(bot, call.message, telegram_id, int(ref), edit=True)
-        return
+        return None
     if kind == "date":
         await _run_ideal_date(bot, call.message, telegram_id, int(ref), edit=True)
-        return
+        return None
 
-    replay = _pending_unlock.pop(user_id, None)
+    replay = await asyncio.to_thread(get_pending_unlock, telegram_id)
     if not replay:
-        await call.message.edit_text("Готово ✅ Пришли сообщение ещё раз — теперь отвечу.")
-        return
+        await call.message.edit_text("Готово ✅ Попытки открыты — пришли сообщение собеседника ещё раз, и я отвечу.")
+        return "context_lost"
     try:
         await call.message.edit_reply_markup(reply_markup=None)
     except Exception:
         pass
 
     stale = "Контекст устарел — начни заново через «💬 Ответ с CueMe»."
-    if replay["kind"] == "reply_incoming":
-        if not (await state.get_data()).get("style_card"):
-            await call.message.answer(stale)
-            return
-        await _process_reply_incoming(call.message, state, bot, replay["incoming"], user_id)
-    elif replay["kind"] == "live_incoming":
-        await _process_live_incoming(call.message, state, bot, replay["incoming"], user_id)
-    else:
-        ctx = _get_action(user_id, replay["action_id"])
-        if not ctx:
-            await call.message.answer(stale)
-            return
-        if replay["kind"] == "variants":
-            await _run_variants_generation(
-                call.message, ctx, user_id, bot, replay["action_id"], state,
-                force_fresh=replay["force_fresh"],
-            )
+    if replay["kind"] in ("reply_incoming", "live_incoming"):
+        # После перезапуска бота состояние диалога в памяти пропало —
+        # восстанавливаем его из снимка, сделанного в момент гейта.
+        if replay.get("fsm_data") and not (await state.get_data()).get("contact_id"):
+            await state.set_state(replay.get("fsm_state"))
+            await state.set_data(replay["fsm_data"])
+        if replay["kind"] == "reply_incoming":
+            if not (await state.get_data()).get("style_card"):
+                await call.message.answer(stale)
+                return "context_lost"
+            await _process_reply_incoming(call.message, state, bot, replay["incoming"], user_id)
         else:
-            await _run_live_coach_step(
-                call.message, ctx, user_id, bot, replay["action_id"], force_fresh=replay["force_fresh"],
+            await _process_live_incoming(call.message, state, bot, replay["incoming"], user_id)
+        return None
+
+    action_id = replay["action_id"]
+    ctx = _get_action(user_id, action_id)
+    if not ctx and replay.get("ctx"):
+        ctx = replay["ctx"]
+        action_id = _new_action(user_id, ctx)
+    if not ctx:
+        await call.message.answer(stale)
+        return "context_lost"
+    if replay["kind"] == "variants":
+        await _run_variants_generation(
+            call.message, ctx, user_id, bot, action_id, state, force_fresh=replay["force_fresh"],
+        )
+    else:
+        await _run_live_coach_step(call.message, ctx, user_id, bot, action_id, force_fresh=replay["force_fresh"])
+    return None
+
+
+@dp.callback_query(F.data.startswith("unlock:reveal:"))
+async def cb_unlock_reveal(call: CallbackQuery, state: FSMContext, bot: Bot) -> None:
+    """«👀 Показать» после подписки. Контекст «Ответить за меня» — из базы
+    (pending_unlock), переживает перезапуск бота. Исход пишется событием
+    gate_reveal_ok / gate_reveal_failed (meta "<kind>:<причина>"). При
+    временной ошибке — сообщение с кнопкой «🔄 Попробовать ещё раз» на тот
+    же контекст; попытка при этом не списывается (списание — только после
+    успешного ответа, в самих функциях генерации)."""
+    _, _, kind, ref = call.data.split(":", 3)
+    telegram_id = str(call.from_user.id)
+    await call.answer()
+    await _record_gate_event(telegram_id, "gate_reveal", kind)
+
+    box: dict = {}
+    token = _gen_outcome.set(box)
+    try:
+        status = await _do_unlock_reveal(call, state, bot, kind, ref)
+    except Exception:
+        logging.exception("unlock reveal: сбой owner=%s kind=%s", telegram_id, kind)
+        status = "unknown"
+    finally:
+        _gen_outcome.reset(token)
+    status = status or box.get("status", "unknown")
+
+    if status == "ok":
+        await asyncio.to_thread(delete_pending_unlock, telegram_id)
+        await _record_gate_event(telegram_id, "gate_reveal_ok", kind)
+        return
+
+    await _record_gate_event(telegram_id, "gate_reveal_failed", f"{kind}:{status}")
+    logging.warning("unlock reveal: не доставлено owner=%s kind=%s причина=%s", telegram_id, kind, status)
+    if status in _REVEAL_RETRY_STATUSES:
+        b = InlineKeyboardBuilder()
+        b.button(text="🔄 Попробовать ещё раз", callback_data=call.data)
+        try:
+            await call.message.answer(
+                "Подписка уже засчитана ✅ Ответ сейчас не получился — нажми, чтобы попробовать ещё раз.",
+                reply_markup=b.as_markup(),
             )
+        except Exception:
+            logging.warning("unlock reveal: не удалось отправить кнопку повтора owner=%s", telegram_id)
+    elif status != "no_quota":
+        # Контекст потерян / данных мало — повтор не поможет; no_quota не
+        # трогаем: _quota_gate только что сохранил свежий контекст нового гейта.
+        await asyncio.to_thread(delete_pending_unlock, telegram_id)
 
 
 @dp.chat_member()
@@ -4293,6 +4426,7 @@ async def _run_deep_analysis(
     if not contact:
         text = "Контакт не найден."
         await (target.edit_text(text) if edit else target.answer(text))
+        _note_outcome("stale")
         return
     name = _contact_name(contact)
 
@@ -4307,10 +4441,12 @@ async def _run_deep_analysis(
         )
     except RateLimitError:
         await progress_msg.edit_text("Лимит LLM исчерпан, попробуй позже.")
+        _note_outcome("rate_limit")
         return
     except Exception:
         logging.exception("deep_analysis: ошибка генерации")
         await progress_msg.edit_text("Не удалось сгенерировать анализ — попробуй ещё раз.")
+        _note_outcome("llm_error")
         return
 
     if not data:
@@ -4320,6 +4456,7 @@ async def _run_deep_analysis(
             "накопление через Автоматизацию чатов).",
             reply_markup=_with_back_to_menu(InlineKeyboardMarkup(inline_keyboard=[])),
         )
+        _note_outcome("no_data")
         return
 
     metrics = json.loads(data["metrics_json"])
@@ -4336,6 +4473,7 @@ async def _run_deep_analysis(
             _unlock_gate_text("analysis"), reply_markup=_unlock_gate_kb("analysis", contact_id),
         )
         await _record_gate_event(telegram_id, "gate_shown", "analysis")
+        _note_outcome("no_quota")
         return
 
     if not full_access:
@@ -4348,6 +4486,7 @@ async def _run_deep_analysis(
             progress_msg, _format_deep_analysis_teaser(name, metrics),
             reply_markup=deep_analysis_teaser_kb(contact_id), parse_mode="HTML",
         )
+        _note_outcome("no_quota")
         return
 
     result_kb = (
@@ -4389,6 +4528,11 @@ async def _run_deep_analysis(
         )
 
     await _charge_feature_trial_if_needed(bot, telegram_id, mark_analysis_trial_used)
+    _note_outcome("ok")
+    try:
+        record_event(telegram_id, "gen_deep_analysis", str(contact_id))
+    except Exception:
+        logging.exception("telemetry: не удалось записать событие анализа")
 
 
 async def _show_deep_analysis(
@@ -4571,6 +4715,7 @@ async def _run_ideal_date(
     if not contact:
         text = "Контакт не найден."
         await (target.edit_text(text) if edit else target.answer(text))
+        _note_outcome("stale")
         return
     name = _contact_name(contact)
 
@@ -4584,10 +4729,12 @@ async def _run_ideal_date(
         )
     except RateLimitError:
         await progress_msg.edit_text("Лимит LLM исчерпан, попробуй позже.")
+        _note_outcome("rate_limit")
         return
     except Exception:
         logging.exception("ideal_date: ошибка генерации")
         await progress_msg.edit_text("Не удалось придумать идею — попробуй ещё раз.")
+        _note_outcome("llm_error")
         return
 
     if not data:
@@ -4596,6 +4743,7 @@ async def _run_ideal_date(
             f"конкретное — нужно хотя бы {IDEAL_DATE_MIN_MSGS} его сообщений "
             "(JSON-экспорт или накопление через Автоматизацию чатов)."
         )
+        _note_outcome("no_data")
         return
 
     if not full_access and _never_unlocked(telegram_id, is_premium):
@@ -4604,6 +4752,7 @@ async def _run_ideal_date(
             _unlock_gate_text("date"), reply_markup=_unlock_gate_kb("date", contact_id),
         )
         await _record_gate_event(telegram_id, "gate_shown", "date")
+        _note_outcome("no_quota")
         return
 
     if not full_access:
@@ -4611,6 +4760,7 @@ async def _run_ideal_date(
             progress_msg, _format_ideal_date_teaser(name, data),
             reply_markup=ideal_date_teaser_kb(contact_id),
         )
+        _note_outcome("no_quota")
         return
 
     result_kb = (
@@ -4619,6 +4769,11 @@ async def _run_ideal_date(
     )
     await _edit_or_answer_long(progress_msg, _format_ideal_date(name, data), reply_markup=result_kb)
     await _charge_feature_trial_if_needed(bot, telegram_id, mark_date_trial_used)
+    _note_outcome("ok")
+    try:
+        record_event(telegram_id, "gen_ideal_date", str(contact_id))
+    except Exception:
+        logging.exception("telemetry: не удалось записать событие свидания")
 
 
 async def _show_ideal_date(
@@ -6768,6 +6923,7 @@ def _build_churn_dashboard_html(rows: list[dict], totals: dict) -> str:
     pressed = [r for r in shown if has(r, "gate_check_ok") or has(r, "gate_check_fail")]
     ok = [r for r in shown if has(r, "gate_check_ok")]
     revealed = [r for r in shown if has(r, "gate_reveal")]
+    delivered = [r for r in shown if has(r, "gate_reveal_ok")]
     fail_no_sub = [r for r in shown if r["gate_status"] == "нажал подписался, не подписан"]
     m = len(shown)
     low_sample = (
@@ -6780,6 +6936,7 @@ def _build_churn_dashboard_html(rows: list[dict], totals: dict) -> str:
         ("✅ Нажали «Я подписался»", len(pressed), len(shown)),
         ("📢 Подписка подтверждена", len(ok), len(pressed)),
         ("👀 Нажали «Показать»", len(revealed), len(ok)),
+        ("✅ Ответ дошёл", len(delivered), len(revealed)),
     ]
     funnel = []
     for i, (label, value, prev) in enumerate(steps):
@@ -8215,6 +8372,7 @@ async def _run_variants_generation(
     text = ctx.get("text") if kind == "reply" else ctx.get("chat_text")
     if text is None:
         await target.answer("Контекст устарел — начни заново.")
+        _note_outcome("stale")
         return
 
     style_card, interaction_card = ctx["style_card"], ctx["interaction_card"]
@@ -8242,7 +8400,7 @@ async def _run_variants_generation(
     progress_msg: Message | None = None
     if variants is None:
         # Реальный вызов LLM — здесь и только здесь гейт + списание.
-        replay = {"kind": "variants", "action_id": action_id, "force_fresh": force_fresh}
+        replay = {"kind": "variants", "action_id": action_id, "force_fresh": force_fresh, "ctx": ctx}
         if not await _quota_gate(bot, target, str(telegram_id), replay=replay):
             return
         prev = ctx.get("variants") if force_fresh else None
@@ -8268,12 +8426,14 @@ async def _run_variants_generation(
             await _finish_generation_message(
                 progress_msg, target, force_fresh, "Лимит исчерпан, попробуй позже.",
             )
+            _note_outcome("rate_limit")
             return
         except Exception:
             logging.exception("%s-variants: ошибка генерации", kind)
             await _finish_generation_message(
                 progress_msg, target, force_fresh, "Не получилось сгенерировать варианты — попробуй ещё раз.",
             )
+            _note_outcome("llm_error")
             return
 
         # Успех — списываем ОДНУ попытку (не за каждый вариант — это один вызов
@@ -8289,6 +8449,7 @@ async def _run_variants_generation(
         await _finish_generation_message(
             progress_msg, target, force_fresh, "Не получилось сгенерировать варианты — попробуй ещё раз.",
         )
+        _note_outcome("empty")
         return
 
     _save_shown_suggestions(str(telegram_id), ctx.get("contact_id"), kind, variants)
@@ -8314,6 +8475,7 @@ async def _run_variants_generation(
     )
     if progress_msg:
         _log_reply_timing("reply", _t_started, _llm_box)
+    _note_outcome("ok")
 
 
 @dp.callback_query(F.data.startswith("varregen:"))
@@ -8347,7 +8509,10 @@ async def _process_reply_incoming(
     # Выйти из режима — любая кнопка меню (handle_menu_button сбрасывает state).
 
     contact_id = data.get("contact_id")
-    replay = {"kind": "reply_incoming", "incoming": incoming}
+    replay = {
+        "kind": "reply_incoming", "incoming": incoming,
+        "fsm_state": await state.get_state(), "fsm_data": data,
+    }
     if not await _quota_gate(bot, message, telegram_id, edit=edit, replay=replay):
         return
 
@@ -8573,13 +8738,17 @@ async def _process_live_incoming(
     # Состояние НЕ сбрасываем — можно форвардить сообщения одно за другим без
     # повторного нажатия кнопки. Выйти из режима — любая кнопка меню.
 
-    replay = {"kind": "live_incoming", "incoming": incoming}
+    replay = {
+        "kind": "live_incoming", "incoming": incoming,
+        "fsm_state": await state.get_state(), "fsm_data": data,
+    }
     if not await _quota_gate(bot, message, telegram_id, replay=replay):
         return
 
     contact_id = data.get("contact_id")
     if not contact_id:
         await message.answer("Контекст диалога потерян — начни заново через «💬 Ответ с CueMe».")
+        _note_outcome("stale")
         return
 
     # В отличие от остальных LLM-вызовов в файле, раньше был без try/except —
@@ -8590,10 +8759,12 @@ async def _process_live_incoming(
         style_card = await _gen_style_card(telegram_id) or _LIVE_NEUTRAL_STYLE_PLACEHOLDER
     except RateLimitError:
         await message.answer("Лимит запросов исчерпан — попробуй через пару минут.")
+        _note_outcome("rate_limit")
         return
     except Exception:
         logging.exception("_process_live_incoming: не удалось получить стиль")
         await message.answer("Сервис сейчас перегружен — попробуй чуть позже.")
+        _note_outcome("llm_error")
         return
     notes_row = get_running_notes(contact_id)
     running_notes = notes_row["notes_text"] if notes_row else None
@@ -8637,13 +8808,14 @@ async def _run_live_coach_step(
     contact_id = ctx.get("contact_id")
     if text is None or not contact_id:
         await target.answer("Контекст устарел — начни заново.")
+        _note_outcome("stale")
         return
 
     style_card = ctx["style_card"]
     running_notes = ctx.get("running_notes") or ""
     gender = get_gender(str(telegram_id))
 
-    replay = {"kind": "live_step", "action_id": action_id, "force_fresh": force_fresh}
+    replay = {"kind": "live_step", "action_id": action_id, "force_fresh": force_fresh, "ctx": ctx}
     if force_fresh:
         if not await _quota_gate(bot, target, str(telegram_id), replay=replay):
             return
@@ -8657,10 +8829,12 @@ async def _run_live_coach_step(
             )
         except RateLimitError:
             await target.edit_text("Лимит исчерпан, попробуй позже.")
+            _note_outcome("rate_limit")
             return
         except Exception:
             logging.exception("live-coach: ошибка регена вариантов")
             await target.edit_text("Не получилось сгенерировать варианты — попробуй ещё раз.")
+            _note_outcome("llm_error")
             return
         await _charge_trial_if_needed(bot, str(telegram_id))
         try:
@@ -8669,6 +8843,7 @@ async def _run_live_coach_step(
             logging.exception("telemetry: не удалось записать событие live-регена")
         if not variants:
             await target.edit_text("Не получилось сгенерировать варианты — попробуй ещё раз.")
+            _note_outcome("empty")
             return
         _save_shown_suggestions(str(telegram_id), contact_id, "live", variants)
         ctx["variants"] = variants
@@ -8680,6 +8855,7 @@ async def _run_live_coach_step(
             target, f"{_format_variants(variants)}\n\n{footer}",
             reply_markup=live_variants_kb(action_id), parse_mode="HTML",
         )
+        _note_outcome("ok")
         return
 
     cache_key = _style_cache_key("live", "", text, style_card, running_notes, extra=gender or "")
@@ -8717,10 +8893,12 @@ async def _run_live_coach_step(
             )
         except RateLimitError:
             await progress_msg.edit_text("Лимит исчерпан, попробуй позже.")
+            _note_outcome("rate_limit")
             return
         except Exception:
             logging.exception("live-coach: ошибка генерации")
             await progress_msg.edit_text("Не получилось сгенерировать совет — попробуй ещё раз.")
+            _note_outcome("llm_error")
             return
 
         # Успех — списываем ОДНУ попытку (один вызов LLM даёт и советы, и заметки).
@@ -8738,6 +8916,7 @@ async def _run_live_coach_step(
     if not variants:
         err_text = "Не получилось сгенерировать совет — попробуй ещё раз."
         await (progress_msg.edit_text(err_text) if progress_msg else target.answer(err_text))
+        _note_outcome("empty")
         return
 
     _save_shown_suggestions(str(telegram_id), contact_id, "live", variants)
@@ -8777,6 +8956,7 @@ async def _run_live_coach_step(
             target, f"{_format_variants(variants)}\n\n{footer}",
             reply_markup=live_variants_kb(action_id), parse_mode="HTML",
         )
+    _note_outcome("ok")
 
 
 @dp.callback_query(F.data.startswith("liveregen:"))

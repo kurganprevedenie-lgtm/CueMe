@@ -184,12 +184,20 @@ deep_analysis(contact_id PK, compatibility_text, howto_text,
 events(id PK AUTO, ts, user_telegram_id, event_type, meta)  -- продуктовая
        -- аналитика: record_event / count_events / event_funnel (storage.py)
        -- event_type: start, gen_reply_variants, gen_live, gen_live_regen,
+       -- gen_deep_analysis, gen_ideal_date (meta — contact_id),
        -- stars_payment, tribute_payment; экран-гейт «подпишись на канал»
        -- (meta = reply|analysis|date, одно и то же подряд не дублируется,
        -- _record_gate_event): gate_shown, gate_check_ok, gate_check_fail,
-       -- gate_reveal. Нажатие «📢 Открыть канал» не пишется — url-кнопка,
+       -- gate_reveal (нажал «Показать»), gate_reveal_ok (ответ дошёл),
+       -- gate_reveal_failed (meta "<kind>:<причина>": rate_limit/llm_error/
+       -- empty/context_lost/no_data/no_quota/stale/unknown). Нажатие
+       -- «📢 Открыть канал» не пишется — url-кнопка,
        -- Telegram о ней боту не сообщает. Всё это — блок «Где уходят» в
        -- /users (_build_churn_dashboard_html), порог ухода — CHURN_HOURS.
+pending_unlock(user_telegram_id PK, payload JSON, created_at)
+       -- что повторить после «👀 Показать» на гейте (kind, входящее, снимок
+       -- диалога FSM/ctx) — переживает перезапуск бота; живёт до успешного
+       -- ответа или 24 ч. При временной ошибке — кнопка «🔄 Попробовать ещё раз».
 saved_ephemeral(connection_id, chat_ref, tg_message_id, saved_at,
                 PRIMARY KEY (connection_id, chat_ref, tg_message_id))
        -- исчезающие медиа, уже присланные владельцу копией (без дублей)
