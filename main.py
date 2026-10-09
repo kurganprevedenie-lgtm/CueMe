@@ -9168,163 +9168,80 @@ def _premium_expiry_line(telegram_id: str) -> str:
     )
 
 
-# _premium_status_text — старая версия (до 2026-10-09): простой текст
-# «👑 Подписка: ✅ Активна — весь функционал CueMe без ограничений» + строка
-# про источник, без списка того, что входит в Premium. Заменена HTML-версией
-# ниже (весь экран одной цитатой + общий список _PREMIUM_FEATURES_HTML),
-# чтобы и подписчик, и неоплативший видели, за что платят. Оставлено для отката.
-# async def _premium_status_text(bot: Bot, telegram_id: str) -> str:
-#     if await _is_premium(bot, telegram_id):
-#         expiry_line = _premium_expiry_line(telegram_id)
-#         return f"👑 Подписка:\n\n✅ Активна — весь функционал CueMe без ограничений.\n\n{expiry_line}"
-#
-#     # Было «осталось N из FREE_TRIAL_REQUESTS» + «БЕСПЛАТНУЮ подписку — за
-#     # друга»: базового лимита больше нет, а друг теперь даёт попытки, не
-#     # подписку — оба утверждения стали неверными.
-#     footer = (
-#         f"Ещё попытки — за каждого друга: +{REFERRAL_REPLY_BONUS} / "
-#         f"+{REFERRAL_ANALYSIS_BONUS} / +{REFERRAL_DATE_BONUS}, раздел 👥 Реферальная система.\n\n"
-#         "Оплатили, но бот не видит подписку? Подождите пару минут и снова наберите /premium."
-#     )
-#     if _never_unlocked(telegram_id, is_premium=False):
-#         claim_line = (
-#             ""
-#             if has_claimed_promo_reward(telegram_id)
-#             else (
-#                 f"🎁 Подпишись на {PROMO_CHANNEL_USERNAME} — и бесплатно откроешь "
-#                 f"{PROMO_CHANNEL_REPLY_BONUS} «Ответить за меня», "
-#                 f"{PROMO_CHANNEL_ANALYSIS_BONUS} «Анализа собеседника», "
-#                 f"{PROMO_CHANNEL_DATE_BONUS} «Идеальных свидания».\n\n"
-#             )
-#         )
-#         return f"👑 Подписка:\n\n❌ Не активна\n\n{claim_line}{footer}"
-#
-#     reply_left = max(0, get_reply_trial_bonus(telegram_id) - get_trial_used(telegram_id))
-#     analysis_left = max(0, get_analysis_trial_bonus(telegram_id) - get_analysis_trial_count(telegram_id))
-#     date_left = max(0, get_date_trial_bonus(telegram_id) - get_date_trial_count(telegram_id))
-#     if not (reply_left or analysis_left or date_left):
-#         left_block = (
-#             "⏳ Бесплатные попытки закончились — но, похоже, тебе заходит 😏\n"
-#             "Дальше по подписке — весь функционал без ограничений.\n\n"
-#         )
-#     else:
-#         left_block = (
-#             "⏳ Осталось бесплатно:\n"
-#             f"💬 «Ответить за меня» — {reply_left}\n"
-#             f"🔬 «Анализ собеседника» — {analysis_left}\n"
-#             f"💡 «Идеальное свидание» — {date_left}\n\n"
-#         )
-#     return f"👑 Подписка:\n\n❌ Не активна\n\n{left_block}{footer}"
-
-
-# Что входит в Premium — один список на все экраны, чтобы не расходился.
-# «🔄 Авто-режим» в список НЕ включён: /auto и авто-переписка убраны из бота
-# (см. комментарий у get_auto_mode в конце файла) — обещать его было бы
-# неправдой. Исчезающие медиа тоже не включены — по решению владельца.
+# Что входит в Premium — один список на все экраны, чтобы не расходился;
+# показывается цитатой (HTML blockquote) под строкой статуса «Подписки».
+# «🔄 Авто-режим» не включён: /auto и авто-переписка убраны из бота.
+# (Пробовали оформить цитатой весь экран и убрать кнопки оплаты у
+# подписчика — откатили по запросу: цитатой только этот список.)
 _PREMIUM_FEATURES_HTML = (
-    "<b>Что входит:</b>\n"
+    "<blockquote><b>Что входит:</b>\n"
     "💬 Ответ с CueMe — без лимита\n"
     "🔬 Анализ собеседника — совместимость, флаги, готовое сообщение\n"
     "💡 Идеальное свидание — куда позвать и как подать\n"
-    "🗑 Удалённые сообщения — текст, фото, видео, кружки, голосовые\n\n"
-    "Всё без ограничений."
+    "🗑 Удалённые сообщения — текст, фото, видео, кружки, голосовые</blockquote>"
 )
 
 
-def _premium_source_line_html(telegram_id: str) -> str:
-    """Последняя строка экрана активного подписчика — откуда подписка и до
-    какого числа (если бот это знает)."""
-    source, until, is_subscription = _premium_expiry_info(telegram_id)
-    date = html.escape(until.strftime("%d.%m.%Y")) if until else None
-    if source == "stars":
-        if is_subscription:
-            return (
-                f"⭐ Stars-подписка — следующее списание {date}. "
-                "Отменить — в Telegram: Настройки → Мои подписки."
-            )
-        return f"⭐ Оплачено Stars — активна до {date}"
-    if date:
-        return f"💎 Оформлено через Tribute — активна до {date}, продление и отмена там же."
-    return "💎 Оформлено через Tribute — продление и отмена там же."
-
-
 async def _premium_status_text(bot: Bot, telegram_id: str) -> str:
-    """HTML (parse_mode="HTML" — у вызывающих). Весь экран подписчика —
-    одной цитатой; у неоплатившего цитатой только «Что входит»."""
     if await _is_premium(bot, telegram_id):
+        expiry_line = html.escape(_premium_expiry_line(telegram_id))
         return (
-            "<blockquote><b>👑 CueMe Premium</b>\n"
-            "<b>✅ Подписка активна</b>\n\n"
-            f"{_PREMIUM_FEATURES_HTML}\n\n"
-            f"{_premium_source_line_html(telegram_id)}</blockquote>"
+            "👑 Подписка:\n\n✅ Активна — весь функционал CueMe без ограничений.\n\n"
+            f"{_PREMIUM_FEATURES_HTML}\n\n{expiry_line}"
         )
 
-    reply_left = max(0, get_reply_trial_bonus(telegram_id) - get_trial_used(telegram_id))
-    analysis_left = max(0, get_analysis_trial_bonus(telegram_id) - get_analysis_trial_count(telegram_id))
-    date_left = max(0, get_date_trial_bonus(telegram_id) - get_date_trial_count(telegram_id))
-    left_line = (
-        f"Осталось бесплатно: 💬 {reply_left} · 🔬 {analysis_left} · 💡 {date_left}\n\n"
-        if (reply_left or analysis_left or date_left) else ""
+    # Было «осталось N из FREE_TRIAL_REQUESTS» + «БЕСПЛАТНУЮ подписку — за
+    # друга»: базового лимита больше нет, а друг теперь даёт попытки, не
+    # подписку — оба утверждения стали неверными.
+    footer = (
+        f"Ещё попытки — за каждого друга: +{REFERRAL_REPLY_BONUS} / "
+        f"+{REFERRAL_ANALYSIS_BONUS} / +{REFERRAL_DATE_BONUS}, раздел 👥 Реферальная система.\n\n"
+        "Оплатили, но бот не видит подписку? Подождите пару минут и снова наберите /premium."
     )
-
     if _never_unlocked(telegram_id, is_premium=False):
-        offer = (
+        claim_line = (
             ""
             if has_claimed_promo_reward(telegram_id)
             else (
-                f"🎁 Подпишись на {html.escape(PROMO_CHANNEL_USERNAME)} — и бесплатно откроешь "
+                f"🎁 Подпишись на {PROMO_CHANNEL_USERNAME} — и бесплатно откроешь "
                 f"{PROMO_CHANNEL_REPLY_BONUS} «Ответить за меня», "
                 f"{PROMO_CHANNEL_ANALYSIS_BONUS} «Анализа собеседника», "
                 f"{PROMO_CHANNEL_DATE_BONUS} «Идеальных свидания».\n\n"
             )
         )
-    elif not left_line:
-        offer = "⏳ Бесплатные попытки закончились — но, похоже, тебе заходит 😏\n\n"
+        return f"👑 Подписка:\n\n❌ Не активна\n\n{_PREMIUM_FEATURES_HTML}\n\n{html.escape(claim_line + footer)}"
+
+    reply_left = max(0, get_reply_trial_bonus(telegram_id) - get_trial_used(telegram_id))
+    analysis_left = max(0, get_analysis_trial_bonus(telegram_id) - get_analysis_trial_count(telegram_id))
+    date_left = max(0, get_date_trial_bonus(telegram_id) - get_date_trial_count(telegram_id))
+    if not (reply_left or analysis_left or date_left):
+        left_block = (
+            "⏳ Бесплатные попытки закончились — но, похоже, тебе заходит 😏\n"
+            "Дальше по подписке — весь функционал без ограничений.\n\n"
+        )
     else:
-        offer = ""
-
-    return (
-        f"{left_line}"
-        "<blockquote><b>👑 CueMe Premium</b>\n\n"
-        f"{_PREMIUM_FEATURES_HTML}</blockquote>\n\n"
-        "❌ Подписка не активна\n\n"
-        f"{offer}"
-        f"Ещё попытки — за каждого друга: +{REFERRAL_REPLY_BONUS} / "
-        f"+{REFERRAL_ANALYSIS_BONUS} / +{REFERRAL_DATE_BONUS} — жми «👥 Реферальная система».\n\n"
-        "Оплатили, но бот не видит подписку? Подождите пару минут и снова наберите /premium."
-    )
-
-
-def premium_active_kb(telegram_id: str) -> InlineKeyboardMarkup:
-    """Под экраном активного подписчика — оплачивать уже нечего. «Управлять
-    подпиской» — только для Tribute и только если задан PREMIUM_SUBSCRIBE_URL
-    (страница подписки канала в Tribute); у Stars отмена — в настройках
-    Telegram, это написано в самом тексте."""
-    b = InlineKeyboardBuilder()
-    source, _, _ = _premium_expiry_info(telegram_id)
-    if source == "tribute" and PREMIUM_SUBSCRIBE_URL:
-        b.button(text="⚙️ Управлять подпиской", url=PREMIUM_SUBSCRIBE_URL)
-    b.button(text="⬅️ Назад", callback_data="sub:to_menu")
-    b.adjust(1)
-    return b.as_markup()
+        left_block = (
+            "⏳ Осталось бесплатно:\n"
+            f"💬 «Ответить за меня» — {reply_left}\n"
+            f"🔬 «Анализ собеседника» — {analysis_left}\n"
+            f"💡 «Идеальное свидание» — {date_left}\n\n"
+        )
+    return f"👑 Подписка:\n\n❌ Не активна\n\n{_PREMIUM_FEATURES_HTML}\n\n{html.escape(left_block + footer)}"
 
 
 @dp.message(Command("premium"))
 async def cmd_premium(message: Message, bot: Bot) -> None:
-    telegram_id = str(message.from_user.id)
-    text = await _premium_status_text(bot, telegram_id)
-    kb = premium_active_kb(telegram_id) if await _is_premium(bot, telegram_id) else paywall_kb()
-    await message.answer(text, reply_markup=kb, parse_mode="HTML")
+    text = await _premium_status_text(bot, str(message.from_user.id))
+    await message.answer(text, reply_markup=paywall_kb(), parse_mode="HTML")
     await _offer_pending_reveals(bot, str(message.from_user.id))
 
 
 async def _show_premium_screen(target: Message, bot: Bot, telegram_id: str, edit: bool = False) -> None:
     text = await _premium_status_text(bot, telegram_id)
-    kb = premium_active_kb(telegram_id) if await _is_premium(bot, telegram_id) else premium_menu_kb()
     if edit:
-        await target.edit_text(text, reply_markup=kb, parse_mode="HTML")
+        await target.edit_text(text, reply_markup=premium_menu_kb(), parse_mode="HTML")
     else:
-        await target.answer(text, reply_markup=kb, parse_mode="HTML")
+        await target.answer(text, reply_markup=premium_menu_kb(), parse_mode="HTML")
     # Premium уже активен, а скрытые удалённые не показаны (тизер мог
     # потеряться) — предложить показать (сама функция проверит и то, и другое).
     await _offer_pending_reveals(bot, telegram_id)
