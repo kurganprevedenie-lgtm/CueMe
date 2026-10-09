@@ -64,6 +64,7 @@ from config import (
     MAIN_MENU_LOGO_FILE_ID,
     MAIN_MENU_LOGO_PATH,
     CONNECT_EFFECT_ID,
+    PROGRESS_MIN_SHOW_SECONDS,
     ONBOARDING_JSON_POST_URL,
     OPENERS_FOR_HER,
     OPENERS_FOR_HIM,
@@ -500,7 +501,8 @@ _PROGRESS_FRAME_COUNT = 10  # кадров в одном круге — при 3
 #             return task.result()  # исключение из coro пробрасывается здесь же
 
 
-_PROGRESS_MIN_SHOW_SECONDS = 1.2  # не раньше — иначе анимация успевает только мигнуть
+# Было 1.2 с; теперь константа в config.py (PROGRESS_MIN_SHOW_SECONDS, 0.8 с).
+_PROGRESS_MIN_SHOW_SECONDS = PROGRESS_MIN_SHOW_SECONDS  # не раньше — иначе анимация успевает только мигнуть
 _PROGRESS_MIN_EDIT_INTERVAL = 0.8  # не чаще раза в столько секунд (лимиты Telegram)
 
 

@@ -115,6 +115,22 @@ VARIANTS_REASONING_BUFFER = int(os.getenv("VARIANTS_REASONING_BUFFER", "300"))
 # зависании быстрее уходим к запасному провайдеру. Groq за сутки ни разу не
 # отвечал дольше ~7.5 с, так что 20 с успешные ответы не режет.
 VARIANTS_GROQ_TIMEOUT = float(os.getenv("VARIANTS_GROQ_TIMEOUT", "20"))
+# Модель Groq для «Ответа с CueMe». Бенчмарк 2026-10-09 (tools/bench_variants.py,
+# настоящий промпт вариантов, 5 прогонов): gpt-oss-20b — 5/5, медиана 0.7 с;
+# gpt-oss-120b — 0/5, все 10 ключей на 429 (у 20b свой лимит, отдельный от
+# 120b). Откат на основную модель (GroqProvider._MODEL) — VARIANTS_GROQ_MODEL="".
+VARIANTS_GROQ_MODEL = os.getenv("VARIANTS_GROQ_MODEL", "openai/gpt-oss-20b")
+# Какие модели Gemini пробовать ПЕРВЫМИ для «Ответа с CueMe» (остальные — в
+# обычном порядке, Gemma 4 26B — в самом конце). Тот же бенчмарк: 3.5 Flash
+# Lite — 5/5, медиана 1.2 с; Gemma 4 26B (первая в обычном каскаде) — 0/5,
+# каждый раз 25 с до таймаута. Пусто — обычный порядок каскада.
+VARIANTS_GEMINI_MODELS = [
+    m.strip() for m in os.getenv("VARIANTS_GEMINI_MODELS", "gemini-3.5-flash-lite,gemini-3.1-flash-lite").split(",")
+    if m.strip()
+]
+# Минимальное время показа индикатора генерации (main.py:
+# with_progress_animation) — меньше не показываем, чтобы не мигало.
+PROGRESS_MIN_SHOW_SECONDS = float(os.getenv("PROGRESS_MIN_SHOW_SECONDS", "0.8"))
 
 # TTL кэша LLM-ответов (сек). Ключ контент-адресный (включает карточки стиля),
 # поэтому смена карточек инвалидирует запись сама; TTL — страховка от разрастания.

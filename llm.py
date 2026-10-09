@@ -84,6 +84,8 @@ from config import (
     LLM_PROVIDER_ORDER,
     OPENROUTER_API_KEY,
     REPLY_STYLES,
+    VARIANTS_GEMINI_MODELS,
+    VARIANTS_GROQ_MODEL,
     VARIANTS_GROQ_TIMEOUT,
     VARIANTS_REASONING_BUFFER,
     VARIANTS_REASONING_EFFORT,
@@ -510,8 +512,11 @@ class GroqProvider(LLMProvider):
         # таймаут: скорость важнее глубины, и меньше токенов — реже 429 по
         # токенному лимиту (см. config.py). Пустой effort — прежнее поведение.
         fast = _llm_fast.get() and bool(VARIANTS_REASONING_EFFORT)
+        # Модель для «Ответа с CueMe» — VARIANTS_GROQ_MODEL (своя, отдельно
+        # от reasoning_effort, чтобы откатывать независимо).
+        model = VARIANTS_GROQ_MODEL if (_llm_fast.get() and VARIANTS_GROQ_MODEL) else self._MODEL
         payload = {
-            "model": self._MODEL,
+            "model": model,
             "messages": [{"role": "user", "content": prompt}],
             "max_tokens": max_tokens + (VARIANTS_REASONING_BUFFER if fast else self._REASONING_BUFFER),
         }
@@ -688,6 +693,20 @@ class GeminiProvider(LLMProvider):
         except (KeyError, IndexError) as e:
             raise ProviderError(f"Gemini {model}: неожиданный формат ответа — {e}") from e
 
+    _SLOW_LAST = "gemma-4-26b-a4b-it"
+
+    def _cascade_for_call(self) -> list[str]:
+        """Порядок моделей для текущего вызова. Обычный — _MODEL_CASCADE. Для
+        «Ответа с CueMe» (_ask(..., fast=True)) — сначала VARIANTS_GEMINI_MODELS,
+        потом остальные, Gemma 4 26B в самом конце: на промпте вариантов она
+        каждый раз молчала 25 с до таймаута (бенчмарк 2026-10-09)."""
+        if not _llm_fast.get() or not VARIANTS_GEMINI_MODELS:
+            return self._MODEL_CASCADE
+        first = [m for m in VARIANTS_GEMINI_MODELS if m in self._MODEL_CASCADE]
+        rest = [m for m in self._MODEL_CASCADE if m not in first and m != self._SLOW_LAST]
+        tail = [self._SLOW_LAST] if self._SLOW_LAST in self._MODEL_CASCADE and self._SLOW_LAST not in first else []
+        return first + rest + tail
+
     async def ask(self, prompt: str, max_tokens: int) -> str:
         """Двойной перебор: для каждого ключа (round-robin, мультиаккаунтинг) —
         весь _MODEL_CASCADE по приоритету лимита (Gemma → Flash Lite → Flash).
@@ -707,21 +726,22 @@ class GeminiProvider(LLMProvider):
             raise ProviderError("GEMINI_API_KEY(S) не задан")
 
         last_exc: Exception = RateLimitError("Ни один ключ/модель Gemini не сработали.")
+        cascade = self._cascade_for_call()
         for ki, key in enumerate(keys):
-            for mi, model in enumerate(self._MODEL_CASCADE):
+            for mi, model in enumerate(cascade):
                 try:
                     return await self._ask_with_key(prompt, max_tokens, key, model)
                 except (RateLimitError, ProviderError) as e:
                     last_exc = e
-                    if mi + 1 < len(self._MODEL_CASCADE):
+                    if mi + 1 < len(cascade):
                         log.warning("Gemini: %s — пробую следующую модель (%d/%d) на том же ключе",
-                                    e, mi + 2, len(self._MODEL_CASCADE))
+                                    e, mi + 2, len(cascade))
                     continue
                 except httpx.ReadTimeout as e:
                     last_exc = ProviderError(f"Gemini {model}: не ответила за 25с — {e}")
-                    if mi + 1 < len(self._MODEL_CASCADE):
+                    if mi + 1 < len(cascade):
                         log.warning("Gemini: %s не ответила за 25с — пробую следующую модель (%d/%d) на том же ключе",
-                                    model, mi + 2, len(self._MODEL_CASCADE))
+                                    model, mi + 2, len(cascade))
                     continue
             if ki + 1 < len(keys):
                 log.warning("Gemini: все модели исчерпаны на ключе %s — пробую следующий ключ (%d/%d)",
