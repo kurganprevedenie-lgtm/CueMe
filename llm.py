@@ -72,6 +72,7 @@ import logging
 import random
 import re
 import time
+import contextvars
 from abc import ABC, abstractmethod
 
 import httpx
@@ -202,13 +203,36 @@ async def _tracked_post(
     есть — вызывающий код (ask()/_ask_with_key() каждого провайдера) сам
     решает, RateLimitError это или ProviderError, эта функция логику ошибок
     не меняет, только добавляет наблюдение поверх."""
+    t0 = time.monotonic()
     try:
         resp = await client.post(url, **kwargs)
-    except Exception:
+    except Exception as e:
         _track_response(provider, key, None)
+        _log_llm_timing(provider, key, type(e).__name__, t0)
         raise
     _track_response(provider, key, resp)
+    _log_llm_timing(provider, key, f"HTTP {resp.status_code}", t0)
     return resp
+
+
+# ВРЕМЕННЫЕ замеры скорости «Ответа с CueMe» (2026-10-09, убрать после
+# анализа): одна строка LLM-TIMING на каждый HTTP-запрос к провайдеру — тег
+# вызова (что генерировали), номер попытки в каскаде, провайдер, ключ
+# (замаскирован), исход, длительность. Тег и счётчик попыток — через
+# contextvar, выставляет _ask(..., tag=...), чтобы не протаскивать параметр
+# через всех провайдеров.
+_llm_call_tag: contextvars.ContextVar[str] = contextvars.ContextVar("llm_call_tag", default="-")
+_llm_attempt: contextvars.ContextVar[list] = contextvars.ContextVar("llm_attempt", default=[0])
+
+
+def _log_llm_timing(provider: str, key: str, outcome: str, t0: float) -> None:
+    counter = _llm_attempt.get()
+    counter[0] += 1
+    log.info(
+        "LLM-TIMING tag=%s attempt=%d provider=%s key=%s outcome=%s ms=%.0f",
+        _llm_call_tag.get(), counter[0], provider, _mask_key(key), outcome,
+        (time.monotonic() - t0) * 1000,
+    )
 
 
 # ── Абстрактный провайдер ─────────────────────────────────────────────────────
@@ -843,9 +867,13 @@ def get_provider_stats() -> dict:
     return out
 
 
-async def _ask(prompt: str, max_tokens: int = 1024) -> str:
+async def _ask(prompt: str, max_tokens: int = 1024, tag: str | None = None) -> str:
     """Пробует провайдеров по цепочке. Пробрасывает ошибку только если все упали.
-    Логирует по каждой попытке: провайдер, исход, тип ошибки, время ответа."""
+    Логирует по каждой попытке: провайдер, исход, тип ошибки, время ответа.
+    tag — что генерируем (для временных замеров LLM-TIMING, см. _log_llm_timing)."""
+    if tag:
+        _llm_call_tag.set(tag)
+    _llm_attempt.set([0])
     last_exc: Exception = RuntimeError("Нет доступных LLM-провайдеров")
     chain = _ordered_providers()
 
@@ -2059,7 +2087,7 @@ async def suggest_reply_variants(
     # внутренние рассуждения ДО финального текста; у контактов с богатой
     # историей (есть winning_examples/data_signals в промпте) он длиннее
     # среднего — риск урезания выше. Подняли запас.
-    raw = await _ask(prompt, max_tokens=1800)
+    raw = await _ask(prompt, max_tokens=1800, tag="variants")
     variants = _parse_variants(raw, n_variants)
     if len(variants) < n_variants:
         log.warning(
@@ -2424,7 +2452,7 @@ async def live_coach_step(
         "Затем — обновлённые заметки целиком (старые дословно + новая строка "
         "в конце, или без изменений, если добавить нечего)."
     )
-    raw = await _ask(prompt, max_tokens=1700)
+    raw = await _ask(prompt, max_tokens=1700, tag="live")
     return _parse_live_step(raw, n_variants, running_notes or "")
 
 

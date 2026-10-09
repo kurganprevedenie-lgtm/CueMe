@@ -493,6 +493,24 @@ async def with_progress_animation(
             return task.result()  # исключение из coro пробрасывается здесь же
 
 
+# ВРЕМЕННЫЕ замеры скорости «Ответа с CueMe» (2026-10-09, убрать после
+# анализа): _timed_llm меряет чистое время LLM, _log_reply_timing пишет
+# одну строку REPLY-TIMING на генерацию — LLM, до показа результата, и
+# сколько сверху добавила анимация (overhead).
+async def _timed_llm(coro, box: list):
+    t0 = time.monotonic()
+    try:
+        return await coro
+    finally:
+        box.append(time.monotonic() - t0)
+
+
+def _log_reply_timing(kind: str, started: float, llm_box: list) -> None:
+    shown = time.monotonic() - started
+    llm = llm_box[0] if llm_box else 0.0
+    logging.info("REPLY-TIMING kind=%s llm=%.2fs shown=%.2fs overhead=%.2fs", kind, llm, shown, shown - llm)
+
+
 async def _edit_or_answer_long(
     message: Message, text: str, reply_markup: InlineKeyboardMarkup | None = None,
     parse_mode: str | None = None,
@@ -8184,9 +8202,10 @@ async def _run_variants_generation(
             if force_fresh:
                 variants = await coro
             else:
+                _t_started, _llm_box = time.monotonic(), []
                 progress_msg = await target.answer(_PROGRESS_FRAMES[0])
                 variants = await with_progress_animation(
-                    bot, progress_msg.chat.id, progress_msg.message_id, coro,
+                    bot, progress_msg.chat.id, progress_msg.message_id, _timed_llm(coro, _llm_box),
                     cycle_seconds=_REPLY_PROGRESS_CYCLE_SECONDS,
                 )
         except RateLimitError:
@@ -8237,6 +8256,8 @@ async def _run_variants_generation(
         progress_msg, target, force_fresh, text_out,
         reply_markup=variants_result_kb(action_id), parse_mode="HTML",
     )
+    if progress_msg:
+        _log_reply_timing("reply", _t_started, _llm_box)
 
 
 @dp.callback_query(F.data.startswith("varregen:"))
@@ -8627,14 +8648,15 @@ async def _run_live_coach_step(
     if variants is None:
         if not await _quota_gate(bot, target, str(telegram_id), replay=replay):
             return
+        _t_started, _llm_box = time.monotonic(), []
         progress_msg = await target.answer(_PROGRESS_FRAMES[0])
         try:
             variants, updated_notes = await with_progress_animation(
                 bot, progress_msg.chat.id, progress_msg.message_id,
-                live_coach_step(
+                _timed_llm(live_coach_step(
                     text, style_card, running_notes or None, ctx.get("dialogue_history"),
                     user_gender=gender,
-                ),
+                ), _llm_box),
                 cycle_seconds=_REPLY_PROGRESS_CYCLE_SECONDS,
             )
         except RateLimitError:
@@ -8693,6 +8715,7 @@ async def _run_live_coach_step(
             progress_msg, f"{_format_variants(variants)}\n\n{footer}",
             reply_markup=live_variants_kb(action_id), parse_mode="HTML",
         )
+        _log_reply_timing("live", _t_started, _llm_box)
     else:
         await _answer_long(
             target, f"{_format_variants(variants)}\n\n{footer}",
