@@ -262,6 +262,60 @@ logging.basicConfig(level=logging.INFO)
 dp = Dispatcher(storage=MemoryStorage())
 
 
+# ── Устойчивость к задержкам (инцидент 2026-10-12) ───────────────────────────
+# Если бот обработал нажатие кнопки позже ~15 с, Telegram отвечает на
+# call.answer() «query is too old», и обработчик падал целиком — юзер видел
+# «Что-то пошло не так» вместо результата, хотя само действие можно было
+# доделать. Теперь эта конкретная ошибка у answer() глушится (спиннер у кнопки
+# просто не погаснет), остальные — как раньше.
+_orig_callback_answer = CallbackQuery.answer
+_STALE_QUERY_HINTS = ("query is too old", "query id is invalid")
+
+
+def _safe_callback_answer(self, *args, **kwargs):
+    method = _orig_callback_answer(self, *args, **kwargs)
+
+    async def run():
+        try:
+            return await method
+        except TelegramBadRequest as e:
+            if any(h in str(e).lower() for h in _STALE_QUERY_HINTS):
+                logging.warning("callback answer опоздал (бот был занят), продолжаю: %s", self.data)
+                return False
+            raise
+    return run()
+
+
+CallbackQuery.answer = _safe_callback_answer
+
+
+async def _edit_or_keep(target: Message, text: str) -> Message:
+    """edit_text, который не падает на «message is not modified» (повторное
+    нажатие, пока висит тот же кадр анимации) — тогда просто берём сообщение
+    как есть."""
+    try:
+        return await target.edit_text(text)
+    except TelegramBadRequest as e:
+        if "message is not modified" in str(e).lower():
+            return target
+        raise
+
+
+# Датчик зависаний: раз в секунду проверяет, не опоздал ли сам цикл бота.
+# Опоздание > 2 с значит, что какой-то код держит цикл (тяжёлый синхронный
+# запрос к базе, расчёт и т.п.) — все нажатия в это время ждут.
+_LOOP_LAG_WARN_SECONDS = 2.0
+
+
+async def _watch_event_loop_lag() -> None:
+    while True:
+        t0 = time.monotonic()
+        await asyncio.sleep(1.0)
+        lag = time.monotonic() - t0 - 1.0
+        if lag > _LOOP_LAG_WARN_SECONDS:
+            logging.warning("event loop lag %.1f с — бот был занят и не обрабатывал нажатия", lag)
+
+
 @dp.errors()
 async def on_unhandled_error(event: ErrorEvent) -> bool:
     """Глобальная сетка на необработанные исключения в хендлерах. Без неё сбой
@@ -4447,7 +4501,7 @@ async def _run_deep_analysis(
     # _gen_deep_analysis сам решает кэш-хит внутри — обёртка анимации просто
     # оборачивает весь вызов: на кэш-хите анимация мелькнёт одним кадром и
     # тут же отменится, реальный вызов LLM крутит её честно.
-    progress_msg = await (target.edit_text(_PROGRESS_FRAMES[0]) if edit else target.answer(_PROGRESS_FRAMES[0]))
+    progress_msg = await (_edit_or_keep(target, _PROGRESS_FRAMES[0]) if edit else target.answer(_PROGRESS_FRAMES[0]))
     try:
         data = await with_progress_animation(
             bot, progress_msg.chat.id, progress_msg.message_id,
@@ -4736,7 +4790,7 @@ async def _run_ideal_date(
 
     # _gen_ideal_date сам решает кэш-хит внутри (см. deep_analysis выше) —
     # обёртка анимации просто оборачивает весь вызов.
-    progress_msg = await (target.edit_text(_PROGRESS_FRAMES[0]) if edit else target.answer(_PROGRESS_FRAMES[0]))
+    progress_msg = await (_edit_or_keep(target, _PROGRESS_FRAMES[0]) if edit else target.answer(_PROGRESS_FRAMES[0]))
     try:
         data = await with_progress_animation(
             bot, progress_msg.chat.id, progress_msg.message_id,
@@ -9898,6 +9952,7 @@ async def main() -> None:
         BotCommand(command="rebuild",     description="Пересобрать все карточки"),
     ])
     asyncio.create_task(_reconcile_promo_channel_premium(bot))
+    asyncio.create_task(_watch_event_loop_lag())
     await _start_tribute_webhook_server(bot)  # no-op, если TRIBUTE_API_KEY не задан
     await dp.start_polling(
         bot,
