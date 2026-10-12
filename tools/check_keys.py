@@ -22,9 +22,11 @@ llm.py (например миграция на новую модель посл�
 tools.check_keys, если зависимости стоят в venv, см. cueme-bot.service)
 """
 import asyncio
+import re
 
 import httpx
 
+import config
 from config import (
     GEMINI_API_KEYS,
     GEMINI_PROXY,
@@ -86,6 +88,96 @@ async def check_groq(key: str) -> tuple[bool, str]:
     if not text:
         return False, "content пустой/null — вероятно, reasoning съел весь бюджет max_tokens"
     return True, text
+
+
+# Было: check_groq выше — крошечный запрос (max_tokens=200) к одной модели.
+# Он проходил даже на ключе, у которого на сегодня почти кончился лимит
+# токенов, а настоящий запрос бота (промпт на тысячи токенов + резерв под
+# ответ) на том же ключе получал 429 — ключ выглядел «живым», хотя бот его
+# использовать не мог. Теперь (check_groq_for_bot): тот же короткий вопрос,
+# но с ТАКИМ ЖЕ резервом под ответ, как у бота — Groq сверяет с лимитом весь
+# заявленный объём, поэтому ключ без запаса честно отвечает 429, а реально
+# тратится лишь десяток токенов. Плюс остатки из заголовков ответа и
+# расшифровка 429 (какой лимит, сколько израсходовано, когда сброс).
+# Старая check_groq оставлена для отката.
+
+# Резерв под ответ, как у бота: самый большой обычный вызов (карточка
+# стиля/варианты ~1800) + буфер под рассуждения gpt-oss.
+_BOT_RESERVE_TOKENS = 1800 + GroqProvider._REASONING_BUFFER
+_LIMIT_RE = re.compile(r"on ([a-z ]+) \((\w+)\): Limit (\d+), Used (\d+), Requested (\d+)", re.IGNORECASE)
+_RETRY_RE = re.compile(r"try again in ([\d.hms]+)", re.IGNORECASE)
+_LIMIT_NAMES = {
+    "TPD": "токенов за сутки", "TPM": "токенов в минуту",
+    "RPD": "запросов за сутки", "RPM": "запросов в минуту",
+}
+
+
+def _groq_models() -> list[str]:
+    """Модели Groq, которые реально использует бот: основная + для «Ответа с CueMe»."""
+    variants = getattr(config, "VARIANTS_GROQ_MODELS", None)
+    if variants is None:
+        single = getattr(config, "VARIANTS_GROQ_MODEL", "")
+        variants = [single] if single else []
+    out = [GroqProvider._MODEL]
+    for m in variants:
+        if m and m not in out:
+            out.append(m)
+    return out
+
+
+def _groq_left(resp: httpx.Response) -> str:
+    h = resp.headers
+    parts = []
+    if h.get("x-ratelimit-remaining-requests"):
+        parts.append(f"запросов сегодня {h['x-ratelimit-remaining-requests']}/{h.get('x-ratelimit-limit-requests', '?')}")
+    if h.get("x-ratelimit-remaining-tokens"):
+        parts.append(f"токенов в минуту {h['x-ratelimit-remaining-tokens']}/{h.get('x-ratelimit-limit-tokens', '?')}")
+    return ", ".join(parts)
+
+
+async def check_groq_for_bot(key: str, model: str) -> tuple[bool, str]:
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": "Ответь одним словом: тест пройден?"}],
+        "max_tokens": _BOT_RESERVE_TOKENS,
+        "reasoning_effort": "low",
+    }
+    async with httpx.AsyncClient(timeout=30.0, trust_env=False) as client:
+        resp = await client.post(GroqProvider._URL, headers={"Authorization": f"Bearer {key}"}, json=payload)
+    left = _groq_left(resp)
+    if resp.status_code == 429:
+        m = _LIMIT_RE.search(resp.text)
+        retry = _RETRY_RE.search(resp.text)
+        if m:
+            kind = _LIMIT_NAMES.get(m.group(2).upper(), m.group(1))
+            detail = f"лимит {kind}: израсходовано {int(m.group(4)):,} из {int(m.group(3)):,}".replace(",", " ")
+        else:
+            detail = resp.text[:120]
+        when = f", сброс через {retry.group(1).rstrip('.')}" if retry else ""
+        return False, f"НЕ ПОТЯНЕТ запрос бота — {detail}{when}"
+    if not resp.is_success:
+        return False, f"HTTP {resp.status_code} — {resp.text[:150]}"
+    return True, f"запрос бота потянет" + (f" (осталось: {left})" if left else "")
+
+
+async def run_groq_check() -> None:
+    models = _groq_models()
+    print(f"\n=== Groq: всего ключей {len(GROQ_API_KEYS)}, модели бота: {', '.join(models)} ===")
+    print(f"  (проверка с резервом под ответ {_BOT_RESERVE_TOKENS} токенов, как у бота)")
+    if not GROQ_API_KEYS:
+        print("  (не задано)")
+        return
+    totals = {m: 0 for m in models}
+    for i, key in enumerate(GROQ_API_KEYS):
+        print(f"  ключ #{i} ({_mask(key)}):")
+        for model in models:
+            try:
+                ok, detail = await check_groq_for_bot(key, model)
+            except Exception as e:
+                ok, detail = False, f"исключение: {type(e).__name__}: {e}"
+            totals[model] += ok
+            print(f"    {model}: {'OK' if ok else 'FAIL'} -> {detail}")
+    print("  итого годных для бота: " + ", ".join(f"{m} — {n} из {len(GROQ_API_KEYS)}" for m, n in totals.items()))
 
 
 async def check_openrouter(key: str) -> tuple[bool, str]:
@@ -160,7 +252,8 @@ async def _run_group(title: str, keys: list[str], checker) -> None:
 
 
 async def main() -> None:
-    await _run_group("Groq", GROQ_API_KEYS, check_groq)
+    # Было: await _run_group("Groq", GROQ_API_KEYS, check_groq) — см. комментарий у check_groq_for_bot.
+    await run_groq_check()
     await run_gemini_check()
     await _run_group("OpenRouter", [OPENROUTER_API_KEY] if OPENROUTER_API_KEY else [], check_openrouter)
 
