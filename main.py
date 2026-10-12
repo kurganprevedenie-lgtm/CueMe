@@ -403,6 +403,18 @@ _ALL_BTNS = {
 
 # Защита от параллельных пересборок одного контакта
 _rebuilding: set[int] = set()
+# Лавина пересборок (инцидент 2026-10-12): после перезапуска бота (каждый
+# деплой) пауза пересборок обнулялась, и на первое же сообщение каждой
+# переписки с накопленными 50+ новыми стартовала своя пересборка — ~40 за
+# 20 с. Каждая синхронно, прямо в цикле бота, пересчитывала выборку
+# сообщений → «event loop lag» до 14 с, нажатия не обрабатывались. Теперь —
+# не больше _REBUILD_CONCURRENCY одновременно (остальные ждут), при очереди
+# больше _REBUILD_MAX_QUEUED новая пропускается (запустится на следующем
+# сообщении этой переписки), а работа с базой — в отдельном потоке.
+_REBUILD_CONCURRENCY = 2
+_REBUILD_MAX_QUEUED = 10
+_rebuild_slots = asyncio.Semaphore(_REBUILD_CONCURRENCY)
+_rebuild_checking: set[int] = set()  # переписки, по которым сейчас считаем, нужна ли пересборка
 
 # Контекст действий (черновик/входящее/скриншот + выбранный стиль) — по user_id,
 # и ВНУТРИ каждого юзера ещё и по action_id (не один слот, а словарь слотов).
@@ -3492,13 +3504,13 @@ def _refresh_samples(owner_user_id: str, contact_id: int) -> None:
 
 async def _rebuild_contact(owner_user_id: str, contact_id: int) -> bool:
     """Пересобирает my_style_per_contact и interaction_card. True если успешно."""
-    my_msgs      = _get_rebuild_sample(owner_user_id, contact_id, "out", SAMPLE_SIZE)
-    contact_msgs = _get_rebuild_sample(owner_user_id, contact_id, "in", SAMPLE_SIZE // 2)
+    my_msgs      = await asyncio.to_thread(_get_rebuild_sample, owner_user_id, contact_id, "out", SAMPLE_SIZE)
+    contact_msgs = await asyncio.to_thread(_get_rebuild_sample, owner_user_id, contact_id, "in", SAMPLE_SIZE // 2)
 
     if not my_msgs:
         return False
 
-    total   = count_biz_messages_for_contact(owner_user_id, contact_id)
+    total   = await asyncio.to_thread(count_biz_messages_for_contact, owner_user_id, contact_id)
     out_avg = sum(len(t) for t in my_msgs) / len(my_msgs)
     in_avg  = sum(len(t) for t in contact_msgs) / len(contact_msgs) if contact_msgs else 0
     stats = (
@@ -3507,22 +3519,18 @@ async def _rebuild_contact(owner_user_id: str, contact_id: int) -> bool:
     )
 
     # Обновляем message_samples объединёнными данными (JSON + business)
-    contact_row = get_contact_by_id(contact_id)
+    contact_row = await asyncio.to_thread(get_contact_by_id, contact_id)
     label = (contact_row["display_name"] or contact_row["contact_alias"]) if contact_row else ""
-    save_message_samples(
-        contact_id,
-        my_msgs[:100],
-        contact_msgs[:50],
-        stats,
-        contact_label=label,
+    await asyncio.to_thread(
+        save_message_samples, contact_id, my_msgs[:100], contact_msgs[:50], stats, contact_label=label,
     )
 
     my_style = await build_my_style_for_contact(my_msgs, stats)
-    save_my_style_per_contact(contact_id, my_style, total)
+    await asyncio.to_thread(save_my_style_per_contact, contact_id, my_style, total)
 
     if contact_msgs:
         interaction = await build_interaction_card(my_msgs, contact_msgs, stats)
-        save_interaction_card(contact_id, interaction)
+        await asyncio.to_thread(save_interaction_card, contact_id, interaction)
 
     return True
 
@@ -3531,40 +3539,49 @@ async def _rebuild_contact(owner_user_id: str, contact_id: int) -> bool:
 
 async def _maybe_rebuild(owner_user_id: str, contact_id: int, bot: Bot | None = None) -> None:
     global _rebuild_cooldown_until
-    if contact_id in _rebuilding:
+    if contact_id in _rebuilding or contact_id in _rebuild_checking:
         return
+    if len(_rebuilding) + len(_rebuild_checking) >= _REBUILD_CONCURRENCY + _REBUILD_MAX_QUEUED:
+        return  # очередь пересборок полна — запустится на следующем сообщении
     if time.monotonic() < _rebuild_cooldown_until:
         return  # лимит Groq недавно исчерпан — не дёргаем API на каждое сообщение
 
-    last  = get_my_style_last_rebuild_count(contact_id)
-    total = count_biz_messages_for_contact(owner_user_id, contact_id)
-
-    # Первая сборка (карточки ещё нет) — сниженный порог, чтобы новый юзер
-    # быстрее увидел результат; сообщения считаем из всех источников
-    # (business + ручная вставка/JSON). Пересборка — обычный порог по biz-дельте.
-    is_first = get_my_style_per_contact(contact_id) is None
-    if is_first:
-        combined = total + count_imported_messages(contact_id)
-        if combined < FIRST_BUILD_THRESHOLD:
-            return
-    elif total - last < REBUILD_THRESHOLD:
-        return
-
-    # Порог достигнут — гарантируем свежие message_samples на момент пересборки
-    # (перекрывает троттлинг на горячем пути) и сбрасываем счётчик.
-    _refresh_pending.pop(contact_id, None)
-    _refresh_samples(owner_user_id, contact_id)
-
-    _rebuilding.add(contact_id)
+    # Место в очереди занимаем сразу, ещё до подсчётов (они — в потоке, с
+    # await): иначе лавина из десятков переписок проходит проверку очереди
+    # раньше, чем хоть одна успевает в неё записаться.
+    _rebuild_checking.add(contact_id)
     try:
-        logging.info("auto-rebuild start: contact_id=%s (new=%s, first=%s)", contact_id, total - last, is_first)
-        ok = await _rebuild_contact(owner_user_id, contact_id)
-        if ok:
-            per_contact = get_all_per_contact_style_cards(owner_user_id)
-            if per_contact:
-                overall = await build_overall_style(per_contact)
-                save_style_card(owner_user_id, overall)
-        logging.info("auto-rebuild done: contact_id=%s ok=%s", contact_id, ok)
+        last  = await asyncio.to_thread(get_my_style_last_rebuild_count, contact_id)
+        total = await asyncio.to_thread(count_biz_messages_for_contact, owner_user_id, contact_id)
+
+        # Первая сборка (карточки ещё нет) — сниженный порог, чтобы новый юзер
+        # быстрее увидел результат; сообщения считаем из всех источников
+        # (business + ручная вставка/JSON). Пересборка — обычный порог по biz-дельте.
+        is_first = await asyncio.to_thread(get_my_style_per_contact, contact_id) is None
+        if is_first:
+            combined = total + await asyncio.to_thread(count_imported_messages, contact_id)
+            if combined < FIRST_BUILD_THRESHOLD:
+                return
+        elif total - last < REBUILD_THRESHOLD:
+            return
+        # Порог достигнут — дальше пересборка (свежие message_samples на момент
+        # пересборки перекрывают троттлинг на горячем пути).
+        _rebuilding.add(contact_id)
+    finally:
+        _rebuild_checking.discard(contact_id)
+
+    try:
+        async with _rebuild_slots:
+            _refresh_pending.pop(contact_id, None)
+            await asyncio.to_thread(_refresh_samples, owner_user_id, contact_id)
+            logging.info("auto-rebuild start: contact_id=%s (new=%s, first=%s)", contact_id, total - last, is_first)
+            ok = await _rebuild_contact(owner_user_id, contact_id)
+            if ok:
+                per_contact = await asyncio.to_thread(get_all_per_contact_style_cards, owner_user_id)
+                if per_contact:
+                    overall = await build_overall_style(per_contact)
+                    await asyncio.to_thread(save_style_card, owner_user_id, overall)
+            logging.info("auto-rebuild done: contact_id=%s ok=%s", contact_id, ok)
 
         if ok and is_first and bot is not None:
             # Первый разбор готов — короткое уведомление. Сама карточка сохранена
