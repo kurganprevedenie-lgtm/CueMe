@@ -88,6 +88,8 @@ from config import (
 )
 from features import detect_reply_situation, extract_features, stage_hint, totals_from_summary, winning_messages
 from llm import (
+    get_invalid_output_counts,
+    set_invalid_output_hook,
     # ILLEGIBLE_MARKER, extract_chat_from_image, screenshot_variants — были
     # нужны только функции «скриншот переписки → ответ», убранной целиком
     # (см. пометки у Screenshot/handle_unified_input/секции «Ответить по
@@ -747,6 +749,17 @@ def _never_unlocked(telegram_id: str, is_premium: bool) -> bool:
 # раз», и пишем gate_reveal_ok / gate_reveal_failed. Вне reveal — None, и
 # _note_outcome ничего не делает.
 _gen_outcome: contextvars.ContextVar[dict | None] = contextvars.ContextVar("gen_outcome", default=None)
+
+
+def _retry_kb(callback_data: str) -> InlineKeyboardMarkup | None:
+    """«🔄 Попробовать ещё раз» под сообщением об ошибке генерации. Внутри
+    «👀 Показать» после подписки (cb_unlock_reveal) — None: там своя кнопка
+    повтора, второй не нужно."""
+    if _gen_outcome.get() is not None:
+        return None
+    b = InlineKeyboardBuilder()
+    b.button(text="🔄 Попробовать ещё раз", callback_data=callback_data)
+    return b.as_markup()
 
 
 def _note_outcome(status: str) -> None:
@@ -4429,6 +4442,7 @@ async def _run_deep_analysis(
         _note_outcome("stale")
         return
     name = _contact_name(contact)
+    retry_cb = f"deepan:{contact_id}"
 
     # _gen_deep_analysis сам решает кэш-хит внутри — обёртка анимации просто
     # оборачивает весь вызов: на кэш-хите анимация мелькнёт одним кадром и
@@ -4440,12 +4454,12 @@ async def _run_deep_analysis(
             _gen_deep_analysis(contact_id, telegram_id),
         )
     except RateLimitError:
-        await progress_msg.edit_text("Лимит LLM исчерпан, попробуй позже.")
+        await progress_msg.edit_text("Лимит LLM исчерпан, попробуй позже.", reply_markup=_retry_kb(retry_cb))
         _note_outcome("rate_limit")
         return
     except Exception:
         logging.exception("deep_analysis: ошибка генерации")
-        await progress_msg.edit_text("Не удалось сгенерировать анализ — попробуй ещё раз.")
+        await progress_msg.edit_text("Не получилось собрать анализ, попробуй ещё раз.", reply_markup=_retry_kb(retry_cb))
         _note_outcome("llm_error")
         return
 
@@ -4718,6 +4732,7 @@ async def _run_ideal_date(
         _note_outcome("stale")
         return
     name = _contact_name(contact)
+    retry_cb = f"idealdate:{contact_id}"
 
     # _gen_ideal_date сам решает кэш-хит внутри (см. deep_analysis выше) —
     # обёртка анимации просто оборачивает весь вызов.
@@ -4728,12 +4743,12 @@ async def _run_ideal_date(
             _gen_ideal_date(contact_id, telegram_id, fresh=fresh),
         )
     except RateLimitError:
-        await progress_msg.edit_text("Лимит LLM исчерпан, попробуй позже.")
+        await progress_msg.edit_text("Лимит LLM исчерпан, попробуй позже.", reply_markup=_retry_kb(retry_cb))
         _note_outcome("rate_limit")
         return
     except Exception:
         logging.exception("ideal_date: ошибка генерации")
-        await progress_msg.edit_text("Не удалось придумать идею — попробуй ещё раз.")
+        await progress_msg.edit_text("Не получилось собрать идею, попробуй ещё раз.", reply_markup=_retry_kb(retry_cb))
         _note_outcome("llm_error")
         return
 
@@ -7741,6 +7756,12 @@ async def cmd_apistatus(message: Message) -> None:
     if not _is_admin(message.from_user.id):
         return
     text = "📡 Статус API по ключам (с рестарта бота):\n\n" + _format_apistatus(get_provider_stats_snapshot())
+    invalid = get_invalid_output_counts()
+    if invalid:
+        lines = ["\n\n<b>Невалидные ответы (мусор/рассуждения/обрыв)</b>"]
+        for prov, (hour, day) in sorted(invalid.items()):
+            lines.append(f"  {html.escape(prov)}: {hour} за час, {day} за сутки")
+        text += "\n".join(lines)
     await _answer_long(message, text, parse_mode="HTML")
 
 
@@ -9827,10 +9848,38 @@ def _validate_startup_config() -> None:
     logging.info("Конфиг проверен. Доступные LLM-ключи: %s", ", ".join(present))
 
 
+_INVALID_ALERT_THRESHOLD = 5  # невалидных за час от одного провайдера → алерт в группу
+_invalid_alerted_at: dict[str, float] = {}
+
+
+def _make_invalid_output_hook(bot: Bot):
+    """Хук для llm.set_invalid_output_hook: событие gen_invalid_output и, если
+    у провайдера за час больше _INVALID_ALERT_THRESHOLD невалидных, — одно
+    сообщение в ADMIN_GROUP_CHAT_ID (не чаще раза в час на провайдера)."""
+    def hook(provider: str, tag: str, reason: str) -> None:
+        try:
+            record_event(None, "gen_invalid_output", json.dumps(
+                {"provider": provider, "tag": tag, "reason": reason}, ensure_ascii=False))
+        except Exception:
+            logging.exception("gen_invalid_output: не удалось записать событие")
+        base = provider.split(" ", 1)[0]
+        hour, _ = get_invalid_output_counts().get(base, (0, 0))
+        now = time.time()
+        if ADMIN_GROUP_CHAT_ID and hour > _INVALID_ALERT_THRESHOLD and now - _invalid_alerted_at.get(base, 0) > 3600:
+            _invalid_alerted_at[base] = now
+            asyncio.get_running_loop().create_task(bot.send_message(
+                int(ADMIN_GROUP_CHAT_ID),
+                f"⚠️ {base}: {hour} невалидных ответов за час (последний — {tag}: {reason}). "
+                "Бот их отбраковывает и идёт к следующему провайдеру, но стоит посмотреть.",
+            ))
+    return hook
+
+
 async def main() -> None:
     _validate_startup_config()
     init_db()
     bot = Bot(token=BOT_TOKEN)
+    set_invalid_output_hook(_make_invalid_output_hook(bot))
     await bot.set_my_commands([
         BotCommand(command="start",       description="Начало работы"),
         BotCommand(command="menu",        description="Главное меню"),

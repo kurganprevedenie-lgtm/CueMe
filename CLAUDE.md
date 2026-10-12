@@ -136,6 +136,19 @@ LLM вызывается лениво — только при запросе п�
   Прогресс-бар (`with_progress_animation`) отдаёт результат сразу по ответу
   LLM (не раньше 1.2 с), кадры раз в 0.8 с в фоне — раньше ждал границы
   3-секундного круга. Сравнить качество до/после: `python3 -m tools.ab_variants`.
+  **Проверка ответа модели** (инцидент 2026-10-11 — сырые рассуждения Gemma
+  на английском в «Идеальном свидании»): каждый ответ проверяется ВНУТРИ
+  провайдера (`llm._check_output` → `validate_llm_output(text, tag)`):
+  кириллицы ≥ 40%, нет маркеров рассуждений («The user», «*Correction»,
+  «Let's»…), есть маркеры своей функции по `tag` (`_REQUIRED_MARKERS`:
+  ideal_date/variants/live/compat). Невалидный = ошибка провайдера (Gemini
+  берёт следующую модель, иначе — следующий провайдер), не попадает в кэш;
+  событие `gen_invalid_output`, счётчик в /apistatus, алерт в
+  ADMIN_GROUP_CHAT_ID при > 5 за час от провайдера. Gemini: «мысли»
+  (`thought: true`) отбрасываются, `MAX_TOKENS` — ошибка; Groq/OpenRouter:
+  `finish_reason=length` с обрубленным концом — ошибка. Обе Gemma — в конце
+  каскада Gemini для всех вызовов. Тег проставлен на всех 14 вызовах `_ask`.
+  Разовая чистка сохранённого мусора: `ops/clean_llm_garbage.py`.
   Vision (скриншоты) — отдельно, Groq/Gemini (см. `VISION_MODEL` в config.py)
 - HTTP: **httpx** с `trust_env=False` (обход SOCKS-прокси)
 - Хранилище: **SQLite** (bot.db)

@@ -234,6 +234,110 @@ _llm_attempt: contextvars.ContextVar[list] = contextvars.ContextVar("llm_attempt
 _llm_fast: contextvars.ContextVar[bool] = contextvars.ContextVar("llm_fast", default=False)
 
 
+# ── Проверка ответа модели (инцидент 2026-10-11) ─────────────────────────────
+# Платный юзер получил в «Идеальном свидании» вместо идеи сырые рассуждения
+# модели на английском («Confident dating coach… *Correction: The user
+# says…», оборвано на полуслове): Groq был на 429, вызов ушёл на Gemini, а
+# там первой стоит Gemma 4 26B — она не поддерживает thinkingConfig и пишет
+# рассуждения прямо в текст, а 650 токенов кончились до самого ответа.
+# _ask отбраковывал только пустую строку, поэтому мусор прошёл как успех и
+# сохранился в кэш. Теперь каждый ответ проверяется ВНУТРИ провайдера
+# (_check_output): невалидный = как ошибка провайдера — Gemini пробует
+# следующую модель, Groq/OpenRouter — каскад идёт к следующему провайдеру.
+_REASONING_MARKERS = (
+    "interlocutor:", "author:", "wait,", "let's", "*correction", "i will",
+    "the user", "draft", "self-correction",
+)
+# Обязательные маркеры по тегу вызова (_ask(..., tag=...)) — то, на что
+# опирается парсер ответа этой функции. Внутри кортежа — «любой из».
+_REQUIRED_MARKERS: dict[str, list[tuple[str, ...]]] = {
+    "ideal_date": [("💐",), ("===ПОДАРКИ===", "🎁")],
+    "variants": [("===ВАРИАНТ===",)],
+    "live": [("===ВАРИАНТ===",)],
+    "compat": [("ВЫВОД:",), ("ЧТО_ДАЛЬШЕ:",)],
+}
+_MIN_CYRILLIC_SHARE = 0.4
+
+
+def _cyrillic_share(text: str) -> float:
+    letters = [c for c in text if c.isalpha()]
+    if not letters:
+        return 1.0
+    cyr = sum(1 for c in letters if "а" <= c.lower() <= "я" or c in "ёЁ")
+    return cyr / len(letters)
+
+
+def validate_llm_output(text: str, tag: str | None = None) -> str | None:
+    """None — ответ годится; иначе причина, почему нет. Общие проверки для
+    всех вызовов (русский текст, нет рассуждений модели) + обязательные
+    маркеры своей функции по tag."""
+    t = (text or "").strip()
+    if not t:
+        return "пустой ответ"
+    share = _cyrillic_share(t)
+    if share < _MIN_CYRILLIC_SHARE:
+        return f"мало кириллицы ({share:.0%})"
+    low = t.lower()
+    for m in _REASONING_MARKERS:
+        if m in low:
+            return f"рассуждения модели («{m}»)"
+    for group in _REQUIRED_MARKERS.get(tag or "", []):
+        if not any(g in t for g in group):
+            return f"нет маркера {group[0]}"
+    return None
+
+
+def _ends_cleanly(text: str) -> bool:
+    """Закончился ли текст законченно: знак конца предложения, кавычка/скобка
+    или эмодзи — а не обрубком слова."""
+    t = text.rstrip()
+    return bool(t) and (t[-1] in ".!?…»\")" or not t[-1].isalnum())
+
+
+# Невалидные ответы по провайдерам (для /apistatus и алерта) + хук, через
+# который main.py пишет событие gen_invalid_output и шлёт алерт в группу.
+_invalid_outputs: dict[str, list[float]] = {}
+_invalid_output_hook = None
+
+
+def set_invalid_output_hook(fn) -> None:
+    """fn(provider, tag, reason) — вызывается на каждый невалидный ответ."""
+    global _invalid_output_hook
+    _invalid_output_hook = fn
+
+
+def get_invalid_output_counts() -> dict[str, tuple[int, int]]:
+    """Провайдер → (невалидных за час, за сутки)."""
+    now = time.time()
+    out = {}
+    for prov, ts in _invalid_outputs.items():
+        day = [t for t in ts if t >= now - 86400]
+        _invalid_outputs[prov] = day
+        out[prov] = (sum(1 for t in day if t >= now - 3600), len(day))
+    return out
+
+
+def _check_output(provider: str, model: str, text: str) -> str:
+    """Проверяет НЕпустой ответ провайдера; невалидный — ProviderError (как
+    сбой провайдера), с WARNING, счётчиком и хуком. Пустой не трогает — его
+    отдельно обрабатывает _ask. Возвращает text, если всё хорошо."""
+    if not text.strip():
+        return text
+    tag = _llm_call_tag.get()
+    reason = validate_llm_output(text, None if tag == "-" else tag)
+    if reason is None:
+        return text
+    who = f"{provider} {model}".strip()
+    log.warning("LLM [%s]: невалидный ответ для %s (%s): «%s»", who, tag, reason, text[:120].replace("\n", " "))
+    _invalid_outputs.setdefault(provider, []).append(time.time())
+    if _invalid_output_hook:
+        try:
+            _invalid_output_hook(who, tag, reason)
+        except Exception:
+            log.exception("invalid output hook failed")
+    raise ProviderError(f"{who}: невалидный ответ — {reason}")
+
+
 def _log_llm_timing(provider: str, key: str, outcome: str, t0: float) -> None:
     counter = _llm_attempt.get()
     counter[0] += 1
@@ -547,7 +651,12 @@ class GroqProvider(LLMProvider):
             raise ProviderError(f"Groq {resp.status_code}: {resp.text[:200]}")
 
         # content может прийти null, не только "" — reasoning ушёл весь бюджет.
-        return (resp.json()["choices"][0]["message"].get("content") or "").strip()
+        # Было: return content как есть — без проверки обрыва и содержания.
+        choice = resp.json()["choices"][0]
+        content = (choice["message"].get("content") or "").strip()
+        if content and choice.get("finish_reason") == "length" and not _ends_cleanly(content):
+            raise ProviderError(f"Groq {model}: ответ оборван по лимиту токенов (finish_reason=length)")
+        return _check_output(self.name, model, content)
 
     async def ask(self, prompt: str, max_tokens: int) -> str:
         """Перебирает ключи Groq по кругу (мультиаккаунтинг), как GeminiProvider."""
@@ -685,10 +794,16 @@ class GeminiProvider(LLMProvider):
         try:
             cand = data["candidates"][0]
             parts = cand.get("content", {}).get("parts") or []
-            text = "".join(p.get("text", "") for p in parts).strip()
-            if text:
-                return text
             reason = cand.get("finishReason", "?")
+            if reason not in ("STOP", "?"):
+                log.info("Gemini %s: finishReason=%s", model, reason)
+            # Было: склеивались ВСЕ parts, включая служебные «мысли» модели
+            # (thought: true), и обрыв по MAX_TOKENS принимался как ответ.
+            text = "".join(p.get("text", "") for p in parts if not p.get("thought")).strip()
+            if reason == "MAX_TOKENS":
+                raise ProviderError(f"Gemini {model}: ответ оборван по лимиту токенов (finishReason=MAX_TOKENS)")
+            if text:
+                return _check_output(self.name, model, text)
             raise ProviderError(f"Gemini {model}: пустой ответ (finishReason={reason})")
         except (KeyError, IndexError) as e:
             raise ProviderError(f"Gemini {model}: неожиданный формат ответа — {e}") from e
@@ -700,7 +815,14 @@ class GeminiProvider(LLMProvider):
         «Ответа с CueMe» (_ask(..., fast=True)) — сначала VARIANTS_GEMINI_MODELS,
         потом остальные, Gemma 4 26B в самом конце: на промпте вариантов она
         каждый раз молчала 25 с до таймаута (бенчмарк 2026-10-09)."""
-        if not _llm_fast.get() or not VARIANTS_GEMINI_MODELS:
+        if not _llm_fast.get():
+            # Было: обычный порядок _MODEL_CASCADE с Gemma 4 26B первой — она не
+            # отключает рассуждения (thinkingConfig не поддерживает) и пишет их
+            # прямо в текст ответа (инцидент 2026-10-11, «Идеальное свидание»).
+            # Теперь обе Gemma — в самом конце и для длинных структурных функций.
+            gemmas = [m for m in self._MODEL_CASCADE if m.startswith("gemma-")]
+            return [m for m in self._MODEL_CASCADE if m not in gemmas] + gemmas
+        if not VARIANTS_GEMINI_MODELS:
             return self._MODEL_CASCADE
         first = [m for m in VARIANTS_GEMINI_MODELS if m in self._MODEL_CASCADE]
         rest = [m for m in self._MODEL_CASCADE if m not in first and m != self._SLOW_LAST]
@@ -799,7 +921,12 @@ class OpenRouterProvider(LLMProvider):
             raise ProviderError(f"OpenRouter {resp.status_code}: {resp.text[:200]}")
 
         # content может прийти null, не только "" — reasoning ушёл весь бюджет.
-        return (resp.json()["choices"][0]["message"].get("content") or "").strip()
+        # Было: return content как есть — без проверки обрыва и содержания.
+        choice = resp.json()["choices"][0]
+        content = (choice["message"].get("content") or "").strip()
+        if content and choice.get("finish_reason") == "length" and not _ends_cleanly(content):
+            raise ProviderError("OpenRouter: ответ оборван по лимиту токенов (finish_reason=length)")
+        return _check_output(self.name, self._MODEL, content)
 
 
 # ── Каскадный вызов ───────────────────────────────────────────────────────────
@@ -1055,7 +1182,7 @@ async def build_style_card(my_sample: list[str], user_features_summary: str) -> 
         "• Доброжелательность: [мягкость/прямота, забота о собеседнике + цитата, или «мало данных»]\n"
         "• Эмоциональная устойчивость: [как реагируешь на стресс/раздражение в переписке + цитата, или «мало данных»]"
     )
-    return await _ask(prompt, max_tokens=1800)
+    return await _ask(prompt, max_tokens=1800, tag="style_card")
 
 
 async def build_interaction_card(
@@ -1103,7 +1230,7 @@ async def build_interaction_card(
         "🧊 Что гасит разговор\n"
         "• [1-2 строки ≤12 слов, короткий пример]"
     )
-    return await _ask(prompt, max_tokens=1100)
+    return await _ask(prompt, max_tokens=1100, tag="interaction_card")
 
 
 async def build_my_style_for_contact(my_msgs: list[str], stats_summary: str) -> str:
@@ -1139,7 +1266,7 @@ async def build_my_style_for_contact(my_msgs: list[str], stats_summary: str) -> 
         "✨ Что характерно именно для этой переписки\n"
         "• [что может отличаться от других твоих чатов]"
     )
-    return await _ask(prompt, max_tokens=1500)
+    return await _ask(prompt, max_tokens=1500, tag="my_style_contact")
 
 
 async def build_overall_style(per_contact_cards: list[dict]) -> str:
@@ -1171,7 +1298,7 @@ async def build_overall_style(per_contact_cards: list[dict]) -> str:
         "💪 Твои сильные стороны\n"
         "• [что стабильно работает хорошо]"
     )
-    return await _ask(prompt, max_tokens=2000)
+    return await _ask(prompt, max_tokens=2000, tag="overall_style")
 
 
 _STYLE_DATING_GUIDE: dict[str, str] = {
@@ -1332,7 +1459,7 @@ async def _repair_rated(prompt: str, bad_msg: str, issues: list[str]) -> tuple[s
         "(сообщение, затем пояснение, затем оценка), но устрани ВСЕ проблемы выше. "
         "Не делай косметическую правку — выбери другой заход и чистый русский текст."
     )
-    msg, expl, rating = _split_rated(await _ask(repair_prompt))
+    msg, expl, rating = _split_rated(await _ask(repair_prompt, tag="rewrite"))
     return _strip_wrapping_quotes(msg), expl, rating
 
 
@@ -1341,7 +1468,7 @@ async def _finalize_rated(prompt: str) -> tuple[str, str, str]:
     Снимает обрамляющие кавычки; при экзотическом скрипте в тексте ответа (глитч
     модели), латинице, клишированном зачине или дожиме один раз просит модель
     отремонтировать ответ и берёт чистый вариант, если он вышел."""
-    msg, expl, rating = _split_rated(await _ask(prompt))
+    msg, expl, rating = _split_rated(await _ask(prompt, tag="rewrite"))
     msg = _strip_wrapping_quotes(msg)
     issues = _quality_issues(msg)
     if issues:
@@ -1431,7 +1558,7 @@ async def analyze_reply_dynamics(
         "ПРОВЕРКА: мысленно убери имена и цитаты. Если текст применим к любой другой паре — "
         "перепиши конкретнее, с опорой на данные выше."
     )
-    return _parse_blocks(await _ask(prompt))
+    return _parse_blocks(await _ask(prompt, tag="reply_dynamics"))
 
 
 # отключено — функция Переписать убрана из UI, заменена Новым диалогом
@@ -2365,7 +2492,7 @@ async def screenshot_variants(
         "ТЕКСТ: [сам ответ, без кавычек]\n"
         f"(повтори блок ===ВАРИАНТ=== ровно {n_variants} раз, ни больше ни меньше)"
     )
-    raw = await _ask(prompt, max_tokens=1400)
+    raw = await _ask(prompt, max_tokens=1400, tag="screenshot")
     return _parse_variants(raw, n_variants)
 
 
@@ -2723,7 +2850,7 @@ async def practice_reply(interaction_card: str, transcript: str, user_message: s
         "Ответь ОДНОЙ короткой репликой от лица собеседника — живо, в его характере, "
         "по-русски (только кириллица). Без кавычек, без пояснений, не выходи из роли."
     )
-    return _strip_wrapping_quotes(await _ask(prompt, max_tokens=300))
+    return _strip_wrapping_quotes(await _ask(prompt, max_tokens=300, tag="practice_reply"))
 
 
 async def practice_debrief(interaction_card: str, transcript: str) -> str:
@@ -2740,7 +2867,7 @@ async def practice_debrief(interaction_card: str, transcript: str) -> str:
         "🎯 Что попробовать — 1-2 практических совета\n"
         "Без воды и без ИИ-штампов."
     )
-    return await _ask(prompt, max_tokens=700)
+    return await _ask(prompt, max_tokens=700, tag="practice_debrief")
 
 
 def _split_by_markers(raw: str, markers: list[str]) -> list[str]:
@@ -4154,7 +4281,7 @@ async def build_compatibility_interpretation(
         "клише. Если последних сообщений нет (см. «нет данных») — открывашка "
         "по общему смыслу переписки, а не абстрактная фраза>"
     )
-    raw = await _ask(prompt, max_tokens=1700)
+    raw = await _ask(prompt, max_tokens=1700, tag="compat")
 
     interpretations = {}
     for key in labels:
@@ -4223,7 +4350,9 @@ async def build_ideal_date(
         "она говорила про [X] — зайдёт [Y]». Если зацепок нет — честно скажи и дай "
         "1-2 нешаблонных безопасных варианта."
     )
-    raw = await _ask(prompt, max_tokens=650)
+    # Было max_tokens=650: у провайдеров без отдельного буфера под рассуждения
+    # (Gemini) ответ обрывался. Groq к этому по-прежнему добавляет свой буфер.
+    raw = await _ask(prompt, max_tokens=1200, tag="ideal_date")
     parts = _split_by_markers(raw, [_ID_GIFTS])
     return parts[0], parts[1]
 
