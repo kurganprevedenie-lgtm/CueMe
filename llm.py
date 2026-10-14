@@ -142,7 +142,12 @@ class _ProviderKeyStats:
         self.errors: list[float] = []
 
 
-_provider_stats: dict[tuple[str, str], _ProviderKeyStats] = {}
+# Статистика ПО КЛЮЧАМ для /apistatus. Раньше называлась _provider_stats —
+# так же, как словарь статистики по провайдерам ниже (_record_stat, для
+# /provider); второе присваивание перетирало первое, обе функции писали в
+# один словарь, и /apistatus с /provider падали на чужих записях
+# (инцидент 2026-10-14, тест tests/test_provider_stats.py).
+_key_stats: dict[tuple[str, str], _ProviderKeyStats] = {}
 _RATE_HEADER_HINTS = ("ratelimit", "retry-after")
 
 
@@ -163,7 +168,7 @@ def _track_response(provider: str, key: str, resp: "httpx.Response | None") -> N
     отдельно, best-effort — заголовки лимитов, если провайдер их прислал."""
     now = time.time()
     ident = (provider, _key_tail(key))
-    st = _provider_stats.setdefault(ident, _ProviderKeyStats())
+    st = _key_stats.setdefault(ident, _ProviderKeyStats())
 
     st.requests.append(now)
     st.requests = _trim_old(st.requests, now)
@@ -187,7 +192,7 @@ def get_provider_stats_snapshot() -> dict[tuple[str, str], dict]:
     маска_ключа) -> {"headers": {...}, "requests_24h": int, "errors_1h": int}."""
     now = time.time()
     out: dict[tuple[str, str], dict] = {}
-    for ident, st in _provider_stats.items():
+    for ident, st in _key_stats.items():
         reqs = _trim_old(st.requests, now)
         errs_1h = [t for t in st.errors if t >= now - 3600]
         out[ident] = {
@@ -1005,7 +1010,8 @@ def _ordered_providers() -> list[LLMProvider]:
     return forced + rest
 
 
-# Наблюдаемость каскада: счётчики по провайдерам (in-memory, сбрасываются при рестарте).
+# Наблюдаемость каскада: счётчики по провайдерам (in-memory, сбрасываются при
+# рестарте). Не путать с _key_stats выше — та разбивка по ключам для /apistatus.
 _provider_stats: dict[str, dict] = {}
 
 

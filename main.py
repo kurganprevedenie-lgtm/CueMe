@@ -7757,15 +7757,22 @@ async def cmd_provider(message: Message) -> None:
     parts = (message.text or "").split(maxsplit=1)
     variants = " · ".join(p.lower() for p in PROVIDER_NAMES) + " · auto"
     if len(parts) < 2:
-        stats = get_provider_stats()
-        stats_lines = ""
-        if stats:
-            rows = [
-                f"• {n}: ok {s['ok']}, лимит {s['rate_limit']}, ошибок {s['error']}, ~{s['avg_ms']:.0f}мс"
-                for n in PROVIDER_NAMES if (s := stats.get(n))
-            ]
-            if rows:
-                stats_lines = "\n\n📊 Вызовы (с рестарта):\n" + "\n".join(rows)
+        try:
+            stats = get_provider_stats()
+            stats_lines = ""
+            if stats:
+                rows = [
+                    f"• {n}: ok {s['ok']}, лимит {s['rate_limit']}, ошибок {s['error']}, ~{s['avg_ms']:.0f}мс"
+                    for n in PROVIDER_NAMES if (s := stats.get(n))
+                ]
+                if rows:
+                    stats_lines = "\n\n📊 Вызовы (с рестарта):\n" + "\n".join(rows)
+        except Exception as e:
+            # Админская диагностика — показываем саму ошибку, а не общую
+            # заглушку «Что-то пошло не так» (так баг с _provider_stats
+            # 2026-10-14 было не разглядеть без логов сервера).
+            logging.exception("cmd_provider: не удалось собрать статистику")
+            stats_lines = f"\n\n⚠️ Статистика не собралась: {type(e).__name__}: {str(e)[:200]}"
         await message.answer(
             f"Сейчас активен: {get_forced_provider()}\n"
             f"Каскад: {' → '.join(PROVIDER_NAMES)}\n\n"
@@ -7826,13 +7833,19 @@ def _format_apistatus(snapshot: dict[tuple[str, str], dict]) -> str:
 async def cmd_apistatus(message: Message) -> None:
     if not _is_admin(message.from_user.id):
         return
-    text = "📡 Статус API по ключам (с рестарта бота):\n\n" + _format_apistatus(get_provider_stats_snapshot())
-    invalid = get_invalid_output_counts()
-    if invalid:
-        lines = ["\n\n<b>Невалидные ответы (мусор/рассуждения/обрыв)</b>"]
-        for prov, (hour, day) in sorted(invalid.items()):
-            lines.append(f"  {html.escape(prov)}: {hour} за час, {day} за сутки")
-        text += "\n".join(lines)
+    try:
+        text = "📡 Статус API по ключам (с рестарта бота):\n\n" + _format_apistatus(get_provider_stats_snapshot())
+        invalid = get_invalid_output_counts()
+        if invalid:
+            lines = ["\n\n<b>Невалидные ответы (мусор/рассуждения/обрыв)</b>"]
+            for prov, (hour, day) in sorted(invalid.items()):
+                lines.append(f"  {html.escape(prov)}: {hour} за час, {day} за сутки")
+            text += "\n".join(lines)
+    except Exception as e:
+        # См. cmd_provider — админу саму ошибку, не общую заглушку.
+        logging.exception("cmd_apistatus: не удалось собрать статус")
+        await message.answer(f"⚠️ /apistatus упал: {type(e).__name__}: {str(e)[:300]}")
+        return
     await _answer_long(message, text, parse_mode="HTML")
 
 
