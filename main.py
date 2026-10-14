@@ -6696,6 +6696,7 @@ async def _collect_users_data(bot: Bot) -> tuple[list[dict], dict]:
             "_last_incoming_label": _relative_label(last_incoming_raw, now),
             "_last_incoming_msk": _fmt_msk(last_incoming_raw),
             "_is_subscribed_channel": is_subscribed_channel,
+            "_inactive": is_stale,
             **_gate_and_churn_fields(
                 u, tid, last_action_raw, now, is_premium_now,
                 gate_by_user.get(tid, set()), gate_tracking_start, tid in gate_fail_no_ok,
@@ -6704,6 +6705,47 @@ async def _collect_users_data(bot: Bot) -> tuple[list[dict], dict]:
 
     totals["gate_tracking_start"] = gate_tracking_start
     return rows, totals
+
+
+def _users_totals(rows: list[dict], gate_tracking_start) -> dict:
+    """Те же агрегаты, что копит _collect_users_data, но по любому подмножеству
+    строк — для среза отчёта /users по полу (переключатель наверху страницы).
+    Считается только из полей строк, без запросов. Совпадение с агрегатами
+    цикла на всех строках проверяет tests/test_users_gender.py."""
+    t = {
+        "total": len(rows), "with_gender": 0, "with_contact": 0,
+        "with_ref_premium": 0, "blocked": 0, "automation_off": 0, "inactive": 0,
+        "premium_now": 0, "used_reply": 0, "used_screenshot": 0, "used_live": 0,
+        "used_deep_analysis": 0, "active_7d": 0, "subscribed_channel": 0,
+        "trial_used": 0, "by_source": {}, "premium_by_source": {},
+        "gate_tracking_start": gate_tracking_start,
+    }
+    for r in rows:
+        has_contacts = r["contacts_count"] > 0
+        trial = bool(r["trial_used"])
+        b = t["by_source"].setdefault(r["source"], {"total": 0, "connected": 0, "trial_used": 0, "premium": 0})
+        b["total"] += 1
+        b["connected"] += has_contacts
+        b["trial_used"] += trial
+        t["with_gender"] += r["gender"] != "?"
+        t["with_contact"] += has_contacts
+        t["trial_used"] += trial
+        t["blocked"] += bool(r["blocked"])
+        t["automation_off"] += bool(r["automation_off"])
+        t["inactive"] += bool(r["_inactive"])
+        t["used_reply"] += bool(r["uses_reply"])
+        t["used_screenshot"] += bool(r["uses_screenshot"])
+        t["used_live"] += bool(r["uses_live"])
+        t["used_deep_analysis"] += bool(r["used_deep_analysis"])
+        t["active_7d"] += bool(r["active_last_7d"])
+        t["subscribed_channel"] += bool(r["_is_subscribed_channel"])
+        if r["is_premium_now"]:
+            t["premium_now"] += 1
+            b["premium"] += 1
+            src = r["premium_source"]
+            t["premium_by_source"][src] = t["premium_by_source"].get(src, 0) + 1
+            t["with_ref_premium"] += src == "referral"
+    return t
 
 
 def _hours_since(iso_str: str | None, now: datetime) -> int | None:
@@ -7283,7 +7325,29 @@ def _build_users_html(rows: list[dict], totals: dict) -> bytes:
     )
 
     generated_at = datetime.now(timezone.utc).strftime("%d.%m.%Y %H:%M UTC")
-    dashboard_html = _build_users_dashboard_html(rows, totals)
+    # Срез по полу: верхние блоки (воронка, источники, Premium, «Где уходят»)
+    # рендерятся по варианту на каждый пол, переключатель наверху показывает
+    # нужный и заодно ставит тот же фильтр на карточки. Было: фильтр по полу
+    # только у карточек, в свёрнутых «Фильтрах», цифры сверху — всегда по всем.
+    gender_variants = [("all", "Все", rows, totals)]
+    if show_gender_filter:
+        for g in genders_present:
+            subset = [r for r in rows if r["gender"] == g]
+            label = {"парень": "Парни", "девушка": "Девушки"}.get(g, gender_display.get(g, g).capitalize())
+            gender_variants.append((g, f"{label} · {len(subset)}", subset,
+                                    _users_totals(subset, totals.get("gate_tracking_start"))))
+    dashboard_html = "".join(
+        f'<div class="dash-variant" data-g="{html.escape(key, quote=True)}"{"" if key == "all" else " hidden"}>'
+        f'{_build_users_dashboard_html(sub_rows, sub_totals)}</div>'
+        for key, _, sub_rows, sub_totals in gender_variants
+    )
+    gender_switch = ""
+    if show_gender_filter:
+        gender_switch = '<div class="g-switch">' + "".join(
+            f'<button type="button" class="g-btn{" active" if key == "all" else ""}" data-g="{html.escape(key, quote=True)}">'
+            f'{html.escape(label)}</button>'
+            for key, label, _, _ in gender_variants
+        ) + "</div>"
     doc = f"""<!DOCTYPE html>
 <html lang="ru">
 <head>
@@ -7346,6 +7410,12 @@ def _build_users_html(rows: list[dict], totals: dict) -> bytes:
   .bar-note {{ font-size: 12px; color: #92400e; }}
   .roster-heading {{ font-size: 17px; margin: 4px 0 10px; }}
 
+  .g-switch {{ display: flex; flex-wrap: wrap; gap: 8px; margin: 12px 0 14px; }}
+  .g-btn {{
+    border: 1px solid #d7dbe0; background: #fff; color: #1b1f24; border-radius: 999px;
+    padding: 8px 16px; font-size: 15px; cursor: pointer;
+  }}
+  .g-btn.active {{ background: #1b1f24; color: #fff; border-color: #1b1f24; }}
   .search-box {{
     display: block; width: 100%; padding: 14px 16px; font-size: 17px;
     border: 1px solid #d7dbe0; border-radius: 12px; margin-bottom: 12px;
@@ -7425,6 +7495,8 @@ def _build_users_html(rows: list[dict], totals: dict) -> bytes:
 <body>
 <h1>👥 Пользователи CueMe</h1>
 <div class="meta">Сформировано {generated_at} · всего {totals['total']}</div>
+
+{gender_switch}
 
 {dashboard_html}
 
@@ -7544,6 +7616,20 @@ def _build_users_html(rows: list[dict], totals: dict) -> bytes:
       }}
       updateSortButtons();
       applySort();
+    }});
+  }});
+
+  // Переключатель пола наверху: показывает нужный вариант верхних блоков и
+  // ставит тот же фильтр на карточки (галочки в «Фильтрах» можно менять и дальше).
+  var gButtons = Array.prototype.slice.call(document.querySelectorAll(".g-btn"));
+  var dashVariants = Array.prototype.slice.call(document.querySelectorAll(".dash-variant"));
+  gButtons.forEach(function (btn) {{
+    btn.addEventListener("click", function () {{
+      var g = btn.dataset.g;
+      gButtons.forEach(function (b) {{ b.classList.toggle("active", b === btn); }});
+      dashVariants.forEach(function (d) {{ d.hidden = d.dataset.g !== g; }});
+      genderBoxes.forEach(function (box) {{ box.checked = g !== "all" && box.value === g; }});
+      applyFilters();
     }});
   }});
 
