@@ -1905,6 +1905,23 @@ def record_star_payment(
     return True
 
 
+def record_gift_premium(telegram_id: str, expires_at: datetime) -> None:
+    """Подарочный Premium (/gift_premium) — строка в star_payments с
+    tier='gift', 0 звёзд, без автопродления. Нужна, чтобы по последнему
+    платежу (get_latest_star_payment) было видно, что текущее окно
+    stars_premium_until — подарок: напоминание об окончании и строка статуса
+    для него свои (main._premium_expiry_info → источник "gift")."""
+    with _conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO star_payments
+                (telegram_id, tier, stars_amount, charge_id, is_subscription, expires_at, created_at)
+            VALUES (?, 'gift', 0, ?, 0, ?, ?)
+            """,
+            (telegram_id, f"gift:{telegram_id}:{uuid.uuid4().hex[:12]}", expires_at.isoformat(), _now()),
+        )
+
+
 def get_latest_star_payment(telegram_id: str) -> sqlite3.Row | None:
     """Последний по времени Stars-платёж юзера (по created_at) — нужен, чтобы
     понять, откуда взялось ТЕКУЩЕЕ окно stars_premium_until: тариф 'month' —

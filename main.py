@@ -240,6 +240,7 @@ from storage import (
     save_suggestions,
     suggestion_stats_by_user,
     record_event,
+    record_gift_premium,
     record_star_payment,
     set_acquisition_source,
     set_deep_analysis_free_until,
@@ -1665,16 +1666,33 @@ async def _send_funnel_reminder(
     await bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=kb)
 
 
-def _premium_expiry_reminder_content(remaining: str) -> tuple[str, InlineKeyboardMarkup]:
+def _premium_expiry_reminder_content(remaining: str, gift: bool = False) -> tuple[str, InlineKeyboardMarkup]:
     """Текст+кнопка напоминания об истечении Premium — вынесено из
     _check_premium_expiry_reminders, чтобы /test_reminders показывал ровно
     то же, что уходит юзерам. Мягкого варианта для Stars-подписки с
     автопродлением больше нет — по просьбе убрано совсем, такие подписки
     не напоминаем (см. _check_premium_expiry_reminders)."""
-    text = f"⏳ Подписка заканчивается через {remaining} — продли, чтобы не потерять доступ."
+    if gift:
+        # Подарок — не пейволл: человек ничего не покупал, просто предупреждаем.
+        text = (f"🎁 Подарочный Premium закончится через {remaining}. "
+                "Если пригодился — продлить можно в «👑 Подписка».")
+    else:
+        text = f"⏳ Подписка заканчивается через {remaining} — продли, чтобы не потерять доступ."
     b = InlineKeyboardBuilder()
     b.button(text="👑 Подписка", callback_data="show_premium")
     return text, b.as_markup()
+
+
+async def _in_premium_channel(bot: Bot, telegram_id: str) -> bool | None:
+    """Живое членство в канале-пропуске Tribute, без кэша. None — канал не
+    настроен или Telegram не ответил."""
+    if not PREMIUM_CHANNEL_ID:
+        return None
+    try:
+        member = await bot.get_chat_member(PREMIUM_CHANNEL_ID, int(telegram_id))
+    except Exception:
+        return None
+    return member.status in ("member", "administrator", "creator")
 
 
 async def _check_premium_expiry_reminders(bot: Bot) -> None:
@@ -1711,7 +1729,9 @@ async def _check_premium_expiry_reminders(bot: Bot) -> None:
 
         if is_subscription:
             continue  # Stars-подписка автопродлевается сама — не напоминаем
-        text, kb = _premium_expiry_reminder_content(_format_remaining(until - now))
+        if source == "gift" and await _in_premium_channel(bot, telegram_id):
+            continue  # подарок поверх Tribute без известной даты — доступ не кончается
+        text, kb = _premium_expiry_reminder_content(_format_remaining(until - now), gift=source == "gift")
 
         try:
             await bot.send_message(int(telegram_id), text, reply_markup=kb)
@@ -2102,10 +2122,19 @@ async def process_stars_successful_payment(message: Message, bot: Bot) -> None:
     telegram_id = str(message.from_user.id)  # доверяем from_user, не payload
     is_subscription = sp.subscription_expiration_date is not None
 
+    # Было: срок ставился от «сейчас» поверх текущего — покупка недели при
+    # оставшихся 20 днях подарка (/gift_premium) или прошлой покупки срезала
+    # срок до 7 дней. Теперь разовая покупка прибавляется к текущему сроку, а
+    # подписка не укорачивает его (дата следующего списания — Telegram'а).
+    current_until = get_stars_premium_until(telegram_id)
+    now_utc = datetime.now(timezone.utc)
     if is_subscription:
         expires_at = datetime.fromtimestamp(sp.subscription_expiration_date, tz=timezone.utc)
+        if current_until and current_until > expires_at:
+            expires_at = current_until
     else:
-        expires_at = datetime.now(timezone.utc) + timedelta(days=_STARS_TIERS[tier]["days"])
+        base = current_until if current_until and current_until > now_utc else now_utc
+        expires_at = base + timedelta(days=_STARS_TIERS[tier]["days"])
 
     # Telegram может задублировать доставку successful_payment — record_star_payment
     # идемпотентен по charge_id (UNIQUE), применяем окно Premium только на первой записи.
@@ -3239,9 +3268,9 @@ _ADMIN_COMMANDS = {
     "users", "export", "provider", "apistatus", "sources", "inspect",
     "suggestion_stats", "funnel_status", "test_reminders", "broadcast_admin",
     "broadcast_deleted_messages", "broadcast_deleted_paywall",
-    "broadcast_invite", "broadcast_price_drop",
+    "broadcast_invite", "broadcast_price_drop", "gift_premium",
 }
-_ADMIN_CALLBACK_PREFIXES = ("bcast:", "export:")
+_ADMIN_CALLBACK_PREFIXES = ("bcast:", "export:", "gift:")
 
 
 def _message_action(message: Message) -> str | None:
@@ -6450,7 +6479,7 @@ def _yn(value: bool) -> str:
 
 _PREMIUM_SOURCE_LABELS = {
     "referral": "реферал", "promo_channel": "промо-канал",
-    "stars": "Stars", "tribute": "Tribute", "нет": "—",
+    "stars": "Stars", "tribute": "Tribute", "gift": "подарок", "нет": "—",
 }
 
 
@@ -9525,6 +9554,12 @@ def _premium_expiry_info(telegram_id: str) -> tuple[str, datetime | None, bool]:
     until = get_stars_premium_until(telegram_id)
     if until and until > now:
         payment = get_latest_star_payment(telegram_id)
+        tribute_until = get_tribute_premium_until(telegram_id)
+        if payment and payment["tier"] == "gift":
+            # Подарок поверх Tribute, который кончается позже, — срок Tribute.
+            if tribute_until and tribute_until > until:
+                return "tribute", tribute_until, False
+            return "gift", until, False
         return "stars", until, bool(payment and payment["is_subscription"])
 
     until = get_tribute_premium_until(telegram_id)
@@ -9552,6 +9587,11 @@ def _premium_expiry_line(telegram_id: str) -> str:
     #         f"📢 Награда за подписку на канал — действует до {_format_until(until)} "
     #         f"(осталось {_format_remaining(until - now)})."
     #     )
+    if source == "gift":
+        return (
+            f"🎁 Подарочный Premium — действует до {_format_until(until)} "
+            f"(осталось {_format_remaining(until - now)})."
+        )
     if source == "stars":
         if is_subscription:
             return (
@@ -9828,14 +9868,16 @@ async def cb_delete_cancel(call: CallbackQuery) -> None:
 
 
 async def _resolve_target_id(
-    message: Message, bot: Bot, command: str,
+    message: Message, bot: Bot, command: str, arg: str | None = None, usage: str | None = None,
 ) -> tuple[str, str] | None:
     """Разбирает "<telegram_id>" или "@username" из текста команды — общий
     парсинг для /wipe и /inspect. Возвращает (target_id, arg_display) или
-    None (сообщение об ошибке уже отправлено)."""
-    parts = (message.text or "").split(maxsplit=1)
-    arg = parts[1].strip() if len(parts) == 2 else ""
-    usage = f"Использование: {command} <telegram_id> или {command} @username"
+    None (сообщение об ошибке уже отправлено). arg — когда у команды есть
+    другие аргументы (/gift_premium), цель передаётся уже вырезанной."""
+    if arg is None:
+        parts = (message.text or "").split(maxsplit=1)
+        arg = parts[1].strip() if len(parts) == 2 else ""
+    usage = usage or f"Использование: {command} <telegram_id> или {command} @username"
     if not arg:
         await message.answer(usage)
         return None
@@ -9941,6 +9983,133 @@ async def cb_wipe_confirm(call: CallbackQuery) -> None:
 async def cb_wipe_cancel(call: CallbackQuery) -> None:
     await call.answer("Отменено")
     await call.message.edit_text("Отменено.")
+
+
+# ── /gift_premium — подарить N дней Premium (только для админа) ─────────────
+# Срок кладётся в stars_premium_until: _is_premium проверяет его первым, а
+# вебхук Tribute пишет в своё поле и его не трогает. Подарок отмечается
+# строкой star_payments(tier='gift') — по ней напоминание и статус знают,
+# что это подарок (_premium_expiry_info → "gift").
+
+_GIFT_USAGE = ("Использование: /gift_premium <@username|telegram_id> <дней> [текст сообщения]\n"
+               "Без текста уйдёт стандартное «🎁 Мы подарили тебе N дней Premium…».")
+_GIFT_MAX_DAYS = 365
+_pending_gifts: dict[str, tuple[str, int, str | None]] = {}  # admin_id → (кому, дней, текст)
+
+
+def _gift_default_text(days: int, gender: str | None) -> str:
+    described = "описала" if gender == "female" else "описал"
+    return (f"🎁 Мы подарили тебе {days} {_plural_days(days)} Premium — спасибо, что подробно "
+            f"{described} проблему, и извини за неудобства. Всё починим.")
+
+
+def _plural_days(n: int) -> str:
+    if n % 10 == 1 and n % 100 != 11:
+        return "день"
+    if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14:
+        return "дня"
+    return "дней"
+
+
+def _gift_new_until(telegram_id: str, days: int, now: datetime | None = None) -> datetime:
+    """Новый срок: от max(сейчас, текущий stars_premium_until) + days."""
+    now = now or datetime.now(timezone.utc)
+    current = get_stars_premium_until(telegram_id)
+    base = current if current and current > now else now
+    return base + timedelta(days=days)
+
+
+def _apply_gift_premium(admin_id: str, telegram_id: str, days: int) -> datetime:
+    until = _gift_new_until(telegram_id, days)
+    set_stars_premium_until(telegram_id, until)
+    record_gift_premium(telegram_id, until)
+    _premium_cache.pop(telegram_id, None)
+    record_event(telegram_id, "gift_premium", json.dumps(
+        {"by": admin_id, "days": days, "until": until.isoformat()}, ensure_ascii=False))
+    return until
+
+
+def _fmt_until_or_dash(dt: datetime | None, now: datetime) -> str:
+    if not dt:
+        return "—"
+    state = "активен" if dt > now else "истёк"
+    return f"{_format_until(dt)} ({state})"
+
+
+@dp.message(Command("gift_premium"))
+async def cmd_gift_premium(message: Message, bot: Bot) -> None:
+    if not _is_admin(message.from_user.id):
+        return
+    parts = (message.text or "").split(maxsplit=3)
+    if len(parts) < 3 or not parts[2].isdigit() or not 1 <= int(parts[2]) <= _GIFT_MAX_DAYS:
+        await message.answer(_GIFT_USAGE + f"\nДней — от 1 до {_GIFT_MAX_DAYS}.")
+        return
+    resolved = await _resolve_target_id(message, bot, "/gift_premium", arg=parts[1], usage=_GIFT_USAGE)
+    if resolved is None:
+        return
+    target_id, arg = resolved
+    days = int(parts[2])
+    custom = parts[3].strip() if len(parts) == 4 and parts[3].strip() else None
+
+    now = datetime.now(timezone.utc)
+    in_channel = await _in_premium_channel(bot, target_id)
+    channel = {True: "да", False: "нет", None: "не проверить"}[in_channel]
+    new_until = _gift_new_until(target_id, days, now)
+    text = custom or _gift_default_text(days, get_gender(target_id))
+    _pending_gifts[str(message.from_user.id)] = (target_id, days, custom)
+
+    b = InlineKeyboardBuilder()
+    b.button(text="Да", callback_data=f"gift:yes:{target_id}:{days}")
+    b.button(text="Отмена", callback_data="gift:no")
+    await message.answer(
+        f"🎁 Подарить <b>{days} {_plural_days(days)}</b> Premium — {html.escape(arg)}?\n\n"
+        f"Сейчас:\n"
+        f"• Stars/подарок: {_fmt_until_or_dash(get_stars_premium_until(target_id), now)}\n"
+        f"• Tribute (вебхук): {_fmt_until_or_dash(get_tribute_premium_until(target_id), now)}\n"
+        f"• В канале Tribute: {channel}\n\n"
+        f"Станет (Stars/подарок): до {_format_until(new_until)}\n\n"
+        f"Сообщение пользователю:\n<blockquote>{html.escape(text)}</blockquote>",
+        parse_mode="HTML", reply_markup=b.as_markup(),
+    )
+
+
+@dp.callback_query(F.data.startswith("gift:"))
+async def cb_gift_premium(call: CallbackQuery, bot: Bot) -> None:
+    if not _is_admin(call.from_user.id):
+        await call.answer()
+        return
+    admin_id = str(call.from_user.id)
+    if call.data == "gift:no":
+        _pending_gifts.pop(admin_id, None)
+        await call.answer("Отменено")
+        await call.message.edit_text("Подарок отменён.")
+        return
+
+    _, _, target_id, days_s = call.data.split(":")
+    days = int(days_s)
+    pending = _pending_gifts.get(admin_id)
+    if pending is None or pending[:2] != (target_id, days):
+        # бот перезапускался или это кнопка от другой команды — текст мог потеряться
+        await call.answer("Запрос устарел — повтори команду", show_alert=True)
+        return
+    _pending_gifts.pop(admin_id, None)
+    await call.answer("Выдаю")
+
+    until = _apply_gift_premium(admin_id, target_id, days)
+    text = pending[2] or _gift_default_text(days, get_gender(target_id))
+    try:
+        await bot.send_message(int(target_id), text)
+        delivered = "✉️ Сообщение доставлено."
+    except TelegramForbiddenError:
+        mark_bot_blocked(target_id)
+        delivered = "⚠️ Сообщение НЕ доставлено: пользователь заблокировал бота. Premium всё равно выдан."
+    except Exception as e:
+        logging.warning("gift_premium: не удалось уведомить %s: %s", target_id, e)
+        delivered = f"⚠️ Сообщение НЕ доставлено ({type(e).__name__}). Premium всё равно выдан."
+    await call.message.edit_text(
+        f"✓ Подарено {days} {_plural_days(days)} Premium пользователю {target_id} — "
+        f"до {_format_until(until)}.\n{delivered}"
+    )
 
 
 # /auto и auto_rewrite_handler (catch-all авто-переписка) убраны вместе с
