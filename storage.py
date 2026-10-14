@@ -2234,10 +2234,12 @@ def get_all_dated_messages(owner_user_id: str, contact_id: int) -> list[dict]:
     # «без пояса» и падали TypeError (инцидент 2026-10-14: «Анализ
     # собеседника» ломался после загрузки JSON). А повтор одного сообщения из
     # двух источников не склеивался — даты в разном виде — и считался дважды.
-    # Теперь всё приводится к UTC с поясом, текст — к строке.
+    # Теперь всё приводится к UTC с поясом, текст — к строке. Пояс JSON-дат
+    # угадывается по пересечению с business (_guess_import_tz).
+    import_tz = _guess_import_tz(biz_rows, imp_rows)
     seen: set[tuple] = set()
     out: list[dict] = []
-    for row, assume_tz in [(r, timezone.utc) for r in biz_rows] + [(r, _IMPORT_TZ) for r in imp_rows]:
+    for row, assume_tz in [(r, timezone.utc) for r in biz_rows] + [(r, import_tz) for r in imp_rows]:
         date = _normalize_msg_date(row["date"], assume_tz)
         text = row["text"] if isinstance(row["text"], str) else str(row["text"] or "")
         key = (date, row["direction"], text.strip())
@@ -2249,9 +2251,55 @@ def get_all_dated_messages(owner_user_id: str, contact_id: int) -> list[dict]:
 
 
 # JSON-экспорт Telegram Desktop пишет время БЕЗ пояса — локальное время
-# компьютера, где делали экспорт. Пояс экспортёра неизвестен; аудитория —
-# в основном Москва, поэтому такие даты считаем московскими.
+# компьютера, где делали экспорт. Если пересечься не с чем — считаем
+# московскими (основная аудитория).
 _IMPORT_TZ = ZoneInfo("Europe/Moscow")
+_GUESS_MIN_MATCHES = 5
+
+
+def _guess_import_tz(biz_rows, imp_rows):
+    """Пояс компьютера, где делали JSON-экспорт: сдвиг (шаг 15 мин, от −12 до
+    +14 ч), при котором больше всего сообщений из JSON совпало с business по
+    тексту, направлению и времени до секунды. Было: всегда Москва — у юзера
+    в UTC+2 одни и те же сообщения не склеивались (сдвиг ровно час) и
+    считались в анализе дважды (2026-10-14, контакт с 194 повторами).
+    Совпадений меньше _GUESS_MIN_MATCHES — Москва. Сдвиг фиксированный: если
+    экспорт захватил переход на зимнее время, старая часть уедет на час — для
+    метрик это терпимо, склейка повторов важнее."""
+    # Один проход: для каждой пары «одинаковый текст и направление» считаем
+    # разницу «время в JSON как будто UTC» − «время в business» — у настоящих
+    # повторов она равна смещению пояса и повторяется много раз.
+    biz: dict[tuple, list[int]] = {}
+    for r in biz_rows:
+        d = _normalize_msg_date(r["date"], timezone.utc)
+        if d:
+            biz.setdefault((r["direction"], str(r["text"] or "").strip()), []).append(
+                int(datetime.fromisoformat(d).timestamp()))
+    if not biz:
+        return _IMPORT_TZ
+    diffs: Counter = Counter()
+    for r in imp_rows:
+        ts_list = biz.get((r["direction"], str(r["text"] or "").strip()))
+        if not ts_list or len(ts_list) > 20:  # «ок»/«да» по 100 раз — не улика
+            continue
+        try:
+            dt = datetime.fromisoformat(str(r["date"]))
+        except (TypeError, ValueError):
+            continue
+        if dt.tzinfo is not None:
+            continue
+        local_ts = int(dt.replace(tzinfo=timezone.utc).timestamp())
+        for ts in ts_list:
+            diff = local_ts - ts
+            if diff % 900 == 0 and -12 * 3600 <= diff <= 14 * 3600:
+                diffs[diff] += 1
+    if not diffs:
+        return _IMPORT_TZ
+    best_diff, best_n = diffs.most_common(1)[0]
+    moscow_diff = 3 * 3600
+    if best_n < _GUESS_MIN_MATCHES or diffs.get(moscow_diff, 0) >= best_n:
+        return _IMPORT_TZ  # Москва при равенстве — в приоритете
+    return timezone(timedelta(seconds=best_diff))
 
 
 def _normalize_msg_date(value, assume_tz) -> str | None:

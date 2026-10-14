@@ -54,6 +54,20 @@ def test_json_naive_date_is_moscow_and_duplicate_is_merged(db):
     assert rows[0]["date"] == "2026-10-01T10:00:00+00:00"
 
 
+def test_export_timezone_is_guessed_from_overlap(db):
+    # экспорт сделан на компьютере в UTC+2: в JSON 12:00, в Business 10:00 UTC
+    base = datetime(2026, 10, 13, 10, 0, 7)
+    imported, n = [], 30
+    for i in range(n):
+        local = base + timedelta(hours=2, minutes=3 * i)
+        imported.append({"direction": "in" if i % 2 else "out", "text": f"текст {i}", "date": local.isoformat()})
+        storage.save_business_message("c1", "1", "ref1", "in" if i % 2 else "out", f"текст {i}",
+                                      (base + timedelta(minutes=3 * i)).replace(tzinfo=timezone.utc).isoformat(), i, {})
+    storage.save_imported_messages(db, imported)
+    rows = storage.get_all_dated_messages("1", db)
+    assert len(rows) == n
+
+
 def test_metrics_on_big_mixed_contact_do_not_crash(db):
     from compatibility_metrics import compute_all
     _fill_big_mixed(db)
