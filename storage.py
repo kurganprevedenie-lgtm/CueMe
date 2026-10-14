@@ -7,6 +7,7 @@ import string
 import uuid
 from collections import Counter
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from pathlib import Path
 
 DB_PATH = Path("bot.db")
@@ -2227,15 +2228,42 @@ def get_all_dated_messages(owner_user_id: str, contact_id: int) -> list[dict]:
             (contact_id,),
         ).fetchall()
 
-    seen: set[tuple[str, str, str]] = set()
+    # Было: даты отдавались как есть — у business с поясом («…+00:00»), у
+    # JSON-экспорта без пояса (Telegram Desktop пишет локальное время). Как
+    # только у контакта были оба источника, метрики вычитали «с поясом» из
+    # «без пояса» и падали TypeError (инцидент 2026-10-14: «Анализ
+    # собеседника» ломался после загрузки JSON). А повтор одного сообщения из
+    # двух источников не склеивался — даты в разном виде — и считался дважды.
+    # Теперь всё приводится к UTC с поясом, текст — к строке.
+    seen: set[tuple] = set()
     out: list[dict] = []
-    for row in list(biz_rows) + list(imp_rows):
-        key = (row["date"], row["direction"], row["text"])
+    for row, assume_tz in [(r, timezone.utc) for r in biz_rows] + [(r, _IMPORT_TZ) for r in imp_rows]:
+        date = _normalize_msg_date(row["date"], assume_tz)
+        text = row["text"] if isinstance(row["text"], str) else str(row["text"] or "")
+        key = (date, row["direction"], text.strip())
         if key in seen:
             continue
         seen.add(key)
-        out.append({"date": row["date"], "direction": row["direction"], "text": row["text"]})
+        out.append({"date": date, "direction": row["direction"], "text": text})
     return out
+
+
+# JSON-экспорт Telegram Desktop пишет время БЕЗ пояса — локальное время
+# компьютера, где делали экспорт. Пояс экспортёра неизвестен; аудитория —
+# в основном Москва, поэтому такие даты считаем московскими.
+_IMPORT_TZ = ZoneInfo("Europe/Moscow")
+
+
+def _normalize_msg_date(value, assume_tz) -> str | None:
+    """Дата сообщения → ISO в UTC с поясом, до секунд. Без пояса — assume_tz.
+    Не разобралась — None (такая строка в метриках по датам не участвует)."""
+    try:
+        dt = datetime.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=assume_tz)
+    return dt.astimezone(timezone.utc).replace(microsecond=0).isoformat()
 
 
 def get_all_dated_messages_for_export(owner_user_id: str, contact_id: int) -> list[dict]:

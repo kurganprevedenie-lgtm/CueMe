@@ -33,8 +33,12 @@ def _sorted_texted(rows: list[dict]) -> list[dict]:
 
 
 def _parse_dt(iso: str) -> datetime | None:
+    """Всегда дата С поясом (без пояса — считаем UTC, см. _as_utc). Было:
+    возвращала как есть, и соседние сообщения «с поясом» и «без» нельзя
+    было вычесть друг из друга (TypeError, инцидент 2026-10-14). Основная
+    нормализация — в storage.get_all_dated_messages, это вторая защита."""
     try:
-        return datetime.fromisoformat(iso)
+        return _as_utc(datetime.fromisoformat(iso))
     except (ValueError, TypeError):
         return None
 

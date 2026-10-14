@@ -4104,6 +4104,10 @@ def _volume_trend_to_dict(vt) -> dict:
     }
 
 
+_RECENT_LINE_MAX_CHARS = 300    # одно сообщение в хвосте для LLM
+_RECENT_TOTAL_MAX_CHARS = 3000  # весь хвост — на больших контактах промпт не раздувается
+
+
 def _recent_dialogue_lines(rows: list[dict], limit: int = 20) -> list[str]:
     """Последние limit сообщений (дата+время+автор), хронологически — контекст
     ТОЛЬКО для блока «Готовое сообщение» в build_compatibility_interpretation,
@@ -4116,7 +4120,12 @@ def _recent_dialogue_lines(rows: list[dict], limit: int = 20) -> list[str]:
     for r in tail:
         who = "Я" if r["direction"] == "out" else "Собеседник"
         when = r["date"][:16].replace("T", " ")
-        lines.append(f"{when} {who}: {r['text']}")
+        text = r["text"] if len(r["text"]) <= _RECENT_LINE_MAX_CHARS else r["text"][:_RECENT_LINE_MAX_CHARS] + "…"
+        lines.append(f"{when} {who}: {text}")
+    # Было: без лимитов — одно огромное сообщение раздувало промпт. Обрезаем
+    # с начала (самое свежее важнее), пока хвост не влезет в лимит.
+    while lines and sum(len(l) for l in lines) > _RECENT_TOTAL_MAX_CHARS:
+        lines.pop(0)
     return lines
 
 
@@ -4143,12 +4152,27 @@ async def _gen_deep_analysis(contact_id: int, owner_user_id: str) -> dict | None
     # детерминированно, один вызов compute_all без предварительных обращений
     # к LLM (сам разбор метрик ниже — build_compatibility_interpretation — на
     # месте, он интерпретирует уже посчитанные числа).
+    logging.info("deep_analysis: contact=%s, сообщений=%d (business + JSON)", contact_id, len(rows))
     metrics = compute_compat_metrics(rows)
     volume_trend = metrics.pop("_volume_trend")
     recent_lines = _recent_dialogue_lines(rows)
-    interpretations, dynamics_text, synthesis, advice, ready_message = await build_compatibility_interpretation(
-        metrics, volume_trend, recent_lines, user_gender=get_gender(owner_user_id),
-    )
+    # Было: сбой LLM-интерпретации ронял весь анализ, хотя метрики уже
+    # посчитаны. Теперь — показываем метрики и факты без выводов
+    # (degraded), в кэш не пишем (в следующий раз попробуем снова), попытку
+    # не списываем (см. _run_deep_analysis).
+    degraded = False
+    try:
+        interpretations, dynamics_text, synthesis, advice, ready_message = await build_compatibility_interpretation(
+            metrics, volume_trend, recent_lines, user_gender=get_gender(owner_user_id),
+        )
+    except Exception as e:
+        logging.warning("deep_analysis: интерпретация не собралась (%s: %s), contact=%s — показываю метрики без выводов",
+                        type(e).__name__, str(e)[:120], contact_id)
+        degraded = True
+        interpretations, dynamics_text, ready_message = {}, "", ""
+        synthesis = ("Выводы словами сейчас не собрались — выше всё, что посчитано по вашей переписке. "
+                     "Нажми «🔄 Обновить анализ» через пару минут, допишу выводы и советы.")
+        advice = ""
     for key, text in interpretations.items():
         metrics[key]["interpretation"] = text
 
@@ -4162,11 +4186,13 @@ async def _gen_deep_analysis(contact_id: int, owner_user_id: str) -> dict | None
     metrics["_volume_trend"] = _volume_trend_to_dict(volume_trend)
 
     metrics_json = json.dumps(metrics, ensure_ascii=False)
-    save_deep_analysis(contact_id, metrics_json, dynamics_text, synthesis, advice, ready_message, total_count)
+    if not degraded:
+        save_deep_analysis(contact_id, metrics_json, dynamics_text, synthesis, advice, ready_message, total_count)
     return {
         "metrics_json": metrics_json, "dynamics_text": dynamics_text,
         "synthesis_text": synthesis, "advice_text": advice,
         "message_text": ready_message, "last_rebuild_count": total_count,
+        "degraded": degraded,
     }
 
 
@@ -4525,11 +4551,17 @@ async def _run_deep_analysis(
             _gen_deep_analysis(contact_id, telegram_id),
         )
     except RateLimitError:
+        _deep_analysis_failed(telegram_id, contact_id, "rate_limit")
         await progress_msg.edit_text("Лимит LLM исчерпан, попробуй позже.", reply_markup=_retry_kb(retry_cb))
         _note_outcome("rate_limit")
         return
-    except Exception:
-        logging.exception("deep_analysis: ошибка генерации")
+    except Exception as e:
+        # Было: одна общая заглушка для всего. Теперь причина — в журнал и в
+        # событие gen_deep_analysis_failed; LLM-сбой сюда больше не доходит
+        # (метрики показываются без выводов, см. _gen_deep_analysis), значит
+        # здесь — ошибка в данных/расчёте.
+        logging.exception("deep_analysis: ошибка расчёта, contact=%s owner=%s", contact_id, telegram_id)
+        _deep_analysis_failed(telegram_id, contact_id, f"data_error:{type(e).__name__}")
         await progress_msg.edit_text("Не получилось собрать анализ, попробуй ещё раз.", reply_markup=_retry_kb(retry_cb))
         _note_outcome("llm_error")
         return
@@ -4612,12 +4644,26 @@ async def _run_deep_analysis(
             reply_markup=result_kb, parse_mode="HTML",
         )
 
-    await _charge_feature_trial_if_needed(bot, telegram_id, mark_analysis_trial_used)
+    if data.get("degraded"):
+        # Показали только метрики без выводов — попытку не списываем.
+        _deep_analysis_failed(telegram_id, contact_id, "degraded")
+    else:
+        await _charge_feature_trial_if_needed(bot, telegram_id, mark_analysis_trial_used)
     _note_outcome("ok")
     try:
         record_event(telegram_id, "gen_deep_analysis", str(contact_id))
     except Exception:
         logging.exception("telemetry: не удалось записать событие анализа")
+
+
+def _deep_analysis_failed(telegram_id: str, contact_id: int, reason: str) -> None:
+    """Событие gen_deep_analysis_failed (meta "<причина>:<contact_id>"):
+    rate_limit / degraded (выводы LLM не собрались, показаны метрики) /
+    data_error:<тип исключения>."""
+    try:
+        record_event(telegram_id, "gen_deep_analysis_failed", f"{reason}:{contact_id}")
+    except Exception:
+        logging.exception("telemetry: не удалось записать gen_deep_analysis_failed")
 
 
 async def _show_deep_analysis(
