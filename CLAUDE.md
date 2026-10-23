@@ -270,7 +270,21 @@ saved_ephemeral(connection_id, chat_ref, tg_message_id, saved_at,
   «стало» — из события; в базе текст сразу обновляется (и для правок
   владельца — им уведомление не шлётся). Нет строки в базе / текст не
   поменялся — молчим. Только Premium (без него — тизер), те же исключения
-  DELETED_MESSAGES_EXCLUSIONS, что у удалённых.
+  DELETED_MESSAGES_EXCLUSIONS, что у удалённых. Новое медиа/подпись/
+  форматирование при правке пишется в content_type/media_json/entities_json.
+- **Все типы сообщений** (с 2026-10-23): `_extract_business_content` (main.py)
+  пишет в business_messages `content_type` (text/photo/video/video_note/voice/
+  audio/document/sticker/animation/location/venue/contact/poll/dice/other),
+  `media_json` (file_id и метаданные, байты не храним), `entities_json`
+  (форматирование, включая custom_emoji), `reply_to_tg_message_id`,
+  `media_group_id`, `forward_info`. У старых строк content_type = NULL — тип
+  по колонкам `*_file_id` (`_row_content_type`), они не удалены. Показ при
+  удалении — диспетчер `_send_deleted_content` по типу; форматирование
+  Telegram может отклонить (custom_emoji) — повтор без него; протухший
+  file_id — текст с типом. Альбом, удалённый целиком, — одним
+  `send_media_group` (`_send_deleted_batch`). Тизер без Premium называет тип
+  без подробностей. `text` по-прежнему только текст/подпись/расшифровка —
+  стикеры и файлы в анализ не попадают.
 - **Кнопка «🗑 Удалённые сообщения»** в главном меню — переключатели трёх
   функций выше (users.watch_deleted / watch_edited / watch_ephemeral, по
   умолчанию 1). Без Premium экран виден, переключатели под замком.

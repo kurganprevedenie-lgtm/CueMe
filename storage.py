@@ -469,6 +469,22 @@ def init_db() -> None:
         _add_column_if_missing(conn, "business_messages", "video_file_id", "TEXT")
         _add_column_if_missing(conn, "business_messages", "video_note_file_id", "TEXT")
         _add_column_if_missing(conn, "business_messages", "voice_file_id", "TEXT")
+        # Все типы сообщений Business API, не только 4 медиа выше (main.py:
+        # _extract_business_content — сохранение, _send_deleted_content —
+        # показ при удалении). content_type: text/photo/video/video_note/
+        # voice/audio/document/sticker/animation/location/venue/contact/poll/
+        # dice/other. media_json — метаданные по типу (file_id,
+        # file_unique_id, имя, mime, размер, длительность, координаты,
+        # вопрос опроса и т.д.; байты файлов не храним). entities_json —
+        # форматирование текста/подписи (жирный, ссылки, custom_emoji…).
+        # У старых строк content_type = NULL — тип вычисляется на лету по
+        # 4 колонкам *_file_id (main._row_content_type), они не удаляются.
+        _add_column_if_missing(conn, "business_messages", "content_type", "TEXT")
+        _add_column_if_missing(conn, "business_messages", "media_json", "TEXT")
+        _add_column_if_missing(conn, "business_messages", "entities_json", "TEXT")
+        _add_column_if_missing(conn, "business_messages", "reply_to_tg_message_id", "INTEGER")
+        _add_column_if_missing(conn, "business_messages", "media_group_id", "TEXT")
+        _add_column_if_missing(conn, "business_messages", "forward_info", "TEXT")
         # Разовая рассылка про уведомления об удалённых сообщениях (main.py:
         # /broadcast_deleted_messages) — тот же паттерн, что
         # price_drop_broadcast_sent выше: повторный запуск уходит только
@@ -2623,6 +2639,12 @@ def save_business_message(
     video_file_id: str | None = None,
     video_note_file_id: str | None = None,
     voice_file_id: str | None = None,
+    content_type: str | None = None,
+    media: dict | None = None,
+    entities: list | None = None,
+    reply_to_tg_message_id: int | None = None,
+    media_group_id: str | None = None,
+    forward_info: dict | None = None,
 ) -> int | None:
     """Сохраняет business-сообщение. Возвращает id вставленного ряда, или None,
     если это дубль (повторная доставка того же connection_id+chat_ref+tg_message_id) —
@@ -2633,15 +2655,21 @@ def save_business_message(
     просмотра в /export (photo_file_id, см. tools/export.py) и для пересылки
     владельцу при удалении собеседником (main.py:
     handle_deleted_business_messages). voice_file_id — сырое аудио отдельно
-    от text (там расшифровка Whisper, см. main._message_text)."""
+    от text (там расшифровка Whisper, см. main._message_text).
+    content_type/media/entities/reply_to_tg_message_id/media_group_id/
+    forward_info — полное описание сообщения любого типа (см. миграцию
+    business_messages.content_type и main._extract_business_content);
+    media/entities/forward_info пишутся как JSON."""
     with _conn() as conn:
         cur = conn.execute(
             """
             INSERT OR IGNORE INTO business_messages
                 (connection_id, owner_user_id, chat_ref, direction,
                  text, date, tg_message_id, raw_meta, photo_file_id,
-                 video_file_id, video_note_file_id, voice_file_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 video_file_id, video_note_file_id, voice_file_id,
+                 content_type, media_json, entities_json,
+                 reply_to_tg_message_id, media_group_id, forward_info)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 connection_id,
@@ -2656,9 +2684,59 @@ def save_business_message(
                 video_file_id,
                 video_note_file_id,
                 voice_file_id,
+                content_type,
+                _json_or_none(media),
+                _json_or_none(entities),
+                reply_to_tg_message_id,
+                media_group_id,
+                _json_or_none(forward_info),
             ),
         )
         return cur.lastrowid if cur.rowcount > 0 else None
+
+
+def _json_or_none(value) -> str | None:
+    return json.dumps(value, ensure_ascii=False, default=str) if value else None
+
+
+_LEGACY_FILE_COLUMNS = {
+    "photo": "photo_file_id", "video": "video_file_id",
+    "video_note": "video_note_file_id", "voice": "voice_file_id",
+}
+
+
+def update_business_message_content(
+    row_id: int, content_type: str, media: dict | None, entities: list | None,
+) -> None:
+    """Новое медиа/подпись/форматирование после правки сообщения (main.py:
+    handle_edited_business_message). Старые колонки *_file_id тоже
+    обновляются — /export берёт фото из photo_file_id."""
+    legacy = {col: None for col in _LEGACY_FILE_COLUMNS.values()}
+    col = _LEGACY_FILE_COLUMNS.get(content_type)
+    if col and media and media.get("file_id"):
+        legacy[col] = media["file_id"]
+    with _conn() as conn:
+        conn.execute(
+            "UPDATE business_messages SET content_type = ?, media_json = ?, entities_json = ?, "
+            "photo_file_id = ?, video_file_id = ?, video_note_file_id = ?, voice_file_id = ? "
+            "WHERE id = ?",
+            (
+                content_type, _json_or_none(media), _json_or_none(entities),
+                legacy["photo_file_id"], legacy["video_file_id"],
+                legacy["video_note_file_id"], legacy["voice_file_id"], row_id,
+            ),
+        )
+
+
+def get_business_media_group(connection_id: str, chat_ref: str, media_group_id: str) -> list[sqlite3.Row]:
+    """Все сохранённые сообщения одного альбома — чтобы понять, удалён ли
+    альбом целиком (тогда показываем одним альбомом, main._send_deleted_batch)."""
+    with _conn() as conn:
+        return conn.execute(
+            "SELECT * FROM business_messages WHERE connection_id = ? AND chat_ref = ? "
+            "AND media_group_id = ? ORDER BY tg_message_id",
+            (connection_id, chat_ref, media_group_id),
+        ).fetchall()
 
 
 # ── suggestions (использование подсказок бота в реальной переписке) ───────────

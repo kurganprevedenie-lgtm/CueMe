@@ -35,6 +35,7 @@ from aiogram.types import (
     BusinessMessagesDeleted,
     CallbackQuery, ChatMemberUpdated, CopyTextButton, Document, ErrorEvent, FSInputFile,
     InputMediaDocument, InputRichMessage, LinkPreviewOptions, Message,
+    InputMediaAudio, InputMediaPhoto, InputMediaVideo, MessageEntity,
     InlineKeyboardButton, InlineKeyboardMarkup,
     LabeledPrice, PreCheckoutQuery,
     MessageOriginUser, MessageOriginHiddenUser, MessageOriginChat, MessageOriginChannel,
@@ -226,6 +227,8 @@ from storage import (
     get_pending_unlock,
     delete_pending_unlock,
     update_business_message_text,
+    update_business_message_content,
+    get_business_media_group,
     get_watch_setting,
     toggle_watch_setting,
     WATCH_SETTINGS,
@@ -5090,6 +5093,109 @@ def _match_outgoing_to_suggestion(
     mark_suggestion_matched(best_row["id"], business_message_id, best_ratio, match_kind)
 
 
+# ── Полное описание business-сообщения любого типа ────────────────────────────
+# Раньше сохранялись только текст и file_id четырёх медиа (фото/видео/кружок/
+# голосовое) — стикер, файл, гифка, геопозиция, контакт, опрос и т.д. при
+# удалении показывались как «текст недоступен». Теперь тип и метаданные
+# пишутся в business_messages.content_type/media_json/entities_json (байты
+# файлов не храним — только file_id, его хватает для повторной отправки).
+# text по-прежнему только текст/подпись/расшифровка голоса — стикеры и
+# файлы в анализ и message_samples не попадают.
+
+_FILE_META_FIELDS = ("file_id", "file_unique_id", "file_size", "file_name", "mime_type", "duration", "width", "height")
+
+# Типы, которые Telegram присылает, но содержимое которых бот повторно
+# отправить не может (см. _send_deleted_content) — запоминаем хотя бы вид.
+_OTHER_CONTENT_KINDS = ("story", "game", "paid_media", "checklist", "giveaway", "giveaway_winners", "invoice")
+
+
+def _file_meta(obj, *extra: str) -> dict:
+    out = {}
+    for field in _FILE_META_FIELDS + extra:
+        value = getattr(obj, field, None)
+        if value is not None:
+            out[field] = value
+    return out
+
+
+def _extract_business_content(msg: Message) -> dict:
+    """Тип сообщения и метаданные для business_messages. Порядок проверок
+    важен: у гифки Telegram заполняет и animation, и document; у места
+    (venue) — и venue, и location."""
+    media: dict | None = None
+    if msg.sticker:
+        content_type = "sticker"
+        media = _file_meta(msg.sticker, "emoji", "set_name", "is_animated", "is_video", "type", "custom_emoji_id")
+    elif msg.animation:
+        content_type, media = "animation", _file_meta(msg.animation)
+    elif msg.photo:
+        content_type, media = "photo", _file_meta(msg.photo[-1])
+    elif msg.video:
+        content_type, media = "video", _file_meta(msg.video)
+    elif msg.video_note:
+        content_type, media = "video_note", _file_meta(msg.video_note, "length")
+    elif msg.voice:
+        content_type, media = "voice", _file_meta(msg.voice)
+    elif msg.audio:
+        content_type, media = "audio", _file_meta(msg.audio, "performer", "title")
+    elif msg.document:
+        content_type, media = "document", _file_meta(msg.document)
+    elif msg.venue:
+        v = msg.venue
+        content_type = "venue"
+        media = {"latitude": v.location.latitude, "longitude": v.location.longitude,
+                 "title": v.title, "address": v.address}
+        for field in ("foursquare_id", "foursquare_type", "google_place_id", "google_place_type"):
+            if getattr(v, field, None):
+                media[field] = getattr(v, field)
+    elif msg.location:
+        loc = msg.location
+        content_type = "location"
+        media = {"latitude": loc.latitude, "longitude": loc.longitude}
+        for field in ("horizontal_accuracy", "live_period", "heading"):
+            if getattr(loc, field, None) is not None:
+                media[field] = getattr(loc, field)
+    elif msg.contact:
+        c = msg.contact
+        content_type = "contact"
+        media = {k: getattr(c, k) for k in ("phone_number", "first_name", "last_name", "user_id", "vcard")
+                 if getattr(c, k, None) is not None}
+    elif msg.poll:
+        p = msg.poll
+        content_type = "poll"
+        media = {"question": p.question, "options": [o.text for o in p.options],
+                 "type": p.type, "is_anonymous": p.is_anonymous,
+                 "allows_multiple_answers": p.allows_multiple_answers}
+    elif msg.dice:
+        content_type, media = "dice", {"emoji": msg.dice.emoji, "value": msg.dice.value}
+    elif msg.text:
+        content_type = "text"
+    else:
+        content_type = "other"
+        kind = next((k for k in _OTHER_CONTENT_KINDS if getattr(msg, k, None)), None)
+        media = {"kind": kind} if kind else None
+        if kind == "checklist":
+            # Повторно отправить чек-лист бот не может (только от имени
+            # бизнес-аккаунта), но показать текстом — может.
+            cl = msg.checklist
+            media.update({"title": cl.title, "tasks": [
+                {"text": t.text, "done": t.completion_date is not None} for t in cl.tasks
+            ]})
+
+    if media is not None and content_type in ("photo", "video", "animation") and msg.has_media_spoiler:
+        media["has_spoiler"] = True
+
+    raw_entities = msg.entities or msg.caption_entities
+    return {
+        "content_type": content_type,
+        "media": media,
+        "entities": [e.model_dump(mode="json", exclude_none=True) for e in raw_entities] if raw_entities else None,
+        "reply_to_tg_message_id": msg.reply_to_message.message_id if msg.reply_to_message else None,
+        "media_group_id": msg.media_group_id,
+        "forward_info": msg.forward_origin.model_dump(mode="json", exclude_none=True) if msg.forward_origin else None,
+    }
+
+
 def _persist_business_message(
     *, conn_id: str, owner_id: str, chat_ref: str, direction: str,
     text: str | None, is_voice: bool, date: str, tg_message_id: int,
@@ -5098,6 +5204,7 @@ def _persist_business_message(
     photo_file_id: str | None = None,
     video_file_id: str | None = None, video_note_file_id: str | None = None,
     voice_file_id: str | None = None,
+    content: dict | None = None,
 ) -> tuple[int | None, tuple[str, str] | None]:
     """Синхронная DB-часть обработки business-сообщения: сохранение + резолв контакта
     + троттлинг refresh + сопоставление с подсказками CueMe (для исходящих).
@@ -5112,6 +5219,7 @@ def _persist_business_message(
         raw_meta=_msg_meta(text, is_voice), photo_file_id=photo_file_id,
         video_file_id=video_file_id, video_note_file_id=video_note_file_id,
         voice_file_id=voice_file_id,
+        **(content or {}),
     )
     if message_id is None:
         # Повторная доставка того же сообщения — не триггерим пересборку.
@@ -5237,6 +5345,7 @@ async def handle_business_message(event: Message, bot: Bot) -> None:
         photo_file_id=photo_file_id,
         video_file_id=video_file_id, video_note_file_id=video_note_file_id,
         voice_file_id=voice_file_id,
+        content=_extract_business_content(event),
     )
 
     if contact_id_for_rebuild:
@@ -5328,6 +5437,7 @@ async def _save_ephemeral_reply_media(
         text=reply.caption, date=reply.date.isoformat(), tg_message_id=reply.message_id,
         raw_meta={"ephemeral": True},
         **{f"{kind}_file_id": file_id},
+        **_extract_business_content(reply),
     )
     if not await asyncio.to_thread(get_watch_setting, owner_id, "watch_ephemeral"):
         return  # выключено в «🗑 Удалённые сообщения»
@@ -5413,11 +5523,21 @@ async def handle_edited_business_message(event: Message, bot: Bot) -> None:
     owner_id = conn_row["owner_user_id"]
     chat_ref = _chat_ref(event.chat.id)
 
-    new_text = event.text or event.caption
-    if not new_text:
-        return
     row = await asyncio.to_thread(get_business_message_by_tg_id, conn_id, chat_ref, event.message_id)
     if not row:
+        return
+    # Новое медиа/подпись/форматирование — в базу сразу, до проверки текста:
+    # иначе при удалении показали бы старый файл, а форматирование съехало
+    # бы относительно нового текста. Уведомление «Было/Стало» — как раньше,
+    # только по тексту.
+    content = _extract_business_content(event)
+    await asyncio.to_thread(
+        update_business_message_content, row["id"],
+        content["content_type"], content["media"], content["entities"],
+    )
+
+    new_text = event.text or event.caption
+    if not new_text:
         return
     old_text = row["text"]
     if old_text == new_text:
@@ -5497,94 +5617,398 @@ async def _deleted_messages_excluded(bot: Bot, owner_id: str, contact_username: 
     return bool(owner_chat.username) and owner_chat.username.lower() in owners
 
 
-def _has_deleted_content(row) -> bool:
-    """Есть ли что показать по удалённому сообщению: текст или медиа по
-    file_id. Строки без того и другого (стикер и т.п.) — только «текст
-    недоступен», в тизер для не-премиум их не берём: после оплаты показать
-    по ним было бы нечего."""
-    if row["text"]:
-        return True
-    return any(
-        k in row.keys() and row[k]
-        for k in ("photo_file_id", "video_file_id", "video_note_file_id", "voice_file_id")
-    )
+# ── Содержимое удалённого сообщения: тип, подписи, отправка ──────────────────
+# Было (до 2026-10-23): _send_deleted_content знал только фото/видео/кружок/
+# голосовое по 4 колонкам *_file_id, всё остальное (стикер, файл, гифка,
+# геопозиция, контакт, опрос…) уходило как «удалил(а) сообщение (текст
+# недоступен)», форматирование текста терялось. Теперь — диспетчер по
+# content_type (_extract_business_content), с форматированием и альбомами.
+# Старые строки (content_type = NULL) работают как раньше: тип вычисляется
+# по заполненной колонке *_file_id (_row_content_type). Прежняя версия
+# функции — закомментирована ниже, оставлена для отката.
+
+_LEGACY_TYPE_COLUMNS = {
+    "photo": "photo_file_id", "video": "video_file_id",
+    "video_note": "video_note_file_id", "voice": "voice_file_id",
+}
+# Типы, которые шлются одним методом с подписью: (метод Bot, имя аргумента файла).
+_CAPTION_SENDERS = {
+    "photo": ("send_photo", "photo"), "video": ("send_video", "video"),
+    "animation": ("send_animation", "animation"), "document": ("send_document", "document"),
+    "audio": ("send_audio", "audio"), "voice": ("send_voice", "voice"),
+}
+_FILE_CONTENT_TYPES = set(_CAPTION_SENDERS) | {"video_note", "sticker"}
+_SPOILER_TYPES = ("photo", "video", "animation")
+_DICE_LABELS = {"🎲": "кубик", "🎯": "дартс", "🏀": "баскетбол", "⚽": "футбол", "🎳": "боулинг", "🎰": "слот-машину"}
+_OTHER_KIND_LABELS = {
+    "story": "историю", "game": "игру", "paid_media": "платное медиа", "checklist": "список задач",
+    "giveaway": "розыгрыш", "giveaway_winners": "итоги розыгрыша", "invoice": "счёт на оплату",
+}
+_CAPTION_LIMIT = 1024
+
+
+def _row_get(row, key: str):
+    return row[key] if key in row.keys() else None
+
+
+def _row_content_type(row) -> str:
+    """content_type строки; для старых строк (NULL) — по колонке *_file_id,
+    как работало раньше. 'unknown' — старая строка без текста и без медиа."""
+    ct = _row_get(row, "content_type")
+    if ct:
+        return ct
+    for kind, col in _LEGACY_TYPE_COLUMNS.items():
+        if _row_get(row, col):
+            return kind
+    return "text" if row["text"] else "unknown"
+
+
+def _row_media(row) -> dict:
+    raw = _row_get(row, "media_json")
+    if raw:
+        try:
+            return json.loads(raw) or {}
+        except ValueError:
+            logging.warning("business_messages.media_json не читается, id=%s", _row_get(row, "id"))
+    col = _LEGACY_TYPE_COLUMNS.get(_row_content_type(row))
+    file_id = _row_get(row, col) if col else None
+    return {"file_id": file_id} if file_id else {}
+
+
+def _row_entities(row) -> list | None:
+    raw = _row_get(row, "entities_json")
+    if not raw:
+        return None
+    try:
+        return json.loads(raw) or None
+    except ValueError:
+        return None
+
+
+def _content_label(ct: str, media: dict, detailed: bool = True) -> str:
+    """Что удалили, в винительном падеже («удалил(а) …»). detailed=False —
+    без подробностей (имя файла, эмодзи стикера): для тизера без Premium,
+    где само содержимое не раскрываем."""
+    if ct == "sticker":
+        emoji = media.get("emoji")
+        return f"стикер {emoji}" if detailed and emoji else "стикер"
+    if ct == "animation":
+        return "гифку"
+    if ct == "photo":
+        return "фото"
+    if ct == "video":
+        return "видео"
+    if ct == "video_note":
+        return "видеосообщение (кружок)"
+    if ct == "voice":
+        return "голосовое"
+    if ct == "audio":
+        title = " — ".join(p for p in (media.get("performer"), media.get("title")) if p)
+        return f"аудио «{title}»" if detailed and title else "аудио"
+    if ct == "document":
+        name = media.get("file_name")
+        return f"файл «{name}»" if detailed and name else "файл"
+    if ct == "location":
+        return "геопозицию"
+    if ct == "venue":
+        title = media.get("title")
+        return f"место «{title}»" if detailed and title else "место"
+    if ct == "contact":
+        return "контакт"
+    if ct == "poll":
+        return "опрос"
+    if ct == "dice":
+        return _DICE_LABELS.get(media.get("emoji"), "кубик")
+    if ct == "other":
+        return _OTHER_KIND_LABELS.get(media.get("kind"), "сообщение")
+    return "сообщение"
+
+
+def _utf16_len(s: str) -> int:
+    return len(s.encode("utf-16-le")) // 2
+
+
+def _compose_with_quote(header: str, text: str | None, entities: list | None, limit: int) -> tuple[str, list | None]:
+    """«{header}:\\n«{text}»» с форматированием исходного текста. Смещения
+    сущностей Telegram считает в UTF-16 — сдвигаем на длину префикса. Не
+    влезает в лимит — режем текст и отдаём без форматирования (обрезанная
+    сущность сломала бы отправку)."""
+    if not text:
+        return header, None
+    prefix = f"{header}:\n«"
+    full = f"{prefix}{text}»"
+    if len(full) > limit:
+        room = max(0, limit - len(prefix) - 2)
+        return f"{prefix}{text[:room]}…»", None
+    if not entities:
+        return full, None
+    shift = _utf16_len(prefix)
+    return full, [{**e, "offset": e["offset"] + shift} for e in entities]
+
+
+def _entity_objects(entities: list | None) -> list[MessageEntity] | None:
+    if not entities:
+        return None
+    try:
+        return [MessageEntity.model_validate(e) for e in entities]
+    except Exception:
+        logging.warning("deleted: не удалось собрать форматирование, шлю без него")
+        return None
+
+
+async def _send_with_entities(send, text_arg: str, text: str, entities: list | None, **kwargs):
+    """Отправка с форматированием; если Telegram его отклонил (обычно
+    custom_emoji — бот не всегда вправе ими пользоваться), повторяем без
+    форматирования обычным текстом. Ошибка самой отправки (протухший
+    file_id и т.п.) после повтора пробрасывается вызывающему."""
+    ents_arg = "entities" if text_arg == "text" else "caption_entities"
+    objs = _entity_objects(entities)
+    if objs:
+        try:
+            return await send(**{text_arg: text, ents_arg: objs}, **kwargs)
+        except TelegramBadRequest as e:
+            logging.warning("deleted: Telegram отклонил форматирование (%s) — повтор без него", e)
+    return await send(**{text_arg: text}, **kwargs)
 
 
 async def _send_deleted_content(bot: Bot, owner_id: str, name: str, row) -> None:
     """Содержимое одного удалённого входящего сообщения владельцу — общий код
     для Premium-юзеров (сразу при удалении) и для кнопки «👀 Показать» на
     тизере (cb_deleted_reveal), чтобы после оплаты показывалось ровно то
-    же, что видят премиум-юзеры."""
+    же, что видят премиум-юзеры. Файлы шлются по сохранённому file_id; если
+    Telegram его уже не отдаёт (старое сообщение, файл протух) — не молчим,
+    откатываемся на текстовое уведомление с указанием типа."""
+    chat_id = int(owner_id)
+    ct = _row_content_type(row)
+    media = _row_media(row)
     text = row["text"]
-    photo_file_id = row["photo_file_id"] if "photo_file_id" in row.keys() else None
-    video_file_id = row["video_file_id"] if "video_file_id" in row.keys() else None
-    video_note_file_id = row["video_note_file_id"] if "video_note_file_id" in row.keys() else None
-    voice_file_id = row["voice_file_id"] if "voice_file_id" in row.keys() else None
-
-    # Фото/видео/кружок/голосовое — пересылаем сам файл по сохранённому
-    # file_id (см. handle_business_message), с исходной подписью/
-    # транскриптом (если был) в caption, а не просто текстовое "медиа
-    # удалено". file_id Telegram иногда отказывается отдавать (сообщение
-    # слишком старое, файл протух на серверах Telegram и т.п.) — тогда
-    # не молчим, откатываемся на обычное текстовое уведомление ниже.
-    # Ровно одно из полей может быть заполнено — сообщение бывает только
-    # одного медиа-типа сразу.
-    if photo_file_id:
-        caption = f"🗑 {name} удалил(а) фото" + (f":\n«{text}»" if text else "")
-        try:
-            await bot.send_photo(int(owner_id), photo_file_id, caption=caption[:1024])
-            return
-        except Exception:
-            logging.exception(
-                "deleted_business_messages: не удалось переслать фото (file_id=%s) owner=%s — откат на текст",
-                photo_file_id, owner_id,
-            )
-    elif video_file_id:
-        caption = f"🗑 {name} удалил(а) видео" + (f":\n«{text}»" if text else "")
-        try:
-            await bot.send_video(int(owner_id), video_file_id, caption=caption[:1024])
-            return
-        except Exception:
-            logging.exception(
-                "deleted_business_messages: не удалось переслать видео (file_id=%s) owner=%s — откат на текст",
-                video_file_id, owner_id,
-            )
-    elif video_note_file_id:
-        # video_note (кружок) НЕ поддерживает caption вообще (ограничение
-        # Bot API, не наше) — уведомление уходит ОТДЕЛЬНЫМ текстовым
-        # сообщением следом, тот же приём, что был в предыдущей версии
-        # медиа-кэша (см. историю коммитов) до отката.
-        try:
-            await bot.send_video_note(int(owner_id), video_note_file_id)
-            await bot.send_message(int(owner_id), f"🗑 {name} удалил(а) видеосообщение (кружок)")
-            return
-        except Exception:
-            logging.exception(
-                "deleted_business_messages: не удалось переслать кружок (file_id=%s) owner=%s — откат на текст",
-                video_note_file_id, owner_id,
-            )
-    elif voice_file_id:
-        caption = f"🗑 {name} удалил(а) голосовое" + (f":\n«{text}»" if text else "")
-        try:
-            await bot.send_voice(int(owner_id), voice_file_id, caption=caption[:1024])
-            return
-        except Exception:
-            logging.exception(
-                "deleted_business_messages: не удалось переслать голосовое (file_id=%s) owner=%s — откат на текст",
-                voice_file_id, owner_id,
-            )
-
-    if text:
-        notice = f"🗑 {name} удалил(а) сообщение:\n«{text}»"
-    elif NOTIFY_DELETED_WITHOUT_TEXT:
-        notice = f"🗑 {name} удалил(а) сообщение (текст недоступен)"
-    else:
-        return
+    entities = _row_entities(row)
+    header = f"🗑 {name} удалил(а) {_content_label(ct, media)}"
+    file_id = media.get("file_id")
 
     try:
-        await bot.send_message(int(owner_id), notice)
+        if ct in _CAPTION_SENDERS and file_id:
+            method, file_arg = _CAPTION_SENDERS[ct]
+            caption, cap_entities = _compose_with_quote(header, text, entities, _CAPTION_LIMIT)
+            extra = {"has_spoiler": True} if ct in _SPOILER_TYPES and media.get("has_spoiler") else {}
+            await _send_with_entities(
+                getattr(bot, method), "caption", caption, cap_entities,
+                chat_id=chat_id, **{file_arg: file_id}, **extra,
+            )
+            return
+        if ct == "video_note" and file_id:
+            # У кружка нет подписи вообще (ограничение Bot API) — текст следом.
+            await bot.send_video_note(chat_id, file_id)
+            await bot.send_message(chat_id, header)
+            return
+        if ct == "sticker" and file_id:
+            # У стикера тоже нет подписи — текст следом.
+            await bot.send_sticker(chat_id, file_id)
+            await bot.send_message(chat_id, header)
+            return
+        if ct == "location" and "latitude" in media:
+            await bot.send_location(chat_id, latitude=media["latitude"], longitude=media["longitude"])
+            await bot.send_message(chat_id, header)
+            return
+        if ct == "venue" and "latitude" in media:
+            await bot.send_venue(
+                chat_id, latitude=media["latitude"], longitude=media["longitude"],
+                title=media.get("title") or "Место", address=media.get("address") or "",
+                foursquare_id=media.get("foursquare_id"), foursquare_type=media.get("foursquare_type"),
+                google_place_id=media.get("google_place_id"), google_place_type=media.get("google_place_type"),
+            )
+            await bot.send_message(chat_id, header)
+            return
+        if ct == "contact" and media.get("phone_number"):
+            await bot.send_contact(
+                chat_id, phone_number=media["phone_number"],
+                first_name=media.get("first_name") or "Контакт",
+                last_name=media.get("last_name"), vcard=media.get("vcard"),
+            )
+            await bot.send_message(chat_id, header)
+            return
+    except Exception:
+        logging.exception(
+            "deleted_business_messages: не удалось переслать %s (file_id=%s) owner=%s — откат на текст",
+            ct, file_id, owner_id,
+        )
+
+    if ct == "poll" and media.get("question"):
+        options = "\n".join(f"• {o}" for o in media.get("options") or [])
+        notice, notice_entities = f"{header}: «{media['question']}»" + (f"\n{options}" if options else ""), None
+    elif ct == "dice" and media.get("value") is not None:
+        notice, notice_entities = f"{header} {media.get('emoji', '')}: выпало {media['value']}", None
+    elif ct == "other" and media.get("kind") == "checklist" and media.get("title"):
+        tasks = "\n".join(f"{'✅' if t.get('done') else '⬜'} {t.get('text', '')}" for t in media.get("tasks") or [])
+        notice, notice_entities = f"{header}: «{media['title']}»" + (f"\n{tasks}" if tasks else ""), None
+    elif ct == "other":
+        notice, notice_entities = f"{header} — показать его содержимое бот не может", None
+    elif ct == "unknown":
+        # Старая строка без текста и без медиа — как было раньше.
+        if not NOTIFY_DELETED_WITHOUT_TEXT:
+            return
+        notice, notice_entities = f"🗑 {name} удалил(а) сообщение (текст недоступен)", None
+    else:
+        # Текст, а также откат для файла, который Telegram уже не отдаёт.
+        notice, notice_entities = _compose_with_quote(header, text, entities, TELEGRAM_MAX_LEN)
+        if ct in _FILE_CONTENT_TYPES or ct in ("location", "venue", "contact"):
+            notice += "\n(сам файл уже недоступен)" if ct in _FILE_CONTENT_TYPES else "\n(показать не получилось)"
+
+    try:
+        await _send_with_entities(bot.send_message, "text", notice, notice_entities, chat_id=chat_id)
     except Exception:
         logging.exception("deleted_business_messages: не удалось уведомить owner=%s", owner_id)
+
+
+# ── Альбомы ───────────────────────────────────────────────────────────────────
+# Удалённый целиком альбом показываем одним альбомом (send_media_group), а
+# не пачкой отдельных сообщений. Telegram разрешает в альбоме фото+видео
+# вместе, документы — только с документами, аудио — только с аудио.
+
+_ALBUM_INPUT = {"photo": InputMediaPhoto, "video": InputMediaVideo,
+                "document": InputMediaDocument, "audio": InputMediaAudio}
+_ALBUM_COMPATIBLE = ({"photo", "video"}, {"photo"}, {"video"}, {"document"}, {"audio"})
+
+
+async def _send_deleted_album(bot: Bot, owner_id: str, name: str, rows: list) -> bool:
+    """True — альбом ушёл. False — собрать не получилось (неподходящие
+    типы, нет file_id, Telegram отказал) — тогда вызывающий шлёт по одному."""
+    kinds = [_row_content_type(r) for r in rows]
+    if not 2 <= len(rows) <= 10 or set(kinds) not in _ALBUM_COMPATIBLE:
+        return False
+    medias = [_row_media(r) for r in rows]
+    if not all(m.get("file_id") for m in medias):
+        return False
+
+    header = f"🗑 {name} удалил(а) альбом ({len(rows)})"
+
+    def build(with_entities: bool) -> list:
+        items = []
+        for i, (row, kind, media) in enumerate(zip(rows, kinds, medias)):
+            text, entities = row["text"], _row_entities(row)
+            if i == 0:
+                caption, cap_entities = _compose_with_quote(header, text, entities, _CAPTION_LIMIT)
+            else:
+                caption = (text or "")[:_CAPTION_LIMIT] or None
+                cap_entities = entities if caption and len(text) <= _CAPTION_LIMIT else None
+            kwargs = {"media": media["file_id"], "caption": caption}
+            objs = _entity_objects(cap_entities) if with_entities else None
+            if objs:
+                kwargs["caption_entities"] = objs
+            if kind in _SPOILER_TYPES and media.get("has_spoiler"):
+                kwargs["has_spoiler"] = True
+            items.append(_ALBUM_INPUT[kind](**kwargs))
+        return items
+
+    for with_entities in (True, False):
+        try:
+            await bot.send_media_group(int(owner_id), media=build(with_entities))
+            return True
+        except TelegramBadRequest as e:
+            if with_entities:
+                logging.warning("deleted album: Telegram отказал (%s) — повтор без форматирования", e)
+                continue
+            logging.warning("deleted album: не удалось отправить альбом (%s) — шлю по одному", e)
+        except Exception:
+            logging.exception("deleted album: сбой отправки альбома owner=%s — шлю по одному", owner_id)
+            break
+    return False
+
+
+async def _send_deleted_batch(bot: Bot, owner_id: str, name: str, rows: list) -> None:
+    """Все удалённые сообщения одного события (или одного тизера) по
+    порядку; альбом, удалённый ЦЕЛИКОМ (все его сохранённые сообщения есть
+    в rows), — одним альбомом, иначе каждое сообщение отдельно."""
+    deleted_ids = {r["id"] for r in rows}
+    done: set[int] = set()
+    for row in rows:
+        if row["id"] in done:
+            continue
+        group_id = _row_get(row, "media_group_id")
+        if group_id:
+            group_rows = [r for r in rows if _row_get(r, "media_group_id") == group_id]
+            members = await asyncio.to_thread(
+                get_business_media_group, row["connection_id"], row["chat_ref"], group_id,
+            )
+            if len(group_rows) >= 2 and {m["id"] for m in members} <= deleted_ids:
+                done.update(r["id"] for r in group_rows)
+                if not await _send_deleted_album(bot, owner_id, name, group_rows):
+                    for r in group_rows:
+                        await _send_deleted_content(bot, owner_id, name, r)
+                continue
+        done.add(row["id"])
+        await _send_deleted_content(bot, owner_id, name, row)
+
+
+def _has_deleted_content(row) -> bool:
+    """Есть ли что показать по удалённому сообщению. Строки без содержимого
+    (старые без текста и медиа, или виды, которые бот повторить не может —
+    история, игра и т.п.) в тизер для не-Premium не берём: после оплаты
+    показать по ним было бы нечего."""
+    if row["text"]:
+        return True
+    ct = _row_content_type(row)
+    if ct == "other":
+        return _row_media(row).get("kind") == "checklist"
+    if ct in ("unknown", "text"):
+        return False
+    return bool(_row_media(row))
+
+
+# Прежняя версия — только 4 типа медиа по колонкам *_file_id, оставлена для отката:
+#
+# def _has_deleted_content(row) -> bool:
+#     if row["text"]:
+#         return True
+#     return any(
+#         k in row.keys() and row[k]
+#         for k in ("photo_file_id", "video_file_id", "video_note_file_id", "voice_file_id")
+#     )
+#
+# async def _send_deleted_content(bot: Bot, owner_id: str, name: str, row) -> None:
+#     text = row["text"]
+#     photo_file_id = row["photo_file_id"] if "photo_file_id" in row.keys() else None
+#     video_file_id = row["video_file_id"] if "video_file_id" in row.keys() else None
+#     video_note_file_id = row["video_note_file_id"] if "video_note_file_id" in row.keys() else None
+#     voice_file_id = row["voice_file_id"] if "voice_file_id" in row.keys() else None
+#     if photo_file_id:
+#         caption = f"🗑 {name} удалил(а) фото" + (f":\n«{text}»" if text else "")
+#         try:
+#             await bot.send_photo(int(owner_id), photo_file_id, caption=caption[:1024])
+#             return
+#         except Exception:
+#             logging.exception("... не удалось переслать фото — откат на текст")
+#     elif video_file_id:
+#         caption = f"🗑 {name} удалил(а) видео" + (f":\n«{text}»" if text else "")
+#         try:
+#             await bot.send_video(int(owner_id), video_file_id, caption=caption[:1024])
+#             return
+#         except Exception:
+#             logging.exception("... не удалось переслать видео — откат на текст")
+#     elif video_note_file_id:
+#         try:
+#             await bot.send_video_note(int(owner_id), video_note_file_id)
+#             await bot.send_message(int(owner_id), f"🗑 {name} удалил(а) видеосообщение (кружок)")
+#             return
+#         except Exception:
+#             logging.exception("... не удалось переслать кружок — откат на текст")
+#     elif voice_file_id:
+#         caption = f"🗑 {name} удалил(а) голосовое" + (f":\n«{text}»" if text else "")
+#         try:
+#             await bot.send_voice(int(owner_id), voice_file_id, caption=caption[:1024])
+#             return
+#         except Exception:
+#             logging.exception("... не удалось переслать голосовое — откат на текст")
+#     if text:
+#         notice = f"🗑 {name} удалил(а) сообщение:\n«{text}»"
+#     elif NOTIFY_DELETED_WITHOUT_TEXT:
+#         notice = f"🗑 {name} удалил(а) сообщение (текст недоступен)"
+#     else:
+#         return
+#     try:
+#         await bot.send_message(int(owner_id), notice)
+#     except Exception:
+#         logging.exception("deleted_business_messages: не удалось уведомить owner=%s", owner_id)
 
 
 def _deleted_teaser_kb(reveal_id: int) -> InlineKeyboardMarkup:
@@ -5599,8 +6023,22 @@ def _deleted_teaser_kb(reveal_id: int) -> InlineKeyboardMarkup:
     return b.as_markup()
 
 
-def _deleted_teaser_text(label: str, count: int) -> str:
-    what = "сообщение" if count == 1 else f"сообщения ({count})"
+def _teaser_kinds(rows: list) -> list[str]:
+    """Типы удалённого для тизера — без подробностей (имя файла, эмодзи
+    стикера), содержимое без Premium не раскрываем."""
+    return [_content_label(_row_content_type(r), _row_media(r), detailed=False) for r in rows]
+
+
+def _deleted_teaser_text(label: str, count: int, kinds: list[str] | None = None) -> str:
+    """kinds — типы удалённого (_teaser_kinds). Без них — как раньше:
+    «сообщение»/«сообщения (N)»."""
+    if count == 1:
+        what = kinds[0] if kinds else "сообщение"
+    else:
+        what = f"сообщения ({count})"
+        distinct = list(dict.fromkeys(k if k != "сообщение" else "текст" for k in (kinds or [])))
+        if distinct and distinct != ["текст"]:
+            what += ": " + ", ".join(distinct)
     return (
         f"🗑 {label} удалил(а) {what}\n\n"
         "🔒 Чтобы посмотреть, что там было, — оформи Premium. После оплаты "
@@ -5644,8 +6082,7 @@ async def handle_deleted_business_messages(event: BusinessMessagesDeleted, bot: 
         return
 
     if await _is_premium(bot, owner_id):
-        for row in rows:
-            await _send_deleted_content(bot, owner_id, name, row)
+        await _send_deleted_batch(bot, owner_id, name, rows)
         return
 
     # Без Premium (бесплатный период закончился, см. /broadcast_deleted_paywall)
@@ -5662,7 +6099,7 @@ async def handle_deleted_business_messages(event: BusinessMessagesDeleted, bot: 
     )
     try:
         await bot.send_message(
-            int(owner_id), _deleted_teaser_text(label, len(revealable)),
+            int(owner_id), _deleted_teaser_text(label, len(revealable), _teaser_kinds(revealable)),
             reply_markup=_deleted_teaser_kb(reveal_id),
         )
     except Exception:
@@ -5702,14 +6139,16 @@ async def cb_deleted_reveal(call: CallbackQuery, bot: Bot) -> None:
 async def _reveal_deleted(bot: Bot, telegram_id: str, reveal) -> int:
     """Показывает содержимое одного скрытого удаления и помечает его
     показанным. Возвращает, сколько сообщений удалось достать из базы."""
-    shown = 0
+    rows = []
     for row_id in json.loads(reveal["message_row_ids"]):
         row = await asyncio.to_thread(get_business_message_by_row_id, row_id)
         if row:
-            await _send_deleted_content(bot, telegram_id, reveal["contact_label"], row)
-            shown += 1
+            rows.append(row)
+    # Через _send_deleted_batch, как у Premium сразу при удалении — альбом
+    # и после оплаты приходит альбомом.
+    await _send_deleted_batch(bot, telegram_id, reveal["contact_label"], rows)
     await asyncio.to_thread(mark_deleted_reveal_revealed, reveal["id"])
-    return shown
+    return len(rows)
 
 
 @dp.callback_query(F.data == "delrev_premium")
