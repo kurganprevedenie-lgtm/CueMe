@@ -31,11 +31,14 @@ def hr(title):
     print(f"\n── {title} " + "─" * max(0, 60 - len(title)))
 
 
-def journal(pattern: str, since="7 days ago") -> list[str]:
+JOURNAL_SINCE = "1 day ago"  # за 7 дней journalctl не укладывается: журнал огромный
+
+
+def journal(pattern: str, since=JOURNAL_SINCE) -> list[str]:
     try:
         out = subprocess.run(
             ["journalctl", "-u", SERVICE, "--since", since, "--no-pager", "-o", "short-iso", "-g", pattern],
-            capture_output=True, text=True, timeout=180,
+            capture_output=True, text=True, timeout=60,
         ).stdout
     except Exception as e:
         print(f"  journalctl не сработал: {e}")
@@ -67,8 +70,10 @@ def probe(url: str) -> str:
 
 
 # ── a) журнал ────────────────────────────────────────────────────────────────
-hr("a) Журнал за 7 дней (строки с «tribute»)")
-lines = journal("tribute")
+hr(f"a) Журнал за {JOURNAL_SINCE} (строки с «tribute» и пути вебхука)")
+path = config.TRIBUTE_WEBHOOK_PATH
+all_lines = journal("tribute|" + re.escape(path))
+lines = [l for l in all_lines if "tribute" in l.lower()]
 cats = {
     "неверная подпись вебхука": 0, "неожиданный payload": 0, "сбой обработки события": 0,
     "не удалось отправить подтверждение оплаты": 0, "не удалось распарсить expires_at": 0,
@@ -85,9 +90,7 @@ print(f"  всего строк с «tribute»: {len(lines)}")
 for l in [l for l in lines if "сбой обработки" in l or "неожиданный payload" in l][-5:]:
     print("   ", l[:220])
 
-path = config.TRIBUTE_WEBHOOK_PATH
-posts = journal(re.escape(path))
-post_lines = [l for l in posts if "POST" in l]
+post_lines = [l for l in all_lines if "POST" in l and path in l]
 codes = Counter(m.group(1) for l in post_lines if (m := re.search(r'POST [^"]*" (\d{3})', l)))
 print(f"\n  входящих POST на {path} в журнале: {len(post_lines)}  {dict(codes) or ''}")
 if not post_lines:
