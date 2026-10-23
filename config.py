@@ -120,6 +120,20 @@ VARIANTS_GROQ_TIMEOUT = float(os.getenv("VARIANTS_GROQ_TIMEOUT", "20"))
 # gpt-oss-120b — 0/5, все 10 ключей на 429 (у 20b свой лимит, отдельный от
 # 120b). Откат на основную модель (GroqProvider._MODEL) — VARIANTS_GROQ_MODEL="".
 VARIANTS_GROQ_MODEL = os.getenv("VARIANTS_GROQ_MODEL", "openai/gpt-oss-20b")
+# Было: одна модель VARIANTS_GROQ_MODEL (20b) всегда — даже когда 120b
+# доступна, отвечала более слабая 20b. Теперь каскад моделей Groq по порядку
+# (llm.GroqProvider._ask_models): 120b, при исчерпании лимита — 20b, дальше —
+# остальные провайдеры. VARIANTS_GROQ_MODEL работает как список из одной
+# модели, если VARIANTS_GROQ_MODELS не задан, но VARIANTS_GROQ_MODEL задан
+# явно. Пустой VARIANTS_GROQ_MODELS — откат на основную модель (GroqProvider._MODEL).
+_variants_groq_models_env = os.getenv("VARIANTS_GROQ_MODELS")
+_variants_groq_model_env = os.getenv("VARIANTS_GROQ_MODEL")
+if _variants_groq_models_env is not None:
+    VARIANTS_GROQ_MODELS = [m.strip() for m in _variants_groq_models_env.split(",") if m.strip()]
+elif _variants_groq_model_env is not None:
+    VARIANTS_GROQ_MODELS = [_variants_groq_model_env.strip()] if _variants_groq_model_env.strip() else []
+else:
+    VARIANTS_GROQ_MODELS = ["openai/gpt-oss-120b", "openai/gpt-oss-20b"]
 # Какие модели Gemini пробовать ПЕРВЫМИ для «Ответа с CueMe» (остальные — в
 # обычном порядке, Gemma 4 26B — в самом конце). Тот же бенчмарк: 3.5 Flash
 # Lite — 5/5, медиана 1.2 с; Gemma 4 26B (первая в обычном каскаде) — 0/5,
