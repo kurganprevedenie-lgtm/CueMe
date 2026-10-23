@@ -106,6 +106,7 @@ from llm import (
     get_forced_provider,
     get_provider_stats,
     get_provider_stats_snapshot,
+    get_groq_model_stats,
     KNOWN_DAILY_LIMITS,
     live_coach_step,
     make_features_summary,
@@ -7996,6 +7997,15 @@ async def cmd_apistatus(message: Message) -> None:
         return
     try:
         text = "📡 Статус API по ключам (с рестарта бота):\n\n" + _format_apistatus(get_provider_stats_snapshot())
+        groq_models = get_groq_model_stats()
+        if groq_models:
+            served = sum(s["ok"] for s in groq_models.values()) or 1
+            lines = ["\n\n<b>Groq по моделям («Ответ с CueMe»)</b>"]
+            for model, s in sorted(groq_models.items()):
+                cd = f", ключей в кулдауне: {s['cooldown_keys']}" if s["cooldown_keys"] else ""
+                lines.append(f"  {html.escape(model)}: ответила {s['ok']} ({s['ok'] * 100 // served}%), "
+                             f"лимит {s['rate_limit']}{cd}")
+            text += "\n".join(lines)
         invalid = get_invalid_output_counts()
         if invalid:
             lines = ["\n\n<b>Невалидные ответы (мусор/рассуждения/обрыв)</b>"]
