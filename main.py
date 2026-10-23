@@ -52,6 +52,7 @@ from config import (
     GROQ_API_KEY,
     OPENROUTER_API_KEY,
     PREMIUM_CACHE_TTL,
+    PREMIUM_NEG_CACHE_TTL,
     CHURN_HOURS,
     PREMIUM_CHANNEL_ID,
     PREMIUM_SUBSCRIBE_URL,
@@ -679,6 +680,7 @@ async def _finish_generation_message(
 # при оплате, убирает при отмене/неоплате). Бот только читает текущий статус.
 
 _premium_cache: dict[str, tuple[bool, float]] = {}  # telegram_id -> (is_premium, checked_at)
+_premium_clock = time.monotonic  # часы кэша Premium и антиспама проверки оплаты (тесты подменяют)
 
 
 async def _is_premium(bot: Bot, telegram_id: str) -> bool:
@@ -711,7 +713,8 @@ async def _is_premium(bot: Bot, telegram_id: str) -> bool:
         return False
 
     cached = _premium_cache.get(telegram_id)
-    if cached and time.monotonic() - cached[1] < PREMIUM_CACHE_TTL:
+    # Было: один TTL (PREMIUM_CACHE_TTL) и для «да», и для «нет».
+    if cached and _premium_clock() - cached[1] < (PREMIUM_CACHE_TTL if cached[0] else PREMIUM_NEG_CACHE_TTL):
         return cached[0]
 
     try:
@@ -720,14 +723,18 @@ async def _is_premium(bot: Bot, telegram_id: str) -> bool:
     except Exception:
         is_prem = False
 
-    _premium_cache[telegram_id] = (is_prem, time.monotonic())
+    _premium_cache[telegram_id] = (is_prem, _premium_clock())
     return is_prem
+
+
+_CHECK_PAYMENT_BTN = "✅ Я оплатил(а) — проверить"
 
 
 def paywall_kb() -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     if PREMIUM_SUBSCRIBE_URL:
         b.button(text="💎 Оформить подписку", url=PREMIUM_SUBSCRIBE_URL)
+        b.button(text=_CHECK_PAYMENT_BTN, callback_data="check_payment")
     b.button(text="⭐ Оплатить Stars", callback_data="stars_menu")
     b.adjust(1)
     return b.as_markup()
@@ -743,6 +750,7 @@ def premium_menu_kb() -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     if PREMIUM_SUBSCRIBE_URL:
         b.button(text="💎 Оформить подписку", url=PREMIUM_SUBSCRIBE_URL)
+        b.button(text=_CHECK_PAYMENT_BTN, callback_data="check_payment")
     b.button(text="⭐ Оплатить Stars", callback_data="stars_menu")
     b.button(text="👥 Реферальная система", callback_data="show_invite")
     b.button(text="📢 Подписаться на канал", callback_data="promo:offer")
@@ -773,6 +781,100 @@ async def _send_paywall(target: Message, text: str, edit: bool = False) -> None:
         await target.edit_text(text, reply_markup=premium_menu_kb())
     else:
         await target.answer(text, reply_markup=premium_menu_kb())
+    if getattr(target, "bot", None):
+        _start_payment_watch(target.bot, str(target.chat.id))
+
+
+# ── «✅ Я оплатил(а) — проверить» и фоновая проверка оплаты Tribute ─────────
+# Вебхук Tribute не настроен (диагностика 2026-10-23: TRIBUTE_API_KEY пуст,
+# все 43 Premium-юзера — только по членству в канале), поэтому о Tribute-
+# оплате бот узнаёт лишь по вступлению в канал. Чтобы не ждать, пока человек
+# сам что-то нажмёт: кнопка ручной проверки и фоновая проверка после показа
+# экрана оплаты — бот не видит нажатие url-кнопки «Оформить подписку».
+
+_CHECK_PAYMENT_COOLDOWN = 10            # секунд между ручными проверками
+_PAYMENT_WATCH_INTERVAL = 20            # секунд между фоновыми проверками
+_PAYMENT_WATCH_DURATION = 5 * 60        # сколько всего ждём
+_check_payment_last: dict[str, float] = {}
+_payment_watches: dict[str, asyncio.Task] = {}
+
+
+def _premium_until_known(telegram_id: str) -> datetime | None:
+    now = datetime.now(timezone.utc)
+    dates = [d for d in (get_tribute_premium_until(telegram_id), get_stars_premium_until(telegram_id)) if d and d > now]
+    return max(dates) if dates else None
+
+
+async def _confirm_premium_active(bot: Bot, telegram_id: str) -> None:
+    until = _premium_until_known(telegram_id)
+    text = f"🎉 Premium активен до {_format_until(until)}." if until else "🎉 Premium активен!"
+    await bot.send_message(int(telegram_id), text)
+    await _offer_pending_reveals(bot, telegram_id)
+
+
+def _start_payment_watch(bot: Bot, telegram_id: str) -> None:
+    """Фоновая проверка каждые _PAYMENT_WATCH_INTERVAL с, до
+    _PAYMENT_WATCH_DURATION: стал Premium — сам присылает подтверждение.
+    Один таск на юзера (уже идёт — не трогаем), сам убирает себя из словаря."""
+    if not PREMIUM_CHANNEL_ID or not PREMIUM_SUBSCRIBE_URL:
+        return
+    task = _payment_watches.get(telegram_id)
+    if task and not task.done():
+        return
+    _payment_watches[telegram_id] = asyncio.get_running_loop().create_task(_payment_watch(bot, telegram_id))
+
+
+async def _payment_watch(bot: Bot, telegram_id: str) -> None:
+    try:
+        if await _is_premium(bot, telegram_id):
+            return  # уже Premium — ждать нечего
+        for _ in range(max(1, round(_PAYMENT_WATCH_DURATION / _PAYMENT_WATCH_INTERVAL))):
+            await asyncio.sleep(_PAYMENT_WATCH_INTERVAL)
+            _premium_cache.pop(telegram_id, None)
+            if await _is_premium(bot, telegram_id):
+                logging.info("payment watch: %s стал Premium — подтверждаю", telegram_id)
+                await _confirm_premium_active(bot, telegram_id)
+                return
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logging.exception("payment watch failed: telegram_id=%s", telegram_id)
+    finally:
+        if _payment_watches.get(telegram_id) is asyncio.current_task():
+            _payment_watches.pop(telegram_id, None)
+
+
+def _check_payment_retry_kb() -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    b.button(text="🔄 Проверить ещё раз", callback_data="check_payment")
+    return b.as_markup()
+
+
+@dp.callback_query(F.data == "check_payment")
+async def cb_check_payment(call: CallbackQuery, bot: Bot) -> None:
+    telegram_id = str(call.from_user.id)
+    now = _premium_clock()
+    left = _CHECK_PAYMENT_COOLDOWN - (now - _check_payment_last.get(telegram_id, -1e9))
+    if left > 0:
+        await call.answer(f"Проверяю не чаще раза в {_CHECK_PAYMENT_COOLDOWN} с — подожди {int(left) + 1} с.")
+        return
+    _check_payment_last[telegram_id] = now
+    await call.answer()
+    _premium_cache.pop(telegram_id, None)
+    if await _is_premium(bot, telegram_id):
+        task = _payment_watches.pop(telegram_id, None)
+        if task and not task.done():
+            task.cancel()  # уже подтвердили — фоновой проверке нечего слать
+        await _confirm_premium_active(bot, telegram_id)
+        return
+    await call.message.answer(
+        "Платёж ещё обрабатывается. Обычно до пары минут. "
+        "Если через 5 минут не появится — напиши мне.\n\n"
+        "Проверь, что вступил(а) в закрытый канал по ссылке от Tribute — "
+        "без этого бот подписку не видит.",
+        reply_markup=_check_payment_retry_kb(),
+    )
+    _start_payment_watch(bot, telegram_id)
 
 
 async def _has_quota(bot: Bot, telegram_id: str) -> bool:
@@ -2265,8 +2367,15 @@ async def _handle_tribute_subscription_event(bot: Bot, event_name: str, payload:
     безусловно выдать доступ, не завязывая на прежний Premium-статус.
     Идемпотентно по (subscription_id, period_id) — record_tribute_payment,
     тот же паттерн UNIQUE-констрейнта, что у record_star_payment."""
+    # Было: чужой канал и пустой payload отбрасывались молча — в журнале не
+    # было видно, почему оплата не дала Premium.
+    if not payload:
+        logging.warning("tribute: пустой payload события %s — пропускаю", event_name)
+        return
     channel_id = payload.get("channel_id")
     if TRIBUTE_CHANNEL_ID and str(channel_id) != TRIBUTE_CHANNEL_ID:
+        logging.warning("tribute: событие %s для другого канала channel_id=%r (жду %s) — пропускаю",
+                        event_name, channel_id, TRIBUTE_CHANNEL_ID)
         return  # событие для другого канала на этом же API-ключе
 
     telegram_id = str(payload.get("telegram_user_id") or "")
@@ -9742,7 +9851,7 @@ async def _premium_status_text(bot: Bot, telegram_id: str) -> str:
     footer = (
         f"Ещё попытки — за каждого друга: +{REFERRAL_REPLY_BONUS} / "
         f"+{REFERRAL_ANALYSIS_BONUS} / +{REFERRAL_DATE_BONUS}, раздел 👥 Реферальная система.\n\n"
-        "Оплатили, но бот не видит подписку? Подождите пару минут и снова наберите /premium."
+        "Оплатил(а)? Нажми «✅ Я оплатил(а) — проверить»."
     )
     if _never_unlocked(telegram_id, is_premium=False):
         claim_line = (
@@ -9780,6 +9889,7 @@ async def cmd_premium(message: Message, bot: Bot) -> None:
     text = await _premium_status_text(bot, str(message.from_user.id))
     await message.answer(text, reply_markup=paywall_kb(), parse_mode="HTML")
     await _offer_pending_reveals(bot, str(message.from_user.id))
+    _start_payment_watch(bot, str(message.from_user.id))
 
 
 async def _show_premium_screen(target: Message, bot: Bot, telegram_id: str, edit: bool = False) -> None:
@@ -9788,6 +9898,7 @@ async def _show_premium_screen(target: Message, bot: Bot, telegram_id: str, edit
         await target.edit_text(text, reply_markup=premium_menu_kb(), parse_mode="HTML")
     else:
         await target.answer(text, reply_markup=premium_menu_kb(), parse_mode="HTML")
+    _start_payment_watch(bot, telegram_id)
     # Premium уже активен, а скрытые удалённые не показаны (тизер мог
     # потеряться) — предложить показать (сама функция проверит и то, и другое).
     await _offer_pending_reveals(bot, telegram_id)

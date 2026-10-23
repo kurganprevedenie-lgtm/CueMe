@@ -281,6 +281,10 @@ REFERRAL_DATE_BONUS = int(os.getenv("REFERRAL_DATE_BONUS", "3"))
 
 # Кэш проверки членства в канале (сек) — не дёргать Telegram API на каждое сообщение.
 PREMIUM_CACHE_TTL = int(os.getenv("PREMIUM_CACHE_TTL", "300"))
+# Отрицательный результат («не в канале») — короче: Tribute добавляет в канал
+# позже, чем бот успевает проверить, и раньше юзер до 5 минут видел «не
+# Premium» уже после оплаты. Положительный — по-прежнему PREMIUM_CACHE_TTL.
+PREMIUM_NEG_CACHE_TTL = int(os.getenv("PREMIUM_NEG_CACHE_TTL", "20"))
 # Через сколько часов без действий в боте юзер считается «ушедшим» в блоке
 # «Где уходят» отчёта /users (main.py: _build_users_dashboard_html).
 CHURN_HOURS = int(os.getenv("CHURN_HOURS", "24"))
