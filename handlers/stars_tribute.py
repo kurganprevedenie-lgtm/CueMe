@@ -52,6 +52,7 @@ from storage import (
 )
 from app_state import dp
 from handlers.subscription import stars_tariff_kb
+import handlers  # ссылки по модулю: имена ниже по исходному main.py / общее состояние
 import main  # ссылки по модулю: имена ниже по исходному main.py / общее состояние
 
 
@@ -207,7 +208,7 @@ async def process_stars_successful_payment(message: Message, bot: Bot) -> None:
     until_label = expires_at.strftime("%d.%m.%Y %H:%M UTC")
     extra = " Продлится автоматически, спишется ещё раз через 30 дней." if is_subscription else ""
     await message.answer(f"🎉 Готово! Premium активен до {until_label}.{extra}")
-    await main._offer_pending_reveals(bot, telegram_id)
+    await handlers.business._offer_pending_reveals(bot, telegram_id)
 
 
 # ── Tribute webhook (события оплаты приватного канала-пропуска) ─────────────
@@ -362,7 +363,7 @@ async def _handle_tribute_subscription_event(bot: Bot, event_name: str, payload:
         await bot.send_message(int(telegram_id), f"🎉 Оплата прошла! Premium активен до {until_label}.")
     except Exception:
         logging.warning("tribute: не удалось отправить подтверждение оплаты %s", telegram_id)
-    await main._offer_pending_reveals(bot, telegram_id)
+    await handlers.business._offer_pending_reveals(bot, telegram_id)
 
     # Безусловно — независимо от того, был ли уже Premium через другой
     # источник (реферал/промо/Stars) до этой оплаты. Именно этот шаг раньше

@@ -123,7 +123,7 @@ async def _credit_referral_if_pending(bot: Bot, referred_id: str) -> None:
         )
     except Exception:
         logging.warning("referral notify failed: referrer=%s", referrer_id)
-    await main._offer_pending_reveals(bot, referrer_id)
+    await handlers.business._offer_pending_reveals(bot, referrer_id)
 
 
 # _has_referral_premium/_has_promo_channel_premium — раньше участвовали в
@@ -247,7 +247,7 @@ async def cb_promo_check(call: CallbackQuery, bot: Bot) -> None:
         f"+{PROMO_CHANNEL_DATE_BONUS} «Идеальное свидание».",
         reply_markup=_promo_back_kb(),
     )
-    await main._offer_pending_reveals(bot, telegram_id)
+    await handlers.business._offer_pending_reveals(bot, telegram_id)
 
 
 # ── Экран-гейт «подпишись на канал» (первая попытка любой из трёх фич) ───────
@@ -541,7 +541,7 @@ async def _notify_promo_reward_granted(bot: Bot, telegram_id: str) -> None:
         await bot.send_message(int(telegram_id), text)
     except Exception:
         logging.warning("promo reward grant notify failed: telegram_id=%s", telegram_id)
-    await main._offer_pending_reveals(bot, telegram_id)
+    await handlers.business._offer_pending_reveals(bot, telegram_id)
 
 
 # async def _notify_promo_premium_resumed(bot: Bot, telegram_id: str, until: datetime) -> None:

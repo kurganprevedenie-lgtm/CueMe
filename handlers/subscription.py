@@ -176,7 +176,7 @@ async def _confirm_premium_active(bot: Bot, telegram_id: str) -> None:
     until = _premium_until_known(telegram_id)
     text = f"🎉 Premium активен до {main._format_until(until)}." if until else "🎉 Premium активен!"
     await bot.send_message(int(telegram_id), text)
-    await main._offer_pending_reveals(bot, telegram_id)
+    await handlers.business._offer_pending_reveals(bot, telegram_id)
 
 
 def _start_payment_watch(bot: Bot, telegram_id: str) -> None:
