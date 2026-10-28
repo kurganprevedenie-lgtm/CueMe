@@ -74,6 +74,7 @@ from handlers.profile import (
 )
 from handlers.cards import Setup, _gen_interaction_card, _gen_style_card
 from handlers.analysis import _show_deep_analysis, _show_ideal_date
+import handlers  # ссылки по модулю: имена ниже по исходному main.py / общее состояние
 import main  # ссылки по модулю: имена ниже по исходному main.py / общее состояние
 
 
@@ -149,7 +150,7 @@ async def _finish_onboarding_chain(bot: Bot, chat_id: int, message_id: int) -> N
 @dp.callback_query(F.data == "qs:yes")
 async def cb_quickstart_yes(call: CallbackQuery, state: FSMContext) -> None:
     await call.answer()
-    await main._start_unified_reply(call.message, state)
+    await handlers.reply._start_unified_reply(call.message, state)
 
 
 def dating_apps_kb() -> InlineKeyboardMarkup:
@@ -192,7 +193,7 @@ async def _quickstart_phrase_content(state: FSMContext, target: str) -> tuple[st
     Возвращает текст+клавиатуру: первый показ шлёт новое сообщение
     (_send_quickstart_phrases), «Другой вариант» редактирует то же."""
     items = OPENERS_FOR_HER if target == "her" else OPENERS_FOR_HIM
-    phrase = await main._pick_no_repeat(state, f"qs_opener_shown_{target}", items)
+    phrase = await handlers.reply._pick_no_repeat(state, f"qs_opener_shown_{target}", items)
     intro = "Вот пара фраз для начала — сохрани, пригодятся:"
     if "[" in phrase:
         intro += " замени [то, что в скобках] на реальную деталь из анкеты."
@@ -540,7 +541,7 @@ async def handle_menu_button(message: Message, state: FSMContext, bot: Bot) -> N
     # elif message.text == BTN_LIVE:
     #     await _show_live_start(message)
     if message.text == BTN_UNIFIED:
-        await main._start_unified_reply(message, state)
+        await handlers.reply._start_unified_reply(message, state)
     elif message.text == BTN_DEEP:
         await _show_deep_analysis(message, bot)
     elif message.text == BTN_DATE:

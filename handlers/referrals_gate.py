@@ -394,9 +394,9 @@ async def _do_unlock_reveal(call: CallbackQuery, state: FSMContext, bot: Bot, ki
             if not (await state.get_data()).get("style_card"):
                 await call.message.answer(stale)
                 return "context_lost"
-            await main._process_reply_incoming(call.message, state, bot, replay["incoming"], user_id)
+            await handlers.reply._process_reply_incoming(call.message, state, bot, replay["incoming"], user_id)
         else:
-            await main._process_live_incoming(call.message, state, bot, replay["incoming"], user_id)
+            await handlers.reply._process_live_incoming(call.message, state, bot, replay["incoming"], user_id)
         return None
 
     action_id = replay["action_id"]
@@ -408,11 +408,11 @@ async def _do_unlock_reveal(call: CallbackQuery, state: FSMContext, bot: Bot, ki
         await call.message.answer(stale)
         return "context_lost"
     if replay["kind"] == "variants":
-        await main._run_variants_generation(
+        await handlers.reply._run_variants_generation(
             call.message, ctx, user_id, bot, action_id, state, force_fresh=replay["force_fresh"],
         )
     else:
-        await main._run_live_coach_step(call.message, ctx, user_id, bot, action_id, force_fresh=replay["force_fresh"])
+        await handlers.reply._run_live_coach_step(call.message, ctx, user_id, bot, action_id, force_fresh=replay["force_fresh"])
     return None
 
 
