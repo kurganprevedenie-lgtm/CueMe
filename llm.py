@@ -85,7 +85,7 @@ from config import (
     OPENROUTER_API_KEY,
     REPLY_STYLES,
     VARIANTS_GEMINI_MODELS,
-    VARIANTS_GROQ_MODEL,
+    VARIANTS_GROQ_MODELS,
     VARIANTS_GROQ_TIMEOUT,
     VARIANTS_REASONING_BUFFER,
     VARIANTS_REASONING_EFFORT,
@@ -237,6 +237,9 @@ _llm_attempt: contextvars.ContextVar[list] = contextvars.ContextVar("llm_attempt
 # рассуждения, таймаут) — выставляет _ask(..., fast=True), читает
 # GroqProvider._ask_with_key. Остальные провайдеры их не видят и не меняются.
 _llm_fast: contextvars.ContextVar[bool] = contextvars.ContextVar("llm_fast", default=False)
+# Какая модель ответила (выставляет провайдер, читает _ask для строки лога
+# «LLM [Groq gpt-oss-20b]: ok…»). None — провайдер модель не сообщил.
+_llm_served_model: contextvars.ContextVar[str | None] = contextvars.ContextVar("llm_served_model", default=None)
 
 
 # ── Проверка ответа модели (инцидент 2026-10-11) ─────────────────────────────
@@ -256,7 +259,12 @@ _REASONING_MARKERS = (
 # Обязательные маркеры по тегу вызова (_ask(..., tag=...)) — то, на что
 # опирается парсер ответа этой функции. Внутри кортежа — «любой из».
 _REQUIRED_MARKERS: dict[str, list[tuple[str, ...]]] = {
-    "ideal_date": [("💐",), ("===ПОДАРКИ===", "🎁")],
+    # Было [("💐",), ("===ПОДАРКИ===", "🎁")]: требовался 💐, который парсеру
+    # не нужен (заголовок добавляет main._format_ideal_date) — ложные
+    # отбраковки и алерты; и пропускался ответ с 🎁 без ===ПОДАРКИ===, после
+    # чего подарки выходили пустыми. Парсер делит только по ===ПОДАРКИ===.
+    # Непустоту обоих блоков дополнительно проверяет validate_llm_output.
+    "ideal_date": [("===ПОДАРКИ===",)],
     "variants": [("===ВАРИАНТ===",)],
     "live": [("===ВАРИАНТ===",)],
     "compat": [("ВЫВОД:",), ("ЧТО_ДАЛЬШЕ:",)],
@@ -289,7 +297,39 @@ def validate_llm_output(text: str, tag: str | None = None) -> str | None:
     for group in _REQUIRED_MARKERS.get(tag or "", []):
         if not any(g in t for g in group):
             return f"нет маркера {group[0]}"
+    if tag == "ideal_date":
+        date_idea, gift_ideas = _split_ideal_date(t)
+        if not date_idea:
+            return "пустой блок идеи свидания"
+        if not gift_ideas:
+            return "пустой блок подарков"
     return None
+
+
+# Заголовок, который модель могла написать сама в начале блока «Идеального
+# свидания» — строка целиком из заголовка (с необязательным двоеточием/тире;
+# у «Идеальное свидание» ещё и имя после тире). main.py добавляет свой
+# заголовок, иначе будет дубль. Строка с содержанием («Подарки: набор для
+# лепки») под шаблон не попадает и остаётся.
+_IDEAL_DATE_HEADER_RE = re.compile(
+    r"^\s*(?:💐|🎁)?\s*"
+    r"(?:идеальное свидание(?:\s*[—–-]\s*[^\n]{1,40})?|как порадовать|подарки|блок\s*\d)"
+    r"\s*[:.\-—–]?\s*$",
+    re.IGNORECASE,
+)
+
+
+def _strip_ideal_date_header(block: str) -> str:
+    lines = block.strip().split("\n")
+    while lines and (not lines[0].strip() or _IDEAL_DATE_HEADER_RE.match(lines[0])):
+        lines.pop(0)
+    return "\n".join(lines).strip()
+
+
+def _split_ideal_date(raw: str) -> tuple[str, str]:
+    """(идея свидания, идеи подарков) — по ===ПОДАРКИ===, без заголовков модели."""
+    parts = _split_by_markers(raw, [_ID_GIFTS])
+    return _strip_ideal_date_header(parts[0]), _strip_ideal_date_header(parts[1])
 
 
 def _ends_cleanly(text: str) -> bool:
@@ -614,16 +654,18 @@ class GroqProvider(LLMProvider):
     # отдельно проверяет пустой content и идёт к следующему провайдеру.
     _REASONING_BUFFER = 900
 
-    async def _ask_with_key(self, prompt: str, max_tokens: int, key: str) -> str:
+    async def _ask_with_key(self, prompt: str, max_tokens: int, key: str, model: str | None = None) -> str:
         # Было: всегда timeout=90, буфер _REASONING_BUFFER, без
         # reasoning_effort. Для «Ответа с CueMe» (_ask(..., fast=True)) —
         # reasoning_effort из VARIANTS_REASONING_EFFORT, меньший буфер и
         # таймаут: скорость важнее глубины, и меньше токенов — реже 429 по
         # токенному лимиту (см. config.py). Пустой effort — прежнее поведение.
         fast = _llm_fast.get() and bool(VARIANTS_REASONING_EFFORT)
-        # Модель для «Ответа с CueMe» — VARIANTS_GROQ_MODEL (своя, отдельно
-        # от reasoning_effort, чтобы откатывать независимо).
-        model = VARIANTS_GROQ_MODEL if (_llm_fast.get() and VARIANTS_GROQ_MODEL) else self._MODEL
+        # Модель выбирает ask() (для «Ответа с CueMe» — каскад
+        # VARIANTS_GROQ_MODELS) и передаёт сюда; без неё — основная _MODEL.
+        # Было: model = VARIANTS_GROQ_MODEL if fast else self._MODEL — одна
+        # модель для fast всегда.
+        model = model or self._MODEL
         payload = {
             "model": model,
             "messages": [{"role": "user", "content": prompt}],
@@ -644,10 +686,15 @@ class GroqProvider(LLMProvider):
         # ключ (та же логика, что у Gemini). Раньше на 429 ещё и спали 65с —
         # с появлением fallback/ротации это не нужно.
         if 400 <= resp.status_code < 500:
-            raise RateLimitError(
+            err = RateLimitError(
                 f"Groq ключ {_mask_key(key)}: HTTP {resp.status_code} — "
                 "невалиден, нет доступа или лимит."
             )
+            # Для каскада моделей (_ask_models): 429 — лимит этой модели на
+            # этом ключе, ставим кулдаун; прочие 4xx — проблема ключа.
+            err.status = resp.status_code
+            err.cooldown = _groq_429_cooldown(resp) if resp.status_code == 429 else None
+            raise err
 
         if resp.status_code in (500, 502, 503):
             raise ProviderError(f"Groq {resp.status_code}: {resp.text[:200]}")
@@ -664,11 +711,16 @@ class GroqProvider(LLMProvider):
         return _check_output(self.name, model, content)
 
     async def ask(self, prompt: str, max_tokens: int) -> str:
-        """Перебирает ключи Groq по кругу (мультиаккаунтинг), как GeminiProvider."""
+        """Перебирает ключи Groq по кругу (мультиаккаунтинг), как GeminiProvider.
+        «Ответ с CueMe» (fast) — каскад моделей VARIANTS_GROQ_MODELS, см.
+        _ask_models; остальные вызовы — одна модель _MODEL, как раньше."""
         keys = _groq_keys_rotated()
         if not keys:
             raise ProviderError("GROQ_API_KEY(S) не задан")
+        if _llm_fast.get():
+            return await self._ask_models(prompt, max_tokens, keys, VARIANTS_GROQ_MODELS or [self._MODEL])
 
+        _llm_served_model.set(self._MODEL)
         last_exc: Exception = RateLimitError("Ни один ключ Groq не сработал.")
         for i, key in enumerate(keys):
             try:
@@ -680,6 +732,86 @@ class GroqProvider(LLMProvider):
                                 e, i + 2, len(keys))
                 continue
         raise last_exc
+
+
+    async def _ask_models(self, prompt: str, max_tokens: int, keys: list[str], models: list[str]) -> str:
+        """Внешний цикл — модели по порядку, внутренний — ключи (ротация как в
+        ask). Пара (модель, ключ) в кулдауне пропускается без запроса. Модель
+        исчерпана, когда ни один ключ не сработал (все RateLimitError или в
+        кулдауне) — тогда следующая модель; исчерпаны все — RateLimitError
+        наружу, и _ask идёт к Gemini. 5xx/таймаут/пустой/обрыв — наружу сразу,
+        как раньше (к следующему провайдеру), кулдаун ставится только на 429."""
+        last_exc: Exception = RateLimitError("Все модели Groq на лимите.")
+        for mi, model in enumerate(models):
+            short = _short_model(model)
+            for key in keys:
+                if _groq_cooldown_left(model, key) > 0:
+                    continue
+                try:
+                    result = await self._ask_with_key(prompt, max_tokens, key, model)
+                except RateLimitError as e:
+                    last_exc = e
+                    if getattr(e, "status", None) == 429:
+                        _groq_cooldown[(model, key)] = _cooldown_clock() + e.cooldown
+                    _record_groq_model(short, "rate_limit")
+                    log.warning("Groq %s: %s — пробую следующий ключ", short, e)
+                    continue
+                _record_groq_model(short, "ok")
+                _llm_served_model.set(model)
+                return result
+            nxt = _short_model(models[mi + 1]) if mi + 1 < len(models) else "следующего провайдера"
+            log.warning("Groq: %s исчерпана, перехожу на %s", short, nxt)
+        raise last_exc
+
+
+# Кулдаун пар (модель, ключ) Groq после 429 — до какого момента (_cooldown_clock)
+# пропускаем без запроса. Было: кулдауна не было, и при исчерпанной модели
+# каждый запрос «Ответа с CueMe» зря бился во все ключи. In-memory, с рестарта.
+_groq_cooldown: dict[tuple[str, str], float] = {}
+_GROQ_COOLDOWN_DEFAULT = 60       # нет retry-after
+_GROQ_COOLDOWN_DAILY = 15 * 60    # суточный лимит — и потолок для любого кулдауна
+_cooldown_clock = time.monotonic  # отдельно, чтобы тесты подменяли время
+
+
+def _groq_cooldown_left(model: str, key: str) -> float:
+    return _groq_cooldown.get((model, key), 0) - _cooldown_clock()
+
+
+def _groq_429_cooldown(resp: "httpx.Response") -> float:
+    """Сколько секунд не трогать пару (модель, ключ) после 429: суточный лимит
+    («per day»/«RPD» в тексте) — 15 мин, иначе retry-after, иначе 60 с; не
+    больше 15 мин — чтобы основная модель регулярно пробовалась снова."""
+    body = (resp.text or "").lower()
+    if "per day" in body or "rpd" in body:
+        return _GROQ_COOLDOWN_DAILY
+    try:
+        seconds = float(resp.headers.get("retry-after", ""))
+    except ValueError:
+        seconds = _GROQ_COOLDOWN_DEFAULT
+    return min(max(seconds, 1.0), _GROQ_COOLDOWN_DAILY)
+
+
+def _short_model(model: str) -> str:
+    return model.rsplit("/", 1)[-1]
+
+
+# Счётчик по моделям Groq для «Ответа с CueMe» (/apistatus — доля 120b и 20b):
+# ok — ответила, rate_limit — 429/4xx на попытке. In-memory, с рестарта.
+_groq_model_stats: dict[str, dict[str, int]] = {}
+
+
+def _record_groq_model(short: str, outcome: str) -> None:
+    s = _groq_model_stats.setdefault(short, {"ok": 0, "rate_limit": 0})
+    s[outcome] += 1
+
+
+def get_groq_model_stats() -> dict[str, dict]:
+    """Модель → {"ok", "rate_limit", "cooldown_keys"} (сколько ключей сейчас в кулдауне)."""
+    out = {m: dict(s, cooldown_keys=0) for m, s in _groq_model_stats.items()}
+    for (model, key), until in _groq_cooldown.items():
+        if until > _cooldown_clock():
+            out.setdefault(_short_model(model), {"ok": 0, "rate_limit": 0, "cooldown_keys": 0})["cooldown_keys"] += 1
+    return out
 
 
 # ── Google Gemini ─────────────────────────────────────────────────────────────
@@ -1047,6 +1179,7 @@ async def _ask(
     _llm_call_tag.set(tag or "-")
     _llm_fast.set(fast)
     _llm_attempt.set([0])
+    _llm_served_model.set(None)
     last_exc: Exception = RuntimeError("Нет доступных LLM-провайдеров")
     chain = _ordered_providers()
 
@@ -1070,7 +1203,9 @@ async def _ask(
                 continue
             _record_stat(provider.name, "ok", elapsed)
             tag = "" if (not _forced and provider is chain[0]) else " (fallback)"
-            log.info("LLM [%s]: ok за %.0f мс%s", provider.name, elapsed, tag)
+            model = _llm_served_model.get()
+            who = f"{provider.name} {_short_model(model)}" if model else provider.name
+            log.info("LLM [%s]: ok за %.0f мс%s", who, elapsed, tag)
             return result
         except RateLimitError as e:
             elapsed = (time.monotonic() - t0) * 1000
@@ -4342,15 +4477,22 @@ async def build_ideal_date(
         "то, что есть.\n\n"
         "ФОРМАТ: короткие абзацы по 1-2 предложения, разделённые пустой строкой — "
         "НЕ сплошная простыня текста.\n\n"
-        "БЛОК 1 — Идея свидания (без маркера, первым):\n"
-        "💐 Идеальное свидание\n"
+        # Было: «БЛОК 1 — Идея свидания (без маркера, первым):» и сразу
+        # «💐 Идеальное свидание» / «🎁 Как порадовать» — модель путалась,
+        # писать ли заголовки; заголовки ставят main.py и build_ideal_date.
+        "СТРУКТУРА ОТВЕТА. БЛОК 1: сразу текст идеи свидания, без заголовка. "
+        f"Затем отдельной строкой ровно {_ID_GIFTS}. БЛОК 2: сразу идеи подарков, "
+        "без заголовка.\n"
+        "Пример структуры (слова-заглушки, их не повторяй):\n"
+        "<идея свидания, абзац 1>\n\n<идея свидания, абзац 2>\n"
+        f"{_ID_GIFTS}\n"
+        "<идея подарка 1>\n\n<идея подарка 2>\n\n"
+        "БЛОК 1 — что писать: "
         "ОДНА конкретная идея — куда пойти / что сделать, привязанная к тому, что "
         "реально упоминалось. 2-3 коротких предложения, не теория. Если нашлась "
         "зацепка — вплети коротко: «она упоминала [X], поэтому...» (род собеседника "
         "определи по переписке).\n\n"
-        f"Затем строка: {_ID_GIFTS}\n"
-        "БЛОК 2 — Подарки:\n"
-        "🎁 Как порадовать\n"
+        "БЛОК 2 — что писать: "
         "2-3 конкретные идеи подарка, каждая коротко и с привязкой к реальному "
         "упоминанию — не общая категория «цветы» без причины, а «судя по тому, что "
         "она говорила про [X] — зайдёт [Y]». Если зацепок нет — честно скажи и дай "
@@ -4359,7 +4501,15 @@ async def build_ideal_date(
     # Было max_tokens=650: у провайдеров без отдельного буфера под рассуждения
     # (Gemini) ответ обрывался. Groq к этому по-прежнему добавляет свой буфер.
     raw = await _ask(prompt, max_tokens=1200, tag="ideal_date")
-    parts = _split_by_markers(raw, [_ID_GIFTS])
-    return parts[0], parts[1]
+    # Заголовки, которые модель всё-таки написала, вырезаются. Пустой блок
+    # сюда дойти не должен — validate_llm_output отдаёт такой ответ
+    # следующей модели/провайдеру; здесь — вторая защита.
+    date_idea, gift_ideas = _split_ideal_date(raw)
+    if not date_idea or not gift_ideas:
+        raise ProviderError("ideal_date: пустой блок после разбора ответа")
+    # Заголовок подарков раньше писала сама модель («🎁 Как порадовать»), а
+    # main._format_ideal_date его не добавляет — ставим его здесь, чтобы
+    # блок подарков в сообщении не остался без заголовка.
+    return date_idea, f"🎁 Как порадовать\n\n{gift_ideas}"
 
 
