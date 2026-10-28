@@ -26,7 +26,7 @@ from storage import (
     set_acquisition_source,
 )
 from app_state import _contact_name, dp
-import main  # ссылки по модулю: имена ниже по исходному main.py / общее состояние
+import handlers  # ссылки по модулю: имена ниже по исходному main.py / общее состояние
 
 
 # ── Пол пользователя ─────────────────────────────────────────────────────────
@@ -142,7 +142,7 @@ async def cb_source_select(call: CallbackQuery, bot: Bot) -> None:
             except Exception:
                 pass
         else:
-            await main._finish_onboarding_chain(bot, call.message.chat.id, call.message.message_id)
+            await handlers.start_menu._finish_onboarding_chain(bot, call.message.chat.id, call.message.message_id)
 
 
 def _contact_words(user_gender: str | None) -> tuple[str, str]:

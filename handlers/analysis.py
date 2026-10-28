@@ -62,7 +62,7 @@ from handlers.subscription import (
 from handlers.redeem_menu import _with_back_to_menu
 from handlers.profile import contacts_kb
 from handlers.cards import _gen_interaction_card
-import main  # ссылки по модулю: имена ниже по исходному main.py / общее состояние
+import handlers  # ссылки по модулю: имена ниже по исходному main.py / общее состояние
 
 
 # ── 🔬 Анализ собеседника ─────────────────────────────────────────────────────
@@ -1067,7 +1067,7 @@ async def _show_deep_analysis(
     telegram_id = telegram_id or str(message.from_user.id)
     contacts = list_contacts(telegram_id)
     if not contacts:
-        await main._send_no_contacts_hint(message)
+        await handlers.start_menu._send_no_contacts_hint(message)
         return
 
     if len(contacts) == 1:
@@ -1303,7 +1303,7 @@ async def _show_ideal_date(
     telegram_id = telegram_id or str(message.from_user.id)
     contacts = list_contacts(telegram_id)
     if not contacts:
-        await main._send_no_contacts_hint(message)
+        await handlers.start_menu._send_no_contacts_hint(message)
         return
 
     if len(contacts) == 1:

@@ -733,7 +733,7 @@ def _funnel_reminder_content(stage: str, telegram_id: str, bond_contact: sqlite3
             "чатам — без этого он не видит переписку и не может подсказывать "
             "ответы. Подключается за минуту:"
         )
-        return text, main.business_connect_kb()
+        return text, handlers.start_menu.business_connect_kb()
 
     # Тексты стадий 'trial'/'bond' — HTML (<b>), шлются с parse_mode="HTML"
     # (_send_funnel_reminder). Текст 'connect' — plain, экранируется там же.
@@ -777,8 +777,8 @@ async def _send_funnel_reminder(
     текст напоминания. Остальные стадии — обычный текст с кнопкой."""
     text, kb = _funnel_reminder_content(stage, telegram_id, bond_contact)
     if stage == _FUNNEL_STAGE_CONNECT:
-        caption = f"{html.escape(text)}\n\n{await main._connect_steps_blockquote(bot)}"
-        await main._send_business_connect_prompt_to(bot, chat_id, caption, parse_mode="HTML")
+        caption = f"{html.escape(text)}\n\n{await handlers.start_menu._connect_steps_blockquote(bot)}"
+        await handlers.start_menu._send_business_connect_prompt_to(bot, chat_id, caption, parse_mode="HTML")
         return
     await bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=kb)
 
