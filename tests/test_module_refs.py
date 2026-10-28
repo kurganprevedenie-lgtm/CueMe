@@ -66,3 +66,11 @@ def test_module_refs_resolve():
             if not ok:
                 missing.append(f"{path.name}:{lineno} {'.'.join(chain)}")
     assert not missing, "не разрешаются: " + ", ".join(missing)
+
+
+def test_modules_do_not_reference_main():
+    """После полного разнесения ни один модуль не обращается к main.* — это
+    было временным мостом на промежуточных шагах."""
+    offenders = [f"{p.name}:{ln} {'.'.join(c)}" for p in _bot_module_files() for ln, c in _refs(p) if c[0] == "main"]
+    offenders += [p.name for p in _bot_module_files() if "\nimport main" in p.read_text(encoding="utf-8")]
+    assert not offenders, "ссылки на main: " + ", ".join(offenders)
