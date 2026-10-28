@@ -1,5 +1,6 @@
 """Проверка ответа модели (инцидент 2026-10-11: в «Идеальном свидании» юзер
 получил сырые рассуждения Gemma на английском вместо идеи)."""
+from tests.bot_patch import patch_bot
 import asyncio
 
 import httpx
@@ -107,11 +108,11 @@ def test_garbage_is_not_saved_to_ideal_date_cache(monkeypatch):
     async def no_card(*a, **k):
         return ""
 
-    monkeypatch.setattr(main, "build_ideal_date", failing_build)
-    monkeypatch.setattr(main, "_gen_interaction_card", no_card)
-    monkeypatch.setattr(main, "get_ideal_date", lambda cid: None)
-    monkeypatch.setattr(main, "_ideal_date_samples", lambda *a: {"contact_sample": ["x"] * 30, "my_sample": [], "features_summary": ""})
-    monkeypatch.setattr(main, "save_ideal_date", lambda *a: saved.append(a))
+    patch_bot(monkeypatch, "build_ideal_date", failing_build)
+    patch_bot(monkeypatch, "_gen_interaction_card", no_card)
+    patch_bot(monkeypatch, "get_ideal_date", lambda cid: None)
+    patch_bot(monkeypatch, "_ideal_date_samples", lambda *a: {"contact_sample": ["x"] * 30, "my_sample": [], "features_summary": ""})
+    patch_bot(monkeypatch, "save_ideal_date", lambda *a: saved.append(a))
     with pytest.raises(RuntimeError):
         asyncio.run(main._gen_ideal_date(1, "1"))
     assert saved == []

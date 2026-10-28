@@ -1,4 +1,5 @@
 """/users: срез отчёта по полу (переключатель «Все / Парни / Девушки»)."""
+from tests.bot_patch import patch_bot
 import asyncio
 import tempfile
 from pathlib import Path
@@ -22,7 +23,7 @@ def data(monkeypatch):
     monkeypatch.setattr(storage, "DB_PATH", Path(tempfile.mktemp(suffix=".db")))
     storage.init_db()
     import main
-    monkeypatch.setattr(main, "PREMIUM_CHANNEL_ID", "")
+    patch_bot(monkeypatch, "PREMIUM_CHANNEL_ID", "")
     main._premium_cache.clear()
     for tid, gender in [("1", "male"), ("2", "male"), ("3", "female"), ("4", None)]:
         storage.upsert_user(tid, f"user{tid}")

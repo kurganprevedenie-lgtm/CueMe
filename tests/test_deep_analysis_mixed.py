@@ -1,6 +1,7 @@
 """«Анализ собеседника» на контакте с двумя источниками (инцидент 2026-10-14:
 после загрузки JSON-экспорта поверх Business анализ падал TypeError —
 даты «с поясом» и «без пояса» вычитались друг из друга)."""
+from tests.bot_patch import patch_bot
 import asyncio
 import json
 import random
@@ -90,10 +91,10 @@ def test_tg_parser_text_entities_become_string():
 
 def _patch_gen(monkeypatch, interp):
     import main
-    monkeypatch.setattr(main, "build_compatibility_interpretation", interp)
-    monkeypatch.setattr(main, "get_gender", lambda tid: "male")
+    patch_bot(monkeypatch, "build_compatibility_interpretation", interp)
+    patch_bot(monkeypatch, "get_gender", lambda tid: "male")
     saved = []
-    monkeypatch.setattr(main, "save_deep_analysis", lambda *a: saved.append(a))
+    patch_bot(monkeypatch, "save_deep_analysis", lambda *a: saved.append(a))
     return main, saved
 
 
@@ -127,16 +128,16 @@ def test_degraded_result_does_not_charge_trial(db, monkeypatch):
 
     async def boom(*a, **k):
         raise RuntimeError("мусор от модели")
-    monkeypatch.setattr(main, "build_compatibility_interpretation", boom)
+    patch_bot(monkeypatch, "build_compatibility_interpretation", boom)
 
     async def prem(bot, tid):
         return False
-    monkeypatch.setattr(main, "_is_premium", prem)
+    patch_bot(monkeypatch, "_is_premium", prem)
     storage.add_analysis_trial_bonus("1", 3)
 
     async def passthrough(bot, chat_id, message_id, coro, **kw):
         return await coro
-    monkeypatch.setattr(main, "with_progress_animation", passthrough)
+    patch_bot(monkeypatch, "with_progress_animation", passthrough)
 
     class Msg:
         message_id = 1

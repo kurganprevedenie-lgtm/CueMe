@@ -3,6 +3,7 @@
 → main._send_deleted_content / _send_deleted_batch). Bot замокан — запросов
 в Telegram нет, проверяем, каким методом и с какими аргументами бот бы
 отправил."""
+from tests.bot_patch import patch_bot
 import asyncio
 from datetime import datetime, timezone
 
@@ -354,8 +355,8 @@ def _teaser(monkeypatch, ids):
 
     async def not_excluded(*a):
         return False
-    monkeypatch.setattr(main, "_is_premium", not_premium)
-    monkeypatch.setattr(main, "_deleted_messages_excluded", not_excluded)
+    patch_bot(monkeypatch, "_is_premium", not_premium)
+    patch_bot(monkeypatch, "_deleted_messages_excluded", not_excluded)
     bot = FakeBot()
     _run(main.handle_deleted_business_messages(_Deleted(ids), bot))
     return bot

@@ -1,4 +1,5 @@
 """/gift_premium: подарок N дней Premium (срок в stars_premium_until)."""
+from tests.bot_patch import patch_bot
 import asyncio
 import json
 import tempfile
@@ -20,8 +21,8 @@ def m(monkeypatch):
     storage.init_db()
     storage.upsert_user(USER, f"user{USER}")
     import main
-    monkeypatch.setattr(main, "ADMIN_TELEGRAM_IDS", {ADMIN})
-    monkeypatch.setattr(main, "PREMIUM_CHANNEL_ID", "")
+    patch_bot(monkeypatch, "ADMIN_TELEGRAM_IDS", {ADMIN})
+    patch_bot(monkeypatch, "PREMIUM_CHANNEL_ID", "")
     main._premium_cache.clear()
     main._pending_gifts.clear()
     return main
@@ -104,7 +105,7 @@ def test_gift_expiry_reminder_is_soft(m):
 
 
 def test_gift_reminder_skipped_for_channel_member(m, monkeypatch):
-    monkeypatch.setattr(m, "PREMIUM_CHANNEL_ID", "-100")
+    patch_bot(monkeypatch, "PREMIUM_CHANNEL_ID", "-100")
     _expire_soon(m)
     bot = _Bot(member=True)
     asyncio.run(m._check_premium_expiry_reminders(bot))

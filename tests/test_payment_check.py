@@ -1,5 +1,6 @@
 """Статус после оплаты Tribute: короткий отрицательный кэш, кнопка
 «✅ Я оплатил(а) — проверить», фоновая проверка, логи отброшенных событий."""
+from tests.bot_patch import patch_bot
 import asyncio
 import tempfile
 from pathlib import Path
@@ -18,15 +19,15 @@ def m(monkeypatch):
     storage.init_db()
     storage.upsert_user(USER, f"user{USER}")
     import main
-    monkeypatch.setattr(main, "PREMIUM_CHANNEL_ID", "-100")
-    monkeypatch.setattr(main, "PREMIUM_SUBSCRIBE_URL", "https://t.me/tribute/app?startapp=x")
-    monkeypatch.setattr(main, "PREMIUM_CACHE_TTL", 300)
-    monkeypatch.setattr(main, "PREMIUM_NEG_CACHE_TTL", 20)
+    patch_bot(monkeypatch, "PREMIUM_CHANNEL_ID", "-100")
+    patch_bot(monkeypatch, "PREMIUM_SUBSCRIBE_URL", "https://t.me/tribute/app?startapp=x")
+    patch_bot(monkeypatch, "PREMIUM_CACHE_TTL", 300)
+    patch_bot(monkeypatch, "PREMIUM_NEG_CACHE_TTL", 20)
     main._premium_cache.clear()
     main._check_payment_last.clear()
     main._payment_watches.clear()
     clock = {"t": 1000.0}
-    monkeypatch.setattr(main, "_premium_clock", lambda: clock["t"])
+    patch_bot(monkeypatch, "_premium_clock", lambda: clock["t"])
     main._clock = clock
     return main
 
@@ -135,8 +136,8 @@ def test_check_payment_antispam(m):
 
 
 def test_payment_watch_confirms_once_and_cleans_up(m, monkeypatch):
-    monkeypatch.setattr(m, "_PAYMENT_WATCH_INTERVAL", 0.01)
-    monkeypatch.setattr(m, "_PAYMENT_WATCH_DURATION", 0.05)
+    patch_bot(monkeypatch, "_PAYMENT_WATCH_INTERVAL", 0.01)
+    patch_bot(monkeypatch, "_PAYMENT_WATCH_DURATION", 0.05)
     bot = _Bot(member=False)
 
     async def run():
@@ -153,8 +154,8 @@ def test_payment_watch_confirms_once_and_cleans_up(m, monkeypatch):
 
 
 def test_payment_watch_gives_up_after_duration(m, monkeypatch):
-    monkeypatch.setattr(m, "_PAYMENT_WATCH_INTERVAL", 0.01)
-    monkeypatch.setattr(m, "_PAYMENT_WATCH_DURATION", 0.03)
+    patch_bot(monkeypatch, "_PAYMENT_WATCH_INTERVAL", 0.01)
+    patch_bot(monkeypatch, "_PAYMENT_WATCH_DURATION", 0.03)
     bot = _Bot(member=False)
 
     async def run():
@@ -165,7 +166,7 @@ def test_payment_watch_gives_up_after_duration(m, monkeypatch):
 
 
 def test_foreign_channel_event_logs_warning(m, monkeypatch, caplog):
-    monkeypatch.setattr(m, "TRIBUTE_CHANNEL_ID", "111")
+    patch_bot(monkeypatch, "TRIBUTE_CHANNEL_ID", "111")
     with caplog.at_level("WARNING"):
         asyncio.run(m._handle_tribute_subscription_event(_Bot(), "new_subscription", {"channel_id": 999}))
     assert "для другого канала channel_id=999" in caplog.text
