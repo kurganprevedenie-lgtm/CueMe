@@ -38,6 +38,7 @@ from storage import (
     record_event,
 )
 from app_state import dp
+import handlers  # ссылки по модулю: имена ниже по исходному main.py / общее состояние
 import main  # ссылки по модулю: имена ниже по исходному main.py / общее состояние
 
 
@@ -71,9 +72,9 @@ async def _is_premium(bot: Bot, telegram_id: str) -> bool:
     #     return True
     # if _has_promo_channel_premium(telegram_id):
     #     return True
-    if main._has_stars_premium(telegram_id):
+    if handlers.referrals_gate._has_stars_premium(telegram_id):
         return True
-    if main._has_tribute_webhook_premium(telegram_id):
+    if handlers.referrals_gate._has_tribute_webhook_premium(telegram_id):
         return True
     if not PREMIUM_CHANNEL_ID:
         return False
