@@ -67,7 +67,7 @@ from handlers.profile import (
     _msg_meta,
 )
 from handlers.cards import _maybe_rebuild, _refresh_samples, _should_refresh_samples
-import main  # ссылки по модулю: имена ниже по исходному main.py / общее состояние
+import handlers  # ссылки по модулю: имена ниже по исходному main.py / общее состояние
 
 
 # ── Business API ──────────────────────────────────────────────────────────────
@@ -1250,7 +1250,7 @@ async def cb_deleted_reveal_premium(call: CallbackQuery, bot: Bot) -> None:
     """Экран подписки с тизера удалённого — НОВЫМ сообщением (edit=False),
     чтобы тизер с кнопкой «👀 Показать» не затёрся (см. _deleted_teaser_kb)."""
     await call.answer()
-    await main._show_premium_screen(call.message, bot, str(call.from_user.id), edit=False)
+    await handlers.premium_screen._show_premium_screen(call.message, bot, str(call.from_user.id), edit=False)
 
 
 async def _offer_pending_reveals(bot: Bot, telegram_id: str) -> None:

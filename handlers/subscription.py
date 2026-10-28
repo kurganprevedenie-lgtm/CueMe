@@ -39,7 +39,6 @@ from storage import (
 )
 from app_state import dp
 import handlers  # ссылки по модулю: имена ниже по исходному main.py / общее состояние
-import main  # ссылки по модулю: имена ниже по исходному main.py / общее состояние
 
 
 # ── Подписка (Tribute) ──────────────────────────────────────────────────────
@@ -174,7 +173,7 @@ def _premium_until_known(telegram_id: str) -> datetime | None:
 
 async def _confirm_premium_active(bot: Bot, telegram_id: str) -> None:
     until = _premium_until_known(telegram_id)
-    text = f"🎉 Premium активен до {main._format_until(until)}." if until else "🎉 Premium активен!"
+    text = f"🎉 Premium активен до {handlers.premium_screen._format_until(until)}." if until else "🎉 Premium активен!"
     await bot.send_message(int(telegram_id), text)
     await handlers.business._offer_pending_reveals(bot, telegram_id)
 

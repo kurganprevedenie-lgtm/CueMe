@@ -53,7 +53,7 @@ from storage import (
 from app_state import _answer_long, _is_admin, dp
 from handlers.subscription import _is_premium
 from handlers.profile import _GENDER_LABELS, _action_label
-import main  # ссылки по модулю: имена ниже по исходному main.py / общее состояние
+import handlers  # ссылки по модулю: имена ниже по исходному main.py / общее состояние
 
 
 # ── /users — список всех пользователей + сводка (только для админа) ─────────
@@ -287,7 +287,7 @@ async def _collect_users_data(bot: Bot) -> tuple[list[dict], dict]:
         premium_until: datetime | None = None
         premium_is_subscription = False
         if is_premium_now:
-            premium_source, premium_until, premium_is_subscription = main._premium_expiry_info(tid)
+            premium_source, premium_until, premium_is_subscription = handlers.premium_screen._premium_expiry_info(tid)
             totals["premium_now"] += 1
             source_bucket["premium"] += 1
             totals["premium_by_source"][premium_source] = (
@@ -299,7 +299,7 @@ async def _collect_users_data(bot: Bot) -> tuple[list[dict], dict]:
             premium_source = "нет"
 
         premium_remaining = (
-            main._format_remaining(premium_until - now) if premium_until else ""
+            handlers.premium_screen._format_remaining(premium_until - now) if premium_until else ""
         )
         premium_line = ""
         if is_premium_now:

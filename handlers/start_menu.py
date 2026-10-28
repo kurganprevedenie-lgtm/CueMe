@@ -75,7 +75,6 @@ from handlers.profile import (
 from handlers.cards import Setup, _gen_interaction_card, _gen_style_card
 from handlers.analysis import _show_deep_analysis, _show_ideal_date
 import handlers  # ссылки по модулю: имена ниже по исходному main.py / общее состояние
-import main  # ссылки по модулю: имена ниже по исходному main.py / общее состояние
 
 
 # ── /start ────────────────────────────────────────────────────────────────────
@@ -547,7 +546,7 @@ async def handle_menu_button(message: Message, state: FSMContext, bot: Bot) -> N
     elif message.text == BTN_DATE:
         await _show_ideal_date(message, bot)
     elif message.text == BTN_SUBSCRIPTION:
-        await main._show_premium_screen(message, bot, str(message.from_user.id))
+        await handlers.premium_screen._show_premium_screen(message, bot, str(message.from_user.id))
     elif message.text == BTN_HELP:
         await handlers.service_cmds._show_help(message)
     elif message.text == BTN_SUPPORT:

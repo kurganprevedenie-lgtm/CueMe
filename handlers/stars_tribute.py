@@ -53,7 +53,6 @@ from storage import (
 from app_state import dp
 from handlers.subscription import stars_tariff_kb
 import handlers  # ссылки по модулю: имена ниже по исходному main.py / общее состояние
-import main  # ссылки по модулю: имена ниже по исходному main.py / общее состояние
 
 
 # ── Stars-подписка (Telegram Stars, XTR) ──────────────────────────────────────
@@ -87,7 +86,7 @@ async def cb_stars_menu(call: CallbackQuery) -> None:
 @dp.callback_query(F.data == "stars_back")
 async def cb_stars_back(call: CallbackQuery, bot: Bot) -> None:
     await call.answer()
-    await main._show_premium_screen(call.message, bot, str(call.from_user.id), edit=True)
+    await handlers.premium_screen._show_premium_screen(call.message, bot, str(call.from_user.id), edit=True)
 
 
 @dp.callback_query(F.data.startswith("stars_buy:"))

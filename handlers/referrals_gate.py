@@ -74,7 +74,6 @@ from app_state import (
 )
 from handlers.subscription import _gen_outcome, _is_premium, _record_gate_event
 import handlers  # ссылки по модулю: имена ниже по исходному main.py / общее состояние
-import main  # ссылки по модулю: имена ниже по исходному main.py / общее состояние
 
 
 # ── Реферальная программа ─────────────────────────────────────────────────────
@@ -836,7 +835,7 @@ async def _check_premium_expiry_reminders(bot: Bot) -> None:
     window_lo, window_hi = now + _PREMIUM_EXPIRY_REMINDER_WINDOW[0], now + _PREMIUM_EXPIRY_REMINDER_WINDOW[1]
 
     for telegram_id in get_users_with_known_premium_expiry():
-        source, until, is_subscription = main._premium_expiry_info(telegram_id)
+        source, until, is_subscription = handlers.premium_screen._premium_expiry_info(telegram_id)
         if until is None:
             continue
         if not (window_lo <= until < window_hi):
@@ -848,7 +847,7 @@ async def _check_premium_expiry_reminders(bot: Bot) -> None:
             continue  # Stars-подписка автопродлевается сама — не напоминаем
         if source == "gift" and await _in_premium_channel(bot, telegram_id):
             continue  # подарок поверх Tribute без известной даты — доступ не кончается
-        text, kb = _premium_expiry_reminder_content(main._format_remaining(until - now), gift=source == "gift")
+        text, kb = _premium_expiry_reminder_content(handlers.premium_screen._format_remaining(until - now), gift=source == "gift")
 
         try:
             await bot.send_message(int(telegram_id), text, reply_markup=kb)
@@ -1055,7 +1054,7 @@ async def cmd_test_reminders(message: Message) -> None:
         await _send_funnel_reminder(message.bot, message.chat.id, stage, telegram_id, contact)
 
     await message.answer("— 4/4 · Истечение Premium —")
-    text, kb = _premium_expiry_reminder_content(main._format_remaining(timedelta(hours=30)))
+    text, kb = _premium_expiry_reminder_content(handlers.premium_screen._format_remaining(timedelta(hours=30)))
     await message.answer(text, reply_markup=kb)
 
 
