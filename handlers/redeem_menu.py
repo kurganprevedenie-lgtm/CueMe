@@ -42,7 +42,6 @@ from app_state import (
     dp,
 )
 import handlers  # ссылки по модулю: имена ниже по исходному main.py / общее состояние
-import main  # ссылки по модулю: имена ниже по исходному main.py / общее состояние
 
 
 class ReferralRedeem(StatesGroup):
@@ -256,7 +255,7 @@ async def cb_main_menu_action(call: CallbackQuery, state: FSMContext, bot: Bot) 
     elif action == "date":
         await handlers.analysis._show_ideal_date(await _menu_screen_target(call.message), bot, telegram_id, edit=True)
     elif action == "support":
-        await main._show_help(await _menu_screen_target(call.message), edit=True)
+        await handlers.service_cmds._show_help(await _menu_screen_target(call.message), edit=True)
 
 
 _BACK_TO_MENU_BUTTON = InlineKeyboardButton(text="⬅️ Вернуться в меню", callback_data="back_to_menu")

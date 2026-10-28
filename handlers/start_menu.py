@@ -549,9 +549,9 @@ async def handle_menu_button(message: Message, state: FSMContext, bot: Bot) -> N
     elif message.text == BTN_SUBSCRIPTION:
         await main._show_premium_screen(message, bot, str(message.from_user.id))
     elif message.text == BTN_HELP:
-        await main._show_help(message)
+        await handlers.service_cmds._show_help(message)
     elif message.text == BTN_SUPPORT:
-        await main._show_help(message)
+        await handlers.service_cmds._show_help(message)
 
 
 @dp.callback_query(F.data.startswith("menu:"))
