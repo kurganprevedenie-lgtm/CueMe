@@ -226,7 +226,24 @@ saved_ephemeral(connection_id, chat_ref, tg_message_id, saved_at,
 
 ## Файлы проекта
 
-- `main.py` — aiogram-хендлеры, FSM, вся логика бота
+- `main.py` — только точка входа (`py -3.13 main.py`): импортирует модули
+  бота **в фиксированном порядке** (= порядок регистрации хендлеров, aiogram
+  берёт первый подходящий) и запускает polling. Реэкспортирует все имена
+  модулей для `import main` в тестах и ops-скриптах.
+- `app_state.py` — инфраструктура: все импорты, `dp`, устойчивость к
+  задержкам, обработчик ошибок, индикатор ожидания LLM, общее состояние.
+- `handlers/*.py` — логика бота, разнесена 2026-10-28 по **непрерывным кускам**
+  исходного main.py (не по темам — иначе меняется порядок хендлеров):
+  subscription, referrals_gate, stars_tribute, admin_broadcast, redeem_menu,
+  profile, cards (FSM + карточки), analysis, business, start_menu,
+  admin_tools, reply, service_cmds, premium_screen, watch_delete, admin_users.
+  Имя из модуля выше — `from handlers.x import имя`; из модуля НИЖЕ —
+  только `handlers.x.имя()` в теле функции (импортировать модуль заранее
+  нельзя: он зарегистрирует свои хендлеры не в свою очередь). Порядок
+  стережёт `tests/test_handler_registry.py` (эталон
+  `tests/fixtures/handler_registry.json`), ссылки — `tests/test_module_refs.py`.
+  В тестах подменять через `tests/bot_patch.patch_bot` (во всех модулях, где
+  есть имя), а не `monkeypatch.setattr(main, …)`.
 - `storage.py` — SQLite, все таблицы и функции работы с БД
 - `llm.py` — вызовы Groq через httpx (trust_env=False)
 - `features.py` — локальные признаки переписки без LLM
@@ -409,3 +426,23 @@ Tribute (10% комиссия):
 ## Репозиторий
 
 https://github.com/kurganprevedenie-lgtm/CueMe
+## Отдельные задачи: риски порядка хендлеров (найдены при рефакторинге 2026-10-28)
+
+Поведение сейчас именно такое — при рефакторинге сохранено намеренно, чинить
+отдельно (любая правка — новый эталон `tests/fixtures/handler_registry.json`):
+
+1. **Оплата Stars против «жду имя».** `process_stars_successful_payment`
+   (`handlers/stars_tribute.py`) зарегистрирован раньше `handle_unified_name` /
+   `handle_live_name` (`handlers/reply.py`) — сейчас это правильно. Опасность:
+   если порядок модулей поменять, сообщение об оплате в состоянии «жду имя»
+   уйдёт в обработчик имени и оплата не зачтётся. Надёжнее — фильтр «не
+   служебное сообщение» у обработчиков имени.
+2. **`/help` и другие команды в состоянии «жду имя».** `handle_unified_name` и
+   `handle_live_name` без фильтра «не команда» стоят раньше `/help`, `/delete`,
+   `/premium`, `/rebuild`, `/progress`, `/inspect`, `/wipe`, `/gift_premium` —
+   в этом состоянии такая команда воспринимается как имя собеседника. `/start`
+   и кнопки меню стоят раньше и срабатывают.
+3. **`handle_redeem_code` раньше `/start`.** Хендлер ввода реферального кода
+   (`handlers/redeem_menu.py`, состояние `ReferralRedeem.waiting_for_code`) без
+   фильтра «не команда» зарегистрирован раньше `/start`, `/menu`, кнопок
+   меню — в этом состоянии они воспринимаются как код.
