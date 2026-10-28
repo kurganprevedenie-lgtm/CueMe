@@ -41,6 +41,7 @@ from app_state import (
     _PROGRESS_FRAMES,
     dp,
 )
+import handlers  # ссылки по модулю: имена ниже по исходному main.py / общее состояние
 import main  # ссылки по модулю: имена ниже по исходному main.py / общее состояние
 
 
@@ -251,9 +252,9 @@ async def cb_main_menu_action(call: CallbackQuery, state: FSMContext, bot: Bot) 
     if action == "unified":
         await main._start_unified_reply(call.message, state)
     elif action == "deep":
-        await main._show_deep_analysis(await _menu_screen_target(call.message), bot, telegram_id, edit=True)
+        await handlers.analysis._show_deep_analysis(await _menu_screen_target(call.message), bot, telegram_id, edit=True)
     elif action == "date":
-        await main._show_ideal_date(await _menu_screen_target(call.message), bot, telegram_id, edit=True)
+        await handlers.analysis._show_ideal_date(await _menu_screen_target(call.message), bot, telegram_id, edit=True)
     elif action == "support":
         await main._show_help(await _menu_screen_target(call.message), edit=True)
 

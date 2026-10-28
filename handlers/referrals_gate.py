@@ -73,6 +73,7 @@ from app_state import (
     dp,
 )
 from handlers.subscription import _gen_outcome, _is_premium, _record_gate_event
+import handlers  # ссылки по модулю: имена ниже по исходному main.py / общее состояние
 import main  # ссылки по модулю: имена ниже по исходному main.py / общее состояние
 
 
@@ -367,10 +368,10 @@ async def _do_unlock_reveal(call: CallbackQuery, state: FSMContext, bot: Bot, ki
     user_id = call.from_user.id
     telegram_id = str(user_id)
     if kind == "analysis":
-        await main._run_deep_analysis(bot, call.message, telegram_id, int(ref), edit=True)
+        await handlers.analysis._run_deep_analysis(bot, call.message, telegram_id, int(ref), edit=True)
         return None
     if kind == "date":
-        await main._run_ideal_date(bot, call.message, telegram_id, int(ref), edit=True)
+        await handlers.analysis._run_ideal_date(bot, call.message, telegram_id, int(ref), edit=True)
         return None
 
     replay = await asyncio.to_thread(get_pending_unlock, telegram_id)
