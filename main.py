@@ -19,6 +19,25 @@ import handlers.premium_screen  # noqa: E402
 import handlers.watch_delete  # noqa: E402
 import handlers.admin_users  # noqa: E402
 
+# Имена, которые нужны самому коду запуска ниже, — явно (проверяемо pyflakes,
+# а не только через реэкспорт).
+import asyncio  # noqa: E402
+import json  # noqa: E402
+import logging  # noqa: E402
+import time  # noqa: E402
+
+from aiogram import Bot  # noqa: E402
+from aiogram.types import BotCommand  # noqa: E402
+
+from config import (  # noqa: E402
+    ADMIN_GROUP_CHAT_ID, BOT_TOKEN, GEMINI_API_KEY, GROQ_API_KEY, OPENROUTER_API_KEY,
+)
+from llm import get_invalid_output_counts, set_invalid_output_hook  # noqa: E402
+from storage import init_db, record_event  # noqa: E402
+from app_state import _watch_event_loop_lag, dp  # noqa: E402
+from handlers.referrals_gate import _reconcile_promo_channel_premium  # noqa: E402
+from handlers.stars_tribute import _start_tribute_webhook_server  # noqa: E402
+
 # Обратная совместимость: main.<имя> для тестов и ops-скриптов (import main).
 # Подменять в тестах надо там, где имя вызывается, — в его модуле.
 for _m in (app_state, handlers.subscription, handlers.referrals_gate, handlers.stars_tribute, handlers.admin_broadcast, handlers.redeem_menu, handlers.profile, handlers.cards, handlers.analysis, handlers.business, handlers.start_menu, handlers.admin_tools, handlers.reply, handlers.service_cmds, handlers.premium_screen, handlers.watch_delete, handlers.admin_users,):
