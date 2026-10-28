@@ -1,0 +1,773 @@
+[
+ {
+  "event": "message",
+  "callback": "cmd_funnel_status",
+  "filters": [
+   "Command(commands=['funnel_status'], ignore_case=False, ignore_mention=False, magic=None, prefix='/')"
+  ]
+ },
+ {
+  "event": "message",
+  "callback": "cmd_test_reminders",
+  "filters": [
+   "Command(commands=['test_reminders'], ignore_case=False, ignore_mention=False, magic=None, prefix='/')"
+  ]
+ },
+ {
+  "event": "message",
+  "callback": "process_stars_successful_payment",
+  "filters": [
+   "F.GetAttributeOperation(name='successful_payment')"
+  ]
+ },
+ {
+  "event": "message",
+  "callback": "cmd_invite",
+  "filters": [
+   "Command(commands=['invite'], ignore_case=False, ignore_mention=False, magic=None, prefix='/')"
+  ]
+ },
+ {
+  "event": "message",
+  "callback": "cmd_broadcast_invite",
+  "filters": [
+   "Command(commands=['broadcast_invite'], ignore_case=False, ignore_mention=False, magic=None, prefix='/')"
+  ]
+ },
+ {
+  "event": "message",
+  "callback": "cmd_broadcast_price_drop",
+  "filters": [
+   "Command(commands=['broadcast_price_drop'], ignore_case=False, ignore_mention=False, magic=None, prefix='/')"
+  ]
+ },
+ {
+  "event": "message",
+  "callback": "cmd_broadcast_deleted_messages",
+  "filters": [
+   "Command(commands=['broadcast_deleted_messages'], ignore_case=False, ignore_mention=False, magic=None, prefix='/')"
+  ]
+ },
+ {
+  "event": "message",
+  "callback": "cmd_broadcast_deleted_paywall",
+  "filters": [
+   "Command(commands=['broadcast_deleted_paywall'], ignore_case=False, ignore_mention=False, magic=None, prefix='/')"
+  ]
+ },
+ {
+  "event": "message",
+  "callback": "cmd_broadcast_admin",
+  "filters": [
+   "Command(commands=['broadcast_admin'], ignore_case=False, ignore_mention=False, magic=None, prefix='/')"
+  ]
+ },
+ {
+  "event": "message",
+  "callback": "cmd_redeem",
+  "filters": [
+   "Command(commands=['redeem'], ignore_case=False, ignore_mention=False, magic=None, prefix='/')"
+  ]
+ },
+ {
+  "event": "message",
+  "callback": "handle_redeem_code",
+  "filters": [
+   "State(state='waiting_for_code', group_name=None, group=ReferralRedeem)"
+  ]
+ },
+ {
+  "event": "message",
+  "callback": "cmd_myref",
+  "filters": [
+   "Command(commands=['myref'], ignore_case=False, ignore_mention=False, magic=None, prefix='/')"
+  ]
+ },
+ {
+  "event": "message",
+  "callback": "cmd_menu",
+  "filters": [
+   "Command(commands=['menu'], ignore_case=False, ignore_mention=False, magic=None, prefix='/')"
+  ]
+ },
+ {
+  "event": "message",
+  "callback": "cmd_deep_analysis",
+  "filters": [
+   "Command(commands=['deep_analysis'], ignore_case=False, ignore_mention=False, magic=None, prefix='/')"
+  ]
+ },
+ {
+  "event": "message",
+  "callback": "handle_photo",
+  "filters": [
+   "F.GetAttributeOperation(name='photo')"
+  ]
+ },
+ {
+  "event": "message",
+  "callback": "cmd_start",
+  "filters": [
+   "CommandStart(commands=['start'], ignore_case=False, ignore_mention=False, magic=None, prefix='/')"
+  ]
+ },
+ {
+  "event": "message",
+  "callback": "cmd_gender",
+  "filters": [
+   "Command(commands=['gender'], ignore_case=False, ignore_mention=False, magic=None, prefix='/')"
+  ]
+ },
+ {
+  "event": "message",
+  "callback": "handle_menu_button",
+  "filters": [
+   "F.GetAttributeOperation(name='text').FunctionOperation(function=in_op, args=[['❓ Помощь', '🆘 Помощь', '👑 Подписка', '💐 Идеальное свидание', '💬 Ответ с CueMe', '🔬 Анализ собеседника']], kwargs=dict())"
+  ]
+ },
+ {
+  "event": "message",
+  "callback": "handle_document",
+  "filters": [
+   "F.GetAttributeOperation(name='document')"
+  ]
+ },
+ {
+  "event": "message",
+  "callback": "cmd_connect",
+  "filters": [
+   "Command(commands=['connect'], ignore_case=False, ignore_mention=False, magic=None, prefix='/')"
+  ]
+ },
+ {
+  "event": "message",
+  "callback": "cmd_users",
+  "filters": [
+   "Command(commands=['users'], ignore_case=False, ignore_mention=False, magic=None, prefix='/')"
+  ]
+ },
+ {
+  "event": "message",
+  "callback": "cmd_sources",
+  "filters": [
+   "Command(commands=['sources'], ignore_case=False, ignore_mention=False, magic=None, prefix='/')"
+  ]
+ },
+ {
+  "event": "message",
+  "callback": "cmd_suggestion_stats",
+  "filters": [
+   "Command(commands=['suggestion_stats'], ignore_case=False, ignore_mention=False, magic=None, prefix='/')"
+  ]
+ },
+ {
+  "event": "message",
+  "callback": "cmd_export",
+  "filters": [
+   "Command(commands=['export'], ignore_case=False, ignore_mention=False, magic=None, prefix='/')"
+  ]
+ },
+ {
+  "event": "message",
+  "callback": "cmd_provider",
+  "filters": [
+   "Command(commands=['provider'], ignore_case=False, ignore_mention=False, magic=None, prefix='/')"
+  ]
+ },
+ {
+  "event": "message",
+  "callback": "cmd_apistatus",
+  "filters": [
+   "Command(commands=['apistatus'], ignore_case=False, ignore_mention=False, magic=None, prefix='/')"
+  ]
+ },
+ {
+  "event": "message",
+  "callback": "cmd_contacts",
+  "filters": [
+   "Command(commands=['contacts'], ignore_case=False, ignore_mention=False, magic=None, prefix='/')"
+  ]
+ },
+ {
+  "event": "message",
+  "callback": "handle_unified_input",
+  "filters": [
+   "State(state='waiting_for_input', group_name=None, group=UnifiedReply)",
+   "_not_command"
+  ]
+ },
+ {
+  "event": "message",
+  "callback": "handle_unified_name",
+  "filters": [
+   "State(state='waiting_for_name', group_name=None, group=UnifiedReply)"
+  ]
+ },
+ {
+  "event": "message",
+  "callback": "handle_incoming",
+  "filters": [
+   "State(state='waiting_for_incoming', group_name=None, group=ReplyHelp)",
+   "_not_command"
+  ]
+ },
+ {
+  "event": "message",
+  "callback": "cmd_reply",
+  "filters": [
+   "Command(commands=['reply'], ignore_case=False, ignore_mention=False, magic=None, prefix='/')"
+  ]
+ },
+ {
+  "event": "message",
+  "callback": "handle_live_name",
+  "filters": [
+   "State(state='waiting_for_name', group_name=None, group=LiveDialogue)"
+  ]
+ },
+ {
+  "event": "message",
+  "callback": "handle_live_incoming",
+  "filters": [
+   "State(state='waiting_for_incoming', group_name=None, group=LiveDialogue)",
+   "_not_command"
+  ]
+ },
+ {
+  "event": "message",
+  "callback": "cmd_rebuild",
+  "filters": [
+   "Command(commands=['rebuild'], ignore_case=False, ignore_mention=False, magic=None, prefix='/')"
+  ]
+ },
+ {
+  "event": "message",
+  "callback": "cmd_progress",
+  "filters": [
+   "Command(commands=['progress'], ignore_case=False, ignore_mention=False, magic=None, prefix='/')"
+  ]
+ },
+ {
+  "event": "message",
+  "callback": "cmd_help",
+  "filters": [
+   "Command(commands=['help'], ignore_case=False, ignore_mention=False, magic=None, prefix='/')"
+  ]
+ },
+ {
+  "event": "message",
+  "callback": "cmd_premium",
+  "filters": [
+   "Command(commands=['premium'], ignore_case=False, ignore_mention=False, magic=None, prefix='/')"
+  ]
+ },
+ {
+  "event": "message",
+  "callback": "cmd_delete",
+  "filters": [
+   "Command(commands=['delete'], ignore_case=False, ignore_mention=False, magic=None, prefix='/')"
+  ]
+ },
+ {
+  "event": "message",
+  "callback": "cmd_inspect",
+  "filters": [
+   "Command(commands=['inspect'], ignore_case=False, ignore_mention=False, magic=None, prefix='/')"
+  ]
+ },
+ {
+  "event": "message",
+  "callback": "cmd_wipe",
+  "filters": [
+   "Command(commands=['wipe'], ignore_case=False, ignore_mention=False, magic=None, prefix='/')"
+  ]
+ },
+ {
+  "event": "message",
+  "callback": "cmd_gift_premium",
+  "filters": [
+   "Command(commands=['gift_premium'], ignore_case=False, ignore_mention=False, magic=None, prefix='/')"
+  ]
+ },
+ {
+  "event": "callback_query",
+  "callback": "cb_check_payment",
+  "filters": [
+   "F.GetAttributeOperation(name='data').ComparatorOperation(right='check_payment', comparator=eq)"
+  ]
+ },
+ {
+  "event": "callback_query",
+  "callback": "cb_promo_offer",
+  "filters": [
+   "F.GetAttributeOperation(name='data').ComparatorOperation(right='promo:offer', comparator=eq)"
+  ]
+ },
+ {
+  "event": "callback_query",
+  "callback": "cb_promo_check",
+  "filters": [
+   "F.GetAttributeOperation(name='data').ComparatorOperation(right='promo:check', comparator=eq)"
+  ]
+ },
+ {
+  "event": "callback_query",
+  "callback": "cb_unlock_check",
+  "filters": [
+   "F.GetAttributeOperation(name='data').GetAttributeOperation(name='startswith').CallOperation(args=['unlock:check:'], kwargs=dict())"
+  ]
+ },
+ {
+  "event": "callback_query",
+  "callback": "cb_unlock_reveal",
+  "filters": [
+   "F.GetAttributeOperation(name='data').GetAttributeOperation(name='startswith').CallOperation(args=['unlock:reveal:'], kwargs=dict())"
+  ]
+ },
+ {
+  "event": "callback_query",
+  "callback": "cb_stars_menu",
+  "filters": [
+   "F.GetAttributeOperation(name='data').ComparatorOperation(right='stars_menu', comparator=eq)"
+  ]
+ },
+ {
+  "event": "callback_query",
+  "callback": "cb_stars_back",
+  "filters": [
+   "F.GetAttributeOperation(name='data').ComparatorOperation(right='stars_back', comparator=eq)"
+  ]
+ },
+ {
+  "event": "callback_query",
+  "callback": "cb_stars_buy",
+  "filters": [
+   "F.GetAttributeOperation(name='data').GetAttributeOperation(name='startswith').CallOperation(args=['stars_buy:'], kwargs=dict())"
+  ]
+ },
+ {
+  "event": "callback_query",
+  "callback": "cb_broadcast_invite_confirm",
+  "filters": [
+   "F.GetAttributeOperation(name='data').ComparatorOperation(right='bcast:invite:confirm', comparator=eq)"
+  ]
+ },
+ {
+  "event": "callback_query",
+  "callback": "cb_broadcast_invite_cancel",
+  "filters": [
+   "F.GetAttributeOperation(name='data').ComparatorOperation(right='bcast:invite:cancel', comparator=eq)"
+  ]
+ },
+ {
+  "event": "callback_query",
+  "callback": "cb_broadcast_price_drop_confirm",
+  "filters": [
+   "F.GetAttributeOperation(name='data').ComparatorOperation(right='bcast:price_drop:confirm', comparator=eq)"
+  ]
+ },
+ {
+  "event": "callback_query",
+  "callback": "cb_broadcast_price_drop_cancel",
+  "filters": [
+   "F.GetAttributeOperation(name='data').ComparatorOperation(right='bcast:price_drop:cancel', comparator=eq)"
+  ]
+ },
+ {
+  "event": "callback_query",
+  "callback": "cb_broadcast_deleted_messages_confirm",
+  "filters": [
+   "F.GetAttributeOperation(name='data').ComparatorOperation(right='bcast:deleted_msgs:confirm', comparator=eq)"
+  ]
+ },
+ {
+  "event": "callback_query",
+  "callback": "cb_broadcast_deleted_messages_cancel",
+  "filters": [
+   "F.GetAttributeOperation(name='data').ComparatorOperation(right='bcast:deleted_msgs:cancel', comparator=eq)"
+  ]
+ },
+ {
+  "event": "callback_query",
+  "callback": "cb_broadcast_deleted_paywall_confirm",
+  "filters": [
+   "F.GetAttributeOperation(name='data').ComparatorOperation(right='bcast:deleted_paywall:confirm', comparator=eq)"
+  ]
+ },
+ {
+  "event": "callback_query",
+  "callback": "cb_broadcast_deleted_paywall_cancel",
+  "filters": [
+   "F.GetAttributeOperation(name='data').ComparatorOperation(right='bcast:deleted_paywall:cancel', comparator=eq)"
+  ]
+ },
+ {
+  "event": "callback_query",
+  "callback": "cb_broadcast_admin_confirm",
+  "filters": [
+   "F.GetAttributeOperation(name='data').ComparatorOperation(right='bcast:admin:confirm', comparator=eq)"
+  ]
+ },
+ {
+  "event": "callback_query",
+  "callback": "cb_broadcast_admin_cancel",
+  "filters": [
+   "F.GetAttributeOperation(name='data').ComparatorOperation(right='bcast:admin:cancel', comparator=eq)"
+  ]
+ },
+ {
+  "event": "callback_query",
+  "callback": "cb_main_menu_action",
+  "filters": [
+   "F.GetAttributeOperation(name='data').GetAttributeOperation(name='startswith').CallOperation(args=['mm:'], kwargs=dict())"
+  ]
+ },
+ {
+  "event": "callback_query",
+  "callback": "cb_back_to_menu",
+  "filters": [
+   "F.GetAttributeOperation(name='data').ComparatorOperation(right='back_to_menu', comparator=eq)"
+  ]
+ },
+ {
+  "event": "callback_query",
+  "callback": "cb_source_select",
+  "filters": [
+   "F.GetAttributeOperation(name='data').GetAttributeOperation(name='startswith').CallOperation(args=['src:'], kwargs=dict())"
+  ]
+ },
+ {
+  "event": "callback_query",
+  "callback": "cb_deep_analysis_refresh",
+  "filters": [
+   "F.GetAttributeOperation(name='data').GetAttributeOperation(name='startswith').CallOperation(args=['deepan_refresh:'], kwargs=dict())"
+  ]
+ },
+ {
+  "event": "callback_query",
+  "callback": "cb_deep_analysis_contact",
+  "filters": [
+   "F.GetAttributeOperation(name='data').GetAttributeOperation(name='startswith').CallOperation(args=['deepan:'], kwargs=dict())"
+  ]
+ },
+ {
+  "event": "callback_query",
+  "callback": "cb_ideal_date_refresh",
+  "filters": [
+   "F.GetAttributeOperation(name='data').GetAttributeOperation(name='startswith').CallOperation(args=['idealdate_refresh:'], kwargs=dict())"
+  ]
+ },
+ {
+  "event": "callback_query",
+  "callback": "cb_ideal_date_contact",
+  "filters": [
+   "F.GetAttributeOperation(name='data').GetAttributeOperation(name='startswith').CallOperation(args=['idealdate:'], kwargs=dict())"
+  ]
+ },
+ {
+  "event": "callback_query",
+  "callback": "cb_deleted_reveal",
+  "filters": [
+   "F.GetAttributeOperation(name='data').GetAttributeOperation(name='startswith').CallOperation(args=['delrev:'], kwargs=dict())"
+  ]
+ },
+ {
+  "event": "callback_query",
+  "callback": "cb_deleted_reveal_premium",
+  "filters": [
+   "F.GetAttributeOperation(name='data').ComparatorOperation(right='delrev_premium', comparator=eq)"
+  ]
+ },
+ {
+  "event": "callback_query",
+  "callback": "cb_deleted_reveal_all",
+  "filters": [
+   "F.GetAttributeOperation(name='data').ComparatorOperation(right='delrev_all', comparator=eq)"
+  ]
+ },
+ {
+  "event": "callback_query",
+  "callback": "cb_quickstart_yes",
+  "filters": [
+   "F.GetAttributeOperation(name='data').ComparatorOperation(right='qs:yes', comparator=eq)"
+  ]
+ },
+ {
+  "event": "callback_query",
+  "callback": "cb_quickstart_no",
+  "filters": [
+   "F.GetAttributeOperation(name='data').ComparatorOperation(right='qs:no', comparator=eq)"
+  ]
+ },
+ {
+  "event": "callback_query",
+  "callback": "cb_quickstart_gender",
+  "filters": [
+   "F.GetAttributeOperation(name='data').GetAttributeOperation(name='startswith').CallOperation(args=['qsphr:'], kwargs=dict())"
+  ]
+ },
+ {
+  "event": "callback_query",
+  "callback": "cb_quickstart_phrase_next",
+  "filters": [
+   "F.GetAttributeOperation(name='data').GetAttributeOperation(name='startswith').CallOperation(args=['qsphr_next:'], kwargs=dict())"
+  ]
+ },
+ {
+  "event": "callback_query",
+  "callback": "cb_gender_select",
+  "filters": [
+   "F.GetAttributeOperation(name='data').FunctionOperation(function=in_op, args=[['gender:female', 'gender:male']], kwargs=dict())"
+  ]
+ },
+ {
+  "event": "callback_query",
+  "callback": "cb_onboarding_business",
+  "filters": [
+   "F.GetAttributeOperation(name='data').ComparatorOperation(right='onb:business', comparator=eq)"
+  ]
+ },
+ {
+  "event": "callback_query",
+  "callback": "cb_onboarding_json",
+  "filters": [
+   "F.GetAttributeOperation(name='data').ComparatorOperation(right='onb:json', comparator=eq)"
+  ]
+ },
+ {
+  "event": "callback_query",
+  "callback": "cb_submenu",
+  "filters": [
+   "F.GetAttributeOperation(name='data').GetAttributeOperation(name='startswith').CallOperation(args=['menu:'], kwargs=dict())"
+  ]
+ },
+ {
+  "event": "callback_query",
+  "callback": "cb_setup_contact",
+  "filters": [
+   "F.GetAttributeOperation(name='data').GetAttributeOperation(name='startswith').CallOperation(args=['setup:'], kwargs=dict())"
+  ]
+ },
+ {
+  "event": "callback_query",
+  "callback": "cb_export_user",
+  "filters": [
+   "F.GetAttributeOperation(name='data').GetAttributeOperation(name='startswith').CallOperation(args=['export:'], kwargs=dict())"
+  ]
+ },
+ {
+  "event": "callback_query",
+  "callback": "cb_my_style_for_contact",
+  "filters": [
+   "F.GetAttributeOperation(name='data').GetAttributeOperation(name='startswith').CallOperation(args=['mystyle:'], kwargs=dict())"
+  ]
+ },
+ {
+  "event": "callback_query",
+  "callback": "cb_reply_contact",
+  "filters": [
+   "F.GetAttributeOperation(name='data').GetAttributeOperation(name='startswith').CallOperation(args=['reply:'], kwargs=dict())"
+  ]
+ },
+ {
+  "event": "callback_query",
+  "callback": "cb_unified_reply_restart",
+  "filters": [
+   "F.GetAttributeOperation(name='data').ComparatorOperation(right='unified_reply_restart', comparator=eq)"
+  ]
+ },
+ {
+  "event": "callback_query",
+  "callback": "cb_unified_contact",
+  "filters": [
+   "F.GetAttributeOperation(name='data').GetAttributeOperation(name='startswith').CallOperation(args=['unified_contact:'], kwargs=dict())"
+  ]
+ },
+ {
+  "event": "callback_query",
+  "callback": "cb_variants_regen",
+  "filters": [
+   "F.GetAttributeOperation(name='data').GetAttributeOperation(name='startswith').CallOperation(args=['varregen:'], kwargs=dict())"
+  ]
+ },
+ {
+  "event": "callback_query",
+  "callback": "cb_live_coach",
+  "filters": [
+   "F.GetAttributeOperation(name='data').ComparatorOperation(right='live:coach', comparator=eq)"
+  ]
+ },
+ {
+  "event": "callback_query",
+  "callback": "cb_live_phrases",
+  "filters": [
+   "F.GetAttributeOperation(name='data').ComparatorOperation(right='live:phrases', comparator=eq)"
+  ]
+ },
+ {
+  "event": "callback_query",
+  "callback": "cb_phrases_gender",
+  "filters": [
+   "F.GetAttributeOperation(name='data').GetAttributeOperation(name='startswith').CallOperation(args=['phrases:'], kwargs=dict())"
+  ]
+ },
+ {
+  "event": "callback_query",
+  "callback": "cb_phrase_next",
+  "filters": [
+   "F.GetAttributeOperation(name='data').GetAttributeOperation(name='startswith').CallOperation(args=['phrase_next:'], kwargs=dict())"
+  ]
+ },
+ {
+  "event": "callback_query",
+  "callback": "cb_revive_next",
+  "filters": [
+   "F.GetAttributeOperation(name='data').ComparatorOperation(right='revive_next', comparator=eq)"
+  ]
+ },
+ {
+  "event": "callback_query",
+  "callback": "cb_live_regen",
+  "filters": [
+   "F.GetAttributeOperation(name='data').GetAttributeOperation(name='startswith').CallOperation(args=['liveregen:'], kwargs=dict())"
+  ]
+ },
+ {
+  "event": "callback_query",
+  "callback": "cb_show_premium",
+  "filters": [
+   "F.GetAttributeOperation(name='data').ComparatorOperation(right='show_premium', comparator=eq)"
+  ]
+ },
+ {
+  "event": "callback_query",
+  "callback": "cb_show_invite",
+  "filters": [
+   "F.GetAttributeOperation(name='data').ComparatorOperation(right='show_invite', comparator=eq)"
+  ]
+ },
+ {
+  "event": "callback_query",
+  "callback": "cb_sub_to_main_menu",
+  "filters": [
+   "F.GetAttributeOperation(name='data').ComparatorOperation(right='sub:to_menu', comparator=eq)"
+  ]
+ },
+ {
+  "event": "callback_query",
+  "callback": "cb_watch_menu",
+  "filters": [
+   "F.GetAttributeOperation(name='data').ComparatorOperation(right='watch:menu', comparator=eq)"
+  ]
+ },
+ {
+  "event": "callback_query",
+  "callback": "cb_watch_locked",
+  "filters": [
+   "F.GetAttributeOperation(name='data').ComparatorOperation(right='watch:locked', comparator=eq)"
+  ]
+ },
+ {
+  "event": "callback_query",
+  "callback": "cb_watch_toggle",
+  "filters": [
+   "F.GetAttributeOperation(name='data').GetAttributeOperation(name='startswith').CallOperation(args=['watch:toggle:'], kwargs=dict())"
+  ]
+ },
+ {
+  "event": "callback_query",
+  "callback": "cb_delete_contact",
+  "filters": [
+   "F.GetAttributeOperation(name='data').GetAttributeOperation(name='startswith').CallOperation(args=['del:'], kwargs=dict())"
+  ]
+ },
+ {
+  "event": "callback_query",
+  "callback": "cb_delete_contact_confirm",
+  "filters": [
+   "F.GetAttributeOperation(name='data').GetAttributeOperation(name='startswith').CallOperation(args=['delyes:'], kwargs=dict())"
+  ]
+ },
+ {
+  "event": "callback_query",
+  "callback": "cb_delete_all",
+  "filters": [
+   "F.GetAttributeOperation(name='data').ComparatorOperation(right='delall', comparator=eq)"
+  ]
+ },
+ {
+  "event": "callback_query",
+  "callback": "cb_delete_all_confirm",
+  "filters": [
+   "F.GetAttributeOperation(name='data').ComparatorOperation(right='delallyes', comparator=eq)"
+  ]
+ },
+ {
+  "event": "callback_query",
+  "callback": "cb_delete_cancel",
+  "filters": [
+   "F.GetAttributeOperation(name='data').ComparatorOperation(right='delno', comparator=eq)"
+  ]
+ },
+ {
+  "event": "callback_query",
+  "callback": "cb_wipe_confirm",
+  "filters": [
+   "F.GetAttributeOperation(name='data').GetAttributeOperation(name='startswith').CallOperation(args=['wipeyes:'], kwargs=dict())"
+  ]
+ },
+ {
+  "event": "callback_query",
+  "callback": "cb_wipe_cancel",
+  "filters": [
+   "F.GetAttributeOperation(name='data').ComparatorOperation(right='wipeno', comparator=eq)"
+  ]
+ },
+ {
+  "event": "callback_query",
+  "callback": "cb_gift_premium",
+  "filters": [
+   "F.GetAttributeOperation(name='data').GetAttributeOperation(name='startswith').CallOperation(args=['gift:'], kwargs=dict())"
+  ]
+ },
+ {
+  "event": "pre_checkout_query",
+  "callback": "process_stars_pre_checkout",
+  "filters": []
+ },
+ {
+  "event": "chat_member",
+  "callback": "on_promo_channel_membership_change",
+  "filters": []
+ },
+ {
+  "event": "deleted_business_messages",
+  "callback": "handle_deleted_business_messages",
+  "filters": []
+ },
+ {
+  "event": "business_connection",
+  "callback": "handle_business_connection",
+  "filters": []
+ },
+ {
+  "event": "edited_business_message",
+  "callback": "handle_edited_business_message",
+  "filters": []
+ },
+ {
+  "event": "business_message",
+  "callback": "handle_business_message",
+  "filters": []
+ },
+ {
+  "event": "error",
+  "callback": "on_unhandled_error",
+  "filters": []
+ },
+ {
+  "event": "update",
+  "callback": "Dispatcher._listen_update",
+  "filters": []
+ }
+]
