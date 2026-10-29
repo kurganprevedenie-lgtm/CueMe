@@ -21,6 +21,7 @@ from storage import (
 from app_state import _contact_name, dp
 from handlers.subscription import _is_premium
 from handlers.redeem_menu import _menu_screen_target
+from handlers.profile import paged_contacts_kb
 
 
 # ── 🗑 Удалённые сообщения — настройки трёх Premium-функций слежки ──────────
@@ -92,13 +93,14 @@ async def cb_watch_toggle(call: CallbackQuery, bot: Bot) -> None:
 
 # ── /delete — удалить данные (152-ФЗ) ────────────────────────────────────────
 
-def _delete_kb(contacts: list) -> InlineKeyboardMarkup:
-    b = InlineKeyboardBuilder()
-    for c in contacts:
-        b.button(text=f"🗑 {_contact_name(c)}", callback_data=f"del:{c['id']}")
-    b.button(text="‼️ Удалить ВСЕ данные", callback_data="delall")
-    b.adjust(1)
-    return b.as_markup()
+def _delete_kb(contacts: list, page: int = 0) -> InlineKeyboardMarkup:
+    # Было: все контакты одной клавиатурой — теперь постранично (handlers/profile.py:
+    # paged_contacts_kb), «‼️ Удалить ВСЕ данные» — на каждой странице.
+    return paged_contacts_kb(
+        contacts, "del", page,
+        lambda c: (f"🗑 {_contact_name(c)}", f"del:{c['id']}"),
+        extra_buttons=(("‼️ Удалить ВСЕ данные", "delall"),),
+    )
 
 
 @dp.message(Command("delete"))

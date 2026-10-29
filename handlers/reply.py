@@ -83,6 +83,7 @@ from handlers.profile import (
     _not_command,
     _style_cache_key,
     contacts_kb,
+    paged_contacts_kb,
 )
 from handlers.cards import (
     LiveDialogue,
@@ -345,13 +346,14 @@ async def cb_unified_reply_restart(call: CallbackQuery, state: FSMContext) -> No
     await _start_unified_reply(call.message, state)
 
 
-def unified_contacts_kb(contacts: list) -> InlineKeyboardMarkup:
-    b = InlineKeyboardBuilder()
-    for c in contacts:
-        b.button(text=_contact_name(c), callback_data=f"unified_contact:{c['id']}")
-    b.button(text="➕ Другой человек", callback_data="unified_contact:new")
-    b.adjust(1)
-    return b.as_markup()
+def unified_contacts_kb(contacts: list, page: int = 0) -> InlineKeyboardMarkup:
+    # Было: все контакты одной клавиатурой — теперь постранично (handlers/profile.py:
+    # paged_contacts_kb), «➕ Другой человек» — на каждой странице.
+    return paged_contacts_kb(
+        contacts, "unified", page,
+        lambda c: (_contact_name(c), f"unified_contact:{c['id']}"),
+        extra_buttons=(("➕ Другой человек", "unified_contact:new"),),
+    )
 
 
 async def _edit_setup_message(

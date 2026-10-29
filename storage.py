@@ -977,6 +977,40 @@ def list_contacts(user_telegram_id: str) -> list[sqlite3.Row]:
         ).fetchall()
 
 
+def contact_last_message_at(owner_user_id: str) -> dict[int, str]:
+    """contact_id → время последнего сообщения (ISO, UTC с поясом) по всем
+    контактам юзера — одним запросом, без похода в базу на каждый контакт.
+    Для сортировки списков контактов «сначала недавние». Считает и живое
+    подключение (business_messages), и JSON-экспорт (imported_messages);
+    у JSON даты без пояса, поэтому MAX берётся по каждому источнику отдельно
+    и сводится в Python через _normalize_msg_date. Контактов без сообщений
+    в ответе нет."""
+    with _conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT bcr.contact_id AS contact_id, 'biz' AS src, MAX(bm.date) AS last_date
+            FROM business_messages bm
+            JOIN business_chat_refs bcr
+                ON bm.chat_ref = bcr.chat_ref AND bm.owner_user_id = bcr.owner_user_id
+            WHERE bm.owner_user_id = ?
+            GROUP BY bcr.contact_id
+            UNION ALL
+            SELECT im.contact_id, 'imp', MAX(im.date)
+            FROM imported_messages im
+            JOIN contacts c ON c.id = im.contact_id
+            WHERE c.user_telegram_id = ?
+            GROUP BY im.contact_id
+            """,
+            (owner_user_id, owner_user_id),
+        ).fetchall()
+    out: dict[int, str] = {}
+    for r in rows:
+        d = _normalize_msg_date(r["last_date"], timezone.utc if r["src"] == "biz" else _IMPORT_TZ)
+        if d and (r["contact_id"] not in out or d > out[r["contact_id"]]):
+            out[r["contact_id"]] = d
+    return out
+
+
 def get_contact_by_id(contact_id: int) -> sqlite3.Row | None:
     with _conn() as conn:
         return conn.execute(

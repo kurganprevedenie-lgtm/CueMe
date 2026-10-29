@@ -438,6 +438,13 @@
  },
  {
   "event": "callback_query",
+  "callback": "cb_contacts_page",
+  "filters": [
+   "F.GetAttributeOperation(name='data').GetAttributeOperation(name='startswith').CallOperation(args=['pg:'], kwargs=dict())"
+  ]
+ },
+ {
+  "event": "callback_query",
   "callback": "cb_deep_analysis_refresh",
   "filters": [
    "F.GetAttributeOperation(name='data').GetAttributeOperation(name='startswith').CallOperation(args=['deepan_refresh:'], kwargs=dict())"

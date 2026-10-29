@@ -285,6 +285,10 @@ PREMIUM_CACHE_TTL = int(os.getenv("PREMIUM_CACHE_TTL", "300"))
 # позже, чем бот успевает проверить, и раньше юзер до 5 минут видел «не
 # Premium» уже после оплаты. Положительный — по-прежнему PREMIUM_CACHE_TTL.
 PREMIUM_NEG_CACHE_TTL = int(os.getenv("PREMIUM_NEG_CACHE_TTL", "20"))
+# Сколько контактов на одной странице inline-списка («Кому отвечаешь?»,
+# анализ, /delete и т.п.) — больше: «◀️ 2/5 ▶️» (handlers/profile.py:
+# paged_contacts_kb). Было: все контакты одной клавиатурой.
+CONTACTS_PAGE_SIZE = int(os.getenv("CONTACTS_PAGE_SIZE", "10"))
 # Через сколько часов без действий в боте юзер считается «ушедшим» в блоке
 # «Где уходят» отчёта /users (main.py: _build_users_dashboard_html).
 CHURN_HOURS = int(os.getenv("CHURN_HOURS", "24"))

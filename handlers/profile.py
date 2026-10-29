@@ -7,8 +7,9 @@ import asyncio
 import hashlib
 import logging
 import re
+from datetime import datetime
 from aiogram import BaseMiddleware, Bot, F
-from aiogram.exceptions import TelegramForbiddenError
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.types import (
     CallbackQuery,
     Message,
@@ -16,12 +17,14 @@ from aiogram.types import (
     InlineKeyboardMarkup,
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
+from config import CONTACTS_PAGE_SIZE
 from llm import transcribe_audio
 from storage import (
     get_acquisition_source,
     get_gender,
     set_last_action,
     mark_bot_blocked,
+    contact_last_message_at,
     list_contacts,
     set_acquisition_source,
 )
@@ -331,13 +334,111 @@ def _style_cache_key(
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
-def contacts_kb(contacts: list, prefix: str) -> InlineKeyboardMarkup:
+# ── Постраничный список контактов ────────────────────────────────────────────
+# Было: contacts_kb / unified_contacts_kb / _delete_kb выводили ВСЕХ контактов
+# одной клавиатурой — при 30+ контактах простыня кнопок. Теперь по
+# CONTACTS_PAGE_SIZE на страницу, внизу «◀️ 2/5 ▶️» (callback pg:<kind>:<page>),
+# под навигацией — спец-кнопки вида клавиатуры. Коллбэки самих контактов не
+# менялись. Листание — один общий хендлер cb_contacts_page: список берётся
+# заново (list_contacts), клавиатура — по реестру _contacts_pager(kind).
+
+_PAGE_NOOP = "pg:noop"
+
+
+def sort_contacts_recent(contacts: list) -> list:
+    """Сначала те, с кем недавно была переписка (по последнему сообщению),
+    потом остальные; при равенстве — по id, чтобы порядок при листании был
+    одним и тем же."""
+    if not contacts:
+        return []
+    last = contact_last_message_at(contacts[0]["user_telegram_id"])
+
+    def key(c):
+        ts = last.get(c["id"])
+        return (0, -datetime.fromisoformat(ts).timestamp(), c["id"]) if ts else (1, 0.0, c["id"])
+    return sorted(contacts, key=key)
+
+
+def paged_contacts_kb(
+    contacts: list, kind: str, page: int, contact_button, extra_buttons: tuple = (),
+) -> InlineKeyboardMarkup:
+    """Одна страница списка контактов. contact_button(c) → (текст, callback_data);
+    extra_buttons — [(текст, callback_data)] под навигацией на каждой странице.
+    page вне диапазона — ближайшая существующая (обычно последняя)."""
+    ordered = sort_contacts_recent(contacts)
+    size = max(1, CONTACTS_PAGE_SIZE)
+    pages = max(1, -(-len(ordered) // size))
+    page = min(max(page, 0), pages - 1)
     b = InlineKeyboardBuilder()
-    for c in contacts:
-        name = _contact_name(c)
-        b.button(text=name, callback_data=f"{prefix}:{c['id']}")
-    b.adjust(1)
+    rows: list[int] = []
+    for c in ordered[page * size:(page + 1) * size]:
+        text, data = contact_button(c)
+        b.button(text=text, callback_data=data)
+        rows.append(1)
+    if pages > 1:
+        nav = 0
+        if page > 0:
+            b.button(text="◀️", callback_data=f"pg:{kind}:{page - 1}")
+            nav += 1
+        b.button(text=f"{page + 1}/{pages}", callback_data=_PAGE_NOOP)
+        nav += 1
+        if page < pages - 1:
+            b.button(text="▶️", callback_data=f"pg:{kind}:{page + 1}")
+            nav += 1
+        rows.append(nav)
+    for text, data in extra_buttons:
+        b.button(text=text, callback_data=data)
+        rows.append(1)
+    if rows:
+        b.adjust(*rows)
     return b.as_markup()
+
+
+def contacts_kb(contacts: list, prefix: str, page: int = 0) -> InlineKeyboardMarkup:
+    """prefix — он же kind для листания (deepan/idealdate/mystyle/reply/setup)."""
+    return paged_contacts_kb(contacts, prefix, page, lambda c: (_contact_name(c), f"{prefix}:{c['id']}"))
+
+
+_CONTACTS_KB_KINDS = ("deepan", "idealdate", "mystyle", "reply", "setup")
+
+
+def _contacts_pager(kind: str):
+    """kind → (contacts, page) -> клавиатура. Модули ниже по исходному
+    main.py — по ссылке (handlers.x.f), см. CLAUDE.md «Файлы проекта»."""
+    if kind in _CONTACTS_KB_KINDS:
+        return lambda contacts, page: contacts_kb(contacts, kind, page)
+    if kind == "unified":
+        return lambda contacts, page: handlers.reply.unified_contacts_kb(contacts, page)
+    if kind == "del":
+        return lambda contacts, page: handlers.watch_delete._delete_kb(contacts, page)
+    return None
+
+
+@dp.callback_query(F.data.startswith("pg:"))
+async def cb_contacts_page(call: CallbackQuery) -> None:
+    """Листание списка контактов: правит только клавиатуру того же сообщения
+    (текст и FSM-состояние не трогает). Контакты — только того, кто нажал:
+    список берётся по call.from_user.id, а чужое сообщение (не личный чат
+    с этим юзером) не правим."""
+    if call.data == _PAGE_NOOP:
+        await call.answer()
+        return
+    parts = call.data.split(":")
+    pager = _contacts_pager(parts[1]) if len(parts) == 3 and parts[2].isdigit() else None
+    msg = call.message
+    if pager is None or msg is None or msg.chat.id != call.from_user.id:
+        await call.answer()
+        return
+    contacts = await asyncio.to_thread(list_contacts, str(call.from_user.id))
+    if not contacts:
+        await call.answer("Контактов больше нет.")
+        return
+    await call.answer()
+    try:
+        await msg.edit_reply_markup(reply_markup=pager(contacts, int(parts[2])))
+    except TelegramBadRequest as e:
+        if "not modified" not in str(e):
+            raise
 
 
 _EMOJI_RE = re.compile(
