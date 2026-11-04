@@ -350,13 +350,20 @@ async def _handle_tribute_subscription_event(bot: Bot, event_name: str, payload:
         currency=str(payload.get("currency") or ""), expires_at=expires_at,
     )
     if not is_new:
-        return  # повторная доставка того же события (subscription_id+period_id) — уже обработано
+        # Раньше повтор сразу завершался: неудачная выдача приглашения
+        # после записи оплаты больше никогда не повторялась.
+        if expires_at > datetime.now(expires_at.tzinfo):
+            await _grant_premium_channel_access(bot, telegram_id, payload.get("telegram_username"))
+        return
 
     set_tribute_premium_until(telegram_id, expires_at)
     upsert_user(telegram_id, f"user{telegram_id}")
     record_event(telegram_id, "tribute_payment", f"{event_name}:{payload.get('amount')}")
 
     username = payload.get("telegram_username")
+    # Доступ в канал — первым после сохранения оплаты. Сбой отложенного
+    # ответа не должен мешать доставке приглашения платному пользователю.
+    await _grant_premium_channel_access(bot, telegram_id, username)
     until_label = expires_at.strftime("%d.%m.%Y %H:%M UTC")
     try:
         await bot.send_message(int(telegram_id), f"🎉 Оплата прошла! Premium активен до {until_label}.")
@@ -367,7 +374,8 @@ async def _handle_tribute_subscription_event(bot: Bot, event_name: str, payload:
     # Безусловно — независимо от того, был ли уже Premium через другой
     # источник (реферал/промо/Stars) до этой оплаты. Именно этот шаг раньше
     # где-то пропускался и вызывал баг с @REVkazik.
-    await _grant_premium_channel_access(bot, telegram_id, username)
+    # await _grant_premium_channel_access(bot, telegram_id, username)
+    # Перенесено выше: приглашение выдаётся до подтверждения и раскрытий.
 
 
 async def handle_tribute_webhook(request: web.Request) -> web.Response:

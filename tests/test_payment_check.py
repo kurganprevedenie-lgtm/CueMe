@@ -182,3 +182,30 @@ def test_keyboards_have_check_button(m):
     for kb in (m.paywall_kb(), m.premium_menu_kb()):
         rows = [b for row in kb.inline_keyboard for b in row]
         assert rows[0].url and rows[1].callback_data == "check_payment"
+
+
+@pytest.mark.parametrize("is_new", [True, False])
+def test_tribute_invite_precedes_pending_answers(m, monkeypatch, is_new):
+    from handlers import stars_tribute, business
+    order = []
+    monkeypatch.setattr(stars_tribute, "TRIBUTE_CHANNEL_ID", "")
+    monkeypatch.setattr(stars_tribute, "record_tribute_payment", lambda **kw: is_new)
+
+    async def grant(*args):
+        order.append("invite")
+
+    async def reveal(*args):
+        order.append("reveal")
+        raise RuntimeError("pending answer failed")
+
+    monkeypatch.setattr(stars_tribute, "_grant_premium_channel_access", grant)
+    monkeypatch.setattr(business, "_offer_pending_reveals", reveal)
+    payload = {"telegram_user_id": USER, "subscription_id": 1,
+               "period_id": 1, "expires_at": "2099-01-01T00:00:00+00:00"}
+    if is_new:
+        with pytest.raises(RuntimeError, match="pending answer failed"):
+            asyncio.run(stars_tribute._handle_tribute_subscription_event(_Bot(), "new_subscription", payload))
+        assert order == ["invite", "reveal"]
+    else:
+        asyncio.run(stars_tribute._handle_tribute_subscription_event(_Bot(), "new_subscription", payload))
+        assert order == ["invite"]
