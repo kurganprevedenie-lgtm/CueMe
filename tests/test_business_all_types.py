@@ -163,7 +163,11 @@ def test_each_type_saved_and_shown_on_delete(db, ctype):
     assert bot.methods()[0] == method
     if file_arg:
         assert bot.calls[0][2][file_arg] == storage.json.loads(row["media_json"])["file_id"]
-    assert any(t and f"🗑 {NAME} {expected}" in t for t in bot.texts()), bot.calls
+    if ctype == "text":
+        assert bot.calls[0][2]["text"].startswith(f"🗑 Сообщение удалено\n\n👤 Автор: {NAME}\n\nпривет\n\n📅 Отправлено:")
+        assert bot.calls[0][2]["link_preview_options"].is_disabled
+    else:
+        assert any(t and f"🗑 {NAME} {expected}" in t for t in bot.texts()), bot.calls
 
 
 def test_persist_business_message_passes_content(db):
@@ -245,15 +249,16 @@ def test_custom_emoji_sent_then_retried_without_entities(db):
     _run(main._send_deleted_content(ok_bot, OWNER, NAME, row))
     assert len(ok_bot.calls) == 1
     ents = ok_bot.calls[0][2]["entities"]
-    shift = main._utf16_len(f"🗑 {NAME} удалил(а) сообщение:\n«")
-    assert [(e.type, e.offset) for e in ents] == [("custom_emoji", 7 + shift), ("bold", 10 + shift)]
-    assert ents[0].custom_emoji_id == "5368"
+    shift = main._utf16_len(f"🗑 Сообщение удалено\n\n👤 Автор: {NAME}\n\n")
+    assert [(e.type, e.offset) for e in ents] == [("blockquote", shift), ("custom_emoji", 7 + shift), ("bold", 10 + shift)]
+    assert ents[1].custom_emoji_id == "5368"
 
     picky_bot = FakeBot(reject_custom_emoji=True)
     _run(main._send_deleted_content(picky_bot, OWNER, NAME, row))
     assert len(picky_bot.calls) == 2
     assert "entities" in picky_bot.calls[0][2] and "entities" not in picky_bot.calls[1][2]
-    assert picky_bot.calls[1][2]["text"] == f"🗑 {NAME} удалил(а) сообщение:\n«{text}»"
+    assert f"👤 Автор: {NAME}\n\n{text}\n\n📅 Отправлено:" in picky_bot.calls[1][2]["text"]
+    assert picky_bot.calls[1][2]["link_preview_options"].is_disabled
 
 
 # ── старые строки (до content_type) ───────────────────────────────────────────
@@ -287,7 +292,7 @@ def test_legacy_rows_other_types_and_empty(db):
     text_row = _save_legacy(5, "просто текст")
     bot = FakeBot()
     _run(main._send_deleted_content(bot, OWNER, NAME, text_row))
-    assert bot.calls[0][2]["text"] == f"🗑 {NAME} удалил(а) сообщение:\n«просто текст»"
+    assert bot.calls[0][2]["text"] == f"🗑 Сообщение удалено\n\n👤 Автор: {NAME}\n\nпросто текст\n\n📅 Отправлено: 01.09.2026 00:00:00 UTC"
 
     empty = _save_legacy(6, None)
     bot = FakeBot()
@@ -295,6 +300,26 @@ def test_legacy_rows_other_types_and_empty(db):
     assert bot.calls[0][2]["text"] == f"🗑 {NAME} удалил(а) сообщение (текст недоступен)"
     assert not main._has_deleted_content(empty)
     assert main._has_deleted_content(_save_legacy(7, None, photo_file_id="P"))
+
+
+def test_deleted_text_layout_keeps_time_and_fits_telegram_limit():
+    row = {"text": "😎" * 5000, "date": "2026-11-05T15:17:30+03:00",
+           "entities_json": None}
+    text, entities = main._deleted_text_notice("Автор", row)
+    assert main._utf16_len(text) <= main.TELEGRAM_MAX_LEN
+    assert text.startswith("🗑 Сообщение удалено\n\n👤 Автор: Автор\n\n")
+    assert text.endswith("…\n\n📅 Отправлено: 05.11.2026 12:17:30 UTC")
+    quote = entities[0]
+    quoted = text.encode("utf-16-le")[quote["offset"] * 2:(quote["offset"] + quote["length"]) * 2].decode("utf-16-le")
+    assert quoted.startswith("😎") and quoted.endswith("…")
+
+
+def test_deleted_text_does_not_nest_quote_entities():
+    row = {"text": "привет", "date": "bad", "entities_json": storage.json.dumps([
+        {"type": "blockquote", "offset": 0, "length": 6}])}
+    text, entities = main._deleted_text_notice("Автор", row)
+    assert text.endswith("📅 Отправлено: время неизвестно")
+    assert len(entities) == 1 and entities[0]["type"] == "blockquote"
 
 
 # ── альбомы ───────────────────────────────────────────────────────────────────

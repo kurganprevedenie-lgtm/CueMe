@@ -24,6 +24,7 @@ from aiogram.types import (
     InputMediaVideo,
     MessageEntity,
     InlineKeyboardMarkup,
+    LinkPreviewOptions,
     ReplyKeyboardRemove,
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
@@ -857,6 +858,8 @@ async def _send_with_entities(send, text_arg: str, text: str, entities: list | N
     форматирования обычным текстом. Ошибка самой отправки (протухший
     file_id и т.п.) после повтора пробрасывается вызывающему."""
     ents_arg = "entities" if text_arg == "text" else "caption_entities"
+    if text_arg == "text":
+        kwargs.setdefault("link_preview_options", LinkPreviewOptions(is_disabled=True))
     objs = _entity_objects(entities)
     if objs:
         try:
@@ -864,6 +867,32 @@ async def _send_with_entities(send, text_arg: str, text: str, entities: list | N
         except TelegramBadRequest as e:
             logging.warning("deleted: Telegram отклонил форматирование (%s) — повтор без него", e)
     return await send(**{text_arg: text}, **kwargs)
+
+
+def _deleted_text_notice(name: str, row) -> tuple[str, list]:
+    """Автор → цитата с пустыми строками → время исходного сообщения."""
+    prefix = f"🗑 Сообщение удалено\n\n👤 Автор: {name}\n\n"
+    try:
+        sent = datetime.fromisoformat(row["date"])
+        if sent.tzinfo is None:
+            sent = sent.replace(tzinfo=timezone.utc)
+        label = sent.astimezone(timezone.utc).strftime("%d.%m.%Y %H:%M:%S UTC")
+    except (ValueError, TypeError):
+        label = "время неизвестно"
+    suffix = f"\n\n📅 Отправлено: {label}"
+    original = row["text"] or ""
+    room = max(0, TELEGRAM_MAX_LEN - _utf16_len(prefix + suffix))
+    truncated = _utf16_len(original) > room
+    text = original
+    if truncated:
+        text = original.encode("utf-16-le")[:max(0, room - 1) * 2].decode("utf-16-le", errors="ignore") + "…"
+    shift = _utf16_len(prefix)
+    entities = [{"type": "blockquote", "offset": shift, "length": _utf16_len(text)}] if text else []
+    if not truncated:
+        entities.extend({**e, "offset": e["offset"] + shift}
+                        for e in (_row_entities(row) or [])
+                        if e.get("type") not in ("blockquote", "expandable_blockquote"))
+    return prefix + text + suffix, entities
 
 
 async def _send_deleted_content(bot: Bot, owner_id: str, name: str, row) -> None:
@@ -943,6 +972,10 @@ async def _send_deleted_content(bot: Bot, owner_id: str, name: str, row) -> None
         if not NOTIFY_DELETED_WITHOUT_TEXT:
             return
         notice, notice_entities = f"🗑 {name} удалил(а) сообщение (текст недоступен)", None
+    elif ct == "text":
+        # Было: _compose_with_quote(header, text, entities, TELEGRAM_MAX_LEN).
+        # Теперь текст между автором и временем отправки, с отступами.
+        notice, notice_entities = _deleted_text_notice(name, row)
     else:
         # Текст, а также откат для файла, который Telegram уже не отдаёт.
         notice, notice_entities = _compose_with_quote(header, text, entities, TELEGRAM_MAX_LEN)
