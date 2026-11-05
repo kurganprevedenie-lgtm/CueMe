@@ -134,9 +134,10 @@ async def handle_business_connection(event: BusinessConnection, bot: Bot) -> Non
             except Exception:
                 logging.warning("business-connect notify failed: owner=%s", event.user.id)
             await asyncio.sleep(3)
-        # Пол спрашиваем не сразу, а из cb_source_select — ПОСЛЕ того как юзер
-        # реально ответит на вопрос про источник (последовательно, не хором).
-        await _maybe_prompt_source(bot, owner_id)
+        # Вопрос об источнике убран по решению продукта. Раньше выбор пола
+        # запускался только после ответа на него:
+        # await _maybe_prompt_source(bot, owner_id)
+        await _maybe_prompt_gender(bot, owner_id)
 
 
 # ── Использование подсказок CueMe в реальной переписке ────────────────────────
