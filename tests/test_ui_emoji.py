@@ -209,3 +209,44 @@ def test_tariff_buttons_keep_payment_payload_and_label(monkeypatch):
         b.callback_data for row in plain.inline_keyboard for b in row]
     restored = ui.ordinary_method(SendMessage(chat_id=1, text="Тарифы", reply_markup=themed))
     assert restored.reply_markup.model_dump() == plain.model_dump()
+
+
+def test_premium_feature_list_uses_matching_custom_icons():
+    from handlers import premium_screen
+    text = premium_screen._PREMIUM_FEATURES_HTML
+    assert text.startswith("<blockquote>") and text.endswith("</blockquote>")
+    assert text.count("<tg-emoji ") == 4
+    for role in ("reply", "analysis", "date", "deleted"):
+        assert ui.ICONS[role].id in text
+
+
+@pytest.mark.parametrize("prefix,role", [("🎁", "gift"), ("⭐", "stars"), ("💎", "premium")])
+def test_premium_expiry_icon_is_not_escaped(monkeypatch, prefix, role):
+    from handlers import premium_screen
+    async def premium(*args):
+        return True
+    monkeypatch.setattr(premium_screen, "_is_premium", premium)
+    monkeypatch.setattr(premium_screen, "_premium_expiry_line", lambda tid: f"{prefix} Срок <тест> & дата")
+    text = asyncio.run(premium_screen._premium_status_text(object(), "1"))
+    assert f'{ui.icon(role)} Срок &lt;тест&gt; &amp; дата' in text
+    assert "&lt;tg-emoji" not in text
+
+
+@pytest.mark.parametrize("edit", [False, True])
+def test_help_custom_icons_and_commands_preserved(edit):
+    from handlers import service_cmds
+    calls = []
+    class Message:
+        async def answer(self, text, **kwargs):
+            calls.append(("answer", text, kwargs))
+        async def edit_text(self, text, **kwargs):
+            calls.append(("edit", text, kwargs))
+    asyncio.run(service_cmds._show_help(Message(), edit=edit))
+    action, text, kwargs = calls[0]
+    assert action == ("edit" if edit else "answer")
+    assert kwargs["parse_mode"] == "HTML"
+    for role in ("support", "reply", "analysis", "date", "media", "edited", "premium", "gift", "settings", "more"):
+        assert ui.icon(role) in text
+    for command in ("/reply", "/deep_analysis", "/invite", "/contacts", "/connect", "/progress", "/redeem", "/myref", "/premium", "/rebuild", "/delete", "/start", "/help"):
+        assert command in text
+    assert "&lt;tg-emoji" not in text

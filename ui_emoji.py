@@ -46,6 +46,9 @@ ICONS = {
     "locked": Emoji("5296369303661067030", "🔒", "🔒", "NewsEmoji"),
     "welcome": Emoji("5472055112702629499", "👋", "👋", "RestrictedEmoji"),
     "warmth": Emoji("5213447602732813642", "💞", "💞", "MadEmoji2"),
+    "media": Emoji("5305265301917549162", "📎", "💾", "NewsEmoji"),
+    "edited": Emoji("5395444784611480792", "✏️", "✏️", "NewsEmoji"),
+    "more": Emoji("5334544901428229844", "ℹ️", "🎬", "NewsEmoji"),
 }
 
 

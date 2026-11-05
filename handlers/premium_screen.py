@@ -4,7 +4,7 @@
 Порядок регистрации хендлеров задаёт main.py порядком импорта модулей —
 этот модуль нельзя импортировать раньше предыдущих (см. tests/test_handler_registry.py)."""
 import html
-from ui_emoji import icon
+from ui_emoji import icon, plain_heading
 from datetime import datetime, timedelta, timezone
 from aiogram import Bot, F
 from aiogram.filters import Command
@@ -194,16 +194,20 @@ def _premium_expiry_line(telegram_id: str) -> str:
 # подписчика — откатили по запросу: цитатой только этот список.)
 _PREMIUM_FEATURES_HTML = (
     "<blockquote><b>Что входит:</b>\n"
-    "💬 Ответ с CueMe — без лимита\n"
-    "🔬 Анализ собеседника — совместимость, флаги, готовое сообщение\n"
-    "💡 Идеальное свидание — куда позвать и как подать\n"
-    "🗑 Удалённые сообщения — текст, фото, видео, кружки, голосовые</blockquote>"
+    f"{icon('reply')} Ответ с CueMe — без лимита\n"
+    f"{icon('analysis')} Анализ собеседника — совместимость, флаги, готовое сообщение\n"
+    f"{icon('date')} Идеальное свидание — куда позвать и как подать\n"
+    f"{icon('deleted')} Удалённые сообщения — текст, фото, видео, кружки, голосовые</blockquote>"
 )
 
 
 async def _premium_status_text(bot: Bot, telegram_id: str) -> str:
     if await _is_premium(bot, telegram_id):
-        expiry_line = html.escape(_premium_expiry_line(telegram_id))
+        # _premium_expiry_line остаётся обычным текстом для других вызывающих.
+        # Оформляем только его UI-значок, не экранируя сам tg-emoji как текст.
+        expiry_text = _premium_expiry_line(telegram_id)
+        role = {"🎁": "gift", "⭐": "stars", "💎": "premium"}.get(expiry_text.split(" ", 1)[0])
+        expiry_line = plain_heading(expiry_text, role) if role else html.escape(expiry_text)
         return (
             f"{icon('premium')} Подписка:\n\n{icon('success')} Активна — весь функционал CueMe без ограничений.\n\n"
             f"{_PREMIUM_FEATURES_HTML}\n\n{expiry_line}"

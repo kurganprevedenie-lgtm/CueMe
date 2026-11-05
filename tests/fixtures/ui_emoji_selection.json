@@ -145,5 +145,26 @@
     "emoji": "💞",
     "is_animated": true,
     "is_video": false
+  },
+  "media": {
+    "set": "NewsEmoji",
+    "custom_emoji_id": "5305265301917549162",
+    "emoji": "📎",
+    "is_animated": true,
+    "is_video": false
+  },
+  "edited": {
+    "set": "NewsEmoji",
+    "custom_emoji_id": "5395444784611480792",
+    "emoji": "✏️",
+    "is_animated": true,
+    "is_video": false
+  },
+  "more": {
+    "set": "NewsEmoji",
+    "custom_emoji_id": "5334544901428229844",
+    "emoji": "ℹ️",
+    "is_animated": true,
+    "is_video": false
   }
 }
