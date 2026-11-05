@@ -160,7 +160,7 @@ def main_menu_kb() -> InlineKeyboardMarkup:
     b.button(text=BTN_WATCH, callback_data="watch:menu")
     b.button(text=BTN_SUBSCRIPTION, callback_data="show_premium")
     b.button(text=BTN_SUPPORT, callback_data="mm:support")
-    b.adjust(2, 2, 1, 1)
+    b.adjust(1, 1, 1, 1, 2)
     return theme_keyboard(b.as_markup())
 
 

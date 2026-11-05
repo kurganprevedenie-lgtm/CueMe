@@ -27,7 +27,7 @@ def test_ids_match_real_get_sticker_set_response():
 
 def test_main_menu_callbacks_unchanged_and_one_icon_per_button():
     kb = main.main_menu_kb()
-    assert [len(row) for row in kb.inline_keyboard] == [2, 2, 1, 1]
+    assert [len(row) for row in kb.inline_keyboard] == [1, 1, 1, 1, 2]
     buttons = [b for row in kb.inline_keyboard for b in row]
     assert [b.callback_data for b in buttons] == ["mm:unified", "mm:deep", "mm:date", "watch:menu", "show_premium", "mm:support"]
     assert all(b.icon_custom_emoji_id and "<tg-emoji" not in b.text for b in buttons)
