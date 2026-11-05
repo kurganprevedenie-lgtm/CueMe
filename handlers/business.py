@@ -692,7 +692,7 @@ NOTIFY_DELETED_WITHOUT_TEXT = True  # False — молча пропускать 
 # кто-то из пары сменит username, исключение перестанет работать.
 DELETED_MESSAGES_EXCLUSIONS: set[tuple[str, str]] = {
     ("furdokw", "lisik2038"),
-    ("furdokw", "maryamul4"),
+    # ("furdokw", "maryamul4"),  # исключение снято: обрабатываем удаления как обычно
 }
 
 
