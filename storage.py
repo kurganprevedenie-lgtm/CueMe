@@ -555,6 +555,53 @@ def get_user(telegram_id: str) -> sqlite3.Row | None:
         ).fetchone()
 
 
+def users_report_snapshot() -> dict:
+    """Пакетный снимок тяжёлых метрик /users вместо запросов на каждый контакт."""
+    with _conn() as conn:
+        conn.execute("BEGIN")
+        contacts = {}
+        for row in conn.execute("SELECT * FROM contacts WHERE archived_into_contact_id IS NULL"):
+            contacts.setdefault(row["user_telegram_id"], []).append(dict(row))
+        messages = {}
+        # Сначала группируем сообщения; соединение сырых таблиц умножило бы строки.
+        for row in conn.execute("""
+            SELECT c.user_telegram_id AS tid, SUM(b.n) AS n
+            FROM contacts c JOIN business_chat_refs r ON r.contact_id=c.id
+                AND r.owner_user_id=c.user_telegram_id
+            JOIN (SELECT owner_user_id, chat_ref, COUNT(*) n FROM business_messages
+                  GROUP BY owner_user_id, chat_ref) b
+                ON b.owner_user_id=r.owner_user_id AND b.chat_ref=r.chat_ref
+            WHERE c.archived_into_contact_id IS NULL GROUP BY c.user_telegram_id
+        """):
+            messages[row["tid"]] = row["n"]
+        for row in conn.execute("""
+            SELECT c.user_telegram_id AS tid, COUNT(*) AS n
+            FROM imported_messages m JOIN contacts c ON c.id=m.contact_id
+            WHERE c.archived_into_contact_id IS NULL GROUP BY c.user_telegram_id
+        """):
+            messages[row["tid"]] = messages.get(row["tid"], 0) + row["n"]
+        latest = {}
+        for row in conn.execute("SELECT * FROM business_connections ORDER BY created_at DESC"):
+            latest.setdefault(row["owner_user_id"], dict(row))
+        events = {r[0]: r[1] for r in conn.execute(
+            "SELECT user_telegram_id, MAX(ts) FROM events GROUP BY user_telegram_id")}
+        incoming = {r[0]: r[1] for r in conn.execute(
+            "SELECT owner_user_id, MAX(date) FROM business_messages WHERE direction='in' GROUP BY owner_user_id")}
+        stars = {r["telegram_id"]: dict(r) for r in conn.execute("""
+            SELECT telegram_id, COUNT(*) AS stars_payments_count,
+                   SUM(stars_amount) AS stars_paid_total, MAX(created_at) AS stars_last_paid_at
+            FROM star_payments WHERE tier != 'gift' AND stars_amount > 0 GROUP BY telegram_id
+        """)}
+        premium = {r["telegram_id"]: dict(r) for r in conn.execute(
+            "SELECT telegram_id, stars_premium_until, tribute_premium_until FROM users")}
+        last_payment = {}
+        for row in conn.execute("SELECT * FROM star_payments ORDER BY created_at DESC, id DESC"):
+            last_payment.setdefault(row["telegram_id"], dict(row))
+    return dict(contacts=contacts, messages=messages, latest=latest,
+                events=events, incoming=incoming, stars=stars,
+                premium=premium, last_payment=last_payment)
+
+
 def list_all_users() -> list[sqlite3.Row]:
     """Все пользователи (для админ-отчётов /users, /sources) — старые первыми."""
     with _conn() as conn:

@@ -9,10 +9,12 @@ import html
 import io
 import json
 import logging
+import time
 import re
 import zipfile
 from datetime import datetime, timezone
 from aiogram import Bot, F
+from aiogram.exceptions import TelegramRetryAfter
 from aiogram.filters import Command, CommandObject
 from aiogram.types import (
     BufferedInputFile,
@@ -21,7 +23,7 @@ from aiogram.types import (
     Message,
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
-from config import ADMIN_GROUP_CHAT_ID, CHURN_HOURS, PROMO_CHANNEL_USERNAME
+from config import ADMIN_GROUP_CHAT_ID, CHURN_HOURS, PROMO_CHANNEL_USERNAME, PREMIUM_CHANNEL_ID
 from llm import (
     get_invalid_output_counts,
     PROVIDER_NAMES,
@@ -35,23 +37,24 @@ from llm import (
 from compatibility_metrics import MOSCOW_TZ
 from tools.export import extract_conversation, to_html, to_text
 from storage import (
-    count_biz_messages_for_contact,
-    count_imported_messages,
+    count_biz_messages_for_contact as count_biz_messages_for_contact,
+    count_imported_messages as count_imported_messages,
     event_counts_by_user,
-    get_latest_business_connection,
-    get_last_event_time,
+    get_latest_business_connection as get_latest_business_connection,
+    get_last_event_time as get_last_event_time,
     gate_events_by_user,
     gate_check_fail_without_ok,
-    get_last_incoming_message_time,
+    get_last_incoming_message_time as get_last_incoming_message_time,
     list_all_users,
     list_contacts,
     referral_counts_by_user,
     suggestion_stats_by_user,
     users_with_deep_analysis,
     users_with_style_card,
+    users_report_snapshot,
 )
 from app_state import _answer_long, _is_admin, dp
-from handlers.subscription import _is_premium
+from handlers.subscription import _is_premium as _is_premium  # совместимость реэкспорта main
 from handlers.profile import _GENDER_LABELS, _action_label
 import handlers  # ссылки по модулю: имена ниже по исходному main.py / общее состояние
 
@@ -160,6 +163,74 @@ _PREMIUM_SOURCE_LABELS = {
 }
 
 
+class _UsersReportBot:
+    """Ограниченный параллелизм и общий темп Telegram-запросов отчёта.
+
+    Не меняет клиент бота. Ошибки сохраняются для отчёта, а не теряются
+    внутри старых проверок, которые возвращают False при сбое Telegram.
+    """
+    def __init__(self, bot):
+        self.bot = bot
+        self.slots = asyncio.Semaphore(8)
+        self.lock = asyncio.Lock()
+        self.next_request = 0.0
+        self.errors = set()
+
+    async def _call(self, method, *args):
+        key = (method, *args)
+        for attempt in range(2):
+            async with self.slots:
+                async with self.lock:
+                    await asyncio.sleep(max(0, self.next_request - time.monotonic()))
+                    self.next_request = time.monotonic() + 0.05
+                try:
+                    result = await asyncio.wait_for(getattr(self.bot, method)(*args), timeout=10)
+                    self.errors.discard(key)
+                    return result
+                except TelegramRetryAfter as exc:
+                    async with self.lock:
+                        self.next_request = max(self.next_request, time.monotonic() + exc.retry_after)
+                    if attempt == 0:
+                        continue
+                    self.errors.add(key)
+                    raise
+                except Exception:
+                    self.errors.add(key)
+                    raise
+
+    async def get_chat(self, user_id):
+        return await self._call("get_chat", user_id)
+
+    async def get_chat_member(self, chat_id, user_id):
+        return await self._call("get_chat_member", chat_id, user_id)
+
+
+def _report_local_premium(snapshot, tid, now):
+    """Оплаченный срок из БД важнее членства в канале и сетевых ошибок."""
+    row = snapshot["premium"].get(tid, {})
+    def date(key):
+        raw = row.get(key)
+        if not raw:
+            return None
+        try:
+            dt = datetime.fromisoformat(raw)
+            return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)
+        except ValueError:
+            logging.warning("users export: invalid %s for user=%s", key, tid)
+            return None
+    stars_until, tribute_until = date("stars_premium_until"), date("tribute_premium_until")
+    if stars_until and stars_until > now:
+        payment = snapshot["last_payment"].get(tid, {})
+        if payment.get("tier") == "gift":
+            if tribute_until and tribute_until > stars_until:
+                return "tribute", tribute_until, False
+            return "gift", stars_until, False
+        return "stars", stars_until, bool(payment.get("is_subscription"))
+    if tribute_until and tribute_until > now:
+        return "tribute", tribute_until, False
+    return None
+
+
 async def _collect_users_data(bot: Bot) -> tuple[list[dict], dict]:
     """ОДИН тяжёлый проход по всем юзерам — из него рендерятся и HTML-отчёт
     (_build_users_report), и CSV (_build_users_csv), чтобы не звать get_chat и
@@ -169,6 +240,30 @@ async def _collect_users_data(bot: Bot) -> tuple[list[dict], dict]:
     см. event_counts_by_user и соседние в storage.py."""
     now = datetime.now(timezone.utc)
     users = list_all_users()
+    started = time.monotonic()
+    snapshot = await asyncio.to_thread(users_report_snapshot)
+    report_bot = _UsersReportBot(bot)
+    resolved = {}
+    queue = asyncio.Queue()
+    for user in users:
+        queue.put_nowait(user["telegram_id"])
+
+    async def resolve_worker():
+        while not queue.empty():
+            tid = queue.get_nowait()
+            who = await _resolve_username(report_bot, tid)
+            local_premium = _report_local_premium(snapshot, tid, now)
+            premium = bool(local_premium)
+            if not premium and PREMIUM_CHANNEL_ID:
+                try:
+                    member = await report_bot.get_chat_member(PREMIUM_CHANNEL_ID, int(tid))
+                    premium = member.status in ("member", "administrator", "creator")
+                except Exception:
+                    pass  # report_bot сохраняет ошибку в отдельную колонку.
+            subscribed = await _is_subscribed_to_promo_channel(report_bot, tid)
+            resolved[tid] = who, premium, subscribed
+
+    await asyncio.gather(*(resolve_worker() for _ in range(min(8, len(users)))))
 
     # Пакетные метрики — по одному запросу на всех юзеров сразу.
     events_by_user = event_counts_by_user()
@@ -191,8 +286,8 @@ async def _collect_users_data(bot: Bot) -> tuple[list[dict], dict]:
 
     for u in users:
         tid = u["telegram_id"]
-        who = await _resolve_username(bot, tid)
-        contacts = list_contacts(tid)
+        who, is_premium_now, is_subscribed_channel = resolved[tid]
+        contacts = snapshot["contacts"].get(tid, [])
 
         if u["gender"]:
             totals["with_gender"] += 1
@@ -216,10 +311,8 @@ async def _collect_users_data(bot: Bot) -> tuple[list[dict], dict]:
         # контакт создаётся уже от одного исходящего business-сообщения,
         # до того как придёт хоть один входящий. Число сообщений тут же —
         # чтобы это не выглядело странно в отчёте.
-        msg_count = sum(
-            count_biz_messages_for_contact(tid, c["id"]) + count_imported_messages(c["id"])
-            for c in contacts
-        )
+        # Было: два COUNT-запроса на КАЖДЫЙ контакт (см. snapshot выше).
+        msg_count = snapshot["messages"].get(tid, 0)
 
         is_blocked = bool(u["blocked_bot"])
         if is_blocked:
@@ -229,7 +322,7 @@ async def _collect_users_data(bot: Bot) -> tuple[list[dict], dict]:
         # Автоматизацию чатов в настройках Telegram, не блокируя самого бота
         # (и наоборот). Берём САМОЕ СВЕЖЕЕ подключение — юзер мог
         # переподключаться несколько раз, старые connection_id не трогаем.
-        latest_conn = get_latest_business_connection(tid)
+        latest_conn = snapshot["latest"].get(tid)
         automation_off = bool(latest_conn) and not latest_conn["is_enabled"]
         if automation_off:
             totals["automation_off"] += 1
@@ -239,8 +332,8 @@ async def _collect_users_data(bot: Bot) -> tuple[list[dict], dict]:
         # приблизительный бэкафилл: последнее событие из events (/start,
         # генерации, оплаты) — как и было здесь раньше. Само действие в таком
         # случае неизвестно ("—"), см. last_action ниже.
-        last_action_raw = u["last_action_at"] or get_last_event_time(tid)
-        last_incoming_raw = get_last_incoming_message_time(tid)
+        last_action_raw = u["last_action_at"] or snapshot["events"].get(tid)
+        last_incoming_raw = snapshot["incoming"].get(tid)
         # "Последняя активность" для отсева неактивных — позже из двух
         # сигналов (сам что-то сделал ИЛИ ему написали).
         candidates = [d for d in (last_action_raw, last_incoming_raw) if d]
@@ -283,11 +376,13 @@ async def _collect_users_data(bot: Bot) -> tuple[list[dict], dict]:
         # же функция, что строит текст под кнопкой «Подписка» (раньше тут
         # был отдельный, более бедный расчёт: не проверял Stars вообще и всё,
         # что не реферал/промо-канал, молча относил к Tribute).
-        is_premium_now = await _is_premium(bot, tid)
+        # is_premium_now уже получен ограниченными параллельными запросами.
         premium_until: datetime | None = None
         premium_is_subscription = False
         if is_premium_now:
-            premium_source, premium_until, premium_is_subscription = handlers.premium_screen._premium_expiry_info(tid)
+            # Раньше _premium_expiry_info открывала БД несколько раз на юзера.
+            premium_source, premium_until, premium_is_subscription = (
+                _report_local_premium(snapshot, tid, now) or ("tribute", None, False))
             totals["premium_now"] += 1
             source_bucket["premium"] += 1
             totals["premium_by_source"][premium_source] = (
@@ -317,7 +412,7 @@ async def _collect_users_data(bot: Bot) -> tuple[list[dict], dict]:
         # профиль стоимости, что уже есть у _is_premium выше (один запрос к
         # Telegram на юзера), отдельного кэша/реконсиляции тут не переиспользуем
         # (та таблица покрывает только юзеров с активным промо-Premium).
-        is_subscribed_channel = await _is_subscribed_to_promo_channel(bot, tid)
+        # is_subscribed_channel уже получен выше, повторный запрос не нужен.
         if is_subscribed_channel:
             totals["subscribed_channel"] += 1
 
@@ -364,6 +459,15 @@ async def _collect_users_data(bot: Bot) -> tuple[list[dict], dict]:
             "premium_until": premium_until.isoformat() if premium_until else "",
             "premium_remaining": premium_remaining,
             "premium_auto_renew": premium_is_subscription if is_premium_now else "",
+            "stars_payments_count": snapshot["stars"].get(tid, {}).get("stars_payments_count", 0),
+            "stars_paid_total": snapshot["stars"].get(tid, {}).get("stars_paid_total", 0),
+            "stars_last_paid_at": snapshot["stars"].get(tid, {}).get("stars_last_paid_at", ""),
+            "telegram_check_errors": ", ".join(sorted(
+                key[0] + (":" + str(key[1]) if key[0] == "get_chat_member" else "")
+                for key in report_bot.errors if key[-1] == int(tid)
+            )),
+            "premium_check_failed": not is_premium_now and (
+                "get_chat_member", PREMIUM_CHANNEL_ID, int(tid)) in report_bot.errors,
             "trial_used": u["trial_used"],
             "referrals_made": referrals_by_user.get(tid, 0),
             # только для HTML-отчёта, в CSV не идут
@@ -381,6 +485,8 @@ async def _collect_users_data(bot: Bot) -> tuple[list[dict], dict]:
         })
 
     totals["gate_tracking_start"] = gate_tracking_start
+    logging.info("users export: users=%d seconds=%.2f telegram_errors=%d",
+                 len(rows), time.monotonic() - started, len(report_bot.errors))
     return rows, totals
 
 
@@ -544,6 +650,8 @@ _USERS_CSV_COLUMNS = [
     "used_deep_analysis",
     "is_premium_now", "premium_source", "premium_until",
     "premium_auto_renew", "trial_used", "referrals_made",
+    "stars_payments_count", "stars_paid_total", "stars_last_paid_at", "telegram_check_errors",
+    "premium_check_failed",
 ]
 
 
@@ -690,12 +798,16 @@ def _build_users_dashboard_html(rows: list[dict], totals: dict) -> str:
     Premium-по-оплате, использование фич, здоровье базы) — отвечает на
     вопрос "всё ли в порядке с ботом", который список карточек не покрывает."""
     total = totals["total"]
+    stars_buyers = sum(r.get("stars_payments_count", 0) > 0 for r in rows)
+    stars_paid = sum(r.get("stars_paid_total", 0) for r in rows)
+    premium_unknown = sum(bool(r.get("premium_check_failed")) for r in rows)
+    telegram_errors = sum(bool(r.get("telegram_check_errors")) for r in rows)
 
     funnel_steps = [
         ("🚀 Старт", total, None),
         ("🔌 Подключили автоматизацию", totals["with_contact"], total),
         ("🧪 Воспользовались триалом", totals["trial_used"], totals["with_contact"]),
-        ("👑 Купили Premium", totals["premium_now"], totals["trial_used"]),
+        ("👑 Premium активен", totals["premium_now"], totals["trial_used"]),
     ]
     funnel_html = []
     for i, (label, value, prev) in enumerate(funnel_steps):
@@ -763,6 +875,8 @@ def _build_users_dashboard_html(rows: list[dict], totals: dict) -> str:
   <section class="dash dash-col">
     <h2>👑 Premium — по источнику оплаты</h2>
     <div class="dash-sub">Всего сейчас: <b>{totals['premium_now']}</b> ({_pct(totals['premium_now'], total)}% от всех)</div>
+    <div class="dash-sub">Платили Stars за всё время: <b>{stars_buyers}</b> пользователей, <b>{stars_paid} ⭐</b>. Подарки не считаются оплатами.</div>
+    <div class="dash-sub">Не удалось проверить Premium: <b>{premium_unknown}</b>. Пользователей с ошибками Telegram: <b>{telegram_errors}</b>. При ошибках число активных подписок может быть неполным.</div>
     {"".join(premium_source_rows) or '<div class="muted">Пока ни у кого нет Premium</div>'}
   </section>
   <section class="dash dash-col">
@@ -927,6 +1041,8 @@ def _build_users_html(rows: list[dict], totals: dict) -> bytes:
     for r in ordered:
         premium_badge_class = _USERS_CARD_BADGE_YES if r["is_premium_now"] else _USERS_CARD_BADGE_NO
         premium_badge_text = "👑 Premium" if r["is_premium_now"] else "Без Premium"
+        if r.get("premium_check_failed"):
+            premium_badge_text = "⚠️ Premium не проверен"
 
         sub_badge_class = _USERS_CARD_BADGE_YES if r["_is_subscribed_channel"] else _USERS_CARD_BADGE_NO
         sub_badge_text = "📢 Подписан" if r["_is_subscribed_channel"] else "📢 Не подписан"
@@ -947,6 +1063,13 @@ def _build_users_html(rows: list[dict], totals: dict) -> bytes:
                 premium_detail = f"{label} (дата окончания неизвестна)"
         else:
             premium_detail = "не активен"
+        if r.get("premium_check_failed"):
+            premium_detail = "не удалось проверить членство в канале; статус неизвестен"
+
+        stars_detail = (
+            f"{r.get('stars_payments_count', 0)} оплат, {r.get('stars_paid_total', 0)} ⭐"
+            + (f", последняя {_fmt_msk(r['stars_last_paid_at'])}" if r.get("stars_last_paid_at") else "")
+        )
 
         data_attrs = (
             f'data-name="{html.escape(r["username"].lower(), quote=True)}" '
@@ -975,6 +1098,7 @@ def _build_users_html(rows: list[dict], totals: dict) -> bytes:
     <div class="info-row"><span class="info-label">Сообщений</span><span>{r['messages_count']}</span></div>
     <div class="info-row"><span class="info-label">Собеседник писал</span><span>{html.escape(r['_last_incoming_msk'])}</span></div>
     <div class="info-row"><span class="info-label">Premium</span><span>{html.escape(premium_detail)}</span></div>
+    <div class="info-row"><span class="info-label">Оплаты Stars за всё время</span><span>{html.escape(stars_detail)}</span></div>
   </div>
 </div>"""
         cards.append(card)
