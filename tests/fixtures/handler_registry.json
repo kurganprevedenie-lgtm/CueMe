@@ -256,6 +256,13 @@
  },
  {
   "event": "message",
+  "callback": "cmd_emoji_preview",
+  "filters": [
+   "Command(commands=['emoji_preview'], ignore_case=False, ignore_mention=False, magic=None, prefix='/')"
+  ]
+ },
+ {
+  "event": "message",
   "callback": "cmd_premium",
   "filters": [
    "Command(commands=['premium'], ignore_case=False, ignore_mention=False, magic=None, prefix='/')"

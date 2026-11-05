@@ -37,6 +37,7 @@ from storage import init_db, record_event  # noqa: E402
 from app_state import _watch_event_loop_lag, dp  # noqa: E402
 from handlers.referrals_gate import _reconcile_promo_channel_premium  # noqa: E402
 from handlers.stars_tribute import _start_tribute_webhook_server  # noqa: E402
+from ui_emoji import install_ui_emoji  # noqa: E402
 
 # Обратная совместимость: main.<имя> для тестов и ops-скриптов (import main).
 # Подменять в тестах надо там, где имя вызывается, — в его модуле.
@@ -103,6 +104,7 @@ async def main() -> None:
     _validate_startup_config()
     init_db()
     bot = Bot(token=BOT_TOKEN)
+    install_ui_emoji(bot)
     set_invalid_output_hook(_make_invalid_output_hook(bot))
     await bot.set_my_commands([
         BotCommand(command="start",       description="Начало работы"),

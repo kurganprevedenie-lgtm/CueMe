@@ -29,6 +29,7 @@ from aiogram.types import (
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from config import CONNECT_EFFECT_ID
+from ui_emoji import icon
 from storage import (
     find_contact_by_original_id,
     find_unlinked_manual_contact_by_username,
@@ -119,16 +120,17 @@ async def handle_business_connection(event: BusinessConnection, bot: Bot) -> Non
             # (_maybe_prompt_source ниже) — а вот всё ПОСЛЕ него (источник →
             # пол → квикстарт → «кому бы написал») остаётся правками одного
             # и того же сообщения.
-            text = "✅ Готово, бот подключён! CueMe готов помогать тебе в переписках )"
+            text = f"{icon('success')} Готово, бот подключён! CueMe готов помогать тебе в переписках )"
             try:
                 try:
                     await bot.send_message(
                         event.user.id, text, reply_markup=ReplyKeyboardRemove(),
                         message_effect_id=CONNECT_EFFECT_ID or None,
+                        parse_mode="HTML",
                     )
                 except TelegramBadRequest as e:
                     logging.warning("business-connect: эффект не принят (%s), шлю без него", e)
-                    await bot.send_message(event.user.id, text, reply_markup=ReplyKeyboardRemove())
+                    await bot.send_message(event.user.id, text, reply_markup=ReplyKeyboardRemove(), parse_mode="HTML")
             except TelegramForbiddenError:
                 mark_bot_blocked(owner_id)
                 return

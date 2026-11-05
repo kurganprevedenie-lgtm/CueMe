@@ -3,6 +3,7 @@
 Вынесено из main.py без изменения логики (строки 10367–10550 исходного файла).
 Порядок регистрации хендлеров задаёт main.py порядком импорта модулей —
 этот модуль нельзя импортировать раньше предыдущих (см. tests/test_handler_registry.py)."""
+from ui_emoji import theme_keyboard, icon
 import asyncio
 from aiogram import Bot, F
 from aiogram.exceptions import TelegramBadRequest
@@ -36,7 +37,7 @@ _WATCH_ITEMS = (
 )
 
 _WATCH_TEXT = (
-    "🗑 Удалённые сообщения\n\n"
+    f"{icon('settings')} Удалённые сообщения\n\n"
     "Что присылать тебе из переписок:\n"
     "• удалённые собеседником сообщения\n"
     "• изменённые — что было и что стало\n"
@@ -58,13 +59,13 @@ def _watch_kb(telegram_id: str, is_premium: bool) -> InlineKeyboardMarkup:
         b.button(text="👑 Оформить Premium", callback_data="show_premium")
     b.button(text="⬅️ Назад", callback_data="sub:to_menu")
     b.adjust(1)
-    return b.as_markup()
+    return theme_keyboard(b.as_markup())
 
 
 async def _show_watch_screen(target: Message, bot: Bot, telegram_id: str) -> None:
     is_premium = await _is_premium(bot, telegram_id)
     text = _WATCH_TEXT if is_premium else f"{_WATCH_TEXT}\n\n🔒 Доступно с Premium."
-    await target.edit_text(text, reply_markup=_watch_kb(telegram_id, is_premium))
+    await target.edit_text(text, reply_markup=_watch_kb(telegram_id, is_premium), parse_mode="HTML")
 
 
 @dp.callback_query(F.data == "watch:menu")

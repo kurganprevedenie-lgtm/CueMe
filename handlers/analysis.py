@@ -4,6 +4,7 @@
 Порядок регистрации хендлеров задаёт main.py порядком импорта модулей —
 этот модуль нельзя импортировать раньше предыдущих (см. tests/test_handler_registry.py)."""
 import html
+from ui_emoji import icon, edit_plain_ui_long
 import json
 import logging
 import random
@@ -627,7 +628,7 @@ def _format_deep_analysis_teaser(name: str, metrics: dict) -> str:
     посчитаны ПОЛНОСТЬЮ как обычно (см. _gen_deep_analysis, тот же кэш, что
     у Premium-юзеров) — здесь только решаем, что показать."""
     meta = metrics.get("_meta") or {}
-    header = f"🔬 Анализ собеседника — {html.escape(name)}\n"
+    header = f"{icon('analysis')} Анализ собеседника — {html.escape(name)}\n"
     if meta.get("total"):
         header += f"<i>{meta['total']} сообщений, {html.escape(meta.get('date_from', ''))} — {html.escape(meta.get('date_to', ''))}</i>\n"
     header += "\n"
@@ -842,7 +843,7 @@ def _build_rich_analysis_html(name: str, metrics: dict, dynamics_text: str, synt
         trend_table = ""
 
     return (
-        f"{_rich_heading(f'🔬 Анализ собеседника — {name}')}\n"
+        f"<p><b>{icon('analysis')} Анализ собеседника — {esc(name)}</b></p>\n"
         f"{subtitle}"
         f"{metric_blocks}\n"
         f"{_rich_heading('📈 Динамика переписки')}\n"
@@ -865,7 +866,7 @@ def _format_deep_analysis_text(name: str, metrics: dict, dynamics_text: str, syn
     meta = metrics.get("_meta") or {}
     vt = metrics.get("_volume_trend") or {}
 
-    header = f"🔬 Анализ собеседника — {html.escape(name)}\n"
+    header = f"{icon('analysis')} Анализ собеседника — {html.escape(name)}\n"
     if meta.get("total"):
         header += f"<i>{meta['total']} сообщений, {html.escape(meta.get('date_from', ''))} — {html.escape(meta.get('date_to', ''))}</i>\n"
     header += "\n"
@@ -1277,8 +1278,8 @@ async def _run_ideal_date(
         return
 
     if not full_access:
-        await _edit_or_answer_long(
-            progress_msg, _format_ideal_date_teaser(name, data),
+        await edit_plain_ui_long(
+            progress_msg, _format_ideal_date_teaser(name, data), "date",
             reply_markup=ideal_date_teaser_kb(contact_id),
         )
         _note_outcome("no_quota")
@@ -1288,7 +1289,9 @@ async def _run_ideal_date(
         ideal_date_free_trial_result_kb(contact_id) if is_free_trial_result
         else ideal_date_result_kb(contact_id)
     )
-    await _edit_or_answer_long(progress_msg, _format_ideal_date(name, data), reply_markup=result_kb)
+    # Было: _edit_or_answer_long с обычным текстом. Теперь оформляем только
+    # заголовок; HTML экранируется после разбиения на безопасные части.
+    await edit_plain_ui_long(progress_msg, _format_ideal_date(name, data), "date", reply_markup=result_kb)
     await _charge_feature_trial_if_needed(bot, telegram_id, mark_date_trial_used)
     _note_outcome("ok")
     try:

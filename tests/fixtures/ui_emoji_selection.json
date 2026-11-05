@@ -1,0 +1,149 @@
+{
+  "reply": {
+    "set": "NewsEmoji",
+    "custom_emoji_id": "5443038326535759644",
+    "emoji": "💬",
+    "is_animated": true,
+    "is_video": false
+  },
+  "analysis": {
+    "set": "RestrictedEmoji",
+    "custom_emoji_id": "5379679518740978720",
+    "emoji": "🔬",
+    "is_animated": true,
+    "is_video": false
+  },
+  "date": {
+    "set": "BirthdayCollection",
+    "custom_emoji_id": "5192959294470895031",
+    "emoji": "💐",
+    "is_animated": true,
+    "is_video": false
+  },
+  "new_dialogue": {
+    "set": "NewsEmoji",
+    "custom_emoji_id": "5397916757333654639",
+    "emoji": "➕",
+    "is_animated": true,
+    "is_video": false
+  },
+  "profile": {
+    "set": "RestrictedEmoji",
+    "custom_emoji_id": "5373012449597335010",
+    "emoji": "👤",
+    "is_animated": true,
+    "is_video": false
+  },
+  "friends": {
+    "set": "RestrictedEmoji",
+    "custom_emoji_id": "5372926953978341366",
+    "emoji": "👥",
+    "is_animated": true,
+    "is_video": false
+  },
+  "premium": {
+    "set": "NewsEmoji",
+    "custom_emoji_id": "5217822164362739968",
+    "emoji": "👑",
+    "is_animated": true,
+    "is_video": false
+  },
+  "gift": {
+    "set": "BirthdayCollection",
+    "custom_emoji_id": "5449800250032143374",
+    "emoji": "🎁",
+    "is_animated": true,
+    "is_video": false
+  },
+  "activation": {
+    "set": "BirthdayCollection",
+    "custom_emoji_id": "5193018401810822951",
+    "emoji": "🎉",
+    "is_animated": true,
+    "is_video": false
+  },
+  "settings": {
+    "set": "NewsEmoji",
+    "custom_emoji_id": "5341715473882955310",
+    "emoji": "⚙️",
+    "is_animated": true,
+    "is_video": false
+  },
+  "support": {
+    "set": "NewsEmoji",
+    "custom_emoji_id": "5452069934089641166",
+    "emoji": "❓",
+    "is_animated": true,
+    "is_video": false
+  },
+  "home": {
+    "set": "NewsEmoji",
+    "custom_emoji_id": "5416041192905265756",
+    "emoji": "🏠",
+    "is_animated": true,
+    "is_video": false
+  },
+  "success": {
+    "set": "NewsEmoji",
+    "custom_emoji_id": "5206607081334906820",
+    "emoji": "✔️",
+    "is_animated": true,
+    "is_video": false
+  },
+  "waiting": {
+    "set": "RestrictedEmoji",
+    "custom_emoji_id": "5451732530048802485",
+    "emoji": "⏳",
+    "is_animated": true,
+    "is_video": false
+  },
+  "warning": {
+    "set": "NewsEmoji",
+    "custom_emoji_id": "5447644880824181073",
+    "emoji": "⚠️",
+    "is_animated": true,
+    "is_video": false
+  },
+  "refresh": {
+    "set": "RestrictedEmoji",
+    "custom_emoji_id": "5264727218734524899",
+    "emoji": "🔄",
+    "is_animated": true,
+    "is_video": false
+  },
+  "deleted": {
+    "set": "NewsEmoji",
+    "custom_emoji_id": "5445267414562389170",
+    "emoji": "🗑",
+    "is_animated": true,
+    "is_video": false
+  },
+  "stars": {
+    "set": "NewsEmoji",
+    "custom_emoji_id": "5438496463044752972",
+    "emoji": "⭐️",
+    "is_animated": true,
+    "is_video": false
+  },
+  "locked": {
+    "set": "NewsEmoji",
+    "custom_emoji_id": "5296369303661067030",
+    "emoji": "🔒",
+    "is_animated": true,
+    "is_video": false
+  },
+  "welcome": {
+    "set": "RestrictedEmoji",
+    "custom_emoji_id": "5472055112702629499",
+    "emoji": "👋",
+    "is_animated": true,
+    "is_video": false
+  },
+  "warmth": {
+    "set": "MadEmoji2",
+    "custom_emoji_id": "5213447602732813642",
+    "emoji": "💞",
+    "is_animated": true,
+    "is_video": false
+  }
+}

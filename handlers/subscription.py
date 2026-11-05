@@ -3,6 +3,7 @@
 Вынесено из main.py без изменения логики (строки 681–1068 исходного файла).
 Порядок регистрации хендлеров задаёт main.py порядком импорта модулей —
 этот модуль нельзя импортировать раньше предыдущих (см. tests/test_handler_registry.py)."""
+from ui_emoji import theme_keyboard
 import asyncio
 import contextvars
 import logging
@@ -103,7 +104,7 @@ def paywall_kb() -> InlineKeyboardMarkup:
         b.button(text=_CHECK_PAYMENT_BTN, callback_data="check_payment")
     b.button(text="⭐ Оплатить Stars", callback_data="stars_menu")
     b.adjust(1)
-    return b.as_markup()
+    return theme_keyboard(b.as_markup())
 
 
 def premium_menu_kb() -> InlineKeyboardMarkup:
@@ -122,7 +123,7 @@ def premium_menu_kb() -> InlineKeyboardMarkup:
     b.button(text="📢 Подписаться на канал", callback_data="promo:offer")
     b.button(text="⬅️ Назад", callback_data="sub:to_menu")
     b.adjust(1)
-    return b.as_markup()
+    return theme_keyboard(b.as_markup())
 
 
 def stars_tariff_kb() -> InlineKeyboardMarkup:
@@ -135,7 +136,7 @@ def stars_tariff_kb() -> InlineKeyboardMarkup:
     b.button(text=f"⭐ Месяц (автопродление) — {STAR_PRICE_MONTH} Stars", callback_data="stars_buy:month")
     b.button(text="‹ Назад", callback_data="stars_back")
     b.adjust(1)
-    return b.as_markup()
+    return theme_keyboard(b.as_markup())
 
 
 async def _send_paywall(target: Message, text: str, edit: bool = False) -> None:
@@ -295,7 +296,7 @@ def _retry_kb(callback_data: str) -> InlineKeyboardMarkup | None:
         return None
     b = InlineKeyboardBuilder()
     b.button(text="🔄 Попробовать ещё раз", callback_data=callback_data)
-    return b.as_markup()
+    return theme_keyboard(b.as_markup())
 
 
 def _note_outcome(status: str) -> None:

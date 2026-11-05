@@ -45,6 +45,8 @@ OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 # telegram_id разработчика — кому доступны админ-команды (/provider, /users,
 # /export, /sources и т.п.), не должны быть открыты всем.
 ADMIN_TELEGRAM_ID = os.getenv("ADMIN_TELEGRAM_ID", "")
+# Оформление интерфейса. false — обычные эмодзи без изменения действий.
+UI_CUSTOM_EMOJI = os.getenv("UI_CUSTOM_EMOJI", "true").lower() in ("1", "true", "yes")
 # Несколько админов через запятую (ADMIN_TELEGRAM_ID тоже входит в список
 # автоматически, если задан, — задавать его отдельно не обязательно).
 _admin_ids_raw = os.getenv("ADMIN_TELEGRAM_IDS", "")

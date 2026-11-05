@@ -5,6 +5,7 @@
 этот модуль нельзя импортировать раньше предыдущих (см. tests/test_handler_registry.py)."""
 import html
 import logging
+from ui_emoji import icon
 from aiogram import Bot
 from aiogram.filters import Command
 from aiogram.types import Message
@@ -29,7 +30,7 @@ from storage import (
     list_contacts,
     save_style_card,
 )
-from app_state import _contact_name, dp
+from app_state import _contact_name, _is_admin, dp
 from handlers.subscription import _require_premium
 from handlers.cards import _rebuild_contact
 from handlers.start_menu import help_kb, support_kb
@@ -141,6 +142,7 @@ async def _show_help(message: Message, edit: bool = False) -> None:
     (/help, BTN_HELP по тексту со старой клавиатуры) — новое сообщение, без
     Назад (нет экрана, в который возвращаться) — только ссылка на поддержку."""
     text = (
+        f"{icon('support')} Помощь\n\n"
         "Вот что я умею. На главном экране — кнопка «💬 Ответ с CueMe» плюс "
         "«🔬 Анализ собеседника», «💐 Идеальное свидание» и «👑 Подписка»:\n\n"
         "💬 Ответ с CueMe — перешли сообщение или вставь текст: если контакт "
@@ -184,3 +186,12 @@ async def _show_help(message: Message, edit: bool = False) -> None:
 @dp.message(Command("help"))
 async def cmd_help(message: Message) -> None:
     await _show_help(message)
+
+
+@dp.message(Command("emoji_preview"))
+async def cmd_emoji_preview(message: Message, bot: Bot) -> None:
+    if not _is_admin(message.from_user.id):
+        return
+    # Даже вызов из админской группы отправляет предпросмотр только в личку.
+    from tools.preview_ui_emoji import send_preview
+    await send_preview(bot, message.from_user.id)

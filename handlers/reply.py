@@ -3,6 +3,7 @@
 Вынесено из main.py без изменения логики (строки 8571–9969 исходного файла).
 Порядок регистрации хендлеров задаёт main.py порядком импорта модулей —
 этот модуль нельзя импортировать раньше предыдущих (см. tests/test_handler_registry.py)."""
+from ui_emoji import theme_keyboard, icon
 import asyncio
 import html
 import json
@@ -351,7 +352,7 @@ def unified_contacts_kb(contacts: list) -> InlineKeyboardMarkup:
         b.button(text=_contact_name(c), callback_data=f"unified_contact:{c['id']}")
     b.button(text="➕ Другой человек", callback_data="unified_contact:new")
     b.adjust(1)
-    return b.as_markup()
+    return theme_keyboard(b.as_markup())
 
 
 async def _edit_setup_message(
@@ -970,11 +971,11 @@ def live_start_kb() -> InlineKeyboardMarkup:
     b.button(text="🎯 Живой коучинг", callback_data="live:coach")
     b.button(text="🎲 Готовые фразы для начала", callback_data="live:phrases")
     b.adjust(1)
-    return b.as_markup()
+    return theme_keyboard(b.as_markup())
 
 
 async def _show_live_start(message: Message) -> None:
-    await message.answer("Как начнём?", reply_markup=live_start_kb())
+    await message.answer(f"{icon('new_dialogue')} Как начнём?", reply_markup=live_start_kb(), parse_mode="HTML")
 
 
 @dp.callback_query(F.data == "live:coach")

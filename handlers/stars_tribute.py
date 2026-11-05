@@ -3,6 +3,7 @@
 Вынесено из main.py без изменения логики (строки 2109–2530 исходного файла).
 Порядок регистрации хендлеров задаёт main.py порядком импорта модулей —
 этот модуль нельзя импортировать раньше предыдущих (см. tests/test_handler_registry.py)."""
+from ui_emoji import theme_keyboard, icon
 import asyncio
 import hashlib
 import hmac
@@ -206,7 +207,7 @@ async def process_stars_successful_payment(message: Message, bot: Bot) -> None:
 
     until_label = expires_at.strftime("%d.%m.%Y %H:%M UTC")
     extra = " Продлится автоматически, спишется ещё раз через 30 дней." if is_subscription else ""
-    await message.answer(f"🎉 Готово! Premium активен до {until_label}.{extra}")
+    await message.answer(f"{icon('activation')} Готово! Premium активен до {until_label}.{extra}", parse_mode="HTML")
     await handlers.business._offer_pending_reveals(bot, telegram_id)
 
 
@@ -290,7 +291,8 @@ async def _grant_premium_channel_access(bot: Bot, telegram_id: str, username: st
             )
             await bot.send_message(
                 int(telegram_id),
-                f"🎉 Оплата прошла! Вот ссылка в закрытый канал Premium:\n{invite.invite_link}",
+                f"{icon('activation')} Оплата прошла! Вот ссылка в закрытый канал Premium:\n{invite.invite_link}",
+                parse_mode="HTML",
             )
             return
         except TelegramForbiddenError as e:
@@ -366,7 +368,7 @@ async def _handle_tribute_subscription_event(bot: Bot, event_name: str, payload:
     await _grant_premium_channel_access(bot, telegram_id, username)
     until_label = expires_at.strftime("%d.%m.%Y %H:%M UTC")
     try:
-        await bot.send_message(int(telegram_id), f"🎉 Оплата прошла! Premium активен до {until_label}.")
+        await bot.send_message(int(telegram_id), f"{icon('activation')} Оплата прошла! Premium активен до {until_label}.", parse_mode="HTML")
     except Exception:
         logging.warning("tribute: не удалось отправить подтверждение оплаты %s", telegram_id)
     await handlers.business._offer_pending_reveals(bot, telegram_id)
@@ -445,8 +447,8 @@ async def _invite_text(bot: Bot, telegram_id: str) -> tuple[str, str]:
     link = await _referral_link(bot, code)
 
     text = (
-        "🎁 Пригласи друга\n\n"
-        f"👥 Приведено друзей: {count}\n\n"
+        f"{icon('gift')} Пригласи друга\n\n"
+        f"{icon('friends')} Приведено друзей: {count}\n\n"
         f"Пригласи друга по ссылке — получи +{REFERRAL_REPLY_BONUS} «Ответить за "
         f"меня», +{REFERRAL_ANALYSIS_BONUS} «Анализ собеседника», "
         f"+{REFERRAL_DATE_BONUS} «Идеальное свидание» сразу, как только он запустит "
@@ -461,7 +463,7 @@ def invite_kb(link: str) -> InlineKeyboardMarkup:
     b.button(text="📋 Скопировать ссылку", copy_text=CopyTextButton(text=link))
     b.button(text="⬅️ Назад", callback_data="show_premium")
     b.adjust(1)
-    return b.as_markup()
+    return theme_keyboard(b.as_markup())
 
 
 async def _show_invite(

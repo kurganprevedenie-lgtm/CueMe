@@ -7,6 +7,7 @@ import asyncio
 import hashlib
 import logging
 import re
+from ui_emoji import icon
 from aiogram import BaseMiddleware, Bot, F
 from aiogram.exceptions import TelegramForbiddenError
 from aiogram.types import (
@@ -63,13 +64,14 @@ async def _maybe_prompt_gender(
     try:
         if edit_chat_id is not None and edit_message_id is not None:
             await bot.edit_message_text(
-                _GENDER_PROMPT_TEXT,
+                f"{icon('profile')} {_GENDER_PROMPT_TEXT}",
                 chat_id=edit_chat_id,
                 message_id=edit_message_id,
                 reply_markup=gender_kb(),
+                parse_mode="HTML",
             )
         else:
-            await bot.send_message(int(telegram_id), _GENDER_PROMPT_TEXT, reply_markup=gender_kb())
+            await bot.send_message(int(telegram_id), f"{icon('profile')} {_GENDER_PROMPT_TEXT}", reply_markup=gender_kb(), parse_mode="HTML")
     except TelegramForbiddenError:
         mark_bot_blocked(telegram_id)
         return False
@@ -205,7 +207,7 @@ _ADMIN_COMMANDS = {
     "users", "export", "provider", "apistatus", "sources", "inspect",
     "suggestion_stats", "funnel_status", "test_reminders", "broadcast_admin",
     "broadcast_deleted_messages", "broadcast_deleted_paywall",
-    "broadcast_invite", "broadcast_price_drop", "gift_premium",
+    "broadcast_invite", "broadcast_price_drop", "gift_premium", "emoji_preview",
 }
 _ADMIN_CALLBACK_PREFIXES = ("bcast:", "export:", "gift:")
 

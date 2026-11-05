@@ -73,6 +73,7 @@ from app_state import (
     dp,
 )
 from handlers.subscription import _gen_outcome, _is_premium, _record_gate_event
+from ui_emoji import icon
 import handlers  # ссылки по модулю: имена ниже по исходному main.py / общее состояние
 
 
@@ -115,10 +116,11 @@ async def _credit_referral_if_pending(bot: Bot, referred_id: str) -> None:
     try:
         await bot.send_message(
             int(referrer_id),
-            "🎉 Твой друг начал пользоваться CueMe! Держи подарок — "
+            f"{icon('warmth')} Твой друг начал пользоваться CueMe! Держи подарок — "
             f"+{REFERRAL_REPLY_BONUS} «Ответить за меня», "
             f"+{REFERRAL_ANALYSIS_BONUS} «Анализ собеседника», "
             f"+{REFERRAL_DATE_BONUS} «Идеальное свидание».",
+            parse_mode="HTML",
         )
     except Exception:
         logging.warning("referral notify failed: referrer=%s", referrer_id)

@@ -4,6 +4,7 @@
 Порядок регистрации хендлеров задаёт main.py порядком импорта модулей —
 этот модуль нельзя импортировать раньше предыдущих (см. tests/test_handler_registry.py)."""
 import html
+from ui_emoji import icon
 from datetime import datetime, timedelta, timezone
 from aiogram import Bot, F
 from aiogram.filters import Command
@@ -204,7 +205,7 @@ async def _premium_status_text(bot: Bot, telegram_id: str) -> str:
     if await _is_premium(bot, telegram_id):
         expiry_line = html.escape(_premium_expiry_line(telegram_id))
         return (
-            "👑 Подписка:\n\n✅ Активна — весь функционал CueMe без ограничений.\n\n"
+            f"{icon('premium')} Подписка:\n\n{icon('success')} Активна — весь функционал CueMe без ограничений.\n\n"
             f"{_PREMIUM_FEATURES_HTML}\n\n{expiry_line}"
         )
 
@@ -227,7 +228,7 @@ async def _premium_status_text(bot: Bot, telegram_id: str) -> str:
                 f"{PROMO_CHANNEL_DATE_BONUS} «Идеальных свидания».\n\n"
             )
         )
-        return f"👑 Подписка:\n\n❌ Не активна\n\n{_PREMIUM_FEATURES_HTML}\n\n{html.escape(claim_line + footer)}"
+        return f"{icon('premium')} Подписка:\n\n❌ Не активна\n\n{_PREMIUM_FEATURES_HTML}\n\n{html.escape(claim_line + footer)}"
 
     reply_left = max(0, get_reply_trial_bonus(telegram_id) - get_trial_used(telegram_id))
     analysis_left = max(0, get_analysis_trial_bonus(telegram_id) - get_analysis_trial_count(telegram_id))
@@ -244,7 +245,7 @@ async def _premium_status_text(bot: Bot, telegram_id: str) -> str:
             f"🔬 «Анализ собеседника» — {analysis_left}\n"
             f"💡 «Идеальное свидание» — {date_left}\n\n"
         )
-    return f"👑 Подписка:\n\n❌ Не активна\n\n{_PREMIUM_FEATURES_HTML}\n\n{html.escape(left_block + footer)}"
+    return f"{icon('premium')} Подписка:\n\n❌ Не активна\n\n{_PREMIUM_FEATURES_HTML}\n\n{html.escape(left_block + footer)}"
 
 
 @dp.message(Command("premium"))

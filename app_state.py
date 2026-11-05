@@ -1,4 +1,5 @@
 import asyncio
+from ui_emoji import icon, plain_heading
 import contextvars
 import csv
 import difflib
@@ -340,9 +341,9 @@ async def on_unhandled_error(event: ErrorEvent) -> bool:
                 await cq.answer(text, show_alert=True)
             except Exception:
                 if cq.message is not None:
-                    await cq.message.answer(text)
+                    await cq.message.answer(f"{icon('warning')} {text}", parse_mode="HTML")
         elif getattr(upd, "message", None) is not None:
-            await upd.message.answer(text)
+            await upd.message.answer(f"{icon('warning')} {text}", parse_mode="HTML")
     except Exception:
         logging.exception("error handler: не удалось уведомить пользователя")
     return True
@@ -604,7 +605,7 @@ async def with_progress_animation(
 
     async def _edit(frame: str) -> None:
         try:
-            await bot.edit_message_text(frame, chat_id=chat_id, message_id=message_id)
+            await bot.edit_message_text(plain_heading(frame, "waiting"), chat_id=chat_id, message_id=message_id, parse_mode="HTML")
         except Exception:
             pass  # гонки/лимит одного кадра — не роняем анимацию
 

@@ -3,6 +3,7 @@
 Вынесено из main.py без изменения логики (строки 2961–3207 исходного файла).
 Порядок регистрации хендлеров задаёт main.py порядком импорта модулей —
 этот модуль нельзя импортировать раньше предыдущих (см. tests/test_handler_registry.py)."""
+from ui_emoji import theme_keyboard, icon
 import logging
 from pathlib import Path
 from aiogram import Bot, F
@@ -137,10 +138,10 @@ async def cmd_myref(message: Message) -> None:
 
 
 _MAIN_MENU_TEXT = (
-    "👋 Вот что я умею:\n\n"
-    "💬 Ответ с CueMe — подскажу, что написать в моменте\n"
-    "🔬 Анализ собеседника — разберу вашу переписку по фактам\n"
-    "💐 Идеальное свидание — накидаю идеи для свидания"
+    f"{icon('welcome')} Вот что я умею:\n\n"
+    f"{icon('reply')} Ответ с CueMe — подскажу, что написать в моменте\n"
+    f"{icon('analysis')} Анализ собеседника — разберу вашу переписку по фактам\n"
+    f"{icon('date')} Идеальное свидание — накидаю идеи для свидания"
 )
 
 
@@ -160,7 +161,7 @@ def main_menu_kb() -> InlineKeyboardMarkup:
     b.button(text=BTN_SUBSCRIPTION, callback_data="show_premium")
     b.button(text=BTN_SUPPORT, callback_data="mm:support")
     b.adjust(1)
-    return b.as_markup()
+    return theme_keyboard(b.as_markup())
 
 
 async def _send_main_menu(target: Message, edit: bool = False) -> None:
@@ -195,7 +196,7 @@ async def _send_main_menu(target: Message, edit: bool = False) -> None:
         mark_legacy_kb_cleared(telegram_id)
 
     if edit:
-        await target.edit_text(_MAIN_MENU_TEXT, reply_markup=main_menu_kb())
+        await target.edit_text(_MAIN_MENU_TEXT, reply_markup=main_menu_kb(), parse_mode="HTML")
     else:
         # Логотип — только для НОВОГО сообщения (edit_text не может превратить
         # текст в фото, см. коммент у функции). Тот же приоритет путей, что и
@@ -205,16 +206,18 @@ async def _send_main_menu(target: Message, edit: bool = False) -> None:
             await target.answer_photo(
                 photo=FSInputFile(photo_path),
                 caption=_MAIN_MENU_TEXT,
+                parse_mode="HTML",
                 reply_markup=main_menu_kb(),
             )
         elif MAIN_MENU_LOGO_FILE_ID:
             await target.answer_photo(
                 photo=MAIN_MENU_LOGO_FILE_ID,
                 caption=_MAIN_MENU_TEXT,
+                parse_mode="HTML",
                 reply_markup=main_menu_kb(),
             )
         else:
-            await target.answer(_MAIN_MENU_TEXT, reply_markup=main_menu_kb())
+            await target.answer(_MAIN_MENU_TEXT, reply_markup=main_menu_kb(), parse_mode="HTML")
 
 
 async def _menu_screen_target(msg: Message) -> Message:
@@ -266,7 +269,7 @@ def _with_back_to_menu(markup: InlineKeyboardMarkup) -> InlineKeyboardMarkup:
     результата генерации (Ответ с CueMe / Анализ собеседника / Идеальное
     свидание) — не трогает остальные кнопки той клавиатуры."""
     markup.inline_keyboard.append([_BACK_TO_MENU_BUTTON])
-    return markup
+    return theme_keyboard(markup)
 
 
 @dp.callback_query(F.data == "back_to_menu")

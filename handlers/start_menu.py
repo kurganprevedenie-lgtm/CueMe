@@ -3,6 +3,7 @@
 Вынесено из main.py без изменения логики (строки 6315–6930 исходного файла).
 Порядок регистрации хендлеров задаёт main.py порядком импорта модулей —
 этот модуль нельзя импортировать раньше предыдущих (см. tests/test_handler_registry.py)."""
+from ui_emoji import theme_keyboard
 import asyncio
 import html
 import logging
@@ -501,7 +502,7 @@ async def cb_onboarding_json(call: CallbackQuery, state: FSMContext, bot: Bot) -
 def support_kb() -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     b.button(text="🆘 Написать в поддержку", url="https://t.me/CueMeSupport")
-    return b.as_markup()
+    return theme_keyboard(b.as_markup())
 
 
 def help_kb() -> InlineKeyboardMarkup:
@@ -513,7 +514,7 @@ def help_kb() -> InlineKeyboardMarkup:
     b.button(text="🆘 Написать в поддержку", url="https://t.me/CueMeSupport")
     b.button(text="⬅️ Назад", callback_data="sub:to_menu")
     b.adjust(1)
-    return b.as_markup()
+    return theme_keyboard(b.as_markup())
 
 
 # _show_support — раньше показывала только ссылку на @CueMeSupport по тапу
