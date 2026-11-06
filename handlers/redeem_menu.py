@@ -139,12 +139,9 @@ async def cmd_myref(message: Message) -> None:
 #     return b.as_markup(resize_keyboard=True)
 
 
-_MAIN_MENU_TEXT = (
-    f"{icon('welcome')} Вот что я умею:\n\n"
-    f"{icon('reply')} Ответ с CueMe — подскажу, что написать в моменте\n"
-    f"{icon('analysis')} Анализ собеседника — разберу вашу переписку по фактам\n"
-    f"{icon('date')} Идеальное свидание — накидаю идеи для свидания"
-)
+# Раньше здесь повторялось описание трёх функций из кнопок («Вот что я умею»).
+# Убрано с главного экрана: подробности остаются в «Помощи».
+_MAIN_MENU_TEXT = f"{icon('welcome')} Что делаем?"
 
 
 def main_menu_kb() -> InlineKeyboardMarkup:
