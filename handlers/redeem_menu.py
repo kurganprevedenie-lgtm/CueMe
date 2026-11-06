@@ -7,6 +7,7 @@ from ui_emoji import theme_keyboard, icon
 import logging
 from pathlib import Path
 from aiogram import Bot, F
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -16,6 +17,7 @@ from aiogram.types import (
     Message,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    InputMediaPhoto,
     ReplyKeyboardRemove,
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
@@ -167,12 +169,9 @@ def main_menu_kb() -> InlineKeyboardMarkup:
 async def _send_main_menu(target: Message, edit: bool = False) -> None:
     """Экран главного меню — общий для /menu, кнопки «⬅️ Вернуться в меню»
     под результатами генерации и возврата «⬅️ Назад» из «👑 Подписка».
-    edit=True (Назад из Подписки) — редактирует ТО ЖЕ сообщение (та же
-    механика, что и у самой Подписки). edit=False — новое сообщение, с
-    логотипом (MAIN_MENU_LOGO_*), если он настроен. Для edit=True логотипа
-    нет намеренно: edit_text не может превратить текстовое сообщение в фото.
-    Обратное тоже нельзя — поэтому кнопки, которые редактируют меню на
-    месте, сначала подменяют фото-меню текстовым (_menu_screen_target).
+    edit=True возвращает логотип через edit_media в то же сообщение.
+    При невозможности правки сначала отправляем фото-меню, затем удаляем
+    прежний экран. edit=False отправляет новое фото-меню.
 
     target.chat.id — telegram_id юзера в обоих случаях (личный чат с ботом,
     chat.id == user id даже когда target это call.message, чей from_user —
@@ -195,29 +194,40 @@ async def _send_main_menu(target: Message, edit: bool = False) -> None:
             logging.warning("legacy kb clear failed: telegram_id=%s", telegram_id)
         mark_legacy_kb_cleared(telegram_id)
 
-    if edit:
-        await target.edit_text(_MAIN_MENU_TEXT, reply_markup=main_menu_kb(), parse_mode="HTML")
+    # Раньше edit=True всегда делал edit_text и терял логотип. Для добавления
+    # фото к текстовому сообщению Telegram поддерживает editMessageMedia.
+    photo_path = Path(MAIN_MENU_LOGO_PATH) if MAIN_MENU_LOGO_PATH else None
+    if photo_path and photo_path.is_file():
+        photo = FSInputFile(photo_path)
+    elif MAIN_MENU_LOGO_FILE_ID:
+        photo = MAIN_MENU_LOGO_FILE_ID
     else:
-        # Логотип — только для НОВОГО сообщения (edit_text не может превратить
-        # текст в фото, см. коммент у функции). Тот же приоритет путей, что и
-        # у онбординг-фото: файл на диске → file_id → голый текст.
-        photo_path = Path(MAIN_MENU_LOGO_PATH) if MAIN_MENU_LOGO_PATH else None
-        if photo_path and photo_path.is_file():
-            await target.answer_photo(
-                photo=FSInputFile(photo_path),
-                caption=_MAIN_MENU_TEXT,
-                parse_mode="HTML",
-                reply_markup=main_menu_kb(),
-            )
-        elif MAIN_MENU_LOGO_FILE_ID:
-            await target.answer_photo(
-                photo=MAIN_MENU_LOGO_FILE_ID,
-                caption=_MAIN_MENU_TEXT,
-                parse_mode="HTML",
-                reply_markup=main_menu_kb(),
-            )
-        else:
-            await target.answer(_MAIN_MENU_TEXT, reply_markup=main_menu_kb(), parse_mode="HTML")
+        # Уже используемое имя логотипа на сервере; абсолютный путь от проекта,
+        # а не cwd. Позволяет показать его и без отдельной настройки в .env.
+        default_path = Path(__file__).resolve().parent.parent / "CueMeLogo1.png"
+        photo = FSInputFile(default_path) if default_path.is_file() else None
+    keyboard = main_menu_kb()
+    if photo is None:
+        logging.warning("main menu: логотип не настроен и CueMeLogo1.png отсутствует")
+        # Сохраняем рабочее меню, если файл физически недоступен.
+        await (target.edit_text(_MAIN_MENU_TEXT, reply_markup=keyboard, parse_mode="HTML") if edit
+               else target.answer(_MAIN_MENU_TEXT, reply_markup=keyboard, parse_mode="HTML"))
+        return
+    if edit:
+        try:
+            await target.edit_media(InputMediaPhoto(media=photo, caption=_MAIN_MENU_TEXT, parse_mode="HTML"),
+                                    reply_markup=keyboard)
+            return
+        except TelegramBadRequest as exc:
+            if "message is not modified" in exc.message.lower():
+                return
+            logging.warning("main menu: замена на фото не удалась; отправляю новое меню")
+    await target.answer_photo(photo=photo, caption=_MAIN_MENU_TEXT, parse_mode="HTML", reply_markup=keyboard)
+    if edit:
+        try:
+            await target.delete()
+        except Exception:
+            logging.warning("main menu: старый экран не удалось удалить")
 
 
 async def _menu_screen_target(msg: Message) -> Message:

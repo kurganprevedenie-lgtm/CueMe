@@ -74,9 +74,9 @@ TEST_ACCOUNT_USERNAMES = {u.strip().lstrip("@").lower() for u in _test_usernames
 ONBOARDING_PHOTO_PATH = os.getenv("ONBOARDING_PHOTO_PATH", "")
 ONBOARDING_PHOTO_FILE_ID = os.getenv("ONBOARDING_PHOTO_FILE_ID", "")
 
-# Логотип над главным меню (только когда меню шлётся НОВЫМ сообщением, см.
-# main.py: _send_main_menu). Те же два способа и тот же приоритет, что у
-# ONBOARDING_PHOTO_* выше: файл на сервере → file_id → без картинки.
+# Логотип главного меню, в том числе при возврате из вложенных экранов
+# (handlers/redeem_menu.py: _send_main_menu). Приоритет: настроенный файл →
+# file_id → CueMeLogo1.png в корне проекта. Без доступного фото остаётся текст.
 MAIN_MENU_LOGO_PATH = os.getenv("MAIN_MENU_LOGO_PATH", "")
 MAIN_MENU_LOGO_FILE_ID = os.getenv("MAIN_MENU_LOGO_FILE_ID", "")
 

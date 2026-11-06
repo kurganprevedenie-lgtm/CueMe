@@ -153,6 +153,13 @@ def ordinary_method(method):
             rich_html = re.sub(r'<tg-emoji emoji-id="' + item.id + r'">.*?</tg-emoji>',
                                lambda _: item.fallback, rich_html, flags=re.DOTALL)
         result.rich_message = rich.model_copy(update={"html": rich_html})
+    media = getattr(result, "media", None)
+    if media is not None and isinstance(getattr(media, "caption", None), str):
+        caption = media.caption
+        for item in ICONS.values():
+            caption = re.sub(r'<tg-emoji emoji-id="' + item.id + r'">.*?</tg-emoji>',
+                             lambda _: item.fallback, caption, flags=re.DOTALL)
+        result.media = media.model_copy(update={"caption": caption})
     markup = getattr(result, "reply_markup", None)
     if isinstance(markup, InlineKeyboardMarkup):
         for row in markup.inline_keyboard:
@@ -171,6 +178,10 @@ def _has_ui_icons(method):
     rich = getattr(method, "rich_message", None)
     if rich is not None and isinstance(getattr(rich, "html", None), str):
         if any(f'emoji-id="{i}"' in rich.html for i in _IDS):
+            return True
+    media = getattr(method, "media", None)
+    if media is not None and isinstance(getattr(media, "caption", None), str):
+        if any(f'emoji-id="{i}"' in media.caption for i in _IDS):
             return True
     markup = getattr(method, "reply_markup", None)
     return isinstance(markup, InlineKeyboardMarkup) and any(
