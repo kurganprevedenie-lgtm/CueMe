@@ -42,8 +42,10 @@ def test_plain_fallback_retains_original_button_text_and_actions(monkeypatch):
     assert markup.inline_keyboard[0][0].icon_custom_emoji_id is None
 
 
-def test_contact_names_never_decorated():
-    contacts = [{"id": 7, "display_name": "💬 Ответ с CueMe"}]
+def test_contact_names_never_decorated(monkeypatch):
+    from handlers import profile
+    monkeypatch.setattr(profile, "contact_last_message_at", lambda owner: {})
+    contacts = [{"id": 7, "display_name": "💬 Ответ с CueMe", "user_telegram_id": "1"}]
     kb = main.unified_contacts_kb(contacts)
     first = kb.inline_keyboard[0][0]
     assert first.text == "💬 Ответ с CueMe" and first.icon_custom_emoji_id is None
