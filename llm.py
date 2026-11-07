@@ -68,6 +68,7 @@ not supported"), gemini-3.5-flash-lite падает именно на thinkingBu
 """
 
 import base64
+import llm_usage
 import logging
 import random
 import re
@@ -213,15 +214,23 @@ async def _tracked_post(
     есть — вызывающий код (ask()/_ask_with_key() каждого провайдера) сам
     решает, RateLimitError это или ProviderError, эта функция логику ошибок
     не меняет, только добавляет наблюдение поверх."""
+    payload = kwargs.get("json") or kwargs.get("data") or {}
+    model = kwargs.pop("_usage_model", None) or (payload.get("model") if isinstance(payload, dict) else None)
+    if not model and "/models/" in url:
+        model = url.split("/models/", 1)[1].split(":", 1)[0]
+    tag = kwargs.pop("_usage_tag", None) or _llm_call_tag.get()
+    usage_request = llm_usage.request_start(provider, model, tag)
     t0 = time.monotonic()
     try:
         resp = await client.post(url, **kwargs)
-    except Exception as e:
+    except BaseException as e:
         _track_response(provider, key, None)
         _log_llm_timing(provider, key, type(e).__name__, t0)
+        llm_usage.request_end(usage_request, (time.monotonic() - t0) * 1000, error_type=type(e).__name__)
         raise
     _track_response(provider, key, resp)
     _log_llm_timing(provider, key, f"HTTP {resp.status_code}", t0)
+    llm_usage.request_end(usage_request, (time.monotonic() - t0) * 1000, response=resp)
     return resp
 
 
@@ -367,13 +376,17 @@ def _check_output(provider: str, model: str, text: str) -> str:
     сбой провайдера), с WARNING, счётчиком и хуком. Пустой не трогает — его
     отдельно обрабатывает _ask. Возвращает text, если всё хорошо."""
     if not text.strip():
+        llm_usage.validation("empty_output")
         return text
     tag = _llm_call_tag.get()
     reason = validate_llm_output(text, None if tag == "-" else tag)
     if reason is None:
+        llm_usage.validation("valid_output")
         return text
     who = f"{provider} {model}".strip()
-    log.warning("LLM [%s]: невалидный ответ для %s (%s): «%s»", who, tag, reason, text[:120].replace("\n", " "))
+    # Было: начало ответа в журнале. Не сохраняем переписки/вывод модели.
+    llm_usage.validation("invalid_output")
+    log.warning("LLM [%s]: невалидный ответ для %s (%s)", who, tag, reason)
     _invalid_outputs.setdefault(provider, []).append(time.time())
     if _invalid_output_hook:
         try:
@@ -446,6 +459,7 @@ def _mask_key(key: str) -> str:
     return f"...{key[-4:]}" if len(key) > 4 else "...?"
 
 
+@llm_usage.logical_call
 async def _gemini_generate_with_media(
     text_prompt: str, mime_type: str, media_b64: str, max_tokens: int
 ) -> str:
@@ -466,11 +480,14 @@ async def _gemini_generate_with_media(
     for key in keys:
         url = (
             f"https://generativelanguage.googleapis.com/v1beta/models/"
-            f"{_GEMINI_MM_MODEL}:generateContent?key={key}"
+            f"{_GEMINI_MM_MODEL}:generateContent"
         )
         try:
             async with httpx.AsyncClient(**_gemini_mm_kwargs()) as client:
-                resp = await client.post(url, json=payload)
+                resp = await _tracked_post("Gemini", key, client, url, json=payload,
+                                           headers={"x-goog-api-key": key},
+                                           _usage_tag="transcription" if mime_type.startswith("audio/") else "vision",
+                                           _usage_model=_GEMINI_MM_MODEL)
             if resp.is_success:
                 parts = resp.json()["candidates"][0].get("content", {}).get("parts") or []
                 return "".join(p.get("text", "") for p in parts).strip()
@@ -478,10 +495,10 @@ async def _gemini_generate_with_media(
                 log.warning("Gemini media: ключ %s — HTTP %d, пробую следующий",
                             _mask_key(key), resp.status_code)
                 continue
-            log.warning("Gemini media %s: %s", resp.status_code, resp.text[:200])
+            log.warning("Gemini media %s: %s", resp.status_code, 'body omitted')
             return ""
         except Exception as e:
-            log.warning("Gemini media: ошибка запроса — %s", e)
+            log.warning("Gemini media: ошибка запроса — %s", type(e).__name__)
             return ""
     return ""
 
@@ -502,6 +519,7 @@ def _groq_keys_rotated() -> list[str]:
     return keys[start:] + keys[:start]
 
 
+@llm_usage.logical_call
 async def _groq_transcribe(data: bytes, filename: str) -> str:
     """Groq Whisper. Пусто при ошибке/без ключа. Перебирает ключи по кругу —
     на любой 4xx (проблема конкретного ключа) пробует следующий, на прочих
@@ -512,8 +530,8 @@ async def _groq_transcribe(data: bytes, filename: str) -> str:
     for key in keys:
         try:
             async with httpx.AsyncClient(timeout=120.0, trust_env=False) as client:
-                resp = await client.post(
-                    _WHISPER_URL,
+                resp = await _tracked_post(
+                    "Groq", key, client, _WHISPER_URL, _usage_tag="transcription",
                     headers={"Authorization": f"Bearer {key}"},
                     files={"file": (filename, data, "application/octet-stream")},
                     data={"model": _WHISPER_MODEL},
@@ -524,10 +542,10 @@ async def _groq_transcribe(data: bytes, filename: str) -> str:
                 log.warning("Whisper: ключ %s — HTTP %d, пробую следующий",
                             _mask_key(key), resp.status_code)
                 continue
-            log.warning("Whisper %s: %s", resp.status_code, resp.text[:200])
+            log.warning("Whisper %s: %s", resp.status_code, 'body omitted')
             return ""
         except Exception as e:
-            log.warning("Whisper: ошибка запроса — %s", e)
+            log.warning("Whisper: ошибка запроса — %s", type(e).__name__)
             return ""
     return ""
 
@@ -565,6 +583,7 @@ _VISION_PROMPT = (
 )
 
 
+@llm_usage.logical_call
 async def _groq_vision(b64: str) -> str:
     """Распознавание через Groq Vision. Пусто при ошибке/без ключа. Перебирает
     ключи по кругу — на любой 4xx пробует следующий, на прочих ошибках
@@ -582,8 +601,8 @@ async def _groq_vision(b64: str) -> str:
     for key in keys:
         try:
             async with httpx.AsyncClient(timeout=120.0, trust_env=False) as client:
-                resp = await client.post(
-                    _VISION_URL,
+                resp = await _tracked_post(
+                    "Groq", key, client, _VISION_URL, _usage_tag="vision",
                     headers={"Authorization": f"Bearer {key}"},
                     json={
                         "model": VISION_MODEL, "messages": messages, "max_tokens": 2000,
@@ -601,10 +620,10 @@ async def _groq_vision(b64: str) -> str:
                 log.warning("Vision(Groq): ключ %s — HTTP %d, пробую следующий",
                             _mask_key(key), resp.status_code)
                 continue
-            log.warning("Vision(Groq) %s: %s", resp.status_code, resp.text[:200])
+            log.warning("Vision(Groq) %s: %s", resp.status_code, 'body omitted')
             return ""
         except Exception as e:
-            log.warning("Vision(Groq): ошибка запроса — %s", e)
+            log.warning("Vision(Groq): ошибка запроса — %s", type(e).__name__)
             return ""
     return ""
 
@@ -697,10 +716,10 @@ class GroqProvider(LLMProvider):
             raise err
 
         if resp.status_code in (500, 502, 503):
-            raise ProviderError(f"Groq {resp.status_code}: {resp.text[:200]}")
+            raise ProviderError(f"Groq {resp.status_code}: {'body omitted'}")
 
         if not resp.is_success:
-            raise ProviderError(f"Groq {resp.status_code}: {resp.text[:200]}")
+            raise ProviderError(f"Groq {resp.status_code}: {'body omitted'}")
 
         # content может прийти null, не только "" — reasoning ушёл весь бюджет.
         # Было: return content как есть — без проверки обрыва и содержания.
@@ -875,7 +894,8 @@ class GeminiProvider(LLMProvider):
 
     @staticmethod
     def _url(model: str, key: str) -> str:
-        return f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
+        # Ключ в заголовке: httpx INFO пишет URL, поэтому ?key= раскрывал секрет.
+        return f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 
     async def _ask_with_key(self, prompt: str, max_tokens: int, key: str, model: str) -> str:
         generation_config = {"maxOutputTokens": max_tokens}
@@ -907,7 +927,8 @@ class GeminiProvider(LLMProvider):
         if GEMINI_PROXY:
             client_kwargs["proxy"] = GEMINI_PROXY
         async with httpx.AsyncClient(**client_kwargs) as client:
-            resp = await _tracked_post(self.name, key, client, self._url(model, key), json=payload)
+            resp = await _tracked_post(self.name, key, client, self._url(model, key), json=payload,
+                                       headers={"x-goog-api-key": key})
 
         # Любой 4xx (400-499) — проблема конкретного ключа/модели: невалиден,
         # нет доступа, исчерпан лимит именно на них — есть смысл пробовать
@@ -921,10 +942,10 @@ class GeminiProvider(LLMProvider):
         # 5xx — тоже переключаем модель (не сразу сдаёмся, см. докстринг класса
         # выше): перегрузка бывает у конкретной модели, а не у всего Gemini.
         if resp.status_code in (500, 502, 503):
-            raise ProviderError(f"Gemini {model} {resp.status_code}: {resp.text[:200]}")
+            raise ProviderError(f"Gemini {model} {resp.status_code}: {'body omitted'}")
 
         if not resp.is_success:
-            raise ProviderError(f"Gemini {model} {resp.status_code}: {resp.text[:200]}")
+            raise ProviderError(f"Gemini {model} {resp.status_code}: {'body omitted'}")
 
         data = resp.json()
         # Достаём текст из всех частей (на случай нескольких parts)
@@ -1052,10 +1073,10 @@ class OpenRouterProvider(LLMProvider):
             raise RateLimitError("Лимит OpenRouter исчерпан.")
 
         if resp.status_code in (500, 502, 503):
-            raise ProviderError(f"OpenRouter {resp.status_code}: {resp.text[:200]}")
+            raise ProviderError(f"OpenRouter {resp.status_code}: {'body omitted'}")
 
         if not resp.is_success:
-            raise ProviderError(f"OpenRouter {resp.status_code}: {resp.text[:200]}")
+            raise ProviderError(f"OpenRouter {resp.status_code}: {'body omitted'}")
 
         # content может прийти null, не только "" — reasoning ушёл весь бюджет.
         # Было: return content как есть — без проверки обрыва и содержания.
@@ -1168,6 +1189,7 @@ def get_provider_stats() -> dict:
     return out
 
 
+@llm_usage.logical_call
 async def _ask(
     prompt: str, max_tokens: int = 1024, tag: str | None = None, fast: bool = False,
 ) -> str:
@@ -1217,7 +1239,7 @@ async def _ask(
             _record_stat(provider.name, "error", elapsed)
             log.warning(
                 "LLM [%s]: %s за %.0f мс (%s) — переключаюсь дальше",
-                provider.name, type(e).__name__, elapsed, str(e)[:120],
+                provider.name, type(e).__name__, elapsed, type(e).__name__,
             )
             last_exc = e
 

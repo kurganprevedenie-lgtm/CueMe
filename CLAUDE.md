@@ -456,6 +456,25 @@ Tribute (10% комиссия):
 Анимированная иконка «Другой человек» сохраняется. Тесты —
 `tests/test_contacts_pagination.py`; тестовые контакты в проде не создаём.
 
+## Учёт стоимости LLM (2026-11-07)
+
+Все POST в llm.py проходят через `_tracked_post` → `llm_usage` (включая
+транскрипцию/vision). JSONL вне репозитория/БД: по умолчанию
+`~/.local/state/cueme/llm_usage`; LLM_USAGE_DIR меняет путь,
+LLM_USAGE_ENABLED=false отключает. Ротация ежедневная, 60 архивов.
+Только технические метаданные/usage, без промптов, ответов, user_id/ключей.
+Reasoning — часть output, не добавлять повторно. Неизвестный usage/тариф
+остаётся null. Ошибка учёта не отменяет генерацию.
+Middleware связывает попытки с апдейтом, `_note_outcome` подтверждает исход;
+`_maybe_rebuild` получает отдельный background action. Бенчмарк помечается
+benchmark и исключается из производственного бюджета.
+Отчёт: `python -m tools.llm_cost_report --days 7`. Тарифная сумма не инвойс;
+экстраполяция требует периода измерений. OpenAI/DeepSeek изолированно:
+`python -m tools.bench_paid_models` — без сети; `--check-models` — GET;
+`--run --budget-usd 2 --repeats 3` — платно, требует обоих ключей в .env,
+не включает модели в рабочий каскад. Только вымышленные ситуации.
+Подробности/ограничения: `docs/llm_cost_audit_20261107.md`.
+
 ## Репозиторий
 
 https://github.com/kurganprevedenie-lgtm/CueMe

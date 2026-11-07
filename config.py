@@ -36,6 +36,9 @@ if not GEMINI_API_KEYS and GEMINI_API_KEY:
     GEMINI_API_KEYS = [GEMINI_API_KEY]
 # OpenRouter — llama-3.1-8b-instruct:free.
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+# Только изолированный админский бенчмарк; в рабочий каскад не включены.
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
 # Cerebras/Mistral/Cloudflare Workers AI/GitHub Models/NVIDIA NIM/Intern AI —
 # убраны 2026-09-28: живая проверка tools/check_keys.py нашла первые три
 # гарантированно мёртвыми (Cerebras 402 Payment Required, Mistral 401

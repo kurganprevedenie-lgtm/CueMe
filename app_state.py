@@ -1,4 +1,5 @@
 import asyncio
+from llm_usage import UsageActionMiddleware
 from ui_emoji import icon, plain_heading
 import contextvars
 import csv
@@ -267,6 +268,8 @@ from storage import (
 logging.basicConfig(level=logging.INFO)
 
 dp = Dispatcher(storage=MemoryStorage())
+dp.message.outer_middleware(UsageActionMiddleware())
+dp.callback_query.outer_middleware(UsageActionMiddleware())
 
 
 # ── Устойчивость к задержкам (инцидент 2026-10-12) ───────────────────────────

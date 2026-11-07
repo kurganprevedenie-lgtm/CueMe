@@ -102,6 +102,8 @@ def _make_invalid_output_hook(bot: Bot):
 
 async def main() -> None:
     _validate_startup_config()
+    import llm_usage
+    llm_usage.emit("coverage_start")
     init_db()
     bot = Bot(token=BOT_TOKEN)
     install_ui_emoji(bot)

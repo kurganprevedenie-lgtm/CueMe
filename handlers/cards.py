@@ -4,6 +4,7 @@
 Порядок регистрации хендлеров задаёт main.py порядком импорта модулей —
 этот модуль нельзя импортировать раньше предыдущих (см. tests/test_handler_registry.py)."""
 import asyncio
+from llm_usage import background_usage
 import logging
 import time
 from aiogram import Bot
@@ -169,6 +170,7 @@ async def _rebuild_contact(owner_user_id: str, contact_id: int) -> bool:
 
 # ── Авто-пересборка (fire-and-forget) ─────────────────────────────────────────
 
+@background_usage
 async def _maybe_rebuild(owner_user_id: str, contact_id: int, bot: Bot | None = None) -> None:
     # (было `global …`: имя живёт в другом модуле — обращение по ссылке ниже)
     if contact_id in _rebuilding or contact_id in _rebuild_checking:

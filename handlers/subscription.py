@@ -5,6 +5,7 @@
 этот модуль нельзя импортировать раньше предыдущих (см. tests/test_handler_registry.py)."""
 from ui_emoji import theme_keyboard
 import asyncio
+import llm_usage
 import contextvars
 import logging
 import time
@@ -300,6 +301,7 @@ def _retry_kb(callback_data: str) -> InlineKeyboardMarkup | None:
 
 
 def _note_outcome(status: str) -> None:
+    llm_usage.note_outcome(status)
     box = _gen_outcome.get()
     if box is not None and "status" not in box:
         box["status"] = status
