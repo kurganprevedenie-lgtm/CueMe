@@ -170,7 +170,7 @@ def safe_name(value):
     return value if re.fullmatch(r"[A-Za-z0-9_.:/-]{1,160}", value) else "unknown"
 
 
-def request_start(provider, model, function):
+def request_start(provider, model, function, credential_ref=None):
     current = _action.get()
     attempt = 1
     if current:
@@ -181,6 +181,7 @@ def request_start(provider, model, function):
         counter[0] += 1
         attempt = counter[0]
     request = dict(request_id=uuid.uuid4().hex, action_id=current.id if current else None,
+                   credential_ref=credential_ref,
                    origin=current.origin if current else "unattributed",
                    call_id=_call.get(), provider=safe_name(provider), requested_model=safe_name(model),
                    function=safe_name(function), attempt=attempt, retry=attempt > 1,

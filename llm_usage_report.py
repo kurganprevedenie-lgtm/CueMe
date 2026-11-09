@@ -103,7 +103,7 @@ def build_report(events, since, until):
         per_action.append(dict(functions=action.get("functions", []), **total))
     total = _totals(production)
     starts = [_date(e["ts"]) for e in events if e.get("type") == "coverage_start" and e.get("ts")]
-    measured_start = max(since, min(starts)) if starts else None
+    measured_start = max(since, min(starts)) if starts and min(starts) < until else None
     days = (until - measured_start).total_seconds() / 86400 if measured_start and until > measured_start else None
     forecast = total["total_tariff_usd"] * 30 / days if days and total["total_tariff_usd"] is not None else None
     costs = [a["total_tariff_usd"] for a in per_action]

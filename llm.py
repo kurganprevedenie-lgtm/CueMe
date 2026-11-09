@@ -68,6 +68,7 @@ not supported"), gemini-3.5-flash-lite падает именно на thinkingBu
 """
 
 import base64
+import hashlib
 import llm_usage
 import logging
 import random
@@ -219,7 +220,10 @@ async def _tracked_post(
     if not model and "/models/" in url:
         model = url.split("/models/", 1)[1].split(":", 1)[0]
     tag = kwargs.pop("_usage_tag", None) or _llm_call_tag.get()
-    usage_request = llm_usage.request_start(provider, model, tag)
+    # Необратимый технический идентификатор для сверки ключей; сам ключ
+    # и его фрагменты в журнал расхода не попадают.
+    credential_ref = hashlib.sha256(key.encode()).hexdigest()[:16] if key else None
+    usage_request = llm_usage.request_start(provider, model, tag, credential_ref=credential_ref)
     t0 = time.monotonic()
     try:
         resp = await client.post(url, **kwargs)
