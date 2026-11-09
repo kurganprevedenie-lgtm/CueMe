@@ -85,8 +85,10 @@ def build_report(events, since, until):
     production = [r for r in api.values() if r.get("origin") != "benchmark"]
     benchmark = [r for r in api.values() if r.get("origin") == "benchmark"]
     groups = defaultdict(list)
+    attempts_by_action = defaultdict(list)
     for row in production:
         groups[(row.get("function"), row.get("provider"), row.get("model"))].append(row)
+        attempts_by_action[row.get("action_id")].append(row)
     functions = []
     for key, rows in sorted(groups.items(), key=lambda pair: str(pair[0])):
         functions.append(dict(function=key[0], provider=key[1], model=key[2], **_totals(rows),
@@ -94,7 +96,10 @@ def build_report(events, since, until):
     successful = [a for a in actions.values() if a.get("origin") == "user" and a.get("outcome") == "ok"]
     per_action = []
     for action in successful:
-        attempts = [r for r in production if r.get("action_id") == action["action_id"]]
+        # Было: [r for r in production if r.get("action_id") == action["action_id"]].
+        # Полный проход по API для каждого действия давал O(actions * API).
+        # Готовый индекс сохраняет те же попытки/порядок за линейный проход.
+        attempts = attempts_by_action.get(action["action_id"], [])
         # Ноль API-запросов у подтверждённого успешного действия — локальный
         # кэш/расчёт. Не приравниваем к нулю неизвестный usage реального вызова.
         total = _totals(attempts)
