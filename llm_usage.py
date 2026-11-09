@@ -91,6 +91,11 @@ def note_outcome(status):
         current.outcome = status
 
 
+def current_origin():
+    current = _action.get()
+    return current.origin if current else None
+
+
 class UsageActionMiddleware:
     async def __call__(self, handler, event, data):
         with action_scope("user", "telegram_update"):

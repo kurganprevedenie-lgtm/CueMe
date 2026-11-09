@@ -22,6 +22,12 @@ _groq_keys_raw = os.getenv("GROQ_API_KEYS", "")
 GROQ_API_KEYS = [k.strip() for k in _groq_keys_raw.split(",") if k.strip()]
 if not GROQ_API_KEYS and GROQ_API_KEY:
     GROQ_API_KEYS = [GROQ_API_KEY]
+# Отдельная ПЛАТНАЯ организация только для ключевых пользовательских функций.
+# Не добавлять ключи этой организации в общий пул: там Whisper и фон.
+GROQ_PAID_API_KEY = os.getenv("GROQ_PAID_API_KEY", "").strip()
+GROQ_PAID_PRIORITY_ENABLED = os.getenv("GROQ_PAID_PRIORITY_ENABLED", "false").lower() in ("1", "true", "yes")
+if GROQ_PAID_API_KEY:
+    GROQ_API_KEYS = [key for key in GROQ_API_KEYS if key != GROQ_PAID_API_KEY]
 # Gemini — основной (gemini-2.5-flash).
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 # Мультиаккаунтинг: несколько ключей Gemini через запятую — код перебирает их

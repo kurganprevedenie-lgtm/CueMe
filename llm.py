@@ -83,6 +83,8 @@ from config import (
     GEMINI_API_KEYS,
     GEMINI_PROXY,
     GROQ_API_KEYS,
+    GROQ_PAID_API_KEY,
+    GROQ_PAID_PRIORITY_ENABLED,
     LLM_PROVIDER_ORDER,
     OPENROUTER_API_KEY,
     REPLY_STYLES,
@@ -224,6 +226,7 @@ async def _tracked_post(
     # и его фрагменты в журнал расхода не попадают.
     credential_ref = hashlib.sha256(key.encode()).hexdigest()[:16] if key else None
     usage_request = llm_usage.request_start(provider, model, tag, credential_ref=credential_ref)
+    usage_request["key_route"] = "dedicated_priority" if provider == "Groq" and key and key == GROQ_PAID_API_KEY else "default_pool"
     t0 = time.monotonic()
     try:
         resp = await client.post(url, **kwargs)
@@ -515,7 +518,7 @@ _groq_key_cursor = 0
 
 def _groq_keys_rotated() -> list[str]:
     global _groq_key_cursor
-    keys = GROQ_API_KEYS
+    keys = [key for key in GROQ_API_KEYS if key != GROQ_PAID_API_KEY]
     if not keys:
         return []
     start = _groq_key_cursor % len(keys)
@@ -785,6 +788,42 @@ class GroqProvider(LLMProvider):
             nxt = _short_model(models[mi + 1]) if mi + 1 < len(models) else "следующего провайдера"
             log.warning("Groq: %s исчерпана, перехожу на %s", short, nxt)
         raise last_exc
+
+
+class PriorityGroqProvider(GroqProvider):
+    """Один ключ отдельной организации, одна 120b, без ротации и 20b.
+
+    Вызывается только выбранными _ask-тегами, никогда транскрипцией/фоном.
+    Ошибка уходит в прежний бесплатный каскад, повторов платного запроса нет.
+    """
+    async def ask(self, prompt: str, max_tokens: int) -> str:
+        key = GROQ_PAID_API_KEY
+        if not key:
+            raise ProviderError("Отдельный ключ Groq не настроен")
+        if _groq_cooldown_left(self._MODEL, key) > 0:
+            raise RateLimitError("Отдельный ключ Groq временно на паузе")
+        _llm_served_model.set(self._MODEL)
+        try:
+            result = await self._ask_with_key(prompt, max_tokens, key, self._MODEL)
+        except RateLimitError as exc:
+            # 400 может означать blocked_api_access при достижении бюджета.
+            pause = getattr(exc, "cooldown", None) or 60
+            _groq_cooldown[(self._MODEL, key)] = _cooldown_clock() + min(pause, 900)
+            _record_groq_model(_short_model(self._MODEL), "rate_limit")
+            raise
+        _record_groq_model(_short_model(self._MODEL), "ok")
+        log.info("Groq: отдельная 120b, функция=%s", _llm_call_tag.get())
+        return result
+
+
+_PAID_PRIORITY_TAGS = frozenset({"variants", "live", "compat"})
+
+
+def _priority_groq_for_call(tag):
+    return bool(GROQ_PAID_PRIORITY_ENABLED and GROQ_PAID_API_KEY
+                and tag in _PAID_PRIORITY_TAGS
+                and llm_usage.current_origin() not in ("background", "benchmark")
+                and not _forced)
 
 
 # Кулдаун пар (модель, ключ) Groq после 429 — до какого момента (_cooldown_clock)
@@ -1208,6 +1247,11 @@ async def _ask(
     _llm_served_model.set(None)
     last_exc: Exception = RuntimeError("Нет доступных LLM-провайдеров")
     chain = _ordered_providers()
+    # Было: для всех задач только общий каскад. Он сохранён как fallback.
+    # Отдельный платный ключ не включаем в _PROVIDERS: фон и Whisper не
+    # должны случайно воспользоваться им через общий список ключей.
+    if _priority_groq_for_call(tag):
+        chain = [PriorityGroqProvider()] + chain
 
     for provider in chain:
         t0 = time.monotonic()
