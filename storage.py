@@ -559,19 +559,30 @@ def init_db() -> None:
             conn, "idx_imported_lookup", "imported_messages",
             "contact_id, direction",
         )
-        # Дедуп business-сообщений: убираем существующие дубли (по connection_id+chat_ref+
-        # tg_message_id), затем ставим UNIQUE-индекс. NULL-id не трогаем (у них нет ключа).
-        conn.execute(
-            """
-            DELETE FROM business_messages
-            WHERE tg_message_id IS NOT NULL
-              AND id NOT IN (
-                  SELECT MIN(id) FROM business_messages
-                  WHERE tg_message_id IS NOT NULL
-                  GROUP BY connection_id, chat_ref, tg_message_id
-              )
-            """
-        )
+        # Было: полный DELETE/GROUP BY на КАЖДОМ старте, даже при готовом
+        # UNIQUE. На большой базе это блокировало записи и запуск на минуты.
+        # Очистка нужна только до первой установки уникальности; NULL-id
+        # по-прежнему не трогаем. Сама старая миграция оставлена ниже.
+        dedup_ready = False
+        for index in conn.execute("PRAGMA index_list(business_messages)").fetchall():
+            if not index[2]:
+                continue
+            name = index[1].replace('"', '""')
+            columns = [r[2] for r in conn.execute(f'PRAGMA index_info("{name}")').fetchall()]
+            if columns == ["connection_id", "chat_ref", "tg_message_id"]:
+                dedup_ready = True
+        if not dedup_ready:
+            conn.execute(
+                """
+                DELETE FROM business_messages
+                WHERE tg_message_id IS NOT NULL
+                  AND id NOT IN (
+                      SELECT MIN(id) FROM business_messages
+                      WHERE tg_message_id IS NOT NULL
+                      GROUP BY connection_id, chat_ref, tg_message_id
+                  )
+                """
+            )
         _create_index_if_missing(
             conn, "idx_biz_msg_unique", "business_messages",
             "connection_id, chat_ref, tg_message_id", unique=True,
