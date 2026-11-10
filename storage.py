@@ -38,6 +38,39 @@ def _create_index_if_missing(
     conn.execute(f"CREATE {kind} IF NOT EXISTS {name} ON {table} ({columns})")
 
 
+def _migrate_tribute_payment_identity(conn: sqlite3.Connection) -> None:
+    """Тариф Tribute общий для покупателей, period_id не идентификатор платежа.
+
+    Старая таблица сохраняется целиком для аудита. SAVEPOINT делает замену
+    атомарной, включая DDL, и допускает вызов внутри init_db-транзакции.
+    """
+    old_constraint = False
+    for index in conn.execute("PRAGMA index_list(tribute_payments)").fetchall():
+        name = index[1].replace('"', '""')
+        columns = [r[2] for r in conn.execute(f'PRAGMA index_info("{name}")').fetchall()]
+        if index[2] and columns == ["subscription_id", "period_id"]:
+            old_constraint = True
+    if not old_constraint:
+        return
+    conn.execute("SAVEPOINT tribute_identity")
+    try:
+        conn.execute("ALTER TABLE tribute_payments RENAME TO tribute_payments_legacy_20261110")
+        conn.execute("""CREATE TABLE tribute_payments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            telegram_id TEXT NOT NULL, subscription_id INTEGER NOT NULL,
+            period_id INTEGER NOT NULL, event_name TEXT NOT NULL,
+            amount INTEGER NOT NULL, currency TEXT NOT NULL,
+            expires_at TEXT NOT NULL, created_at TEXT NOT NULL,
+            UNIQUE(telegram_id, subscription_id, period_id, expires_at)
+        )""")
+        conn.execute("INSERT INTO tribute_payments SELECT * FROM tribute_payments_legacy_20261110")
+        conn.execute("RELEASE SAVEPOINT tribute_identity")
+    except Exception:
+        conn.execute("ROLLBACK TO SAVEPOINT tribute_identity")
+        conn.execute("RELEASE SAVEPOINT tribute_identity")
+        raise
+
+
 def init_db() -> None:
     with _conn() as conn:
         conn.executescript("""
@@ -195,7 +228,9 @@ def init_db() -> None:
                 currency         TEXT NOT NULL,
                 expires_at       TEXT NOT NULL,   -- окно Premium ПОСЛЕ этого платежа (UTC ISO)
                 created_at       TEXT NOT NULL,
-                UNIQUE(subscription_id, period_id)
+                -- Было UNIQUE(subscription_id, period_id): подавляло покупки
+                -- других пользователей и продления того же тарифа.
+                UNIQUE(telegram_id, subscription_id, period_id, expires_at)
             );
 
             -- Скрытые от не-премиум удалённые сообщения (main.py:
@@ -262,6 +297,7 @@ def init_db() -> None:
                 created_at           TEXT NOT NULL
             );
         """)
+        _migrate_tribute_payment_identity(conn)
         _create_index_if_missing(
             conn, "idx_suggestions_lookup", "suggestions",
             "telegram_id, contact_id, matched, created_at",
@@ -1957,11 +1993,11 @@ def record_tribute_payment(
     telegram_id: str, subscription_id: int, period_id: int, event_name: str,
     amount: int, currency: str, expires_at: datetime,
 ) -> bool:
-    """Логирует событие Tribute-вебхука. UNIQUE(subscription_id, period_id) —
-    идемпотентность: Tribute ретраит доставку при таймауте/5xx на нашей
-    стороне (тот же period_id придёт снова) — возвращает False (ничего не
-    сделал), если такая пара уже записана, иначе True — вызывающий код
-    применяет set_tribute_premium_until/выдаёт доступ в канал только при True."""
+    """Повтор — тот же покупатель, тариф и срок, а не просто тот же тариф.
+    Было UNIQUE(subscription_id, period_id), что подавляло чужие покупки и
+    продления. Тот же expires_at с другим UTC offset нормализуется.
+    """
+    expires_at = expires_at.replace(tzinfo=timezone.utc) if expires_at.tzinfo is None else expires_at.astimezone(timezone.utc)
     with _conn() as conn:
         try:
             conn.execute(

@@ -44,6 +44,7 @@ from storage import (
     count_successful_referrals,
     get_or_create_referral_code,
     get_stars_premium_until,
+    get_tribute_premium_until,
     set_tribute_premium_until,
     record_tribute_payment,
     record_event,
@@ -264,7 +265,30 @@ async def _alert_admin_tribute_grant_failed(
             logging.exception("tribute: не удалось отправить алерт админу %s", admin_id)
 
 
-async def _grant_premium_channel_access(bot: Bot, telegram_id: str, username: str | None) -> None:
+def _channel_access_event(telegram_id: str, status: str) -> None:
+    try:
+        record_event(telegram_id, "premium_channel_access", status)
+    except Exception:
+        logging.exception("tribute: не удалось сохранить статус приглашения %s", telegram_id)
+
+
+async def _notify_admin_tribute_payment(bot: Bot, telegram_id: str, username: str | None,
+                                      expires_at: datetime, channel_status: str | None) -> None:
+    if channel_status == "failed":
+        return  # отдельный подробный алерт уже отправлен
+    status = {"already_member": "уже состоит в канале", "invite_sent": "приглашение отправлено, вступление ещё не подтверждено",
+              "not_configured": "канал не настроен"}.get(channel_status, "статус приглашения не подтверждён")
+    who = f"@{username}" if username else f"id{telegram_id}"
+    text = (f"💳 Tribute: подтверждена подписка {who} ({telegram_id}).\n"
+            f"Premium до {expires_at:%d.%m.%Y %H:%M UTC}.\nКанал: {status}.")
+    for admin_id in ADMIN_TELEGRAM_IDS:
+        try:
+            await bot.send_message(int(admin_id), text)
+        except Exception:
+            logging.exception("tribute: не удалось уведомить админа об оплате %s", telegram_id)
+
+
+async def _grant_premium_channel_access(bot: Bot, telegram_id: str, username: str | None) -> str:
     """Безусловно, после КАЖДОЙ успешной Tribute-оплаты (new_subscription/
     renewed_subscription) — НЕ завязано на текущий is_premium_now (это и
     была причина бага с @REVkazik: юзер уже был Premium по рефералке, и шаг
@@ -278,14 +302,16 @@ async def _grant_premium_channel_access(bot: Bot, telegram_id: str, username: st
     временного сбоя Telegram API; если не вышло — алерт админу, платёж/
     Premium в БД не откатываем."""
     if not PREMIUM_CHANNEL_ID:
-        return  # канал не настроен — нечего выдавать
+        _channel_access_event(telegram_id, "not_configured")
+        return "not_configured"
 
     last_error: Exception | None = None
     for attempt in range(1, _TRIBUTE_GRANT_RETRIES + 1):
         try:
             member = await bot.get_chat_member(PREMIUM_CHANNEL_ID, int(telegram_id))
             if member.status in ("member", "administrator", "creator"):
-                return  # уже в канале — Tribute справилась сама либо повтор вебхука
+                _channel_access_event(telegram_id, "already_member")
+                return "already_member"
             invite = await bot.create_chat_invite_link(
                 PREMIUM_CHANNEL_ID, name=f"tribute:{telegram_id}"[:32], member_limit=1,
             )
@@ -294,7 +320,9 @@ async def _grant_premium_channel_access(bot: Bot, telegram_id: str, username: st
                 f"{icon('activation')} Оплата прошла! Вот ссылка в закрытый канал Premium:\n{invite.invite_link}",
                 parse_mode="HTML",
             )
-            return
+            _channel_access_event(telegram_id, "invite_sent")
+            logging.info("tribute: приглашение доставлено user=%s; вступление не подтверждено", telegram_id)
+            return "invite_sent"
         except TelegramForbiddenError as e:
             # Юзер заблокировал бота — ссылку в личку не доставить никаким
             # числом попыток, это не временный сбой API. Сразу алерт.
@@ -310,6 +338,8 @@ async def _grant_premium_channel_access(bot: Bot, telegram_id: str, username: st
                 await asyncio.sleep(_TRIBUTE_GRANT_RETRY_DELAY_SECONDS)
 
     await _alert_admin_tribute_grant_failed(bot, telegram_id, username, last_error)
+    _channel_access_event(telegram_id, "failed")
+    return "failed"
 
 
 async def _handle_tribute_subscription_event(bot: Bot, event_name: str, payload: dict) -> None:
@@ -346,11 +376,19 @@ async def _handle_tribute_subscription_event(bot: Bot, event_name: str, payload:
         logging.warning("tribute: не удалось распарсить expires_at %r", expires_at_raw)
         return
 
+    expires_at = expires_at.replace(tzinfo=timezone.utc) if expires_at.tzinfo is None else expires_at.astimezone(timezone.utc)
+
     is_new = record_tribute_payment(
         telegram_id=telegram_id, subscription_id=int(subscription_id), period_id=int(period_id),
         event_name=event_name, amount=int(payload.get("amount") or 0),
         currency=str(payload.get("currency") or ""), expires_at=expires_at,
     )
+    # Было: повтор тарифа завершал обработку без восстановления срока;
+    # set до upsert также терял срок у человека, ещё не запускавшего бота.
+    upsert_user(telegram_id, f"user{telegram_id}")
+    current_until = get_tribute_premium_until(telegram_id)
+    if current_until is None or expires_at > current_until:
+        set_tribute_premium_until(telegram_id, expires_at)
     if not is_new:
         # Раньше повтор сразу завершался: неудачная выдача приглашения
         # после записи оплаты больше никогда не повторялась.
@@ -358,14 +396,13 @@ async def _handle_tribute_subscription_event(bot: Bot, event_name: str, payload:
             await _grant_premium_channel_access(bot, telegram_id, payload.get("telegram_username"))
         return
 
-    set_tribute_premium_until(telegram_id, expires_at)
-    upsert_user(telegram_id, f"user{telegram_id}")
     record_event(telegram_id, "tribute_payment", f"{event_name}:{payload.get('amount')}")
 
     username = payload.get("telegram_username")
     # Доступ в канал — первым после сохранения оплаты. Сбой отложенного
     # ответа не должен мешать доставке приглашения платному пользователю.
-    await _grant_premium_channel_access(bot, telegram_id, username)
+    channel_status = await _grant_premium_channel_access(bot, telegram_id, username)
+    await _notify_admin_tribute_payment(bot, telegram_id, username, expires_at, channel_status)
     until_label = expires_at.strftime("%d.%m.%Y %H:%M UTC")
     try:
         await bot.send_message(int(telegram_id), f"{icon('activation')} Оплата прошла! Premium активен до {until_label}.", parse_mode="HTML")
@@ -395,16 +432,18 @@ async def handle_tribute_webhook(request: web.Request) -> web.Response:
     name = event.get("name")
     payload = event.get("payload") or {}
     bot: Bot = request.app["bot"]
+    logging.info("tribute: вебхук name=%s user=%s subscription=%s", name,
+                 payload.get("telegram_user_id") if isinstance(payload, dict) else None,
+                 payload.get("subscription_id") if isinstance(payload, dict) else None)
 
     if name in ("new_subscription", "renewed_subscription"):
         try:
             await _handle_tribute_subscription_event(bot, name, payload)
         except Exception:
-            # 200 всё равно возвращаем — иначе Tribute будет ретраить вебхук
-            # до ~24ч (см. комментарий выше про её retry-политику), а сбой
-            # уже залогирован — при задублированном событии record_tribute_payment
-            # всё равно идемпотентен, повторная попытка ничего не сломает.
+            # Было: 200 даже при исключении, после чего Tribute не повторяла
+            # потерянную обработку. Идемпотентность исправлена, разрешаем retry.
             logging.exception("tribute: сбой обработки события %s", name)
+            return web.json_response({"status": "retry"}, status=503)
     # Остальные типы (donation/product/order/cancelled_subscription) нас
     # пока не касаются — просто подтверждаем доставку, чтобы Tribute не ретраила.
 
