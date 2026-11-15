@@ -70,7 +70,7 @@ def test_repeat_repairs_missing_window_and_does_not_double_notify(db, monkeypatc
         conn.execute("update users set tribute_premium_until=NULL where telegram_id='42'")
     asyncio.run(handler._handle_tribute_subscription_event(bot, "new_subscription", payload))
     assert db.get_tribute_premium_until("42") is not None
-    assert notifications.count(999) == 1
+    assert notifications.count(999) == 0
     assert invites == ["42", "42"]
 
 
@@ -123,3 +123,29 @@ def test_webhook_processing_error_requests_provider_retry(monkeypatch):
         async def read(self):
             return b'{"name":"new_subscription","payload":{}}'
     assert asyncio.run(handler.handle_tribute_webhook(Request())).status == 503
+
+
+@pytest.mark.parametrize("status", ["already_member", "invite_sent", "failed"])
+def test_admin_payment_report_silent_for_success_or_already_alerted(monkeypatch, status):
+    import main
+    from handlers import stars_tribute as handler
+    monkeypatch.setattr(handler, "ADMIN_TELEGRAM_IDS", {"999"})
+    async def send(*args, **kwargs):
+        pytest.fail("Успех или уже отправленная ошибка не должны давать новый отчёт")
+    asyncio.run(handler._notify_admin_tribute_payment(SimpleNamespace(send_message=send), "42", None,
+        datetime(2030, 1, 1, tzinfo=timezone.utc), status))
+
+
+def test_admin_still_receives_channel_configuration_error(monkeypatch):
+    import main
+    from handlers import stars_tribute as handler
+    monkeypatch.setattr(handler, "ADMIN_TELEGRAM_IDS", {"999"})
+    sent = []
+    async def send(*args, **kwargs):
+        sent.append(args)
+    asyncio.run(handler._notify_admin_tribute_payment(SimpleNamespace(send_message=send), "42", None,
+        datetime(2030, 1, 1, tzinfo=timezone.utc), "not_configured"))
+    assert len(sent) == 1
+    assert sent[0][0] == 999
+    assert "канал не настроен" in sent[0][1]
+    assert "⚠️" in sent[0][1]

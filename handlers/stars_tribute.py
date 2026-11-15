@@ -274,12 +274,14 @@ def _channel_access_event(telegram_id: str, status: str) -> None:
 
 async def _notify_admin_tribute_payment(bot: Bot, telegram_id: str, username: str | None,
                                       expires_at: datetime, channel_status: str | None) -> None:
-    if channel_status == "failed":
-        return  # отдельный подробный алерт уже отправлен
+    # 2026-11-15: админу нужны только ошибки, не отчёты об успешных оплатах.
+    # Было: уведомляли при already_member/invite_sent; оставлено для отката.
+    if channel_status in ("already_member", "invite_sent", "failed"):
+        return  # при failed отдельный подробный алерт уже отправлен
     status = {"already_member": "уже состоит в канале", "invite_sent": "приглашение отправлено, вступление ещё не подтверждено",
               "not_configured": "канал не настроен"}.get(channel_status, "статус приглашения не подтверждён")
     who = f"@{username}" if username else f"id{telegram_id}"
-    text = (f"💳 Tribute: подтверждена подписка {who} ({telegram_id}).\n"
+    text = (f"⚠️ Tribute: проверь доступ в Premium-канал для {who} ({telegram_id}).\n"
             f"Premium до {expires_at:%d.%m.%Y %H:%M UTC}.\nКанал: {status}.")
     for admin_id in ADMIN_TELEGRAM_IDS:
         try:
