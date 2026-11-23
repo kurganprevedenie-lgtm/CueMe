@@ -1,6 +1,8 @@
 """Тесты слоя БД (storage.py). Каждый тест — на изолированной временной БД:
 storage.DB_PATH подменяется на файл в tmp_path, схема поднимается init_db().
 """
+import sqlite3
+
 import pytest
 
 import storage
@@ -14,6 +16,23 @@ def db(tmp_path, monkeypatch):
 
 
 # ── users ────────────────────────────────────────────────────────────────────
+
+def test_connection_closes_after_commit_and_rollback(db):
+    with storage._conn() as conn:
+        conn.execute("CREATE TABLE connection_test (value INTEGER)")
+        conn.execute("INSERT INTO connection_test VALUES (1)")
+    with pytest.raises(sqlite3.ProgrammingError, match="closed database"):
+        conn.execute("SELECT 1")
+
+    with pytest.raises(ValueError):
+        with storage._conn() as failed_conn:
+            failed_conn.execute("INSERT INTO connection_test VALUES (2)")
+            raise ValueError("rollback")
+    with pytest.raises(sqlite3.ProgrammingError, match="closed database"):
+        failed_conn.execute("SELECT 1")
+    with storage._conn() as fresh_conn:
+        assert [row[0] for row in fresh_conn.execute("SELECT value FROM connection_test")] == [1]
+
 
 def test_upsert_and_get_user(db):
     assert storage.get_user("u1") is None

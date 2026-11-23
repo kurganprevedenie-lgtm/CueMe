@@ -1,3 +1,5 @@
+from contextlib import contextmanager
+
 import storage
 
 
@@ -6,10 +8,13 @@ def test_ready_unique_index_skips_full_history_cleanup(tmp_path, monkeypatch):
     storage.init_db()
     queries = []
     connect = storage._conn
+
+    @contextmanager
     def traced():
-        conn = connect()
-        conn.set_trace_callback(queries.append)
-        return conn
+        with connect() as conn:
+            conn.set_trace_callback(queries.append)
+            yield conn
+
     monkeypatch.setattr(storage, "_conn", traced)
     storage.init_db()
     assert not any(q.lstrip().upper().startswith("DELETE FROM BUSINESS_MESSAGES") for q in queries)

@@ -6,6 +6,8 @@ import sqlite3
 import string
 import uuid
 from collections import Counter
+from collections.abc import Iterator
+from contextlib import closing, contextmanager
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from pathlib import Path
@@ -13,14 +15,20 @@ from pathlib import Path
 DB_PATH = Path("bot.db")
 
 
-def _conn() -> sqlite3.Connection:
+@contextmanager
+def _conn() -> Iterator[sqlite3.Connection]:
     # timeout=30 — ждать снятия блокировки до 30 с вместо мгновенного "database is locked"
     # (актуально при живом Business-потоке + фоновых пересборках).
-    conn = sqlite3.connect(DB_PATH, timeout=30)
-    conn.row_factory = sqlite3.Row
-    # WAL — параллельные чтения не блокируются записью; настройка персистентная на файле БД.
-    conn.execute("PRAGMA journal_mode=WAL")
-    return conn
+    # Контекст sqlite3 завершает транзакцию, но не закрывает соединение.
+    with closing(sqlite3.connect(DB_PATH, timeout=30)) as conn:
+        conn.row_factory = sqlite3.Row
+        # WAL — параллельные чтения не блокируются записью.
+        conn.execute("PRAGMA journal_mode=WAL")
+        # Оставляем штатный автоконтроль WAL по размеру. Иначе при закрытии
+        # последнего соединения SQLite синхронизирует WAL после каждого запроса.
+        conn.setconfig(sqlite3.SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, True)
+        with conn:
+            yield conn
 
 
 def _add_column_if_missing(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
