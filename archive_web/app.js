@@ -12,6 +12,14 @@ let olderCursor = null;
 let pageController;
 let mediaSession = new AbortController();
 const mediaUrls = new Set();
+const listImages = new Map();
+const listImageObserver = typeof IntersectionObserver === "function" ? new IntersectionObserver(entries => {
+  for (const entry of entries) {
+    if (!entry.isIntersecting) continue;
+    listImageObserver.unobserve(entry.target);
+    void showListImage(entry.target);
+  }
+}, {rootMargin: "70px 0px"}) : null;
 const previewLoaders = new WeakMap();
 const photoObserver = typeof IntersectionObserver === "function" ? new IntersectionObserver(entries => {
   for (const entry of entries) {
@@ -35,6 +43,54 @@ function status(id, text) {
 
 function initials(name) {
   return name.trim().split(/\s+/).slice(0, 2).map(word => Array.from(word)[0]).join("").toLocaleUpperCase("ru") || "•";
+}
+
+function renderAvatar(node, chat) {
+  const tone = Array.from(chat.id).reduce((sum, character) => sum * 31 + character.codePointAt(0) | 0, 0);
+  node.className = "avatar avatar-tone-" + (Math.abs(tone) % 6);
+  node.textContent = initials(chat.name);
+  if (chat.avatar) observeListImage(node, "avatars/" + chat.id);
+}
+
+function observeListImage(node, path) {
+  node.dataset.imagePath = path;
+  if (listImageObserver) listImageObserver.observe(node);
+  else void showListImage(node);
+}
+
+async function showListImage(node) {
+  const path = node.dataset.imagePath;
+  if (!node.isConnected) return;
+  if (!listImages.has(path)) {
+    listImages.set(path, request(path, AbortSignal.timeout(10000))
+      .then(response => response.blob())
+      .then(blob => URL.createObjectURL(blob))
+      .catch(() => null));
+    if (listImages.size > 96) {
+      const oldest = listImages.keys().next().value;
+      listImages.get(oldest).then(url => { if (url) URL.revokeObjectURL(url); });
+      listImages.delete(oldest);
+    }
+  }
+  const url = await listImages.get(path);
+  if (!node.isConnected || node.dataset.imagePath !== path) return;
+  if (!url) {
+    delete node.dataset.imagePath;
+    return;
+  }
+  const image = element("img", "");
+  image.alt = "";
+  image.src = url;
+  try {
+    await image.decode();
+    if (node.isConnected && node.dataset.imagePath === path) {
+      node.append(image);
+      node.classList.add("image-ready");
+    }
+  } catch {
+    // Для недоступного фото остаются инициалы или тип медиа.
+    if (node.dataset.imagePath === path) delete node.dataset.imagePath;
+  }
 }
 
 function resetMedia() {
@@ -69,29 +125,39 @@ function renderChats() {
   const now = new Date();
   const yesterday = new Date(now);
   yesterday.setDate(now.getDate() - 1);
+  for (const node of list.querySelectorAll("[data-image-path]")) listImageObserver?.unobserve(node);
   list.replaceChildren();
   for (const chat of visible) {
     const row = element("button", "chat-row");
     row.type = "button";
-    const avatar = element("span", "avatar", initials(chat.name));
+    const avatar = element("span", "avatar");
     avatar.setAttribute("aria-hidden", "true");
     const meta = element("span", "chat-meta");
+    const top = element("span", "chat-row-top");
     const date = new Date(chat.recent);
-    meta.append(element("strong", "", chat.name));
-    if (chat.preview) meta.append(element("span", "chat-preview", chat.preview));
-    row.append(avatar, meta);
+    top.append(element("strong", "", chat.name));
     if (!Number.isNaN(date.valueOf())) {
-      const label = date.toDateString() === now.toDateString() ? "Сегодня"
+      const label = date.toDateString() === now.toDateString() ? timeFormat.format(date)
         : date.toDateString() === yesterday.toDateString() ? "Вчера" : shortDate.format(date);
-      const timestamp = element("time", "", label + ", " + timeFormat.format(date));
+      const timestamp = element("time", "", label);
       timestamp.dateTime = chat.recent;
-      row.append(timestamp);
+      top.append(timestamp);
     }
-    const arrow = element("span", "arrow", "›");
-    arrow.setAttribute("aria-hidden", "true");
-    row.append(arrow);
+    meta.append(top);
+    const previewLine = element("span", "chat-preview-line");
+    const thumbnail = element("span", "chat-thumbnail");
+    thumbnail.setAttribute("aria-hidden", "true");
+    const previewText = element("span", "chat-preview");
+    if (chat.out) previewText.append(element("span", "chat-sender", "Вы: "));
+    if (chat.kind && chat.kind !== chat.preview) previewText.append(element("span", "chat-sender", chat.kind + " · "));
+    previewText.append(document.createTextNode(chat.preview || chat.kind || ""));
+    previewLine.append(thumbnail, previewText);
+    if (chat.preview || chat.kind) meta.append(previewLine);
+    row.append(avatar, meta);
     row.addEventListener("click", () => openChat(chat));
     list.append(row);
+    renderAvatar(avatar, chat);
+    if (chat.thumbnail) observeListImage(thumbnail, "thumbs/" + chat.thumbnail);
   }
   status("inbox-status", visible.length ? "" : query ? "Ничего не нашлось." : "Здесь появятся сохранённые переписки.");
 }
@@ -264,9 +330,11 @@ function setFilter(onlyDeleted) {
 function openChat(chat) {
   activeChat = chat;
   byId("chat-name").textContent = chat.name;
-  byId("chat-avatar").textContent = initials(chat.name);
+  const avatar = byId("chat-avatar");
+  delete avatar.dataset.imagePath;
   byId("inbox").hidden = true;
   byId("conversation").hidden = false;
+  renderAvatar(avatar, chat);
   byId("conversation").classList.remove("condensed");
   setFilter(false);
 }

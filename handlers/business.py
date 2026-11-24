@@ -213,6 +213,8 @@ def _file_meta(obj, *extra: str) -> dict:
         value = getattr(obj, field, None)
         if value is not None:
             out[field] = value
+    if thumbnail := getattr(obj, "thumbnail", None):
+        out["thumbnail_file_id"] = thumbnail.file_id
     return out
 
 
@@ -228,6 +230,7 @@ def _extract_business_content(msg: Message) -> dict:
         content_type, media = "animation", _file_meta(msg.animation)
     elif msg.photo:
         content_type, media = "photo", _file_meta(msg.photo[-1])
+        media["thumbnail_file_id"] = msg.photo[0].file_id
     elif msg.video:
         content_type, media = "video", _file_meta(msg.video)
     elif msg.video_note:

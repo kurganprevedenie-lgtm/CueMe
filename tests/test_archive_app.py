@@ -15,7 +15,7 @@ import storage
 
 
 TOKEN = "test-token"
-CHAT_REF = "1234567890abcdef"
+CHAT_REF = hashlib.sha256(b"100").hexdigest()[:16]
 
 
 def signed_data(owner, timestamp):
@@ -74,6 +74,21 @@ def test_page_merges_sources_and_only_marks_owned_rows(archive_db, monkeypatch):
     chats = archive_app.list_chats("10")
     assert [chat["id"] for chat in chats] == ["bfedcba0987654321", "c1"]
     assert [chat["preview"] for chat in chats] == ["Без контакта", "Сохранено"]
+    assert chats[0]["avatar"] is False
+    assert chats[1]["avatar"] is True
+    assert chats[1]["thumbnail"] == "1"
+
+
+def test_video_thumbnail_and_spoiler(archive_db):
+    with storage._conn() as conn:
+        conn.execute("UPDATE business_messages SET content_type = 'video', media_json = ? WHERE id = 1",
+                     (json.dumps({"file_id": "video", "thumbnail_file_id": "small"}),))
+    assert archive_app._file_id("10", 1, thumbnail=True) == "small"
+    assert archive_app._file_id("20", 1, thumbnail=True) is None
+    with storage._conn() as conn:
+        conn.execute("UPDATE business_messages SET media_json = ? WHERE id = 1",
+                     (json.dumps({"thumbnail_file_id": "small", "has_spoiler": True}),))
+    assert archive_app._file_id("10", 1, thumbnail=True) is None
 
 
 def test_archive_endpoints_enforce_access(archive_db):
@@ -82,14 +97,19 @@ def test_archive_endpoints_enforce_access(archive_db):
             return owner == "10"
 
         async def get_file(file_id):
-            assert file_id == "file"
+            assert file_id in ("file", "avatar-file")
             return SimpleNamespace(file_path="photos/test.jpg", file_size=4)
+
+        async def get_user_profile_photos(user_id, limit):
+            assert user_id == 100 and limit == 1
+            return SimpleNamespace(photos=[[SimpleNamespace(file_id="avatar-file", width=160, height=160)]])
 
         async def download_file(path, destination, timeout):
             destination.write(b"demo")
 
         app = web.Application()
-        bot = SimpleNamespace(token=TOKEN, get_file=get_file, download_file=download_file)
+        bot = SimpleNamespace(token=TOKEN, get_file=get_file, download_file=download_file,
+                              get_user_profile_photos=get_user_profile_photos)
         archive_app.register_archive(app, bot, is_premium)
         headers = {"X-Telegram-Init-Data": signed_data(10, int(time.time()))}
         async with TestClient(TestServer(app)) as client:
@@ -108,6 +128,12 @@ def test_archive_endpoints_enforce_access(archive_db):
             response = await client.get("/archive/api/chats/c2", headers=headers)
             assert (await response.json())["messages"] == []
             assert (await client.get("/archive/api/files/2", headers=headers)).status == 404
+            assert (await client.get("/archive/api/avatars/c1")).status == 401
+            assert (await client.get("/archive/api/avatars/c2", headers=headers)).status == 404
+            avatar = await client.get("/archive/api/avatars/c1", headers=headers)
+            assert avatar.status == 200 and await avatar.read() == b"demo"
+            assert (await client.get("/archive/api/thumbs/2", headers=headers)).status == 404
+            assert (await client.get("/archive/api/thumbs/1", headers=headers)).content_type == "image/jpeg"
             response = await client.get("/archive/api/files/1", headers=headers)
             assert await response.read() == b"demo"
             assert response.content_type == "image/jpeg"

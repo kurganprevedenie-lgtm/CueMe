@@ -8,11 +8,12 @@ import io
 import json
 import re
 import time
+from collections import OrderedDict
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import parse_qsl
 
-from aiohttp import web
+from aiohttp import ClientError, web
 from aiogram.exceptions import TelegramAPIError
 
 import storage
@@ -22,6 +23,8 @@ _ASSETS = Path(__file__).with_name("archive_web")
 _WALLPAPER = "wallpaper-v3.webp"
 _PAGE_SIZE = 50
 _FILE_LIMIT = 20 * 1024 * 1024
+_PREVIEW_LIMIT = 384 * 1024
+_PROFILE_ID = re.compile(r"user([1-9][0-9]{0,15})")
 _CHAT_KEY = re.compile(r"c[1-9][0-9]{0,17}|b[0-9a-f]{16}")
 _IMPORTED_DATE = """CASE WHEN instr(substr(date, 11), '+') = 0
                          AND instr(substr(date, 11), '-') = 0 AND substr(date, -1) <> 'Z'
@@ -93,26 +96,37 @@ def list_chats(owner: str) -> list[dict]:
                 SELECT 'c' || c.id AS id, COALESCE(NULLIF(c.display_name, ''), 'Собеседник') AS name,
                        MAX(COALESCE(m.recent, ''), COALESCE(i.recent, '')) AS recent,
                        CASE WHEN COALESCE(m.recent, '') >= COALESCE(i.recent, '') THEN m.id END AS live_id,
-                       CASE WHEN COALESCE(m.recent, '') < COALESCE(i.recent, '') THEN i.id END AS import_id
+                       CASE WHEN COALESCE(m.recent, '') < COALESCE(i.recent, '') THEN i.id END AS import_id,
+                       CASE WHEN m.id IS NOT NULL THEN c.original_from_id END AS profile
                 FROM contacts c LEFT JOIN mapped m ON m.contact_id = c.id AND m.rank = 1
                 LEFT JOIN imported i ON i.contact_id = c.id
                 WHERE c.user_telegram_id = ? AND c.archived_into_contact_id IS NULL
                 UNION ALL
-                SELECT 'b' || live.chat_ref, 'Собеседник', live.recent, live.id, NULL FROM live
+                SELECT 'b' || live.chat_ref, 'Собеседник', live.recent, live.id, NULL, NULL FROM live
                 WHERE NOT EXISTS (SELECT 1 FROM business_chat_refs r
                                   WHERE r.owner_user_id = ? AND r.chat_ref = live.chat_ref)
             )
-            SELECT inbox.id, inbox.name, inbox.recent,
-                   COALESCE(substr(b.text, 1, 140), substr(i.text, 1, 140)) AS preview, b.content_type
+            SELECT inbox.id, inbox.name, inbox.recent, inbox.profile, b.id AS message_id,
+                   COALESCE(substr(b.text, 1, 180), substr(i.text, 1, 180)) AS preview,
+                   COALESCE(b.direction, i.direction) AS direction,
+                   b.content_type, b.media_json, b.photo_file_id, b.video_file_id,
+                   b.video_note_file_id, b.voice_file_id
             FROM inbox LEFT JOIN business_messages b ON b.id = inbox.live_id AND b.owner_user_id = ?
             LEFT JOIN imported_messages i ON i.id = inbox.import_id
             WHERE recent <> '' ORDER BY recent DESC, inbox.id
         """, (owner, owner, owner, owner, owner, owner)).fetchall()
-    return [
-        {"id": row["id"], "name": row["name"], "recent": row["recent"].replace(" ", "T") + "Z",
-         "preview": (row["preview"] or "").strip() or _KINDS.get(row["content_type"], "")}
-        for row in rows
-    ]
+    chats = []
+    for row in rows:
+        kind, media, file_id = _attachment(row)
+        chats.append({
+            "id": row["id"], "name": row["name"], "recent": row["recent"].replace(" ", "T") + "Z",
+            "preview": (row["preview"] or "").strip() or _KINDS.get(kind, ""),
+            "kind": _KINDS.get(kind),
+            "out": row["direction"] == "out",
+            "avatar": bool(_PROFILE_ID.fullmatch(row["profile"] or "")),
+            "thumbnail": str(row["message_id"]) if _thumbnail_id(kind, media, file_id) else None,
+        })
+    return chats
 
 
 _KINDS = {
@@ -147,6 +161,29 @@ def _attachment(row) -> tuple[str, dict, str | None]:
             if row[f"{legacy}_file_id"]:
                 return legacy, media, row[f"{legacy}_file_id"]
     return kind, media, file_id if isinstance(file_id, str) else None
+
+
+def _thumbnail_id(kind: str, media: dict, file_id: str | None) -> str | None:
+    if media.get("has_spoiler") or kind not in ("photo", "video", "video_note", "animation"):
+        return None
+    thumbnail = media.get("thumbnail_file_id")
+    if isinstance(thumbnail, str) and thumbnail:
+        return thumbnail
+    return file_id if kind == "photo" else None
+
+
+def _avatar_user(owner: str, contact: int) -> int | None:
+    with storage._conn() as conn:
+        rows = conn.execute("""
+            SELECT c.original_from_id, r.chat_ref FROM contacts c
+            JOIN business_chat_refs r ON r.contact_id = c.id AND r.owner_user_id = c.user_telegram_id
+            WHERE c.id = ? AND c.user_telegram_id = ? AND c.archived_into_contact_id IS NULL
+        """, (contact, owner)).fetchall()
+    for row in rows:
+        match = _PROFILE_ID.fullmatch(row["original_from_id"])
+        if match and hashlib.sha256(match[1].encode()).hexdigest()[:16] == row["chat_ref"]:
+            return int(match[1])
+    return None
 
 
 _MEDIA_COLUMNS = """content_type, media_json, photo_file_id, video_file_id,
@@ -219,18 +256,23 @@ def chat_page(owner: str, chat: str, before: tuple, deleted: bool) -> dict:
     return {"messages": messages, "next": next_page}
 
 
-def _file_id(owner: str, row_id: int) -> str | None:
+def _file_id(owner: str, row_id: int, *, thumbnail: bool = False) -> str | None:
     with storage._conn() as conn:
         row = conn.execute(
             f"SELECT {_MEDIA_COLUMNS} FROM business_messages WHERE id = ? AND owner_user_id = ?",
             (row_id, owner),
         ).fetchone()
-    return _attachment(row)[2] if row else None
+    if not row:
+        return None
+    kind, media, file_id = _attachment(row)
+    return _thumbnail_id(kind, media, file_id) if thumbnail else file_id
 
 
 def register_archive(app: web.Application, bot, is_premium) -> None:
     database_slots = asyncio.Semaphore(3)
     download_slots = asyncio.Semaphore(2)
+    preview_slots = asyncio.Semaphore(3)
+    avatars: OrderedDict[tuple[str, int], tuple[float, tuple[bytes, str] | None]] = OrderedDict()
     logo = base64.b64encode((_ASSETS / "logo-v2.webp").read_bytes()).decode("ascii")
     index = (_ASSETS / "index.html").read_text(encoding="utf-8").replace(
         "{{LOGO_URL}}", f"data:image/webp;base64,{logo}",
@@ -281,6 +323,69 @@ def register_archive(app: web.Application, bot, is_premium) -> None:
             )
         return web.json_response(data, headers=_HEADERS)
 
+    async def read_file(file_id: str, limit: int, timeout: int) -> tuple[bytes, str]:
+        file = await bot.get_file(file_id)
+        if not file.file_path:
+            raise web.HTTPNotFound(headers=_HEADERS)
+        if file.file_size is None or file.file_size > limit:
+            raise web.HTTPRequestEntityTooLarge(max_size=limit, actual_size=file.file_size or 0, headers=_HEADERS)
+        data = io.BytesIO()
+        await bot.download_file(file.file_path, destination=data, timeout=timeout)
+        extension = Path(file.file_path).suffix
+        extension = extension if re.fullmatch(r"\.[a-zA-Z0-9]{1,8}", extension) else ""
+        return data.getvalue(), extension
+
+    def preview_response(saved: tuple[bytes, str] | None) -> web.Response:
+        if saved is None:
+            raise web.HTTPNotFound(headers=_HEADERS)
+        data, extension = saved
+        mime = _MEDIA_TYPES.get(extension.lower(), "")
+        if not mime.startswith("image/"):
+            raise web.HTTPNotFound(headers=_HEADERS)
+        return web.Response(body=data, content_type=mime, headers=_HEADERS)
+
+    async def avatar(request: web.Request) -> web.Response:
+        owner = await authorized(request)
+        contact = int(request.match_info["id"])
+        async with database_slots:
+            user_id = await asyncio.to_thread(_avatar_user, owner, contact)
+        if user_id is None:
+            raise web.HTTPNotFound(headers=_HEADERS)
+        key = (owner, user_id)
+        async with preview_slots:
+            cached = avatars.get(key)
+            if cached and cached[0] > time.monotonic():
+                avatars.move_to_end(key)
+                return preview_response(cached[1])
+            saved = None
+            try:
+                async with asyncio.timeout(7):
+                    photos = await bot.get_user_profile_photos(user_id, limit=1)
+                    if photos.photos and photos.photos[0]:
+                        smallest = min(photos.photos[0], key=lambda photo: photo.width * photo.height)
+                        saved = await read_file(smallest.file_id, 128 * 1024, 5)
+            except (TelegramAPIError, ClientError, TimeoutError, web.HTTPException):
+                pass
+            avatars[key] = (time.monotonic() + (600 if saved else 120), saved)
+            avatars.move_to_end(key)
+            if len(avatars) > 128:
+                avatars.popitem(last=False)
+        return preview_response(saved)
+
+    async def thumbnail(request: web.Request) -> web.Response:
+        owner = await authorized(request)
+        async with database_slots:
+            file_id = await asyncio.to_thread(_file_id, owner, int(request.match_info["id"]), thumbnail=True)
+        if not file_id:
+            raise web.HTTPNotFound(headers=_HEADERS)
+        async with preview_slots:
+            try:
+                async with asyncio.timeout(7):
+                    saved = await read_file(file_id, _PREVIEW_LIMIT, 5)
+            except (TelegramAPIError, ClientError, TimeoutError, web.HTTPException):
+                raise web.HTTPNotFound(headers=_HEADERS) from None
+        return preview_response(saved)
+
     async def download(request: web.Request) -> web.Response:
         owner = await authorized(request)
         async with database_slots:
@@ -290,26 +395,17 @@ def register_archive(app: web.Application, bot, is_premium) -> None:
         async with download_slots:
             try:
                 async with asyncio.timeout(30):
-                    file = await bot.get_file(file_id)
-                    if not file.file_path:
-                        raise web.HTTPNotFound(headers=_HEADERS)
-                    if file.file_size is None or file.file_size > _FILE_LIMIT:
-                        raise web.HTTPRequestEntityTooLarge(max_size=_FILE_LIMIT, actual_size=file.file_size or 0,
-                                                            headers=_HEADERS)
-                    data = io.BytesIO()
-                    await bot.download_file(file.file_path, destination=data, timeout=25)
+                    data, extension = await read_file(file_id, _FILE_LIMIT, 25)
             except TelegramAPIError as exc:
                 if "file is too big" in str(exc).lower():
                     raise web.HTTPRequestEntityTooLarge(
                         max_size=_FILE_LIMIT, actual_size=_FILE_LIMIT + 1, headers=_HEADERS,
                     ) from None
                 raise web.HTTPBadGateway(headers=_HEADERS) from None
-            except TimeoutError:
+            except (ClientError, TimeoutError):
                 raise web.HTTPBadGateway(headers=_HEADERS) from None
-        extension = Path(file.file_path).suffix
-        extension = extension if re.fullmatch(r"\.[a-zA-Z0-9]{1,8}", extension) else ""
         return web.Response(
-            body=data.getvalue(), content_type=_MEDIA_TYPES.get(extension.lower(), "application/octet-stream"),
+            body=data, content_type=_MEDIA_TYPES.get(extension.lower(), "application/octet-stream"),
             headers={**_HEADERS, "Content-Disposition": f'attachment; filename="cueme-media{extension}"'},
         )
 
@@ -317,4 +413,6 @@ def register_archive(app: web.Application, bot, is_premium) -> None:
     app.router.add_get(r"/archive/{name:app\.css|app\.js|wallpaper-v3\.webp}", asset)
     app.router.add_get("/archive/api/chats", chats, allow_head=False)
     app.router.add_get(f"/archive/api/chats/{{chat:{_CHAT_KEY.pattern}}}", messages, allow_head=False)
+    app.router.add_get(r"/archive/api/avatars/c{id:[1-9][0-9]{0,17}}", avatar, allow_head=False)
+    app.router.add_get(r"/archive/api/thumbs/{id:[1-9][0-9]{0,17}}", thumbnail, allow_head=False)
     app.router.add_get(r"/archive/api/files/{id:[1-9][0-9]{0,17}}", download, allow_head=False)
