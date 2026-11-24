@@ -23,7 +23,7 @@ def reply_author_voice(messages: list[str]) -> str:
         return ""
 
     length = int(median(len(text) for text, _ in observations))
-    hints = [f"Медианная длина реплики автора — {length} символов. Это ориентир по краткости."]
+    hints = [f"Медианная длина реплики автора — {length} символов. Это справка о темпе его переписки."]
     # Капс отражает эмоцию и не определяет обычную первую букву.
     starts = [word[0] for _, word in observations if len(word) == 1 or not word.isupper()]
     if len(starts) >= 8 and sum(letter.islower() for letter in starts) / len(starts) >= 0.8:
