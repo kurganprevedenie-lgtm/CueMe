@@ -655,7 +655,7 @@ def _reply_cache_extra(gender: str | None, ctx: dict) -> str:
     if not ADAPTIVE_REPLY_PROMPT:
         return gender or ""
     return json.dumps(
-        ["adaptive-reply-v4", gender, *(ctx.get(key) for key in (
+        ["adaptive-reply-v5", gender, *(ctx.get(key) for key in (
             "recent_dialogue", "author_voice", "data_signals", "winning",
         ))],
         ensure_ascii=False,
