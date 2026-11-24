@@ -2263,8 +2263,38 @@ _VARIANT_DELIM = "===ВАРИАНТ==="
 _VARIANT_NAME_RE = re.compile(r"НАЗВАНИЕ\s*:\s*(.+)", re.IGNORECASE)
 _VARIANT_TEXT_RE = re.compile(r"ТЕКСТ\s*:\s*(.+)", re.IGNORECASE | re.DOTALL)
 
+_REPLY_GENDER_FORMS = (
+    ("понял", "поняла"), ("услышал", "услышала"), ("согласен", "согласна"),
+    ("уверен", "уверена"), ("готов", "готова"), ("рад", "рада"),
+    ("ошибся", "ошиблась"), ("устал", "устала"), ("пошутил", "пошутила"),
+)
+_REPLY_OPENING_RE = re.compile(
+    r"^(?P<speaker>я\s+)?(?P<form>" + "|".join(form for pair in _REPLY_GENDER_FORMS for form in pair)
+    + r")\b(?!\s*\?|\s+(?:ли|ты|вы|он|она)\b)",
+    re.IGNORECASE,
+)
 
-def _parse_variants(raw: str, n_variants: int) -> list[tuple[str, str]]:
+
+def _agree_reply_opening(text: str, user_gender: str | None) -> str:
+    """Поправляет частые формы от первого лица в начале готовой реплики."""
+    if user_gender not in ("female", "male"):
+        return text
+    match = _REPLY_OPENING_RE.match(text)
+    if not match:
+        return text
+    word = match["form"]
+    for male, female in _REPLY_GENDER_FORMS:
+        if word.lower() in (male, female):
+            replacement = female if user_gender == "female" else male
+            if word.isupper():
+                replacement = replacement.upper()
+            elif word[0].isupper():
+                replacement = replacement.capitalize()
+            return text[:match.start("form")] + replacement + text[match.end("form"):]
+    return text
+
+
+def _parse_variants(raw: str, n_variants: int, user_gender: str | None = None) -> list[tuple[str, str]]:
     """Разбирает ответ LLM на блоки ===ВАРИАНТ=== с полями НАЗВАНИЕ:/ТЕКСТ:.
     Устойчиво к лишним пробелам/переносам; блоки без обоих полей пропускаются."""
     blocks = [b.strip() for b in raw.split(_VARIANT_DELIM) if b.strip()]
@@ -2277,7 +2307,7 @@ def _parse_variants(raw: str, n_variants: int) -> list[tuple[str, str]]:
         name = name_m.group(1).strip().strip("[]").strip()
         text = _strip_wrapping_quotes(text_m.group(1).strip().strip("[]").strip())
         if name and text:
-            variants.append((name, text))
+            variants.append((name, _agree_reply_opening(text, user_gender)))
     return variants[:n_variants]
 
 
@@ -2357,6 +2387,15 @@ def _adaptive_reply_prompt(
     examples: list[str] | None = None,
     previous: list[tuple[str, str]] | None = None,
 ) -> str:
+    gender_rule = _gender_note(user_gender).strip()
+    if gender_rule:
+        gender_rule += (
+            " Автор — пользователь, который будет отправлять каждый вариант. "
+            "Род из профиля обязателен для всех его реплик от первого лица, даже без слова «я». "
+            "Карточки, примеры и род собеседника его не меняют."
+        )
+    else:
+        gender_rule = "Если род автора не указан, используй естественные нейтральные формы."
     turn_note = ""
     incoming_lower = incoming_msg.casefold().replace("ё", "е")
     if re.search(r"\bбез уговоров\b|\bне уговаривай\b|\bне надо уговаривать\b", incoming_lower):
@@ -2364,17 +2403,17 @@ def _adaptive_reply_prompt(
             "Для этой реплики собеседник прямо попросил оставить вопрос закрытым. "
             "Каждый вариант состоит из одного короткого ответа, который принимает просьбу. "
             "На этом закончи реплику. Не добавляй вторую фразу, условия, приглашения, "
-            "предложения общаться или вопросы. Подходящие смыслы: «я услышал», «не буду к этому возвращаться», "
-            "«спасибо, что сказала прямо»."
+            "предложения общаться или вопросы. Передай один из смыслов: принять просьбу, "
+            "оставить тему закрытой или поблагодарить за прямоту."
         )
     elif re.search(r"\bсерьезно\b.*\bшут\w*|\bшут\w*.*\bсерьезно\b", incoming_lower):
         turn_note = (
             "Если из истории нельзя понять, о какой конкретно фразе автора речь и как он её имел в виду, "
             "дай ему выбор по намерению: первое название «если это шутка», второе «если всерьёз», "
             "третье «если вышло двусмысленно». Под каждым напиши готовую короткую реплику для этого случая. "
-            "Начни с ясного ответа вроде «я пошутил» или «я всерьёз». Для двусмысленной фразы "
-            "можно признать, что неудачно выразился. Не переводи вопрос обратно на собеседника. "
-            "Если смысл предыдущей фразы ясен из истории, отвечай по ней. Сохрани род автора из инструкции выше."
+            "Начни с ясного указания, шутка это или всерьёз. Для двусмысленной фразы "
+            "можно признать неудачную формулировку. Не переводи вопрос обратно на собеседника. "
+            "Если смысл предыдущей фразы ясен из истории, отвечай по ней."
         )
     elif re.search(r"\bудиви меня\b", incoming_lower):
         turn_note = (
@@ -2384,6 +2423,7 @@ def _adaptive_reply_prompt(
             "Без рассказов о якобы случившихся событиях, заезженных фактов про животных и предположений о встрече."
         )
     parts = [
+        gender_rule,
         f"Предложи ровно {n_variants} варианта ответа на последнюю реплику собеседника. "
         "Начни вывод со строки ===ВАРИАНТ=== и повторяй этот маркер перед каждым вариантом. "
         "Сам выбери уместные реакции на эту реплику. Дай каждой короткую подпись без кавычек, "
@@ -2409,7 +2449,6 @@ def _adaptive_reply_prompt(
         "Обычно достаточно 1–2 коротких предложений, примерно 8–18 слов в каждом варианте. "
         "Если достаточно коротко принять отказ, не растягивай ответ ради длины. "
         "Вместо дежурных фраз вроде «без лишних драм», «давай уточним детали» или отдельного междометия дай ясную мысль.",
-        _gender_note(user_gender).strip(),
         "ГОЛОС АВТОРА. Соблюдай его привычный регистр, тон, пунктуацию и эмодзи. "
         "Измеренные привычки важнее общих формулировок карточки. Содержание и степень инициативы выбирай по ситуации. "
         "В разговоре о расставании, обиде или границах сохрани привычный регистр и ритм автора. "
@@ -2432,7 +2471,8 @@ def _adaptive_reply_prompt(
         "ПРЕЖНИЕ ОТВЕТЫ. Подбери новые реакции и формулировки. "
         "Не повторяй ни один прежний текст, даже с другими знаками, эмодзи или названием.\n"
         + "\n".join(f"- {name}: {text}" for name, text in previous) if previous else "",
-        f"Выведи только {n_variants} блока в таком формате. Заполни все поля и сохрани маркеры дословно.\n"
+        f"Выведи только {n_variants} блока в таком формате. Заполни все поля и сохрани маркеры дословно. "
+        "Проверь согласование от первого лица в каждом поле ТЕКСТ.\n"
         + "\n".join(
             "===ВАРИАНТ===\nНАЗВАНИЕ: [реакция]\nТЕКСТ: [готовый ответ]"
             for _ in range(n_variants)
@@ -2465,7 +2505,7 @@ async def suggest_reply_variants(
             prompt, max_tokens=1800, tag="variants", fast=True, expected_variants=n_variants,
             previous_variant_texts=frozenset(_variant_text_key(body) for _, body in previous_variants or ()),
         )
-        variants = _parse_variants(raw, n_variants)
+        variants = _parse_variants(raw, n_variants, user_gender)
         if len(variants) != n_variants:
             raise ProviderError(f"Получено {len(variants)} из {n_variants} вариантов")
         return [(_strip_wrapping_quotes(name), text) for name, text in variants]
@@ -2604,7 +2644,7 @@ async def suggest_reply_variants(
     # историей (есть winning_examples/data_signals в промпте) он длиннее
     # среднего — риск урезания выше. Подняли запас.
     raw = await _ask(prompt, max_tokens=1800, tag="variants", fast=True)
-    variants = _parse_variants(raw, n_variants)
+    variants = _parse_variants(raw, n_variants, user_gender)
     if len(variants) < n_variants:
         log.warning(
             "suggest_reply_variants: распарсено %d/%d вариантов — вероятно, "
@@ -2849,7 +2889,7 @@ _LIVE_NOTES_DELIM = "===ЗАМЕТКИ==="
 
 
 def _parse_live_step(
-    raw: str, n_variants: int, previous_notes: str
+    raw: str, n_variants: int, previous_notes: str, user_gender: str | None = None
 ) -> tuple[list[tuple[str, str]], str]:
     """Разбирает ответ live_coach_step: варианты + обновлённые running_notes.
     Если модель не вернула маркер/заметки — оставляем прежние notes без
@@ -2858,7 +2898,7 @@ def _parse_live_step(
         variants_part, notes_part = raw.split(_LIVE_NOTES_DELIM, 1)
     else:
         variants_part, notes_part = raw, ""
-    variants = _parse_variants(variants_part, n_variants)
+    variants = _parse_variants(variants_part, n_variants, user_gender)
     notes = notes_part.strip()
     return variants, notes or previous_notes
 
@@ -2889,7 +2929,7 @@ async def live_coach_step(
             "Если нового факта нет, сохрани заметки как есть."
         )
         raw = await _ask(prompt, max_tokens=1700, tag="live", fast=True, expected_variants=n_variants)
-        variants, notes = _parse_live_step(raw, n_variants, running_notes or "")
+        variants, notes = _parse_live_step(raw, n_variants, running_notes or "", user_gender)
         if len(variants) != n_variants:
             raise ProviderError(f"Получено {len(variants)} из {n_variants} вариантов")
         return [(_strip_wrapping_quotes(name), text) for name, text in variants], notes
@@ -2987,7 +3027,7 @@ async def live_coach_step(
         "в конце, или без изменений, если добавить нечего)."
     )
     raw = await _ask(prompt, max_tokens=1700, tag="live", fast=True)
-    return _parse_live_step(raw, n_variants, running_notes or "")
+    return _parse_live_step(raw, n_variants, running_notes or "", user_gender)
 
 
 async def suggest_reply_from_screenshot(

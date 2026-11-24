@@ -58,7 +58,35 @@ def test_adaptive_reply_and_rollback_keep_distinct_prompts_and_cache(monkeypatch
     asyncio.run(llm.suggest_reply_variants("ты серьёзно?", "карточка", "контекст", **kwargs))
     assert "ДЕФОЛТНЫЙ НАБОР" in prompts[1]
     assert "пусть будет так" not in prompts[1]
-    assert reply._reply_cache_extra("male", kwargs) == "male"
+    assert reply._reply_cache_extra("male", kwargs) == "reply-gender-v2:male"
+
+
+@pytest.mark.parametrize("user_gender,generated,expected", [
+    ("female", "понял, не будем дальше.", "поняла, не будем дальше."),
+    ("male", "Я Услышала тебя.", "Я Услышал тебя."),
+    (None, "понял, не будем дальше.", "понял, не будем дальше."),
+])
+def test_reply_and_live_agree_with_profile_gender(monkeypatch, user_gender, generated, expected):
+    async def ask(prompt, **kwargs):
+        if user_gender:
+            assert prompt.startswith(llm._gender_note(user_gender).strip())
+        assert "я услышал" not in prompt
+        raw = (
+            f"===ВАРИАНТ===\nНАЗВАНИЕ: Принять\nТЕКСТ: {generated}\n"
+            "===ВАРИАНТ===\nНАЗВАНИЕ: Закрыть тему\nТЕКСТ: понял? я не настаиваю.\n"
+            "===ВАРИАНТ===\nНАЗВАНИЕ: С уважением\nТЕКСТ: спасибо за прямоту"
+        )
+        return raw + "\n===ЗАМЕТКИ===\n#1: понял, что общаться не хочет" if kwargs["tag"] == "live" else raw
+
+    monkeypatch.setattr(llm, "ADAPTIVE_REPLY_PROMPT", True)
+    monkeypatch.setattr(llm, "_ask", ask)
+    message = "без уговоров, пожалуйста"
+    reply_variants = asyncio.run(llm.suggest_reply_variants(message, "", "", user_gender=user_gender))
+    live_variants, notes = asyncio.run(llm.live_coach_step(message, "", "", None, user_gender=user_gender))
+    assert reply_variants == live_variants
+    assert reply_variants[0][1] == expected
+    assert reply_variants[1][1] == "понял? я не настаиваю."
+    assert notes == "#1: понял, что общаться не хочет"
 
 
 def test_partial_adaptive_result_does_not_reach_success_path(monkeypatch):
