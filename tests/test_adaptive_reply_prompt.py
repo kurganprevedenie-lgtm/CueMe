@@ -1,4 +1,6 @@
 import asyncio
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -99,6 +101,9 @@ def test_live_dialogue_still_returns_running_notes(monkeypatch):
     ("===ВАРИАНТ===\nНАЗВАНИЕ: Уточнить\nТЕКСТ: если бы это mattered\n"
      "===ВАРИАНТ===\nНАЗВАНИЕ: Предложить\nТЕКСТ: давай вечером\n"
      "===ВАРИАНТ===\nНАЗВАНИЕ: Поддержать\nТЕКСТ: как скажешь"),
+    ("===ВАРИАНТ===\nНАЗВАНИЕ: Новая подпись\nТЕКСТ: ПОЕХАЛИ! 🙂\n"
+     "===ВАРИАНТ===\nНАЗВАНИЕ: Предложить\nТЕКСТ: давай вечером\n"
+     "===ВАРИАНТ===\nНАЗВАНИЕ: Поддержать\nТЕКСТ: как скажешь"),
 ])
 def test_variant_format_error_falls_back_to_another_provider(monkeypatch, bad_response):
     calls = []
@@ -125,6 +130,30 @@ def test_variant_format_error_falls_back_to_another_provider(monkeypatch, bad_re
     monkeypatch.setattr(llm, "_invalid_outputs", {})
     monkeypatch.setattr(llm, "_provider_stats", {})
     monkeypatch.setattr(llm.llm_usage, "emit", lambda *args, **kwargs: None)
-    variants = asyncio.run(llm.suggest_reply_variants("пойдём гулять?", "", ""))
+    variants = asyncio.run(llm.suggest_reply_variants(
+        "пойдём гулять?", "", "", previous_variants=[("Старая подпись", "поехали")],
+    ))
     assert calls == ["first", "reserve"]
     assert len(variants) == 3
+
+
+@pytest.mark.parametrize("kind", ["reply", "live"])
+def test_regeneration_keeps_button_and_trial_when_model_repeats_answer(monkeypatch, kind):
+    message = SimpleNamespace(answer=AsyncMock(), edit_text=AsyncMock())
+    charge = AsyncMock()
+    monkeypatch.setattr(reply, "_quota_gate", AsyncMock(return_value=True))
+    monkeypatch.setattr(reply, "_charge_trial_if_needed", charge)
+    monkeypatch.setattr(reply, "get_gender", lambda _: None)
+    monkeypatch.setattr(reply, "suggest_reply_variants", AsyncMock(return_value=[("Новый заголовок", "Поехали!")]))
+    ctx = {
+        "kind": kind, "text": "идём?", "contact_id": 5, "style_card": "",
+        "interaction_card": "", "variants": [("Старый заголовок", "поехали")],
+    }
+    if kind == "live":
+        asyncio.run(reply._run_live_coach_step(message, ctx, 42, None, "1", force_fresh=True))
+    else:
+        asyncio.run(reply._run_variants_generation(message, ctx, 42, None, "1", force_fresh=True))
+    message.answer.assert_awaited_once()
+    message.edit_text.assert_not_awaited()
+    charge.assert_not_awaited()
+    assert ctx["variants"] == [("Старый заголовок", "поехали")]

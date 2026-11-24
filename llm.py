@@ -252,6 +252,9 @@ _llm_call_tag: contextvars.ContextVar[str] = contextvars.ContextVar("llm_call_ta
 _llm_expected_variants: contextvars.ContextVar[int | None] = contextvars.ContextVar(
     "llm_expected_variants", default=None,
 )
+_llm_previous_variant_texts: contextvars.ContextVar[frozenset[str]] = contextvars.ContextVar(
+    "llm_previous_variant_texts", default=frozenset(),
+)
 _llm_attempt: contextvars.ContextVar[list] = contextvars.ContextVar("llm_attempt", default=[0])
 # Опции конкретного вызова для Groq (reasoning_effort, запас токенов под
 # рассуждения, таймаут) — выставляет _ask(..., fast=True), читает
@@ -401,6 +404,8 @@ def _check_output(provider: str, model: str, text: str) -> str:
             reason = "латиница в названии или тексте варианта"
         elif any(not re.search(r"[а-яё]", field, re.IGNORECASE) for variant in variants for field in variant):
             reason = "вариант без русского названия или текста"
+        elif _llm_previous_variant_texts.get().intersection(_variant_text_key(body) for _, body in variants):
+            reason = "повторён предыдущий вариант"
     if reason is None:
         llm_usage.validation("valid_output")
         return text
@@ -1249,7 +1254,7 @@ def get_provider_stats() -> dict:
 @llm_usage.logical_call
 async def _ask(
     prompt: str, max_tokens: int = 1024, tag: str | None = None, fast: bool = False,
-    *, expected_variants: int | None = None,
+    *, expected_variants: int | None = None, previous_variant_texts: frozenset[str] = frozenset(),
 ) -> str:
     """Пробует провайдеров по цепочке. Пробрасывает ошибку только если все упали.
     Логирует по каждой попытке: провайдер, исход, тип ошибки, время ответа.
@@ -1258,6 +1263,7 @@ async def _ask(
     VARIANTS_* в config.py (см. GroqProvider._ask_with_key)."""
     _llm_call_tag.set(tag or "-")
     _llm_expected_variants.set(expected_variants)
+    _llm_previous_variant_texts.set(previous_variant_texts)
     _llm_fast.set(fast)
     _llm_attempt.set([0])
     _llm_served_model.set(None)
@@ -2275,6 +2281,11 @@ def _parse_variants(raw: str, n_variants: int) -> list[tuple[str, str]]:
     return variants[:n_variants]
 
 
+def _variant_text_key(text: str) -> str:
+    """Регистр, знаки препинания и эмодзи не делают старый ответ новым."""
+    return " ".join(re.findall(r"\w+", text.casefold()))
+
+
 # Дефолтный набор вариантов — фиксированные три подхода, чтобы юзер видел
 # знакомые лейблы каждый раз, а не гадал новые названия. Отступать можно
 # только когда контекст явно требует другого (тяжёлые/деликатные темы).
@@ -2386,7 +2397,8 @@ def _adaptive_reply_prompt(
         f"СИГНАЛЫ ПО ДАННЫМ\n{data_signals}" if data_signals else "",
         f"НЕДАВНИЕ РЕПЛИКИ\n{recent_dialogue}" if recent_dialogue else "",
         f"ПОСЛЕДНЯЯ РЕПЛИКА СОБЕСЕДНИКА\n<<<\n{incoming_msg}\n>>>",
-        "ПРЕЖНИЕ ОТВЕТЫ. Подбери новые реакции и формулировки.\n"
+        "ПРЕЖНИЕ ОТВЕТЫ. Подбери новые реакции и формулировки. "
+        "Не повторяй ни один прежний текст, даже с другими знаками, эмодзи или названием.\n"
         + "\n".join(f"- {name}: {text}" for name, text in previous) if previous else "",
         f"Выведи только {n_variants} блока в таком формате. Заполни все поля и сохрани маркеры дословно.\n"
         + "\n".join(
@@ -2417,7 +2429,10 @@ async def suggest_reply_variants(
             author_voice=author_voice, recent_dialogue=recent_dialogue,
             data_signals=data_signals, examples=winning_examples, previous=previous_variants,
         )
-        raw = await _ask(prompt, max_tokens=1800, tag="variants", fast=True, expected_variants=n_variants)
+        raw = await _ask(
+            prompt, max_tokens=1800, tag="variants", fast=True, expected_variants=n_variants,
+            previous_variant_texts=frozenset(_variant_text_key(body) for _, body in previous_variants or ()),
+        )
         variants = _parse_variants(raw, n_variants)
         if len(variants) != n_variants:
             raise ProviderError(f"Получено {len(variants)} из {n_variants} вариантов")

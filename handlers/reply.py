@@ -41,6 +41,7 @@ from features import (
 )
 from llm import (
     RateLimitError,
+    _variant_text_key,
     analyze_reply_dynamics,
     live_coach_step,
     NEUTRAL_INTERACTION_PLACEHOLDER,
@@ -742,6 +743,12 @@ def _save_shown_suggestions(
 # "screenshot" убран вместе с функцией «скриншот переписки → ответ» (см.
 # закомментированную секцию «Ответить по скриншоту» выше).
 _VARIANT_KINDS = ("reply",)
+_regenerating: set[tuple[int, str]] = set()
+
+
+def _has_new_variants(variants: list[tuple[str, str]], ctx: dict) -> bool:
+    previous = {_variant_text_key(body) for _, body in ctx.get("variants") or ()}
+    return bool(variants) and not previous.intersection(_variant_text_key(body) for _, body in variants)
 
 
 def variants_result_kb(action_id: str) -> InlineKeyboardMarkup:
@@ -819,6 +826,10 @@ async def _run_variants_generation(
                     cycle_seconds=_REPLY_PROGRESS_CYCLE_SECONDS,
                 )
         except RateLimitError:
+            if force_fresh:
+                await target.answer("Лимит исчерпан. Нажми «Другие варианты» чуть позже.")
+                _note_outcome("rate_limit")
+                return
             await _finish_generation_message(
                 progress_msg, target, force_fresh, "Лимит исчерпан, попробуй позже.",
             )
@@ -826,12 +837,20 @@ async def _run_variants_generation(
             return
         except Exception:
             logging.exception("%s-variants: ошибка генерации", kind)
+            if force_fresh:
+                await target.answer("Не удалось подобрать другие варианты. Попробуй ещё раз.")
+                _note_outcome("llm_error")
+                return
             await _finish_generation_message(
                 progress_msg, target, force_fresh, "Не получилось сгенерировать варианты — попробуй ещё раз.",
             )
             _note_outcome("llm_error")
             return
 
+        if force_fresh and not _has_new_variants(variants, ctx):
+            await target.answer("Не удалось подобрать другие варианты. Попробуй ещё раз.")
+            _note_outcome("empty")
+            return
         # Успех — списываем ОДНУ попытку (не за каждый вариант — это один вызов
         # LLM) и кэшируем, даже если разбор дал меньше вариантов, чем просили.
         await _charge_trial_if_needed(bot, str(telegram_id))
@@ -881,8 +900,16 @@ async def cb_variants_regen(call: CallbackQuery, state: FSMContext) -> None:
     if not ctx or ctx.get("kind") not in _VARIANT_KINDS:
         await call.answer("Контекст устарел — начни заново.", show_alert=True)
         return
-    await call.answer("Подбираю другие варианты...")
-    await _run_variants_generation(call.message, ctx, call.from_user.id, call.bot, action_id, state, force_fresh=True)
+    key = (call.from_user.id, action_id)
+    if key in _regenerating:
+        await call.answer("Уже подбираю другие варианты…")
+        return
+    _regenerating.add(key)
+    try:
+        await call.answer("Подбираю другие варианты...")
+        await _run_variants_generation(call.message, ctx, call.from_user.id, call.bot, action_id, state, force_fresh=True)
+    finally:
+        _regenerating.discard(key)
 
 
 async def _process_reply_incoming(
@@ -1238,23 +1265,23 @@ async def _run_live_coach_step(
                 recent_dialogue=ctx.get("recent_dialogue") or "",
             )
         except RateLimitError:
-            await target.edit_text("Лимит исчерпан, попробуй позже.")
+            await target.answer("Лимит исчерпан. Нажми «Другие варианты» чуть позже.")
             _note_outcome("rate_limit")
             return
         except Exception:
             logging.exception("live-coach: ошибка регена вариантов")
-            await target.edit_text("Не получилось сгенерировать варианты — попробуй ещё раз.")
+            await target.answer("Не удалось подобрать другие варианты. Попробуй ещё раз.")
             _note_outcome("llm_error")
+            return
+        if not _has_new_variants(variants, ctx):
+            await target.answer("Не удалось подобрать другие варианты. Попробуй ещё раз.")
+            _note_outcome("empty")
             return
         await _charge_trial_if_needed(bot, str(telegram_id))
         try:
             record_event(str(telegram_id), "gen_live_regen", str(len(variants)))
         except Exception:
             logging.exception("telemetry: не удалось записать событие live-регена")
-        if not variants:
-            await target.edit_text("Не получилось сгенерировать варианты — попробуй ещё раз.")
-            _note_outcome("empty")
-            return
         _save_shown_suggestions(str(telegram_id), contact_id, "live", variants)
         ctx["variants"] = variants
         # footer_html уже посчитан при первой генерации (см. конец функции) и
@@ -1377,8 +1404,16 @@ async def cb_live_regen(call: CallbackQuery) -> None:
     if not ctx or ctx.get("kind") != "live":
         await call.answer("Контекст устарел — начни заново через «💫 Новый диалог».", show_alert=True)
         return
-    await call.answer("Подбираю другие варианты...")
-    await _run_live_coach_step(call.message, ctx, call.from_user.id, call.bot, action_id, force_fresh=True)
+    key = (call.from_user.id, action_id)
+    if key in _regenerating:
+        await call.answer("Уже подбираю другие варианты…")
+        return
+    _regenerating.add(key)
+    try:
+        await call.answer("Подбираю другие варианты...")
+        await _run_live_coach_step(call.message, ctx, call.from_user.id, call.bot, action_id, force_fresh=True)
+    finally:
+        _regenerating.discard(key)
 
 
 # ── 📸 Ответить по скриншоту — УБРАНА ЦЕЛИКОМ по запросу пользователя ────────
