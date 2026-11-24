@@ -26,6 +26,7 @@ from aiogram.types import (
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from config import (
+    ADAPTIVE_REPLY_PROMPT,
     LLM_CACHE_TTL_SEC,
     OPENERS_FOR_HER,
     OPENERS_FOR_HIM,
@@ -33,6 +34,7 @@ from config import (
 )
 from features import (
     detect_reply_situation,
+    reply_author_voice,
     stage_hint,
     totals_from_summary,
     winning_messages,
@@ -625,6 +627,41 @@ def _winning_for_contact(owner: str, contact_id) -> list[str] | None:
     return wins or None
 
 
+def _adaptive_contact_context(owner: str, contact_id: int | None, incoming: str) -> dict:
+    if not contact_id:
+        return {}
+    history = sorted(
+        (row for row in get_all_dated_messages(owner, contact_id) if row["date"]),
+        key=lambda row: row["date"],
+    )
+    # Пересланное сообщение может быть из середины истории. При совпадении
+    # используем то, что предшествовало последней такой входящей реплике.
+    for index in range(len(history) - 1, -1, -1):
+        row = history[index]
+        if row["direction"] == "in" and row["text"].strip() == incoming.strip():
+            history = history[:index]
+            break
+    recent = "\n".join(
+        f"{'Автор' if row['direction'] == 'out' else 'Собеседник'}: "
+        + json.dumps(row["text"].strip()[:240], ensure_ascii=False)
+        for row in history[-6:] if row["text"].strip()
+    )
+    author_voice = reply_author_voice([row["text"] for row in history if row["direction"] == "out"])
+    examples = [example[:240] for example in winning_messages(history[-300:], min_author_words=3)]
+    return {"recent_dialogue": recent, "author_voice": author_voice, "winning": examples or None}
+
+
+def _reply_cache_extra(gender: str | None, ctx: dict) -> str:
+    if not ADAPTIVE_REPLY_PROMPT:
+        return gender or ""
+    return json.dumps(
+        ["adaptive-reply-v1", gender, *(ctx.get(key) for key in (
+            "recent_dialogue", "author_voice", "data_signals", "winning",
+        ))],
+        ensure_ascii=False,
+    )
+
+
 async def _send_reply_analysis(message: Message, contact_id, incoming: str) -> None:
     """Короткий разбор динамики переписки перед выбором стиля.
     Дополняет готовый ответ, не заменяет его. При любой проблеме — молча пропускаем,
@@ -734,7 +771,9 @@ async def _run_variants_generation(
     signals = ctx.get("data_signals")
     winning = ctx.get("winning")
     gender = get_gender(str(telegram_id))
-    cache_key = _style_cache_key(f"{kind}_variants", "", text, style_card, interaction_card, extra=gender or "")
+    cache_key = _style_cache_key(
+        f"{kind}_variants", "", text, style_card, interaction_card, extra=_reply_cache_extra(gender, ctx),
+    )
 
     variants = None
     if not force_fresh:
@@ -766,6 +805,8 @@ async def _run_variants_generation(
             text, style_card, interaction_card,
             data_signals=signals, previous_variants=prev, winning_examples=winning,
             user_gender=gender,
+            author_voice=ctx.get("author_voice") or "",
+            recent_dialogue=ctx.get("recent_dialogue") or "",
         )
         try:
             if force_fresh:
@@ -875,12 +916,20 @@ async def _process_reply_incoming(
     # пользователь ждёт просто ответ, а не аналитику перед каждым ответом.
     # Вернуть — один вызов: await _send_reply_analysis(message, contact_id, incoming)
     samples = get_message_samples(contact_id) if contact_id else None
+    if ADAPTIVE_REPLY_PROMPT:
+        try:
+            reply_context = await asyncio.to_thread(_adaptive_contact_context, telegram_id, contact_id, incoming)
+        except Exception:
+            logging.exception("Не удалось собрать недавний контекст для ответа")
+            reply_context = {}
+    else:
+        reply_context = {"winning": _winning_for_contact(telegram_id, contact_id)}
     ctx = {
         "kind": "reply", "text": incoming, "result": None, "style": None,
         "contact_id": contact_id,
         "style_card": data["style_card"], "interaction_card": data["interaction_card"],
         "data_signals": _reply_data_signals(samples, incoming),
-        "winning": _winning_for_contact(telegram_id, contact_id),
+        **reply_context,
     }
     action_id = _new_action(user_id, ctx)
     await _run_variants_generation(message, ctx, user_id, bot, action_id, state)
@@ -1125,11 +1174,16 @@ async def _process_live_incoming(
     running_notes = notes_row["notes_text"] if notes_row else None
     message_count = notes_row["message_count"] if notes_row else 0
     dialogue_history = data.get("dialogue_history") or []
+    recent_dialogue = "\n".join(
+        f"Собеседник: {json.dumps(line[:240], ensure_ascii=False)}"
+        for line in dialogue_history[-6:]
+    ) if ADAPTIVE_REPLY_PROMPT else ""
 
     ctx = {
         "kind": "live", "text": incoming, "contact_id": contact_id,
         "style_card": style_card, "running_notes": running_notes,
         "dialogue_history": dialogue_history, "message_count": message_count,
+        "recent_dialogue": recent_dialogue,
         "variants": None,
     }
     action_id = _new_action(user_id, ctx)
@@ -1181,6 +1235,7 @@ async def _run_live_coach_step(
             variants = await suggest_reply_variants(
                 text, style_card, running_notes, previous_variants=ctx.get("variants"),
                 user_gender=gender,
+                recent_dialogue=ctx.get("recent_dialogue") or "",
             )
         except RateLimitError:
             await target.edit_text("Лимит исчерпан, попробуй позже.")
@@ -1213,7 +1268,7 @@ async def _run_live_coach_step(
         _note_outcome("ok")
         return
 
-    cache_key = _style_cache_key("live", "", text, style_card, running_notes, extra=gender or "")
+    cache_key = _style_cache_key("live", "", text, style_card, running_notes, extra=_reply_cache_extra(gender, ctx))
     cached = get_llm_cache(cache_key, LLM_CACHE_TTL_SEC)
     variants = updated_notes = None
     if cached:
@@ -1243,6 +1298,7 @@ async def _run_live_coach_step(
                 _timed_llm(live_coach_step(
                     text, style_card, running_notes or None, ctx.get("dialogue_history"),
                     user_gender=gender,
+                    recent_dialogue=ctx.get("recent_dialogue") or "",
                 ), _llm_box),
                 cycle_seconds=_REPLY_PROGRESS_CYCLE_SECONDS,
             )

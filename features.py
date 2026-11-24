@@ -1,11 +1,37 @@
 import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from statistics import median
 from typing import Optional
 
 from tg_parser import Message, ParsedChat
 
 SESSION_GAP = timedelta(hours=4)
+
+
+def reply_author_voice(messages: list[str]) -> str:
+    """Измеряет привычки автора по его недавним исходящим сообщениям."""
+    observations = []
+    for message in messages[-60:]:
+        text = message.strip()
+        if not text or text.startswith(("https://", "http://")):
+            continue
+        match = re.search(r"[а-яёa-z]+", text, re.IGNORECASE)
+        if match:
+            observations.append((text, match.group()))
+    if len(observations) < 8:
+        return ""
+
+    length = int(median(len(text) for text, _ in observations))
+    hints = [f"Медианная длина реплики автора — {length} символов. Это ориентир по краткости."]
+    # Капс отражает эмоцию и не определяет обычную первую букву.
+    starts = [word[0] for _, word in observations if len(word) == 1 or not word.isupper()]
+    if len(starts) >= 8 and sum(letter.islower() for letter in starts) / len(starts) >= 0.8:
+        hints.append("Обычно автор начинает со строчной. Начинай текст каждого варианта со строчной, сохраняя написание имён и аббревиатур.")
+    if sum(text.endswith(".") for text, _ in observations) / len(observations) <= 0.2:
+        hints.append("В коротких репликах автор обычно опускает точку в конце.")
+    return "\n".join(hints)
+
 
 _EMOJI_RE = re.compile(
     "[\U0001F300-\U0001F9FF"
@@ -195,7 +221,7 @@ def stage_hint(my_total: int, contact_total: int) -> str:
 
 
 def winning_messages(dated_msgs: list[dict], max_examples: int = 3,
-                     min_reply_words: int = 3) -> list[str]:
+                     min_reply_words: int = 3, *, min_author_words: int = 1) -> list[str]:
     """«Обучение на своих удачных заходах» без ML: исходящие сообщения автора, на
     которые собеседник ответил ЖИВО — быстро (в пределах сессии), не сухо и не
     негативом, содержательной репликой. Эмпирические примеры «что реально
@@ -216,7 +242,7 @@ def winning_messages(dated_msgs: list[dict], max_examples: int = 3,
         if len(re.findall(r"\w+", reply)) < min_reply_words:
             continue
         text = (cur["text"] or "").strip()
-        if not (1 <= len(re.findall(r"\w+", text)) <= 40):
+        if not (min_author_words <= len(re.findall(r"\w+", text)) <= 40):
             continue
         # быстрый ответ — в пределах сессии (если даты парсятся)
         try:
