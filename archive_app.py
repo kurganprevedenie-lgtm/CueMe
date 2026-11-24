@@ -76,23 +76,41 @@ def list_chats(owner: str) -> list[dict]:
     with storage._conn() as conn:
         rows = conn.execute(f"""
             WITH live AS (
-                SELECT b.chat_ref, MAX(datetime(b.date)) AS recent
+                SELECT b.chat_ref, b.id, MAX(datetime(b.date)) AS recent
                 FROM business_messages b WHERE b.owner_user_id = ? GROUP BY b.chat_ref
+            ), mapped AS (
+                SELECT r.contact_id, live.id, live.recent,
+                       ROW_NUMBER() OVER (PARTITION BY r.contact_id ORDER BY live.recent DESC, live.id DESC) AS rank
+                FROM live JOIN business_chat_refs r ON r.chat_ref = live.chat_ref
+                WHERE r.owner_user_id = ?
+            ), imported AS (
+                SELECT i.contact_id, i.id, MAX({_IMPORTED_DATE}) AS recent
+                FROM contacts c JOIN imported_messages i ON i.contact_id = c.id
+                WHERE c.user_telegram_id = ? AND c.archived_into_contact_id IS NULL GROUP BY i.contact_id
             ), inbox AS (
                 SELECT 'c' || c.id AS id, COALESCE(NULLIF(c.display_name, ''), 'Собеседник') AS name,
-                       MAX(COALESCE((SELECT MAX(recent) FROM live JOIN business_chat_refs r
-                                     ON r.chat_ref = live.chat_ref
-                                     WHERE r.owner_user_id = ? AND r.contact_id = c.id), ''),
-                           COALESCE((SELECT MAX({_IMPORTED_DATE})
-                                     FROM imported_messages WHERE contact_id = c.id), '')) AS recent
-                FROM contacts c WHERE c.user_telegram_id = ? AND c.archived_into_contact_id IS NULL
+                       MAX(COALESCE(m.recent, ''), COALESCE(i.recent, '')) AS recent,
+                       CASE WHEN COALESCE(m.recent, '') >= COALESCE(i.recent, '') THEN m.id END AS live_id,
+                       CASE WHEN COALESCE(m.recent, '') < COALESCE(i.recent, '') THEN i.id END AS import_id
+                FROM contacts c LEFT JOIN mapped m ON m.contact_id = c.id AND m.rank = 1
+                LEFT JOIN imported i ON i.contact_id = c.id
+                WHERE c.user_telegram_id = ? AND c.archived_into_contact_id IS NULL
                 UNION ALL
-                SELECT 'b' || live.chat_ref, 'Собеседник', live.recent FROM live
+                SELECT 'b' || live.chat_ref, 'Собеседник', live.recent, live.id, NULL FROM live
                 WHERE NOT EXISTS (SELECT 1 FROM business_chat_refs r
                                   WHERE r.owner_user_id = ? AND r.chat_ref = live.chat_ref)
-            ) SELECT * FROM inbox WHERE recent <> '' ORDER BY recent DESC, id
-        """, (owner, owner, owner, owner)).fetchall()
-    return [{**row, "recent": row["recent"].replace(" ", "T") + "Z"} for row in rows]
+            )
+            SELECT inbox.id, inbox.name, inbox.recent,
+                   COALESCE(substr(b.text, 1, 140), substr(i.text, 1, 140)) AS preview, b.content_type
+            FROM inbox LEFT JOIN business_messages b ON b.id = inbox.live_id AND b.owner_user_id = ?
+            LEFT JOIN imported_messages i ON i.id = inbox.import_id
+            WHERE recent <> '' ORDER BY recent DESC, inbox.id
+        """, (owner, owner, owner, owner, owner, owner)).fetchall()
+    return [
+        {"id": row["id"], "name": row["name"], "recent": row["recent"].replace(" ", "T") + "Z",
+         "preview": (row["preview"] or "").strip() or _KINDS.get(row["content_type"], "")}
+        for row in rows
+    ]
 
 
 _KINDS = {
@@ -280,7 +298,7 @@ def register_archive(app: web.Application, bot, is_premium) -> None:
         )
 
     app.router.add_get("/archive/", asset)
-    app.router.add_get(r"/archive/{name:app\.css|app\.js}", asset)
+    app.router.add_get(r"/archive/{name:app\.css|app\.js|logo\.png|wallpaper\.png}", asset)
     app.router.add_get("/archive/api/chats", chats, allow_head=False)
     app.router.add_get(f"/archive/api/chats/{{chat:{_CHAT_KEY.pattern}}}", messages, allow_head=False)
     app.router.add_get(r"/archive/api/files/{id:[1-9][0-9]{0,17}}", download, allow_head=False)

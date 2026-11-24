@@ -4,6 +4,7 @@ const app = window.Telegram?.WebApp;
 const byId = id => document.getElementById(id);
 const dateFormat = new Intl.DateTimeFormat("ru", {dateStyle: "medium"});
 const timeFormat = new Intl.DateTimeFormat("ru", {hour: "2-digit", minute: "2-digit"});
+const shortDate = new Intl.DateTimeFormat("ru", {day: "numeric", month: "short"});
 let chats = [];
 let activeChat = null;
 let deletedOnly = false;
@@ -65,6 +66,9 @@ function renderChats() {
   const query = byId("search").value.trim().toLocaleLowerCase("ru");
   const visible = chats.filter(chat => chat.name.toLocaleLowerCase("ru").includes(query));
   const list = byId("chat-list");
+  const now = new Date();
+  const yesterday = new Date(now);
+  yesterday.setDate(now.getDate() - 1);
   list.replaceChildren();
   for (const chat of visible) {
     const row = element("button", "chat-row");
@@ -74,8 +78,15 @@ function renderChats() {
     const meta = element("span", "chat-meta");
     const date = new Date(chat.recent);
     meta.append(element("strong", "", chat.name));
-    if (!Number.isNaN(date.valueOf())) row.append(avatar, meta, element("time", "", dateFormat.format(date)));
-    else row.append(avatar, meta);
+    if (chat.preview) meta.append(element("span", "chat-preview", chat.preview));
+    row.append(avatar, meta);
+    if (!Number.isNaN(date.valueOf())) {
+      const label = date.toDateString() === now.toDateString() ? "Сегодня"
+        : date.toDateString() === yesterday.toDateString() ? "Вчера" : shortDate.format(date);
+      const timestamp = element("time", "", label + ", " + timeFormat.format(date));
+      timestamp.dateTime = chat.recent;
+      row.append(timestamp);
+    }
     const arrow = element("span", "arrow", "›");
     arrow.setAttribute("aria-hidden", "true");
     row.append(arrow);
@@ -256,7 +267,7 @@ function openChat(chat) {
   byId("chat-avatar").textContent = initials(chat.name);
   byId("inbox").hidden = true;
   byId("conversation").hidden = false;
-  app.BackButton?.show();
+  byId("conversation").classList.remove("condensed");
   setFilter(false);
 }
 
@@ -266,7 +277,6 @@ function back() {
   byId("messages").replaceChildren();
   byId("conversation").hidden = true;
   byId("inbox").hidden = false;
-  app.BackButton?.hide();
 }
 
 async function start() {
@@ -274,10 +284,16 @@ async function start() {
   app?.ready();
   app?.expand();
   if (app?.isVersionAtLeast("6.1")) {
-    app.setHeaderColor("#15121c");
-    app.setBackgroundColor("#15121c");
+    app.setHeaderColor("#0d0912");
+    app.setBackgroundColor("#0d0912");
   }
-  app?.BackButton?.onClick(back);
+  byId("history").addEventListener("scroll", event => {
+    const history = event.currentTarget;
+    const chat = byId("conversation");
+    const distance = history.scrollHeight - history.clientHeight - history.scrollTop;
+    if (distance > 116) chat.classList.add("condensed");
+    else if (distance < 30) chat.classList.remove("condensed");
+  }, {passive: true});
   byId("search").addEventListener("input", renderChats);
   byId("back").addEventListener("click", back);
   byId("all").addEventListener("click", () => { if (deletedOnly) setFilter(false); });

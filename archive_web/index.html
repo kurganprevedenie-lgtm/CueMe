@@ -3,41 +3,45 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-  <meta name="theme-color" content="#15121c">
+  <meta name="theme-color" content="#0d0912">
   <title>CueMe · Архив переписок</title>
-  <link rel="stylesheet" href="app.css?v=2">
+  <link rel="stylesheet" href="app.css?v=3">
   <script src="https://telegram.org/js/telegram-web-app.js" defer></script>
-  <script src="app.js?v=2" defer></script>
+  <script src="app.js?v=3" defer></script>
 </head>
 <body>
   <section class="splash" id="splash" aria-label="Загрузка архива" role="status">
-    <div class="monogram" aria-hidden="true"><span></span></div>
+    <div class="monogram" aria-hidden="true"><img src="logo.png" alt="" width="168" height="168"></div>
     <strong>CueMe</strong>
     <span class="loading-track"></span>
   </section>
   <main class="shell" id="app" hidden>
     <section id="inbox">
       <header class="archive-header">
-        <span class="brand"><span class="brand-mark" aria-hidden="true"></span>CueMe</span>
-        <h1>Архив переписок</h1>
+        <div class="archive-title">
+          <img src="logo.png" alt="CueMe" width="48" height="48">
+          <h1>Архив</h1>
+        </div>
+        <div class="search" id="search-box" hidden>
+          <span aria-hidden="true"></span>
+          <input id="search" type="search" placeholder="Поиск по чатам" aria-label="Поиск по чатам" autocomplete="off">
+        </div>
       </header>
-      <div class="search" id="search-box" hidden>
-        <span aria-hidden="true"></span>
-        <input id="search" type="search" placeholder="Найти собеседника" aria-label="Найти собеседника" autocomplete="off">
-      </div>
       <p class="empty" id="inbox-status" role="status" hidden></p>
       <div class="chat-list" id="chat-list"></div>
     </section>
     <section id="conversation" hidden>
-      <header class="chat-header">
-        <button type="button" class="back" id="back" aria-label="К списку переписок">←</button>
-        <span id="chat-avatar" class="avatar" aria-hidden="true"></span>
-        <h2 id="chat-name"></h2>
+      <header class="chat-top">
+        <div class="chat-header">
+          <button type="button" class="back" id="back" aria-label="К списку переписок">←</button>
+          <span id="chat-avatar" class="avatar" aria-hidden="true"></span>
+          <h2 id="chat-name"></h2>
+        </div>
+        <div class="tabs" role="group" aria-label="Фильтр сообщений">
+          <button type="button" id="all" aria-pressed="true">Все</button>
+          <button type="button" id="deleted" aria-pressed="false">Удалённые</button>
+        </div>
       </header>
-      <div class="tabs" role="group" aria-label="Фильтр сообщений">
-        <button type="button" id="all" aria-pressed="true">Все сообщения</button>
-        <button type="button" id="deleted" aria-pressed="false">Удалённые</button>
-      </div>
       <div id="history" class="history">
         <button type="button" class="more" id="more" hidden>Загрузить более ранние</button>
         <p class="empty" id="chat-status" role="status" hidden></p>

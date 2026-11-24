@@ -71,7 +71,9 @@ def test_page_merges_sources_and_only_marks_owned_rows(archive_db, monkeypatch):
     assert second["messages"][0]["preview"] is None
     assert second["next"] is None
     assert archive_app.chat_page("20", "c2", ("~", 1, 1), True)["messages"] == []
-    assert [chat["id"] for chat in archive_app.list_chats("10")] == ["bfedcba0987654321", "c1"]
+    chats = archive_app.list_chats("10")
+    assert [chat["id"] for chat in chats] == ["bfedcba0987654321", "c1"]
+    assert [chat["preview"] for chat in chats] == ["Без контакта", "Сохранено"]
 
 
 def test_archive_endpoints_enforce_access(archive_db):
@@ -93,6 +95,8 @@ def test_archive_endpoints_enforce_access(archive_db):
         async with TestClient(TestServer(app)) as client:
             assert (await client.get("/archive/")).status == 200
             assert (await client.get("/archive/app.js")).status == 200
+            assert (await client.get("/archive/logo.png")).content_type == "image/png"
+            assert (await client.get("/archive/wallpaper.png")).content_type == "image/png"
             assert (await client.get("/archive/api/chats")).status == 401
             blocked = {"X-Telegram-Init-Data": signed_data(20, int(time.time()))}
             assert (await client.get("/archive/api/chats", headers=blocked)).status == 403
