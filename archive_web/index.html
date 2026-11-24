@@ -5,13 +5,14 @@
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <meta name="theme-color" content="#0d0912">
   <title>CueMe · Архив переписок</title>
-  <link rel="stylesheet" href="app.css?v=4">
+  <link rel="preload" href="wallpaper-v2.webp" as="image" fetchpriority="high">
+  <link rel="stylesheet" href="app.css?v=5">
   <script src="https://telegram.org/js/telegram-web-app.js" defer></script>
-  <script src="app.js?v=3" defer></script>
+  <script src="app.js?v=5" defer></script>
 </head>
 <body>
   <section class="splash" id="splash" aria-label="Загрузка архива" role="status">
-    <div class="monogram" aria-hidden="true"><img src="logo.png" alt="" width="168" height="168"></div>
+    <div class="monogram" aria-hidden="true"><img id="splash-logo" src="{{LOGO_URL}}" alt="" width="168" height="168"></div>
     <strong>CueMe</strong>
     <span class="loading-track"></span>
   </section>
@@ -19,7 +20,7 @@
     <section id="inbox">
       <header class="archive-header">
         <div class="archive-title">
-          <img src="logo.png" alt="CueMe" width="48" height="48">
+          <img id="archive-logo" alt="CueMe" width="48" height="48">
           <h1>Архив</h1>
         </div>
         <div class="search" id="search-box" hidden>

@@ -281,6 +281,13 @@ function back() {
 
 async function start() {
   const started = performance.now();
+  byId("archive-logo").src = byId("splash-logo").src;
+  const wallpaper = new Image();
+  wallpaper.src = document.querySelector('link[rel="preload"][as="image"]').href;
+  const wallpaperReady = Promise.race([
+    wallpaper.decode().catch(() => {}),
+    new Promise(resolve => setTimeout(resolve, 1100)),
+  ]);
   app?.ready();
   app?.expand();
   if (app?.isVersionAtLeast("6.1")) {
@@ -311,7 +318,10 @@ async function start() {
   } catch (error) {
     status("inbox-status", error.message);
   } finally {
-    await new Promise(resolve => setTimeout(resolve, Math.max(0, 550 - (performance.now() - started))));
+    await Promise.all([
+      wallpaperReady,
+      new Promise(resolve => setTimeout(resolve, Math.max(0, 550 - (performance.now() - started)))),
+    ]);
     byId("splash").hidden = true;
     byId("app").hidden = false;
   }

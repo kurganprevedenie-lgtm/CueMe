@@ -1,6 +1,7 @@
 """Private Telegram Mini App for saved conversations."""
 
 import asyncio
+import base64
 import hashlib
 import hmac
 import io
@@ -18,6 +19,7 @@ import storage
 
 
 _ASSETS = Path(__file__).with_name("archive_web")
+_WALLPAPER = "wallpaper-v2.webp"
 _PAGE_SIZE = 50
 _FILE_LIMIT = 20 * 1024 * 1024
 _CHAT_KEY = re.compile(r"c[1-9][0-9]{0,17}|b[0-9a-f]{16}")
@@ -30,7 +32,7 @@ _HEADERS = {
     "X-Content-Type-Options": "nosniff",
     "Content-Security-Policy": (
         "default-src 'none'; script-src 'self' https://telegram.org; "
-        "style-src 'self'; connect-src 'self'; img-src 'self' blob:; media-src blob:; base-uri 'none'"
+        "style-src 'self'; connect-src 'self'; img-src 'self' blob: data:; media-src blob:; base-uri 'none'"
     ),
 }
 
@@ -229,6 +231,10 @@ def _file_id(owner: str, row_id: int) -> str | None:
 def register_archive(app: web.Application, bot, is_premium) -> None:
     database_slots = asyncio.Semaphore(3)
     download_slots = asyncio.Semaphore(2)
+    logo = base64.b64encode((_ASSETS / "logo-v2.webp").read_bytes()).decode("ascii")
+    index = (_ASSETS / "index.html").read_text(encoding="utf-8").replace(
+        "{{LOGO_URL}}", f"data:image/webp;base64,{logo}",
+    )
 
     async def authorized(request: web.Request) -> str:
         owner = telegram_user(request.headers.get("X-Telegram-Init-Data", ""), bot.token, time.time())
@@ -238,9 +244,15 @@ def register_archive(app: web.Application, bot, is_premium) -> None:
             raise web.HTTPForbidden(headers=_HEADERS)
         return owner
 
+    async def home(request: web.Request) -> web.Response:
+        return web.Response(text=index, content_type="text/html", headers=_HEADERS)
+
     async def asset(request: web.Request) -> web.FileResponse:
-        name = request.match_info.get("name", "index.html")
-        return web.FileResponse(_ASSETS / name, headers=_HEADERS)
+        name = request.match_info["name"]
+        headers = _HEADERS
+        if name == _WALLPAPER:
+            headers = {**_HEADERS, "Cache-Control": "public, max-age=31536000, immutable"}
+        return web.FileResponse(_ASSETS / name, headers=headers)
 
     async def chats(request: web.Request) -> web.Response:
         owner = await authorized(request)
@@ -297,8 +309,8 @@ def register_archive(app: web.Application, bot, is_premium) -> None:
             headers={**_HEADERS, "Content-Disposition": f'attachment; filename="cueme-media{extension}"'},
         )
 
-    app.router.add_get("/archive/", asset)
-    app.router.add_get(r"/archive/{name:app\.css|app\.js|logo\.png|wallpaper\.svg}", asset)
+    app.router.add_get("/archive/", home)
+    app.router.add_get(r"/archive/{name:app\.css|app\.js|wallpaper-v2\.webp}", asset)
     app.router.add_get("/archive/api/chats", chats, allow_head=False)
     app.router.add_get(f"/archive/api/chats/{{chat:{_CHAT_KEY.pattern}}}", messages, allow_head=False)
     app.router.add_get(r"/archive/api/files/{id:[1-9][0-9]{0,17}}", download, allow_head=False)

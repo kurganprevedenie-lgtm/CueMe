@@ -93,10 +93,15 @@ def test_archive_endpoints_enforce_access(archive_db):
         archive_app.register_archive(app, bot, is_premium)
         headers = {"X-Telegram-Init-Data": signed_data(10, int(time.time()))}
         async with TestClient(TestServer(app)) as client:
-            assert (await client.get("/archive/")).status == 200
+            response = await client.get("/archive/")
+            assert response.status == 200
+            html = await response.text()
+            assert 'src="data:image/webp;base64,' in html
+            assert 'rel="preload" href="wallpaper-v2.webp"' in html
             assert (await client.get("/archive/app.js")).status == 200
-            assert (await client.get("/archive/logo.png")).content_type == "image/png"
-            assert (await client.get("/archive/wallpaper.svg")).content_type == "image/svg+xml"
+            wallpaper = await client.get("/archive/wallpaper-v2.webp")
+            assert wallpaper.content_type == "image/webp"
+            assert "immutable" in wallpaper.headers["Cache-Control"]
             assert (await client.get("/archive/api/chats")).status == 401
             blocked = {"X-Telegram-Init-Data": signed_data(20, int(time.time()))}
             assert (await client.get("/archive/api/chats", headers=blocked)).status == 403
