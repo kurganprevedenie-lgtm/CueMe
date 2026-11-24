@@ -64,9 +64,11 @@ def test_page_merges_sources_and_only_marks_owned_rows(archive_db, monkeypatch):
     assert first["messages"][0]["text"] == "Сохранено"
     assert first["messages"][0]["deleted"] is True
     assert first["messages"][0]["attachment"] is True
+    assert first["messages"][0]["preview"] == "image"
     second = archive_app.chat_page("10", "c1", tuple(first["next"]), False)
     assert second["messages"][0]["text"] == "Импорт"
     assert second["messages"][0]["date"] == "2026-11-20T09:00:00Z"
+    assert second["messages"][0]["preview"] is None
     assert second["next"] is None
     assert archive_app.chat_page("20", "c2", ("~", 1, 1), True)["messages"] == []
     assert [chat["id"] for chat in archive_app.list_chats("10")] == ["bfedcba0987654321", "c1"]
@@ -99,7 +101,9 @@ def test_archive_endpoints_enforce_access(archive_db):
             assert (await client.get("/archive/api/files/2", headers=headers)).status == 404
             response = await client.get("/archive/api/files/1", headers=headers)
             assert await response.read() == b"demo"
+            assert response.content_type == "image/jpeg"
             assert response.headers["Content-Disposition"].startswith("attachment;")
+            assert "media-src blob:" in response.headers["Content-Security-Policy"]
             assert (await client.get("/archive/api/chats/c1?before=1", headers=headers)).status == 400
 
     asyncio.run(run())

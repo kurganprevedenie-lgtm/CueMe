@@ -30,7 +30,7 @@ _HEADERS = {
     "X-Content-Type-Options": "nosniff",
     "Content-Security-Policy": (
         "default-src 'none'; script-src 'self' https://telegram.org; "
-        "style-src 'self'; connect-src 'self'; img-src 'self' blob:; base-uri 'none'"
+        "style-src 'self'; connect-src 'self'; img-src 'self' blob:; media-src blob:; base-uri 'none'"
     ),
 }
 
@@ -101,6 +101,16 @@ _KINDS = {
     "location": "Геопозиция", "venue": "Место", "contact": "Контакт", "poll": "Опрос",
     "dice": "Кубик", "other": "Сообщение",
 }
+_PREVIEWS = {
+    "photo": "image", "sticker": "image", "animation": "video",
+    "video": "video", "video_note": "video", "voice": "audio", "audio": "audio",
+}
+_MEDIA_TYPES = {
+    ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
+    ".webp": "image/webp", ".gif": "image/gif", ".mp4": "video/mp4", ".webm": "video/webm",
+    ".oga": "audio/ogg", ".ogg": "audio/ogg", ".opus": "audio/ogg",
+    ".mp3": "audio/mpeg", ".m4a": "audio/mp4", ".wav": "audio/wav",
+}
 
 
 def _attachment(row) -> tuple[str, dict, str | None]:
@@ -112,7 +122,7 @@ def _attachment(row) -> tuple[str, dict, str | None]:
         media = {}
     kind = row["content_type"] or "text"
     file_id = media.get("file_id")
-    if not file_id:
+    if not isinstance(file_id, str) or not file_id:
         for legacy in ("photo", "video", "video_note", "voice"):
             if row[f"{legacy}_file_id"]:
                 return legacy, media, row[f"{legacy}_file_id"]
@@ -170,11 +180,17 @@ def chat_page(owner: str, chat: str, before: tuple, deleted: bool) -> dict:
             details = media.get("question")
         elif kind == "document":
             details = media.get("file_name")
+        preview = _PREVIEWS.get(kind) if file_id else None
+        if kind == "sticker":
+            preview = "video" if media.get("is_video") else None if media.get("is_animated") else preview
+        if kind == "animation" and media.get("mime_type") == "image/gif":
+            preview = "image"
         messages.append({
             "id": row["id"], "source": row["source"], "out": row["direction"] == "out",
             "text": row["text"], "date": row["stamp"].replace(" ", "T") + "Z" if row["stamp"] else None,
             "deleted": bool(row["deleted_at"]), "kind": _KINDS.get(kind), "details": details,
-            "attachment": bool(file_id),
+            "attachment": bool(file_id), "preview": preview,
+            "round": kind == "video_note",
         })
     next_page = None
     if len(rows) > _PAGE_SIZE:
@@ -241,17 +257,25 @@ def register_archive(app: web.Application, bot, is_premium) -> None:
             try:
                 async with asyncio.timeout(30):
                     file = await bot.get_file(file_id)
-                    if not file.file_path or file.file_size is None or file.file_size > _FILE_LIMIT:
+                    if not file.file_path:
+                        raise web.HTTPNotFound(headers=_HEADERS)
+                    if file.file_size is None or file.file_size > _FILE_LIMIT:
                         raise web.HTTPRequestEntityTooLarge(max_size=_FILE_LIMIT, actual_size=file.file_size or 0,
                                                             headers=_HEADERS)
                     data = io.BytesIO()
                     await bot.download_file(file.file_path, destination=data, timeout=25)
-            except (TelegramAPIError, TimeoutError):
+            except TelegramAPIError as exc:
+                if "file is too big" in str(exc).lower():
+                    raise web.HTTPRequestEntityTooLarge(
+                        max_size=_FILE_LIMIT, actual_size=_FILE_LIMIT + 1, headers=_HEADERS,
+                    ) from None
+                raise web.HTTPBadGateway(headers=_HEADERS) from None
+            except TimeoutError:
                 raise web.HTTPBadGateway(headers=_HEADERS) from None
         extension = Path(file.file_path).suffix
         extension = extension if re.fullmatch(r"\.[a-zA-Z0-9]{1,8}", extension) else ""
         return web.Response(
-            body=data.getvalue(), content_type="application/octet-stream",
+            body=data.getvalue(), content_type=_MEDIA_TYPES.get(extension.lower(), "application/octet-stream"),
             headers={**_HEADERS, "Content-Disposition": f'attachment; filename="cueme-media{extension}"'},
         )
 

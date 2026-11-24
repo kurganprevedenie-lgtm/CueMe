@@ -3,11 +3,11 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-  <meta name="theme-color" content="#140f19">
+  <meta name="theme-color" content="#15121c">
   <title>CueMe · Архив переписок</title>
-  <link rel="stylesheet" href="app.css">
+  <link rel="stylesheet" href="app.css?v=2">
   <script src="https://telegram.org/js/telegram-web-app.js" defer></script>
-  <script src="app.js" defer></script>
+  <script src="app.js?v=2" defer></script>
 </head>
 <body>
   <section class="splash" id="splash" aria-label="Загрузка архива" role="status">
@@ -17,10 +17,9 @@
   </section>
   <main class="shell" id="app" hidden>
     <section id="inbox">
-      <header class="hero">
-        <div class="brand"><span class="brand-mark" aria-hidden="true"></span>CueMe</div>
-        <h1>Архив<br>переписок<span>.</span></h1>
-        <p>Открой сохранённую копию чата, даже если переписку удалили в Telegram.</p>
+      <header class="archive-header">
+        <span class="brand"><span class="brand-mark" aria-hidden="true"></span>CueMe</span>
+        <h1>Архив переписок</h1>
       </header>
       <div class="search" id="search-box" hidden>
         <span aria-hidden="true"></span>
@@ -31,8 +30,9 @@
     </section>
     <section id="conversation" hidden>
       <header class="chat-header">
-        <button type="button" class="back" id="back" aria-label="К списку переписок">‹</button>
-        <div><h2 id="chat-name"></h2><p>Сохранённая переписка</p></div>
+        <button type="button" class="back" id="back" aria-label="К списку переписок">←</button>
+        <span id="chat-avatar" class="avatar" aria-hidden="true"></span>
+        <h2 id="chat-name"></h2>
       </header>
       <div class="tabs" role="group" aria-label="Фильтр сообщений">
         <button type="button" id="all" aria-pressed="true">Все сообщения</button>

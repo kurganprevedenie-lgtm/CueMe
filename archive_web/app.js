@@ -9,6 +9,16 @@ let activeChat = null;
 let deletedOnly = false;
 let olderCursor = null;
 let pageController;
+let mediaSession = new AbortController();
+const mediaUrls = new Set();
+const previewLoaders = new WeakMap();
+const photoObserver = typeof IntersectionObserver === "function" ? new IntersectionObserver(entries => {
+  for (const entry of entries) {
+    if (!entry.isIntersecting) continue;
+    photoObserver.unobserve(entry.target);
+    previewLoaders.get(entry.target)?.();
+  }
+}, {root: byId("history"), rootMargin: "120px 0px"}) : null;
 
 function element(tag, className, text) {
   const node = document.createElement(tag);
@@ -20,6 +30,18 @@ function element(tag, className, text) {
 function status(id, text) {
   byId(id).textContent = text;
   byId(id).hidden = !text;
+}
+
+function initials(name) {
+  return name.trim().split(/\s+/).slice(0, 2).map(word => Array.from(word)[0]).join("").toLocaleUpperCase("ru") || "•";
+}
+
+function resetMedia() {
+  photoObserver?.disconnect();
+  mediaSession.abort();
+  mediaSession = new AbortController();
+  for (const url of mediaUrls) URL.revokeObjectURL(url);
+  mediaUrls.clear();
 }
 
 async function request(path, signal) {
@@ -47,40 +69,110 @@ function renderChats() {
   for (const chat of visible) {
     const row = element("button", "chat-row");
     row.type = "button";
-    const initials = chat.name.trim().split(/\s+/).slice(0, 2).map(word => Array.from(word)[0]).join("");
-    const avatar = element("span", "avatar", initials.toLocaleUpperCase("ru"));
+    const avatar = element("span", "avatar", initials(chat.name));
     avatar.setAttribute("aria-hidden", "true");
     const meta = element("span", "chat-meta");
     const date = new Date(chat.recent);
     meta.append(element("strong", "", chat.name));
-    if (!Number.isNaN(date.valueOf())) meta.append(element("time", "", dateFormat.format(date)));
+    if (!Number.isNaN(date.valueOf())) row.append(avatar, meta, element("time", "", dateFormat.format(date)));
+    else row.append(avatar, meta);
     const arrow = element("span", "arrow", "›");
     arrow.setAttribute("aria-hidden", "true");
-    row.append(avatar, meta, arrow);
+    row.append(arrow);
     row.addEventListener("click", () => openChat(chat));
     list.append(row);
   }
   status("inbox-status", visible.length ? "" : query ? "Ничего не нашлось." : "Здесь появятся сохранённые переписки.");
 }
 
-async function download(message, button) {
-  button.disabled = true;
-  try {
-    const response = await request("files/" + message.id, AbortSignal.timeout(34000));
-    const url = URL.createObjectURL(await response.blob());
-    const filename = response.headers.get("Content-Disposition")?.match(/filename="([^"]+)"/)?.[1];
-    const link = element("a", "");
-    link.href = url;
-    link.download = filename || "cueme-media";
-    document.body.append(link);
-    link.click();
-    link.remove();
-    setTimeout(() => URL.revokeObjectURL(url), 60000);
-  } catch (error) {
-    button.textContent = error.message;
-  } finally {
-    button.disabled = false;
+function attachmentNode(message) {
+  const box = element("div", "media");
+  const scope = mediaSession.signal;
+  const feedback = element("span", "media-status");
+  feedback.setAttribute("role", "status");
+  const save = element("button", "attachment", "Скачать");
+  save.type = "button";
+  let file, pending;
+  async function getFile() {
+    if (file) return file;
+    if (pending) return pending;
+    pending = (async () => {
+      const response = await request("files/" + message.id,
+        AbortSignal.any([scope, AbortSignal.timeout(34000)]));
+      const blob = await response.blob();
+      if (scope.aborted) throw scope.reason;
+      const url = URL.createObjectURL(blob);
+      mediaUrls.add(url);
+      const filename = response.headers.get("Content-Disposition")?.match(/filename="([^"]+)"/)?.[1];
+      file = {url, filename, mime: blob.type};
+      return file;
+    })();
+    try {
+      return await pending;
+    } finally {
+      pending = null;
+    }
   }
+  save.addEventListener("click", async () => {
+    save.disabled = true;
+    try {
+      const {url, filename} = await getFile();
+      const link = element("a", "");
+      link.href = url;
+      link.download = filename || "cueme-media";
+      document.body.append(link);
+      link.click();
+      link.remove();
+      feedback.textContent = "";
+    } catch (error) {
+      if (!scope.aborted) feedback.textContent = error.message;
+    } finally {
+      save.disabled = false;
+    }
+  });
+  if (message.preview) {
+    const label = message.preview === "image" ? "Показать" : "Загрузить " + (message.kind || "медиа").toLowerCase();
+    const open = element("button", "media-open", label);
+    open.type = "button";
+    const load = async () => {
+      if (scope.aborted || open.disabled) return;
+      open.disabled = true;
+      open.textContent = "Загружаем…";
+      try {
+        const {url, mime} = await getFile();
+        const family = mime.split("/")[0];
+        if (!["image", "video", "audio"].includes(family)) throw new Error("Для этого формата доступно скачивание.");
+        const player = element(family === "image" ? "img" : family, "media-preview");
+        if (family === "image") {
+          player.alt = message.kind || "Изображение";
+        } else {
+          player.controls = true;
+          player.preload = "metadata";
+          player.playsInline = true;
+          player.setAttribute("aria-label", message.kind || "Медиа");
+          if (message.round) player.classList.add("round-video");
+        }
+        player.addEventListener("error", () => {
+          player.remove();
+          feedback.textContent = "Формат не поддерживается на этом устройстве. Попробуй скачать файл.";
+        }, {once: true});
+        player.src = url;
+        open.replaceWith(player);
+      } catch (error) {
+        if (!scope.aborted) feedback.textContent = error.message;
+        open.textContent = label;
+        open.disabled = false;
+      }
+    };
+    open.addEventListener("click", load);
+    box.append(open);
+    if (message.preview === "image" && photoObserver) {
+      previewLoaders.set(box, load);
+      photoObserver.observe(box);
+    }
+  }
+  box.append(save, feedback);
+  return box;
 }
 
 function messageNode(message) {
@@ -90,14 +182,9 @@ function messageNode(message) {
   const day = element("p", "day", node.dataset.day);
   const bubble = element("article", message.out ? "bubble out" : "bubble");
   if (message.kind) bubble.append(element("p", "kind", [message.kind, message.details].filter(Boolean).join(" · ")));
+  if (message.attachment) bubble.append(attachmentNode(message));
   if (message.text) bubble.append(element("p", "", message.text));
   if (!message.text && !message.kind) bubble.append(element("p", "", "Содержимое не сохранилось"));
-  if (message.attachment) {
-    const button = element("button", "attachment", "Скачать вложение");
-    button.type = "button";
-    button.addEventListener("click", () => download(message, button));
-    bubble.append(button);
-  }
   const footer = element("footer", "");
   if (message.deleted) footer.append(element("strong", "", "Удалено"));
   if (date) footer.append(element("time", "", timeFormat.format(date)));
@@ -114,6 +201,7 @@ async function loadMessages(appendOlder = false) {
   const messages = byId("messages");
   const more = byId("more");
   if (!appendOlder) {
+    resetMedia();
     messages.replaceChildren();
     olderCursor = null;
     more.hidden = true;
@@ -165,6 +253,7 @@ function setFilter(onlyDeleted) {
 function openChat(chat) {
   activeChat = chat;
   byId("chat-name").textContent = chat.name;
+  byId("chat-avatar").textContent = initials(chat.name);
   byId("inbox").hidden = true;
   byId("conversation").hidden = false;
   app.BackButton?.show();
@@ -173,6 +262,8 @@ function openChat(chat) {
 
 function back() {
   pageController?.abort();
+  resetMedia();
+  byId("messages").replaceChildren();
   byId("conversation").hidden = true;
   byId("inbox").hidden = false;
   app.BackButton?.hide();
@@ -183,8 +274,8 @@ async function start() {
   app?.ready();
   app?.expand();
   if (app?.isVersionAtLeast("6.1")) {
-    app.setHeaderColor("#140f19");
-    app.setBackgroundColor("#140f19");
+    app.setHeaderColor("#15121c");
+    app.setBackgroundColor("#15121c");
   }
   app?.BackButton?.onClick(back);
   byId("search").addEventListener("input", renderChats);
