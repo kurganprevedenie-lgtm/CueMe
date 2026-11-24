@@ -11,6 +11,8 @@ let deletedOnly = false;
 let olderCursor = null;
 let pageController;
 let mediaSession = new AbortController();
+let viewedMedia = null;
+const zoom = {scale: 1, x: 0, y: 0, pointers: new Map(), pinched: false, lastTap: null, lastTouchZoom: -Infinity};
 const mediaUrls = new Set();
 const listImages = new Map();
 const listImageObserver = typeof IntersectionObserver === "function" ? new IntersectionObserver(entries => {
@@ -94,6 +96,7 @@ async function showListImage(node) {
 }
 
 function resetMedia() {
+  if (byId("media-viewer").open) byId("media-viewer").close();
   photoObserver?.disconnect();
   mediaSession.abort();
   mediaSession = new AbortController();
@@ -162,13 +165,162 @@ function renderChats() {
   status("inbox-status", visible.length ? "" : query ? "Ничего не нашлось." : "Здесь появятся сохранённые переписки.");
 }
 
+function downloadMedia({url, filename}) {
+  const link = element("a", "");
+  link.href = url;
+  link.download = filename || "cueme-media";
+  document.body.append(link);
+  link.click();
+  link.remove();
+}
+
+function showViewerMenu(show) {
+  byId("viewer-menu").hidden = !show;
+  byId("viewer-options").setAttribute("aria-expanded", String(show));
+}
+
+function applyZoom(scale, x = zoom.x, y = zoom.y) {
+  const stage = byId("viewer-stage");
+  const image = stage.querySelector("img");
+  if (!image) return;
+  zoom.scale = Math.max(1, Math.min(4, scale));
+  const limitX = Math.max(0, (image.offsetWidth * zoom.scale - stage.clientWidth) / 2);
+  const limitY = Math.max(0, (image.offsetHeight * zoom.scale - stage.clientHeight) / 2);
+  zoom.x = Math.max(-limitX, Math.min(limitX, x));
+  zoom.y = Math.max(-limitY, Math.min(limitY, y));
+  image.style.transform = `translate(${zoom.x}px, ${zoom.y}px) scale(${zoom.scale})`;
+  byId("viewer-less").disabled = zoom.scale <= 1;
+  byId("viewer-more").disabled = zoom.scale >= 4;
+}
+
+async function openMediaViewer(message, getFile) {
+  const dialog = byId("media-viewer");
+  const view = {getFile};
+  viewedMedia = view;
+  Object.assign(zoom, {scale: 1, x: 0, y: 0, pinched: false, lastTap: null, lastTouchZoom: -Infinity});
+  zoom.pointers.clear();
+  byId("viewer-title").textContent = message.kind || "Медиа";
+  byId("viewer-stage").replaceChildren();
+  byId("viewer-stage").classList.remove("is-photo");
+  byId("viewer-zoom").hidden = true;
+  byId("viewer-options").disabled = false;
+  byId("viewer-download").disabled = false;
+  showViewerMenu(false);
+  status("viewer-status", "Загружаем…");
+  dialog.showModal();
+  try {
+    const {url, mime} = await getFile();
+    if (!dialog.open || viewedMedia !== view) return;
+    const image = mime.startsWith("image/");
+    if (!image && !mime.startsWith("video/")) throw new Error("Файл можно скачать через меню сверху.");
+    const media = element(image ? "img" : "video", "viewer-content");
+    if (image) {
+      media.alt = message.kind || "Фото";
+      media.draggable = false;
+      byId("viewer-stage").classList.add("is-photo");
+      byId("viewer-zoom").hidden = false;
+    } else {
+      media.controls = true;
+      media.playsInline = true;
+      media.preload = "metadata";
+    }
+    media.addEventListener("error", () => {
+      if (viewedMedia === view) status("viewer-status", "Формат можно скачать через меню сверху.");
+    }, {once: true});
+    media.src = url;
+    byId("viewer-stage").append(media);
+    applyZoom(1, 0, 0);
+    status("viewer-status", "");
+  } catch (error) {
+    if (viewedMedia === view) status("viewer-status", error.message || "Не получилось открыть файл.");
+  }
+}
+
+function setupMediaViewer() {
+  const dialog = byId("media-viewer");
+  const stage = byId("viewer-stage");
+  const menu = byId("viewer-menu");
+  const options = byId("viewer-options");
+  byId("viewer-close").addEventListener("click", () => dialog.close());
+  options.addEventListener("click", () => showViewerMenu(menu.hidden));
+  dialog.addEventListener("click", event => {
+    if (!menu.contains(event.target) && !options.contains(event.target)) showViewerMenu(false);
+  });
+  dialog.addEventListener("close", () => {
+    if (dialog.open) return;
+    viewedMedia = null;
+    zoom.pointers.clear();
+    stage.replaceChildren();
+  });
+  byId("viewer-download").addEventListener("click", async () => {
+    const view = viewedMedia;
+    if (!view) return;
+    const button = byId("viewer-download");
+    button.disabled = true;
+    try {
+      const file = await view.getFile();
+      if (viewedMedia !== view) return;
+      downloadMedia(file);
+      showViewerMenu(false);
+      options.focus();
+    } catch (error) {
+      if (viewedMedia === view) status("viewer-status", error.message);
+    } finally {
+      if (viewedMedia === view) button.disabled = false;
+    }
+  });
+  byId("viewer-more").addEventListener("click", () => applyZoom(zoom.scale + .5));
+  byId("viewer-less").addEventListener("click", () => applyZoom(zoom.scale - .5));
+  stage.addEventListener("dblclick", () => {
+    if (performance.now() - zoom.lastTouchZoom > 350) applyZoom(zoom.scale > 1 ? 1 : 2, 0, 0);
+  });
+  stage.addEventListener("pointerdown", event => {
+    if (!stage.classList.contains("is-photo")) return;
+    if (!zoom.pointers.size) zoom.pinched = false;
+    zoom.pinched ||= zoom.pointers.size > 0;
+    zoom.pointers.set(event.pointerId, {x: event.clientX, y: event.clientY, startX: event.clientX, startY: event.clientY});
+    stage.setPointerCapture(event.pointerId);
+  });
+  stage.addEventListener("pointermove", event => {
+    const point = zoom.pointers.get(event.pointerId);
+    if (!point) return;
+    const other = [...zoom.pointers.entries()].find(([id]) => id !== event.pointerId)?.[1];
+    const dx = event.clientX - point.x;
+    const dy = event.clientY - point.y;
+    if (other) {
+      const before = Math.hypot(point.x - other.x, point.y - other.y);
+      const after = Math.hypot(event.clientX - other.x, event.clientY - other.y);
+      if (before > 0) applyZoom(zoom.scale * after / before, zoom.x + dx / 2, zoom.y + dy / 2);
+    } else if (zoom.scale > 1) {
+      applyZoom(zoom.scale, zoom.x + dx, zoom.y + dy);
+    }
+    point.x = event.clientX;
+    point.y = event.clientY;
+  });
+  stage.addEventListener("pointerup", event => {
+    const point = zoom.pointers.get(event.pointerId);
+    zoom.pointers.delete(event.pointerId);
+    if (event.pointerType !== "touch" || !point || zoom.pinched
+        || Math.hypot(point.x - point.startX, point.y - point.startY) > 10) return;
+    const now = performance.now();
+    const last = zoom.lastTap;
+    if (last && now - last.time < 300 && Math.hypot(last.x - point.x, last.y - point.y) < 35) {
+      applyZoom(zoom.scale > 1 ? 1 : 2, 0, 0);
+      zoom.lastTouchZoom = now;
+      zoom.lastTap = null;
+    } else {
+      zoom.lastTap = {time: now, x: point.x, y: point.y};
+    }
+  });
+  stage.addEventListener("pointercancel", event => zoom.pointers.delete(event.pointerId));
+  addEventListener("resize", () => { if (dialog.open) applyZoom(zoom.scale); });
+}
+
 function attachmentNode(message) {
   const box = element("div", "media");
   const scope = mediaSession.signal;
   const feedback = element("span", "media-status");
   feedback.setAttribute("role", "status");
-  const save = element("button", "attachment", "Скачать");
-  save.type = "button";
   let file, pending;
   async function getFile() {
     if (file) return file;
@@ -190,25 +342,53 @@ function attachmentNode(message) {
       pending = null;
     }
   }
-  save.addEventListener("click", async () => {
-    save.disabled = true;
-    try {
-      const {url, filename} = await getFile();
-      const link = element("a", "");
-      link.href = url;
-      link.download = filename || "cueme-media";
-      document.body.append(link);
-      link.click();
-      link.remove();
-      feedback.textContent = "";
-    } catch (error) {
-      if (!scope.aborted) feedback.textContent = error.message;
-    } finally {
-      save.disabled = false;
+  const visual = message.preview === "image" || message.preview === "video";
+  if (!visual) {
+    const save = element("button", "attachment", "Скачать");
+    save.type = "button";
+    save.addEventListener("click", async () => {
+      save.disabled = true;
+      try {
+        downloadMedia(await getFile());
+        feedback.textContent = "";
+      } catch (error) {
+        if (!scope.aborted) feedback.textContent = error.message;
+      } finally {
+        save.disabled = false;
+      }
+    });
+    box.append(save);
+  }
+  if (visual) {
+    const isPhoto = message.preview === "image";
+    const open = element("button", "media-open media-tile", isPhoto ? "Открыть фото" : "▶ Смотреть видео");
+    open.type = "button";
+    open.addEventListener("click", () => void openMediaViewer(message, getFile));
+    const preview = element("span", "media-tile-thumb");
+    open.prepend(preview);
+    box.prepend(open);
+    if (isPhoto && photoObserver) {
+      previewLoaders.set(box, async () => {
+        try {
+          const {url, mime} = await getFile();
+          if (!mime.startsWith("image/")) return;
+          const image = element("img", "media-preview");
+          image.alt = "";
+          image.src = url;
+          await image.decode();
+          open.setAttribute("aria-label", "Открыть фото");
+          open.classList.add("photo-ready");
+          open.replaceChildren(image);
+        } catch {
+          // Кнопка просмотра позволяет повторить запрос.
+        }
+      });
+      photoObserver.observe(box);
+    } else if (message.thumbnail) {
+      observeListImage(preview, "thumbs/" + message.id);
     }
-  });
-  if (message.preview) {
-    const label = message.preview === "image" ? "Показать" : "Загрузить " + (message.kind || "медиа").toLowerCase();
+  } else if (message.preview === "audio") {
+    const label = "Загрузить " + (message.kind || "аудио").toLowerCase();
     const open = element("button", "media-open", label);
     open.type = "button";
     const load = async () => {
@@ -218,17 +398,11 @@ function attachmentNode(message) {
       try {
         const {url, mime} = await getFile();
         const family = mime.split("/")[0];
-        if (!["image", "video", "audio"].includes(family)) throw new Error("Для этого формата доступно скачивание.");
-        const player = element(family === "image" ? "img" : family, "media-preview");
-        if (family === "image") {
-          player.alt = message.kind || "Изображение";
-        } else {
-          player.controls = true;
-          player.preload = "metadata";
-          player.playsInline = true;
-          player.setAttribute("aria-label", message.kind || "Медиа");
-          if (message.round) player.classList.add("round-video");
-        }
+        if (family !== "audio") throw new Error("Для этого формата доступно скачивание.");
+        const player = element("audio", "media-preview");
+        player.controls = true;
+        player.preload = "metadata";
+        player.setAttribute("aria-label", message.kind || "Аудио");
         player.addEventListener("error", () => {
           player.remove();
           feedback.textContent = "Формат не поддерживается на этом устройстве. Попробуй скачать файл.";
@@ -242,13 +416,9 @@ function attachmentNode(message) {
       }
     };
     open.addEventListener("click", load);
-    box.append(open);
-    if (message.preview === "image" && photoObserver) {
-      previewLoaders.set(box, load);
-      photoObserver.observe(box);
-    }
+    box.prepend(open);
   }
-  box.append(save, feedback);
+  box.append(feedback);
   return box;
 }
 
@@ -349,6 +519,7 @@ function back() {
 
 async function start() {
   const started = performance.now();
+  setupMediaViewer();
   byId("archive-logo").src = byId("splash-logo").src;
   const wallpaper = new Image();
   wallpaper.src = document.querySelector('link[rel="preload"][as="image"]').href;

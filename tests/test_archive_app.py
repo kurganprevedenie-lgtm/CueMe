@@ -85,6 +85,8 @@ def test_video_thumbnail_and_spoiler(archive_db):
                      (json.dumps({"file_id": "video", "thumbnail_file_id": "small"}),))
     assert archive_app._file_id("10", 1, thumbnail=True) == "small"
     assert archive_app._file_id("20", 1, thumbnail=True) is None
+    messages = archive_app.chat_page("10", "c1", ("~", 1, 1), False)["messages"]
+    assert messages[0]["preview"] == "video" and messages[0]["thumbnail"] is True
     with storage._conn() as conn:
         conn.execute("UPDATE business_messages SET media_json = ? WHERE id = 1",
                      (json.dumps({"thumbnail_file_id": "small", "has_spoiler": True}),))

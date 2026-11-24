@@ -247,6 +247,7 @@ def chat_page(owner: str, chat: str, before: tuple, deleted: bool) -> dict:
             "text": row["text"], "date": row["stamp"].replace(" ", "T") + "Z" if row["stamp"] else None,
             "deleted": bool(row["deleted_at"]), "kind": _KINDS.get(kind), "details": details,
             "attachment": bool(file_id), "preview": preview,
+            "thumbnail": preview == "video" and bool(_thumbnail_id(kind, media, file_id)),
             "round": kind == "video_note",
         })
     next_page = None
