@@ -551,6 +551,7 @@ def init_db() -> None:
         _add_column_if_missing(conn, "users", "watch_deleted", "INTEGER NOT NULL DEFAULT 1")
         _add_column_if_missing(conn, "users", "watch_edited", "INTEGER NOT NULL DEFAULT 1")
         _add_column_if_missing(conn, "users", "watch_ephemeral", "INTEGER NOT NULL DEFAULT 1")
+        _add_column_if_missing(conn, "business_messages", "deleted_at", "TEXT")
         # Последнее действие юзера В БОТЕ (кнопка/команда/сообщение боту, не
         # сообщения собеседников) — пишет LastActionMiddleware в main.py, для
         # блока «Где уходят» в /users. NULL — с момента появления колонки

@@ -54,6 +54,7 @@ from storage import (
 )
 from app_state import dp
 from handlers.subscription import stars_tariff_kb
+from config import ARCHIVE_MINIAPP_URL
 import handlers  # ссылки по модулю: имена ниже по исходному main.py / общее состояние
 
 
@@ -453,16 +454,18 @@ async def handle_tribute_webhook(request: web.Request) -> web.Response:
 
 
 async def _start_tribute_webhook_server(bot: Bot) -> None:
-    """Поднимает aiohttp-сервер ТОЛЬКО если TRIBUTE_API_KEY задан — иначе
-    вебхук выключен полностью, бот работает как раньше (только polling).
-    Слушает локально на TRIBUTE_WEBHOOK_PORT — наружу нужен реверс-прокси
-    (nginx/caddy) с HTTPS, Tribute требует https-адрес в настройках вебхука
-    в личном кабинете."""
-    if not TRIBUTE_API_KEY:
+    """Запускает HTTP-маршруты вебхука и архива, если они настроены."""
+    if not TRIBUTE_API_KEY and not ARCHIVE_MINIAPP_URL:
         return
     app = web.Application()
     app["bot"] = bot
-    app.router.add_post(TRIBUTE_WEBHOOK_PATH, handle_tribute_webhook)
+    if TRIBUTE_API_KEY:
+        app.router.add_post(TRIBUTE_WEBHOOK_PATH, handle_tribute_webhook)
+    if ARCHIVE_MINIAPP_URL:
+        from archive_app import register_archive
+        from handlers.subscription import _is_premium
+
+        register_archive(app, bot, _is_premium)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", TRIBUTE_WEBHOOK_PORT)

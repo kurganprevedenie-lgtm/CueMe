@@ -267,6 +267,7 @@ PREMIUM_SUBSCRIBE_URL = os.getenv("PREMIUM_SUBSCRIBE_URL", "")
 TRIBUTE_API_KEY = os.getenv("TRIBUTE_API_KEY", "")
 TRIBUTE_WEBHOOK_PATH = os.getenv("TRIBUTE_WEBHOOK_PATH", "/tribute/webhook")
 TRIBUTE_WEBHOOK_PORT = int(os.getenv("TRIBUTE_WEBHOOK_PORT", "8081"))
+ARCHIVE_MINIAPP_URL = os.getenv("ARCHIVE_MINIAPP_URL", "").strip()
 # Опциональная доп. проверка: channel_id из пейлоада Tribute (их внутренний
 # ID канала, НЕ Telegram chat_id) — если задан, события для чужого канала
 # игнорируются. Пусто (по умолчанию) — не фильтруем, предполагаем один канал.

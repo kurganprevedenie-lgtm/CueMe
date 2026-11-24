@@ -8,7 +8,7 @@ import asyncio
 from aiogram import Bot, F
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
-from aiogram.types import CallbackQuery, Message, InlineKeyboardMarkup
+from aiogram.types import CallbackQuery, Message, InlineKeyboardMarkup, WebAppInfo
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from storage import (
     delete_all_user_data,
@@ -20,6 +20,7 @@ from storage import (
     WATCH_SETTINGS,
 )
 from app_state import _contact_name, dp
+from config import ARCHIVE_MINIAPP_URL
 from handlers.subscription import _is_premium
 from handlers.redeem_menu import _menu_screen_target
 from handlers.profile import paged_contacts_kb
@@ -58,6 +59,8 @@ def _watch_kb(telegram_id: str, is_premium: bool) -> InlineKeyboardMarkup:
             b.button(text=f"🔒 {label}", callback_data="watch:locked")
     if not is_premium:
         b.button(text="👑 Оформить Premium", callback_data="show_premium")
+    if ARCHIVE_MINIAPP_URL and is_premium:
+        b.button(text="📂 Архив переписок", web_app=WebAppInfo(url=ARCHIVE_MINIAPP_URL))
     b.button(text="⬅️ Назад", callback_data="sub:to_menu")
     b.adjust(1)
     return theme_keyboard(b.as_markup())

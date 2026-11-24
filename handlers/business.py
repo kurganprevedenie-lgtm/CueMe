@@ -1191,6 +1191,13 @@ async def handle_deleted_business_messages(event: BusinessMessagesDeleted, bot: 
     if await _deleted_messages_excluded(bot, owner_id, event.chat.username):
         return
 
+    from archive_app import mark_deleted
+
+    try:
+        await asyncio.to_thread(mark_deleted, owner_id, conn_id, chat_ref, event.message_ids)
+    except Exception:
+        logging.exception("archive: не удалось отметить удалённые сообщения")
+
     contact_id = await asyncio.to_thread(get_contact_id_for_chat_ref, owner_id, chat_ref)
     contact = await asyncio.to_thread(get_contact_by_id, contact_id) if contact_id else None
     name = _contact_name(contact) if contact else "Собеседник"
