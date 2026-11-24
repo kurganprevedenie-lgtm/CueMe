@@ -68,8 +68,8 @@ h1 { font-size: clamp(30px, 8vw, 38px); line-height: 1.1; font-weight: 760; lett
     radial-gradient(ellipse at 5% 85%, #dd6cb9, transparent 66%),
     #fec496;
   opacity: .45;
-  -webkit-mask: url("wallpaper-v2.webp") center / 420px auto repeat;
-  mask: url("wallpaper-v2.webp") center / 420px auto repeat;
+  -webkit-mask: url("wallpaper-v3.webp") center / 420px auto repeat;
+  mask: url("wallpaper-v3.webp") center / 420px auto repeat;
 }
 .chat-top {
   position: relative; z-index: 1; border: 1px solid #5a3d60; border-top: 0;

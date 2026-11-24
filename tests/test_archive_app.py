@@ -97,9 +97,9 @@ def test_archive_endpoints_enforce_access(archive_db):
             assert response.status == 200
             html = await response.text()
             assert 'src="data:image/webp;base64,' in html
-            assert 'rel="preload" href="wallpaper-v2.webp"' in html
+            assert 'rel="preload" href="wallpaper-v3.webp"' in html
             assert (await client.get("/archive/app.js")).status == 200
-            wallpaper = await client.get("/archive/wallpaper-v2.webp")
+            wallpaper = await client.get("/archive/wallpaper-v3.webp")
             assert wallpaper.content_type == "image/webp"
             assert "immutable" in wallpaper.headers["Cache-Control"]
             assert (await client.get("/archive/api/chats")).status == 401

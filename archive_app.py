@@ -19,7 +19,7 @@ import storage
 
 
 _ASSETS = Path(__file__).with_name("archive_web")
-_WALLPAPER = "wallpaper-v2.webp"
+_WALLPAPER = "wallpaper-v3.webp"
 _PAGE_SIZE = 50
 _FILE_LIMIT = 20 * 1024 * 1024
 _CHAT_KEY = re.compile(r"c[1-9][0-9]{0,17}|b[0-9a-f]{16}")
@@ -251,7 +251,11 @@ def register_archive(app: web.Application, bot, is_premium) -> None:
         name = request.match_info["name"]
         headers = _HEADERS
         if name == _WALLPAPER:
-            headers = {**_HEADERS, "Cache-Control": "public, max-age=31536000, immutable"}
+            headers = {
+                **_HEADERS,
+                "Cache-Control": "public, max-age=31536000, immutable",
+                "Content-Type": "image/webp",
+            }
         return web.FileResponse(_ASSETS / name, headers=headers)
 
     async def chats(request: web.Request) -> web.Response:
@@ -310,7 +314,7 @@ def register_archive(app: web.Application, bot, is_premium) -> None:
         )
 
     app.router.add_get("/archive/", home)
-    app.router.add_get(r"/archive/{name:app\.css|app\.js|wallpaper-v2\.webp}", asset)
+    app.router.add_get(r"/archive/{name:app\.css|app\.js|wallpaper-v3\.webp}", asset)
     app.router.add_get("/archive/api/chats", chats, allow_head=False)
     app.router.add_get(f"/archive/api/chats/{{chat:{_CHAT_KEY.pattern}}}", messages, allow_head=False)
     app.router.add_get(r"/archive/api/files/{id:[1-9][0-9]{0,17}}", download, allow_head=False)
