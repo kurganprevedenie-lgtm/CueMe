@@ -35,7 +35,7 @@ def test_adaptive_reply_and_rollback_keep_distinct_prompts_and_cache(monkeypatch
         prompts.append(prompt)
         return "\n".join(
             f"===ВАРИАНТ===\nНАЗВАНИЕ: {name}\nТЕКСТ: хорошо"
-            for name in ("Поддержать", "Обыграть", "Уточнить")
+            for name in ("«Поддержать»", "Обыграть", "Уточнить")
         )
 
     monkeypatch.setattr(llm, "_ask", ask)
@@ -96,6 +96,9 @@ def test_live_dialogue_still_returns_running_notes(monkeypatch):
 @pytest.mark.parametrize("bad_response", [
     "Первый вариант: хорошо\nВторой вариант: понял\nТретий вариант: увидимся",
     "===ВАРИАНТ===\nНАЗВАНИЕ: Уточнить\nТЕКСТ: хорошо",
+    ("===ВАРИАНТ===\nНАЗВАНИЕ: Уточнить\nТЕКСТ: если бы это mattered\n"
+     "===ВАРИАНТ===\nНАЗВАНИЕ: Предложить\nТЕКСТ: давай вечером\n"
+     "===ВАРИАНТ===\nНАЗВАНИЕ: Поддержать\nТЕКСТ: как скажешь"),
 ])
 def test_variant_format_error_falls_back_to_another_provider(monkeypatch, bad_response):
     calls = []
