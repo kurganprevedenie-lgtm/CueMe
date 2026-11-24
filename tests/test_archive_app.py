@@ -96,7 +96,7 @@ def test_archive_endpoints_enforce_access(archive_db):
             assert (await client.get("/archive/")).status == 200
             assert (await client.get("/archive/app.js")).status == 200
             assert (await client.get("/archive/logo.png")).content_type == "image/png"
-            assert (await client.get("/archive/wallpaper.png")).content_type == "image/png"
+            assert (await client.get("/archive/wallpaper.svg")).content_type == "image/svg+xml"
             assert (await client.get("/archive/api/chats")).status == 401
             blocked = {"X-Telegram-Init-Data": signed_data(20, int(time.time()))}
             assert (await client.get("/archive/api/chats", headers=blocked)).status == 403

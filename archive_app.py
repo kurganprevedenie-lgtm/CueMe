@@ -298,7 +298,7 @@ def register_archive(app: web.Application, bot, is_premium) -> None:
         )
 
     app.router.add_get("/archive/", asset)
-    app.router.add_get(r"/archive/{name:app\.css|app\.js|logo\.png|wallpaper\.png}", asset)
+    app.router.add_get(r"/archive/{name:app\.css|app\.js|logo\.png|wallpaper\.svg}", asset)
     app.router.add_get("/archive/api/chats", chats, allow_head=False)
     app.router.add_get(f"/archive/api/chats/{{chat:{_CHAT_KEY.pattern}}}", messages, allow_head=False)
     app.router.add_get(r"/archive/api/files/{id:[1-9][0-9]{0,17}}", download, allow_head=False)
