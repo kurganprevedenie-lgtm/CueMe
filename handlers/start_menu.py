@@ -48,6 +48,7 @@ from storage import (
     save_message_samples,
     save_referral_pending,
     record_event,
+    set_last_action,
     set_gender,
     upsert_user,
 )
@@ -399,6 +400,8 @@ async def cmd_start(message: Message, state: FSMContext, bot: Bot) -> None:
     if is_new:
         mark_legacy_kb_cleared(telegram_id)  # новый юзер старую reply-клавиатуру никогда не видел
     try:
+        if is_new:
+            set_last_action(telegram_id, "cmd:/start")
         record_event(telegram_id, "start")  # для "последнее действие" в /users
     except Exception:
         logging.exception("cmd_start: не удалось записать событие")

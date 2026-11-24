@@ -7,10 +7,14 @@ import asyncio
 from llm_usage import background_usage
 import logging
 import time
+from contextlib import AsyncExitStack
+from datetime import datetime, timedelta, timezone
+from typing import Literal
 from aiogram import Bot
 from aiogram.fsm.state import State, StatesGroup
 from config import (
     FIRST_BUILD_THRESHOLD,
+    REBUILD_INACTIVITY_DAYS,
     REBUILD_THRESHOLD,
     REFRESH_SAMPLES_EVERY_N,
     SAMPLE_SIZE,
@@ -36,6 +40,7 @@ from storage import (
     get_my_style_per_contact,
     get_running_notes,
     get_style_card,
+    get_user,
     save_interaction_card,
     save_message_samples,
     save_my_style_per_contact,
@@ -50,6 +55,7 @@ from app_state import (
     _rebuilding,
 )
 import app_state  # ссылки по модулю: имена ниже по исходному main.py / общее состояние
+from handlers import subscription
 
 
 # ── FSM ───────────────────────────────────────────────────────────────────────
@@ -170,6 +176,60 @@ async def _rebuild_contact(owner_user_id: str, contact_id: int) -> bool:
 
 # ── Авто-пересборка (fire-and-forget) ─────────────────────────────────────────
 
+_REBUILD_ACTIVITY_WINDOW = timedelta(days=REBUILD_INACTIVITY_DAYS)
+_TRIAL_COUNTERS = (
+    ("reply_trial_bonus", "trial_used"),
+    ("analysis_trial_bonus", "analysis_trial_used"),
+    ("date_trial_bonus", "date_trial_used"),
+)
+
+
+def _rebuild_date(raw: str | None) -> datetime | None:
+    if not raw:
+        return None
+    try:
+        value = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+
+
+def _background_rebuild_tier(owner_user_id: str) -> Literal["premium", "trial"] | None:
+    user = get_user(owner_user_id)
+    if user is None:
+        return None
+    now = datetime.now(timezone.utc)
+    expiries = (
+        _rebuild_date(user["stars_premium_until"]),
+        _rebuild_date(user["tribute_premium_until"]),
+    )
+    expires = max((value for value in expiries if value is not None), default=None)
+    if expires is not None and expires > now:
+        return "premium"
+    # Для старых подписчиков Tribute без записанного срока используем уже
+    # проверенное членство. Business-поток не делает запросов к Telegram.
+    if expires is None and subscription.PREMIUM_CHANNEL_ID:
+        cached = subscription._premium_cache.get(owner_user_id)
+        if cached and cached[0] and subscription._premium_clock() - cached[1] < subscription.PREMIUM_CACHE_TTL:
+            return "premium"
+    if expires is not None and now - expires < _REBUILD_ACTIVITY_WINDOW:
+        return "trial"
+
+    last_action = _rebuild_date(user["last_action_at"])
+    if last_action is None or now - last_action >= _REBUILD_ACTIVITY_WINDOW:
+        return None
+    if not any(user[bonus] or user[used] for bonus, used in _TRIAL_COUNTERS):
+        return "trial"  # начал пользоваться, бесплатный пул ещё не открывал
+    if any((user[bonus] or 0) > (user[used] or 0) for bonus, used in _TRIAL_COUNTERS):
+        return "trial"
+    return None
+
+
+def _rebuild_on_cooldown(tier: str) -> bool:
+    until = app_state._rebuild_premium_cooldown_until if tier == "premium" else app_state._rebuild_cooldown_until
+    return time.monotonic() < until
+
+
 @background_usage
 async def _maybe_rebuild(owner_user_id: str, contact_id: int, bot: Bot | None = None) -> None:
     # (было `global …`: имя живёт в другом модуле — обращение по ссылке ниже)
@@ -177,14 +237,19 @@ async def _maybe_rebuild(owner_user_id: str, contact_id: int, bot: Bot | None = 
         return
     if len(_rebuilding) + len(_rebuild_checking) >= _REBUILD_CONCURRENCY + _REBUILD_MAX_QUEUED:
         return  # очередь пересборок полна — запустится на следующем сообщении
-    if time.monotonic() < app_state._rebuild_cooldown_until:
-        return  # лимит Groq недавно исчерпан — не дёргаем API на каждое сообщение
-
     # Место в очереди занимаем сразу, ещё до подсчётов (они — в потоке, с
     # await): иначе лавина из десятков переписок проходит проверку очереди
     # раньше, чем хоть одна успевает в неё записаться.
     _rebuild_checking.add(contact_id)
     try:
+        tier = await asyncio.to_thread(_background_rebuild_tier, owner_user_id)
+        if tier is None or _rebuild_on_cooldown(tier):
+            return
+        if tier == "trial":
+            # Оставляем два места в очереди для Premium даже при всплеске триала.
+            if len(app_state._rebuild_trial_jobs) >= _REBUILD_MAX_QUEUED:
+                return
+            app_state._rebuild_trial_jobs.add(contact_id)
         last  = await asyncio.to_thread(get_my_style_last_rebuild_count, contact_id)
         total = await asyncio.to_thread(count_biz_messages_for_contact, owner_user_id, contact_id)
 
@@ -203,9 +268,20 @@ async def _maybe_rebuild(owner_user_id: str, contact_id: int, bot: Bot | None = 
         _rebuilding.add(contact_id)
     finally:
         _rebuild_checking.discard(contact_id)
+        if contact_id not in _rebuilding:
+            app_state._rebuild_trial_jobs.discard(contact_id)
 
     try:
-        async with _rebuild_slots:
+        async with AsyncExitStack() as slots:
+            if tier == "trial":
+                await slots.enter_async_context(app_state._rebuild_trial_slot)
+            await slots.enter_async_context(_rebuild_slots)
+            current_tier = await asyncio.to_thread(_background_rebuild_tier, owner_user_id)
+            if current_tier is None or (tier == "premium" and current_tier != tier):
+                return
+            tier = current_tier
+            if _rebuild_on_cooldown(tier):
+                return
             _refresh_pending.pop(contact_id, None)
             await asyncio.to_thread(_refresh_samples, owner_user_id, contact_id)
             logging.info("auto-rebuild start: contact_id=%s (new=%s, first=%s)", contact_id, total - last, is_first)
@@ -232,12 +308,16 @@ async def _maybe_rebuild(owner_user_id: str, contact_id: int, bot: Bot | None = 
                 logging.warning("first-build notify failed: owner=%s", owner_user_id)
     except RateLimitError:
         # Дневной лимит исчерпан — молчим 30 мин, пересоберём позже. Без трейсбека.
-        app_state._rebuild_cooldown_until = time.monotonic() + 1800
+        if tier == "premium":
+            app_state._rebuild_premium_cooldown_until = time.monotonic() + 1800
+        else:
+            app_state._rebuild_cooldown_until = time.monotonic() + 1800
         logging.warning("auto-rebuild отложена на 30 мин (лимит Groq): contact_id=%s", contact_id)
     except Exception:
         logging.exception("auto-rebuild failed: contact_id=%s", contact_id)
     finally:
         _rebuilding.discard(contact_id)
+        app_state._rebuild_trial_jobs.discard(contact_id)
 
 
 # ── Ленивая генерация карточек ────────────────────────────────────────────────

@@ -68,7 +68,7 @@ from handlers.profile import (
     _message_text,
     _msg_meta,
 )
-from handlers.cards import _maybe_rebuild, _refresh_samples, _should_refresh_samples
+from handlers.cards import _background_rebuild_tier, _maybe_rebuild, _refresh_samples, _should_refresh_samples
 import handlers  # ссылки по модулю: имена ниже по исходному main.py / общее состояние
 
 
@@ -374,7 +374,7 @@ def _persist_business_message(
         _match_outgoing_to_suggestion(owner_id, cid, text, message_id)
 
     # Освежаем message_samples (без LLM, дёшево), но не чаще раза в N сообщений
-    if _should_refresh_samples(cid):
+    if _should_refresh_samples(cid) and _background_rebuild_tier(owner_id) is not None:
         _refresh_samples(owner_id, cid)
     return cid, merge_notice
 

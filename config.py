@@ -169,6 +169,7 @@ GEMINI_PROXY = os.getenv("GEMINI_PROXY")
 VISION_MODEL = os.getenv("VISION_MODEL", "qwen/qwen3.6-27b")
 
 REBUILD_THRESHOLD = int(os.getenv("REBUILD_THRESHOLD", "50"))
+REBUILD_INACTIVITY_DAYS = 14
 SAMPLE_SIZE = int(os.getenv("SAMPLE_SIZE", "150"))
 # Троттлинг обновления message_samples: не чаще, чем раз в N business-сообщений на контакт
 # (перед реальной пересборкой карточек делается принудительный refresh).

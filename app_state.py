@@ -424,6 +424,8 @@ _rebuilding: set[int] = set()
 _REBUILD_CONCURRENCY = 2
 _REBUILD_MAX_QUEUED = 10
 _rebuild_slots = asyncio.Semaphore(_REBUILD_CONCURRENCY)
+_rebuild_trial_slot = asyncio.Semaphore(1)  # второй слот доступен только Premium
+_rebuild_trial_jobs: set[int] = set()
 _rebuild_checking: set[int] = set()  # переписки, по которым сейчас считаем, нужна ли пересборка
 
 # Контекст действий (черновик/входящее/скриншот + выбранный стиль) — по user_id,
@@ -459,6 +461,7 @@ def _get_action(user_id: int, action_id: str) -> dict | None:
 # После лимита Groq фоновые авто-пересборки молчат до этого момента (monotonic-время),
 # чтобы не дёргать API обречёнными запросами на каждое сообщение.
 _rebuild_cooldown_until: float = 0.0
+_rebuild_premium_cooldown_until: float = 0.0
 
 
 def _contact_name(c) -> str:
