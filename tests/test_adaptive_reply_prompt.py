@@ -47,6 +47,7 @@ def test_adaptive_reply_and_rollback_keep_distinct_prompts_and_cache(monkeypatch
     assert "ДЕФОЛТНЫЙ НАБОР" not in prompts[0]
     assert "начинай со строчной" in prompts[0]
     assert "пусть будет так" in prompts[0]
+    assert prompts[0].count("===ВАРИАНТ===\nНАЗВАНИЕ:") == 3
     adaptive_key = reply._reply_cache_extra("male", kwargs)
     assert adaptive_key != reply._reply_cache_extra("male", {})
 
@@ -90,3 +91,37 @@ def test_live_dialogue_still_returns_running_notes(monkeypatch):
     ))
     assert len(variants) == 3
     assert notes.splitlines() == ["#1: любит прогулки", "#2: свободна вечером"]
+
+
+@pytest.mark.parametrize("bad_response", [
+    "Первый вариант: хорошо\nВторой вариант: понял\nТретий вариант: увидимся",
+    "===ВАРИАНТ===\nНАЗВАНИЕ: Уточнить\nТЕКСТ: хорошо",
+])
+def test_variant_format_error_falls_back_to_another_provider(monkeypatch, bad_response):
+    calls = []
+    complete = "\n".join(
+        f"===ВАРИАНТ===\nНАЗВАНИЕ: {name}\nТЕКСТ: {answer}"
+        for name, answer in (("Уточнить", "когда удобно?"), ("Предложить", "давай вечером"), ("Поддержать", "как скажешь"))
+    )
+
+    class Provider:
+        def __init__(self, name, response):
+            self.name = name
+            self.response = response
+
+        async def ask(self, prompt, max_tokens):
+            calls.append(self.name)
+            return llm._check_output(self.name, "test-model", self.response)
+
+    monkeypatch.setattr(llm, "ADAPTIVE_REPLY_PROMPT", True)
+    monkeypatch.setattr(llm, "_ordered_providers", lambda: [
+        Provider("first", bad_response), Provider("reserve", complete),
+    ])
+    monkeypatch.setattr(llm, "_priority_groq_for_call", lambda _: False)
+    monkeypatch.setattr(llm, "_invalid_output_hook", None)
+    monkeypatch.setattr(llm, "_invalid_outputs", {})
+    monkeypatch.setattr(llm, "_provider_stats", {})
+    monkeypatch.setattr(llm.llm_usage, "emit", lambda *args, **kwargs: None)
+    variants = asyncio.run(llm.suggest_reply_variants("пойдём гулять?", "", ""))
+    assert calls == ["first", "reserve"]
+    assert len(variants) == 3

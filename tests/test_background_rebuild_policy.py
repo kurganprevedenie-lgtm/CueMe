@@ -66,15 +66,16 @@ def test_trial_jobs_cannot_occupy_both_slots(monkeypatch):
 
         monkeypatch.setattr(cards, "_rebuild_contact", rebuild)
         first = asyncio.create_task(cards._maybe_rebuild("trial", 1))
-        second = asyncio.create_task(cards._maybe_rebuild("trial", 2))
+        tasks = [first]
         try:
             await asyncio.wait_for(started[1].wait(), 3)
+            tasks.append(asyncio.create_task(cards._maybe_rebuild("trial", 2)))
             await asyncio.wait_for(cards._maybe_rebuild("premium", 3), 3)
             assert started[3].is_set()
             assert not started[2].is_set()
         finally:
             release.set()
-            await asyncio.gather(first, second)
+            await asyncio.gather(*tasks)
         assert started[2].is_set()
 
     asyncio.run(run())

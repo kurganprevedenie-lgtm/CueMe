@@ -249,6 +249,9 @@ async def _tracked_post(
 # contextvar, выставляет _ask(..., tag=...), чтобы не протаскивать параметр
 # через всех провайдеров.
 _llm_call_tag: contextvars.ContextVar[str] = contextvars.ContextVar("llm_call_tag", default="-")
+_llm_expected_variants: contextvars.ContextVar[int | None] = contextvars.ContextVar(
+    "llm_expected_variants", default=None,
+)
 _llm_attempt: contextvars.ContextVar[list] = contextvars.ContextVar("llm_attempt", default=[0])
 # Опции конкретного вызова для Groq (reasoning_effort, запас токенов под
 # рассуждения, таймаут) — выставляет _ask(..., fast=True), читает
@@ -388,6 +391,12 @@ def _check_output(provider: str, model: str, text: str) -> str:
         return text
     tag = _llm_call_tag.get()
     reason = validate_llm_output(text, None if tag == "-" else tag)
+    expected = _llm_expected_variants.get()
+    if reason is None and expected is not None:
+        variants_text = text.partition(_LIVE_NOTES_DELIM)[0] if tag == "live" else text
+        count = len(_parse_variants(variants_text, expected + 1))
+        if count != expected:
+            reason = f"получено {count} из {expected} вариантов"
     if reason is None:
         llm_usage.validation("valid_output")
         return text
@@ -1236,6 +1245,7 @@ def get_provider_stats() -> dict:
 @llm_usage.logical_call
 async def _ask(
     prompt: str, max_tokens: int = 1024, tag: str | None = None, fast: bool = False,
+    *, expected_variants: int | None = None,
 ) -> str:
     """Пробует провайдеров по цепочке. Пробрасывает ошибку только если все упали.
     Логирует по каждой попытке: провайдер, исход, тип ошибки, время ответа.
@@ -1243,6 +1253,7 @@ async def _ask(
     fast=True — «Ответ с CueMe»: у Groq reasoning_effort/буфер/таймаут из
     VARIANTS_* в config.py (см. GroqProvider._ask_with_key)."""
     _llm_call_tag.set(tag or "-")
+    _llm_expected_variants.set(expected_variants)
     _llm_fast.set(fast)
     _llm_attempt.set([0])
     _llm_served_model.set(None)
@@ -2333,6 +2344,7 @@ def _adaptive_reply_prompt(
 ) -> str:
     parts = [
         f"Предложи ровно {n_variants} варианта ответа на последнюю реплику собеседника. "
+        "Начни вывод со строки ===ВАРИАНТ=== и повторяй этот маркер перед каждым вариантом. "
         "По недавним сообщениям сам выбери уместные реакции. Дай каждой короткое название, которое описывает именно её подход. "
         "При взаимном флирте можно варьировать инициативу, намёк и прямоту. В серьёзном разговоре возможны поддержка, прямой ответ или уточнение. "
         "Подкол уместен, когда контекст поддерживает такую реакцию. Если тон неоднозначен, предложи разные по смыслу способы ответить и не выдавай догадку за факт. "
@@ -2353,8 +2365,11 @@ def _adaptive_reply_prompt(
         f"ПОСЛЕДНЯЯ РЕПЛИКА СОБЕСЕДНИКА\n<<<\n{incoming_msg}\n>>>",
         "ПРЕЖНИЕ ОТВЕТЫ. Подбери новые реакции и формулировки.\n"
         + "\n".join(f"- {name}: {text}" for name, text in previous) if previous else "",
-        f"Верни ровно {n_variants} блока по шаблону, без вступления и рассуждений.\n"
-        "===ВАРИАНТ===\nНАЗВАНИЕ: [реакция]\nТЕКСТ: [готовый ответ]",
+        f"Выведи только {n_variants} блока в таком формате. Заполни все поля и сохрани маркеры дословно.\n"
+        + "\n".join(
+            "===ВАРИАНТ===\nНАЗВАНИЕ: [реакция]\nТЕКСТ: [готовый ответ]"
+            for _ in range(n_variants)
+        ),
     ]
     return "\n\n".join(part for part in parts if part)
 
@@ -2379,7 +2394,7 @@ async def suggest_reply_variants(
             author_voice=author_voice, recent_dialogue=recent_dialogue,
             data_signals=data_signals, examples=winning_examples, previous=previous_variants,
         )
-        raw = await _ask(prompt, max_tokens=1800, tag="variants", fast=True)
+        raw = await _ask(prompt, max_tokens=1800, tag="variants", fast=True, expected_variants=n_variants)
         variants = _parse_variants(raw, n_variants)
         if len(variants) != n_variants:
             raise ProviderError(f"Получено {len(variants)} из {n_variants} вариантов")
@@ -2803,7 +2818,7 @@ async def live_coach_step(
             "пункта в формате #N: наблюдаемый факт из последней реплики. "
             "Если нового факта нет, сохрани заметки как есть."
         )
-        raw = await _ask(prompt, max_tokens=1700, tag="live", fast=True)
+        raw = await _ask(prompt, max_tokens=1700, tag="live", fast=True, expected_variants=n_variants)
         variants, notes = _parse_live_step(raw, n_variants, running_notes or "")
         if len(variants) != n_variants:
             raise ProviderError(f"Получено {len(variants)} из {n_variants} вариантов")
