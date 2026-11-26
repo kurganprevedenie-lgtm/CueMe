@@ -98,10 +98,13 @@ h1 { font-size: clamp(30px, 8vw, 38px); line-height: 1.1; font-weight: 760; lett
 .day { width: fit-content; margin: 12px auto; padding: 5px 11px; border-radius: 20px; color: #ece0ef; background: #261e2c; font-size: 12px; }
 .bubble { width: fit-content; max-width: 89%; margin-bottom: 7px; padding: 8px 11px 6px; border: 1px solid #48374d; border-radius: 16px; background: #251d2a; overflow-wrap: anywhere; }
 .bubble.out { margin-left: auto; border-color: #634361; background: #472d44; }
+.bubble.deleted-message { border-inline-start: 3px solid #ef9bd4; }
+.deleted-preview { color: var(--pink); }
 .bubble p { white-space: pre-wrap; font-size: 15px; line-height: 1.4; }
 .bubble .kind { margin-bottom: 5px; color: #dfbbdd; font-size: 12px; font-weight: 630; }
 .bubble footer { display: flex; justify-content: flex-end; gap: 8px; margin-top: 4px; color: var(--muted); font-size: 11px; }
 .bubble footer strong { color: var(--pink); font-weight: 650; }
+.deleted-label { padding: 1px 5px; border-radius: 5px; background: #ef9bd426; }
 .media { display: grid; justify-items: start; gap: 5px; max-width: 100%; margin: 0 0 5px; }
 .media-preview { display: block; max-width: 100%; max-height: min(55dvh, 420px); border-radius: 10px; object-fit: contain; }
 :is(img, video).media-preview { width: min(66vw, 345px); background: #160f1d; }

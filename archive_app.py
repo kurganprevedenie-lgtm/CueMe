@@ -29,6 +29,37 @@ _CHAT_KEY = re.compile(r"c[1-9][0-9]{0,17}|b[0-9a-f]{16}")
 _IMPORTED_DATE = """CASE WHEN instr(substr(date, 11), '+') = 0
                          AND instr(substr(date, 11), '-') = 0 AND substr(date, -1) <> 'Z'
                     THEN datetime(date, '-3 hours') ELSE datetime(date) END"""
+
+# В старых версиях удаления без Premium фиксировались в тизерах. Эти строки
+# тоже считаются удалёнными, даже если самой метки в business_messages ещё нет.
+_NOTICE_DELETED = """notice_deleted AS (
+    SELECT j.value AS id, MAX(n.created_at) AS deleted_at
+    FROM deleted_reveals n
+    JOIN json_each(CASE WHEN json_valid(n.message_row_ids) THEN n.message_row_ids ELSE '[]' END) j
+    WHERE n.owner_user_id = :owner AND j.type = 'integer'
+    GROUP BY j.value
+)"""
+
+# В импорте нет Telegram ID сообщения. Скрываем совпадения в том же чате
+# по направлению, тексту и секунде, учитывая возможный часовой пояс экспорта.
+_DELETED_COPIES = """deleted_copies AS MATERIALIZED (
+    SELECT r.contact_id, b.direction, trim(b.text) AS body, unixepoch(b.date) AS stamp
+    FROM business_messages b
+    JOIN business_chat_refs r ON r.owner_user_id = b.owner_user_id AND r.chat_ref = b.chat_ref
+    LEFT JOIN notice_deleted n ON n.id = b.id
+    WHERE NOT :allow_deleted AND b.owner_user_id = :owner
+      AND (b.deleted_at IS NOT NULL OR n.id IS NOT NULL) AND trim(b.text) <> ''
+)"""
+_VISIBLE_IMPORT = """(:allow_deleted OR NOT EXISTS (
+    SELECT 1 FROM deleted_copies d
+    WHERE d.contact_id = i.contact_id AND d.direction = i.direction AND d.body = trim(i.text)
+      AND (d.stamp = unixepoch(i.date) OR (
+          instr(substr(i.date, 11), '+') = 0 AND instr(substr(i.date, 11), '-') = 0
+          AND substr(i.date, -1) <> 'Z'
+          AND unixepoch(i.date) - d.stamp BETWEEN -43200 AND 50400
+          AND (unixepoch(i.date) - d.stamp) % 900 = 0
+      ))
+))"""
 _HEADERS = {
     "Cache-Control": "no-store",
     "Referrer-Policy": "no-referrer",
@@ -77,21 +108,25 @@ def mark_deleted(owner_id: str, connection_id: str, chat_ref: str, ids: list[int
         )
 
 
-def list_chats(owner: str) -> list[dict]:
+def list_chats(owner: str, *, allow_deleted: bool = True) -> list[dict]:
     with storage._conn() as conn:
         rows = conn.execute(f"""
-            WITH live AS (
+            WITH {_NOTICE_DELETED}, {_DELETED_COPIES}, live AS (
                 SELECT b.chat_ref, b.id, MAX(datetime(b.date)) AS recent
-                FROM business_messages b WHERE b.owner_user_id = ? GROUP BY b.chat_ref
+                FROM business_messages b LEFT JOIN notice_deleted n ON n.id = b.id
+                WHERE b.owner_user_id = :owner
+                  AND (:allow_deleted OR (b.deleted_at IS NULL AND n.id IS NULL))
+                GROUP BY b.chat_ref
             ), mapped AS (
                 SELECT r.contact_id, live.id, live.recent,
                        ROW_NUMBER() OVER (PARTITION BY r.contact_id ORDER BY live.recent DESC, live.id DESC) AS rank
                 FROM live JOIN business_chat_refs r ON r.chat_ref = live.chat_ref
-                WHERE r.owner_user_id = ?
+                WHERE r.owner_user_id = :owner
             ), imported AS (
                 SELECT i.contact_id, i.id, MAX({_IMPORTED_DATE}) AS recent
                 FROM contacts c JOIN imported_messages i ON i.contact_id = c.id
-                WHERE c.user_telegram_id = ? AND c.archived_into_contact_id IS NULL GROUP BY i.contact_id
+                WHERE c.user_telegram_id = :owner AND c.archived_into_contact_id IS NULL
+                  AND {_VISIBLE_IMPORT} GROUP BY i.contact_id
             ), inbox AS (
                 SELECT 'c' || c.id AS id, COALESCE(NULLIF(c.display_name, ''), 'Собеседник') AS name,
                        MAX(COALESCE(m.recent, ''), COALESCE(i.recent, '')) AS recent,
@@ -100,21 +135,23 @@ def list_chats(owner: str) -> list[dict]:
                        CASE WHEN m.id IS NOT NULL THEN c.original_from_id END AS profile
                 FROM contacts c LEFT JOIN mapped m ON m.contact_id = c.id AND m.rank = 1
                 LEFT JOIN imported i ON i.contact_id = c.id
-                WHERE c.user_telegram_id = ? AND c.archived_into_contact_id IS NULL
+                WHERE c.user_telegram_id = :owner AND c.archived_into_contact_id IS NULL
                 UNION ALL
                 SELECT 'b' || live.chat_ref, 'Собеседник', live.recent, live.id, NULL, NULL FROM live
                 WHERE NOT EXISTS (SELECT 1 FROM business_chat_refs r
-                                  WHERE r.owner_user_id = ? AND r.chat_ref = live.chat_ref)
+                                  WHERE r.owner_user_id = :owner AND r.chat_ref = live.chat_ref)
             )
             SELECT inbox.id, inbox.name, inbox.recent, inbox.profile, b.id AS message_id,
                    COALESCE(substr(b.text, 1, 180), substr(i.text, 1, 180)) AS preview,
                    COALESCE(b.direction, i.direction) AS direction,
                    b.content_type, b.media_json, b.photo_file_id, b.video_file_id,
+                   COALESCE(b.deleted_at, n.deleted_at) AS deleted_at,
                    b.video_note_file_id, b.voice_file_id
-            FROM inbox LEFT JOIN business_messages b ON b.id = inbox.live_id AND b.owner_user_id = ?
+            FROM inbox LEFT JOIN business_messages b ON b.id = inbox.live_id AND b.owner_user_id = :owner
+            LEFT JOIN notice_deleted n ON n.id = b.id
             LEFT JOIN imported_messages i ON i.id = inbox.import_id
             WHERE recent <> '' ORDER BY recent DESC, inbox.id
-        """, (owner, owner, owner, owner, owner, owner)).fetchall()
+        """, {"owner": owner, "allow_deleted": allow_deleted}).fetchall()
     chats = []
     for row in rows:
         kind, media, file_id = _attachment(row)
@@ -123,6 +160,7 @@ def list_chats(owner: str) -> list[dict]:
             "preview": (row["preview"] or "").strip() or _KINDS.get(kind, ""),
             "kind": _KINDS.get(kind),
             "out": row["direction"] == "out",
+            "deleted": bool(row["deleted_at"]),
             "avatar": bool(_PROFILE_ID.fullmatch(row["profile"] or "")),
             "thumbnail": str(row["message_id"]) if _thumbnail_id(kind, media, file_id) else None,
         })
@@ -190,25 +228,27 @@ _MEDIA_COLUMNS = """content_type, media_json, photo_file_id, video_file_id,
                     video_note_file_id, voice_file_id"""
 
 
-def chat_page(owner: str, chat: str, before: tuple, deleted: bool) -> dict:
+def chat_page(owner: str, chat: str, before: tuple, deleted: bool, *, allow_deleted: bool = True) -> dict:
+    if deleted and not allow_deleted:
+        return {"messages": [], "next": None}
+    params = {
+        "owner": owner, "target": chat[1:], "deleted": deleted, "allow_deleted": allow_deleted,
+        "stamp": before[0], "source": before[1], "id": before[2], "limit": _PAGE_SIZE + 1,
+    }
     if chat.startswith("c"):
         scope = """chat_ref IN (SELECT chat_ref FROM business_chat_refs
-                                WHERE owner_user_id = ? AND contact_id = ?)"""
+                                WHERE owner_user_id = :owner AND contact_id = :target)"""
         target = int(chat[1:])
-        scope_args = (owner, target)
         imported = f"""
             UNION ALL SELECT 0, id, direction, text, {_IMPORTED_DATE},
                 NULL, NULL, NULL, NULL, NULL, NULL, NULL
-            FROM imported_messages WHERE contact_id = ?"""
-        imported_args = () if deleted else (target,)
+            FROM imported_messages i WHERE contact_id = :target AND {_VISIBLE_IMPORT}"""
     else:
-        scope = """chat_ref = ? AND NOT EXISTS (
+        scope = """chat_ref = :target AND NOT EXISTS (
                     SELECT 1 FROM business_chat_refs r
                     WHERE r.owner_user_id = business_messages.owner_user_id
                       AND r.chat_ref = business_messages.chat_ref)"""
-        scope_args = (chat[1:],)
         imported = ""
-        imported_args = ()
     with storage._conn() as conn:
         if chat.startswith("c") and not conn.execute(
             "SELECT 1 FROM contacts WHERE id = ? AND user_telegram_id = ? AND archived_into_contact_id IS NULL",
@@ -216,17 +256,19 @@ def chat_page(owner: str, chat: str, before: tuple, deleted: bool) -> dict:
         ).fetchone():
             return {"messages": [], "next": None}
         rows = conn.execute(f"""
-            WITH messages AS (
-                SELECT 1 AS source, id, direction, text, datetime(date) AS stamp,
-                       deleted_at, {_MEDIA_COLUMNS}
-                FROM business_messages WHERE owner_user_id = ? AND {scope}
-                    AND (? = 0 OR deleted_at IS NOT NULL)
+            WITH {_NOTICE_DELETED}, {_DELETED_COPIES}, messages AS (
+                SELECT 1 AS source, business_messages.id, direction, text, datetime(date) AS stamp,
+                       COALESCE(business_messages.deleted_at, n.deleted_at) AS deleted_at, {_MEDIA_COLUMNS}
+                FROM business_messages LEFT JOIN notice_deleted n ON n.id = business_messages.id
+                WHERE owner_user_id = :owner AND {scope}
+                  AND (:allow_deleted OR (business_messages.deleted_at IS NULL AND n.id IS NULL))
+                  AND (NOT :deleted OR business_messages.deleted_at IS NOT NULL OR n.id IS NOT NULL)
                 {imported if not deleted else ""}
             )
             SELECT * FROM messages
-            WHERE (COALESCE(stamp, ''), source, id) < (?, ?, ?)
-            ORDER BY COALESCE(stamp, '') DESC, source DESC, id DESC LIMIT ?
-        """, (owner, *scope_args, deleted, *imported_args, *before, _PAGE_SIZE + 1)).fetchall()
+            WHERE (COALESCE(stamp, ''), source, id) < (:stamp, :source, :id)
+            ORDER BY COALESCE(stamp, '') DESC, source DESC, id DESC LIMIT :limit
+        """, params).fetchall()
     messages = []
     for row in rows[:_PAGE_SIZE]:
         kind, media, file_id = _attachment(row)
@@ -257,11 +299,15 @@ def chat_page(owner: str, chat: str, before: tuple, deleted: bool) -> dict:
     return {"messages": messages, "next": next_page}
 
 
-def _file_id(owner: str, row_id: int, *, thumbnail: bool = False) -> str | None:
+def _file_id(owner: str, row_id: int, *, thumbnail: bool = False, allow_deleted: bool = True) -> str | None:
     with storage._conn() as conn:
         row = conn.execute(
-            f"SELECT {_MEDIA_COLUMNS} FROM business_messages WHERE id = ? AND owner_user_id = ?",
-            (row_id, owner),
+            f"""WITH {_NOTICE_DELETED}
+            SELECT {_MEDIA_COLUMNS} FROM business_messages b
+            LEFT JOIN notice_deleted n ON n.id = b.id
+            WHERE b.id = :id AND b.owner_user_id = :owner
+              AND (:allow_deleted OR (b.deleted_at IS NULL AND n.id IS NULL))""",
+            {"id": row_id, "owner": owner, "allow_deleted": allow_deleted},
         ).fetchone()
     if not row:
         return None
@@ -283,8 +329,6 @@ def register_archive(app: web.Application, bot, is_premium) -> None:
         owner = telegram_user(request.headers.get("X-Telegram-Init-Data", ""), bot.token, time.time())
         if owner is None:
             raise web.HTTPUnauthorized(headers=_HEADERS)
-        if not await is_premium(bot, owner):
-            raise web.HTTPForbidden(headers=_HEADERS)
         return owner
 
     async def home(request: web.Request) -> web.Response:
@@ -303,12 +347,17 @@ def register_archive(app: web.Application, bot, is_premium) -> None:
 
     async def chats(request: web.Request) -> web.Response:
         owner = await authorized(request)
+        allow_deleted = await is_premium(bot, owner)
         async with database_slots:
-            data = await asyncio.to_thread(list_chats, owner)
-        return web.json_response({"chats": data}, headers=_HEADERS)
+            data = await asyncio.to_thread(list_chats, owner, allow_deleted=allow_deleted)
+        return web.json_response({"chats": data, "can_view_deleted": allow_deleted}, headers=_HEADERS)
 
     async def messages(request: web.Request) -> web.Response:
         owner = await authorized(request)
+        allow_deleted = await is_premium(bot, owner)
+        deleted = request.query.get("deleted") == "1"
+        if deleted and not allow_deleted:
+            raise web.HTTPForbidden(headers=_HEADERS)
         try:
             before = json.loads(request.query.get("before", '["~",1,1]'))
             if (not isinstance(before, list) or len(before) != 3
@@ -320,7 +369,8 @@ def register_archive(app: web.Application, bot, is_premium) -> None:
             raise web.HTTPBadRequest(headers=_HEADERS) from None
         async with database_slots:
             data = await asyncio.to_thread(
-                chat_page, owner, request.match_info["chat"], tuple(before), request.query.get("deleted") == "1",
+                chat_page, owner, request.match_info["chat"], tuple(before), deleted,
+                allow_deleted=allow_deleted,
             )
         return web.json_response(data, headers=_HEADERS)
 
@@ -375,8 +425,11 @@ def register_archive(app: web.Application, bot, is_premium) -> None:
 
     async def thumbnail(request: web.Request) -> web.Response:
         owner = await authorized(request)
+        allow_deleted = await is_premium(bot, owner)
         async with database_slots:
-            file_id = await asyncio.to_thread(_file_id, owner, int(request.match_info["id"]), thumbnail=True)
+            file_id = await asyncio.to_thread(
+                _file_id, owner, int(request.match_info["id"]), thumbnail=True, allow_deleted=allow_deleted,
+            )
         if not file_id:
             raise web.HTTPNotFound(headers=_HEADERS)
         async with preview_slots:
@@ -389,8 +442,11 @@ def register_archive(app: web.Application, bot, is_premium) -> None:
 
     async def download(request: web.Request) -> web.Response:
         owner = await authorized(request)
+        allow_deleted = await is_premium(bot, owner)
         async with database_slots:
-            file_id = await asyncio.to_thread(_file_id, owner, int(request.match_info["id"]))
+            file_id = await asyncio.to_thread(
+                _file_id, owner, int(request.match_info["id"]), allow_deleted=allow_deleted,
+            )
         if not file_id:
             raise web.HTTPNotFound(headers=_HEADERS)
         async with download_slots:

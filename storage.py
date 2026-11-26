@@ -254,6 +254,7 @@ def init_db() -> None:
                 created_at      TEXT NOT NULL,
                 revealed_at     TEXT
             );
+            CREATE INDEX IF NOT EXISTS idx_deleted_reveals_owner ON deleted_reveals(owner_user_id);
 
             -- Исчезающие медиа собеседника, уже отправленные владельцу копией
             -- (main.py: _save_ephemeral_reply_media) — чтобы второй ответ

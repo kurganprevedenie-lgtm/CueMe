@@ -94,6 +94,17 @@ def test_video_thumbnail_and_spoiler(archive_db):
 
 
 def test_archive_endpoints_enforce_access(archive_db):
+    storage.create_deleted_reveal("20", "Чужой чат", [2])
+    with storage._conn() as conn:
+        conn.execute(
+            """INSERT INTO business_messages
+               (id, connection_id, owner_user_id, chat_ref, direction, text, date, tg_message_id, photo_file_id)
+               VALUES (4, 'other', '20', ?, 'out', 'Обычное фото', '2026-11-19T10:00:00+00:00', 2, 'file')""",
+            (CHAT_REF,),
+        )
+        conn.execute("INSERT INTO imported_messages VALUES (2, 2, 'in', 'Чужое', '2026-11-20T12:00:00')")
+    archive_app.mark_deleted("10", "own", CHAT_REF, [1])
+
     async def run():
         async def is_premium(bot, owner):
             return owner == "10"
@@ -125,8 +136,21 @@ def test_archive_endpoints_enforce_access(archive_db):
             assert wallpaper.content_type == "image/webp"
             assert "immutable" in wallpaper.headers["Cache-Control"]
             assert (await client.get("/archive/api/chats")).status == 401
-            blocked = {"X-Telegram-Init-Data": signed_data(20, int(time.time()))}
-            assert (await client.get("/archive/api/chats", headers=blocked)).status == 403
+            free = {"X-Telegram-Init-Data": signed_data(20, int(time.time()))}
+            free_list = await client.get("/archive/api/chats", headers=free)
+            assert free_list.status == 200
+            free_data = await free_list.json()
+            assert free_data["can_view_deleted"] is False
+            assert free_data["chats"][0]["preview"] == "Обычное фото"
+            assert free_data["chats"][0]["thumbnail"] == "4"
+            response = await client.get("/archive/api/chats/c2", headers=free)
+            assert [m["id"] for m in (await response.json())["messages"]] == [4]
+            assert (await client.get("/archive/api/chats/c2?deleted=1", headers=free)).status == 403
+            assert (await client.get("/archive/api/files/2", headers=free)).status == 404
+            assert (await client.get("/archive/api/thumbs/2", headers=free)).status == 404
+            assert (await client.get("/archive/api/files/4", headers=free)).status == 200
+            premium = await client.get("/archive/api/chats/c1?deleted=1", headers=headers)
+            assert (await premium.json())["messages"][0]["deleted"] is True
             response = await client.get("/archive/api/chats/c2", headers=headers)
             assert (await response.json())["messages"] == []
             assert (await client.get("/archive/api/files/2", headers=headers)).status == 404
@@ -144,3 +168,13 @@ def test_archive_endpoints_enforce_access(archive_db):
             assert (await client.get("/archive/api/chats/c1?before=1", headers=headers)).status == 400
 
     asyncio.run(run())
+
+
+def test_old_deletion_notice_is_marked_for_premium(archive_db):
+    storage.create_deleted_reveal("20", "Чужой чат", [2])
+    listed = archive_app.list_chats("20")
+    assert listed[0]["deleted"] is True
+    page = archive_app.chat_page("20", "c2", ("~", 1, 1), True)
+    assert page["messages"][0]["deleted"] is True
+    assert archive_app.list_chats("20", allow_deleted=False) == []
+    assert not archive_app.chat_page("20", "c2", ("~", 1, 1), False, allow_deleted=False)["messages"]

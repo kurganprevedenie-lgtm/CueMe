@@ -57,10 +57,10 @@ def _watch_kb(telegram_id: str, is_premium: bool) -> InlineKeyboardMarkup:
             b.button(text=f"{mark} {label}", callback_data=f"watch:toggle:{key}")
         else:
             b.button(text=f"🔒 {label}", callback_data="watch:locked")
+    if ARCHIVE_MINIAPP_URL:
+        b.button(text="📂 Архив переписок", web_app=WebAppInfo(url=ARCHIVE_MINIAPP_URL))
     if not is_premium:
         b.button(text="👑 Оформить Premium", callback_data="show_premium")
-    if ARCHIVE_MINIAPP_URL and is_premium:
-        b.button(text="📂 Архив переписок", web_app=WebAppInfo(url=ARCHIVE_MINIAPP_URL))
     b.button(text="⬅️ Назад", callback_data="sub:to_menu")
     b.adjust(1)
     return theme_keyboard(b.as_markup())
@@ -68,7 +68,9 @@ def _watch_kb(telegram_id: str, is_premium: bool) -> InlineKeyboardMarkup:
 
 async def _show_watch_screen(target: Message, bot: Bot, telegram_id: str) -> None:
     is_premium = await _is_premium(bot, telegram_id)
-    text = _WATCH_TEXT if is_premium else f"{_WATCH_TEXT}\n\n🔒 Доступно с Premium."
+    text = _WATCH_TEXT if is_premium else (
+        f"{_WATCH_TEXT}\n\n🔒 Уведомления и просмотр удалённых сообщений в архиве доступны с Premium."
+    )
     await target.edit_text(text, reply_markup=_watch_kb(telegram_id, is_premium), parse_mode="HTML")
 
 

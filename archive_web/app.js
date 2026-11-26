@@ -112,7 +112,7 @@ async function request(path, signal) {
   if (!response.ok) {
     const errors = {
       401: "Сеанс закончился. Закрой архив и открой его снова в CueMe.",
-      403: "Архив доступен с активным CueMe Premium.",
+      403: "Удалённые сообщения доступны с активным CueMe Premium.",
       404: "Файл больше недоступен.",
       413: "Этот файл слишком большой для скачивания из архива.",
     };
@@ -151,6 +151,7 @@ function renderChats() {
     const thumbnail = element("span", "chat-thumbnail");
     thumbnail.setAttribute("aria-hidden", "true");
     const previewText = element("span", "chat-preview");
+    if (chat.deleted) previewText.append(element("span", "deleted-preview", "Удалено · "));
     if (chat.out) previewText.append(element("span", "chat-sender", "Вы: "));
     if (chat.kind && chat.kind !== chat.preview) previewText.append(element("span", "chat-sender", chat.kind + " · "));
     previewText.append(document.createTextNode(chat.preview || chat.kind || ""));
@@ -428,12 +429,13 @@ function messageNode(message) {
   node.dataset.day = date ? dateFormat.format(date) : "Дата неизвестна";
   const day = element("p", "day", node.dataset.day);
   const bubble = element("article", message.out ? "bubble out" : "bubble");
+  if (message.deleted) bubble.classList.add("deleted-message");
   if (message.kind) bubble.append(element("p", "kind", [message.kind, message.details].filter(Boolean).join(" · ")));
   if (message.attachment) bubble.append(attachmentNode(message));
   if (message.text) bubble.append(element("p", "", message.text));
   if (!message.text && !message.kind) bubble.append(element("p", "", "Содержимое не сохранилось"));
   const footer = element("footer", "");
-  if (message.deleted) footer.append(element("strong", "", "Удалено"));
+  if (message.deleted) footer.append(element("strong", "deleted-label", "Удалено"));
   if (date) footer.append(element("time", "", timeFormat.format(date)));
   bubble.append(footer);
   node.append(day, bubble);
@@ -551,7 +553,9 @@ async function start() {
   try {
     if (!app?.initData) throw new Error("Открой архив из бота CueMe, в разделе «Удалённые сообщения».");
     const response = await request("chats", AbortSignal.timeout(15000));
-    chats = (await response.json()).chats;
+    const data = await response.json();
+    chats = data.chats;
+    byId("chat-filters").hidden = !data.can_view_deleted;
     byId("search-box").hidden = !chats.length;
     renderChats();
   } catch (error) {
