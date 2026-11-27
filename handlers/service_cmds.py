@@ -6,9 +6,10 @@
 import html
 import logging
 from ui_emoji import icon
-from aiogram import Bot
+from aiogram import Bot, F
 from aiogram.filters import Command
-from aiogram.types import Message
+from aiogram.types import CallbackQuery, Message
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 from config import (
     FIRST_BUILD_THRESHOLD,
     PROMO_CHANNEL_USERNAME,
@@ -140,7 +141,7 @@ async def _show_help(message: Message, edit: bool = False) -> None:
     """edit=True (из главного меню, BTN_SUPPORT/mm:support) — редактирует ТО
     ЖЕ сообщение (как «Подписка»), с «⬅️ Назад» в меню (help_kb). edit=False
     (/help, BTN_HELP по тексту со старой клавиатуры) — новое сообщение, без
-    Назад (нет экрана, в который возвращаться) — только ссылка на поддержку."""
+    Назад в главное меню."""
     text = (
         f"{icon('support')} Помощь\n\n"
         f"Вот что я умею. На главном экране — кнопка «{icon('reply')} Ответ с CueMe» плюс "
@@ -186,6 +187,29 @@ async def _show_help(message: Message, edit: bool = False) -> None:
 @dp.message(Command("help"))
 async def cmd_help(message: Message) -> None:
     await _show_help(message)
+
+
+@dp.callback_query(F.data.in_(("help:documents", "help:back")))
+async def cb_help_documents(call: CallbackQuery) -> None:
+    await call.answer()
+    if not isinstance(call.message, Message):
+        return
+    if call.data == "help:back":
+        await _show_help(call.message, edit=True)
+        return
+
+    builder = InlineKeyboardBuilder()
+    builder.button(
+        text="Пользовательское соглашение",
+        url="https://telegra.ph/Polzovatelskoe-soglashenie-CueMe-11-27",
+    )
+    builder.button(
+        text="Политика конфиденциальности",
+        url="https://telegra.ph/Politika-konfidencialnosti-CueMe-11-27",
+    )
+    builder.button(text="⬅️ Назад", callback_data="help:back")
+    builder.adjust(1)
+    await call.message.edit_text("📄 Документы CueMe", reply_markup=builder.as_markup())
 
 
 @dp.message(Command("emoji_preview"))

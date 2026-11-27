@@ -502,9 +502,13 @@ async def cb_onboarding_json(call: CallbackQuery, state: FSMContext, bot: Bot) -
     )
 
 
-def support_kb() -> InlineKeyboardMarkup:
+def support_kb(*, back_to_menu: bool = False) -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     b.button(text="🆘 Написать в поддержку", url="https://t.me/CueMeSupport")
+    b.button(text="📄 Документы", callback_data="help:documents")
+    if back_to_menu:
+        b.button(text="⬅️ Назад", callback_data="sub:to_menu")
+    b.adjust(1)
     return theme_keyboard(b.as_markup())
 
 
@@ -513,11 +517,7 @@ def help_kb() -> InlineKeyboardMarkup:
     главного меню (callback_data="sub:to_menu" — тот же таргет, что и
     «Назад» из «Подписка», см. cb_sub_to_main_menu, работает для любого
     сообщения, не только для экрана Подписки)."""
-    b = InlineKeyboardBuilder()
-    b.button(text="🆘 Написать в поддержку", url="https://t.me/CueMeSupport")
-    b.button(text="⬅️ Назад", callback_data="sub:to_menu")
-    b.adjust(1)
-    return theme_keyboard(b.as_markup())
+    return support_kb(back_to_menu=True)
 
 
 # _show_support — раньше показывала только ссылку на @CueMeSupport по тапу

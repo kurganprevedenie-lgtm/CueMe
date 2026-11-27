@@ -648,6 +648,13 @@
  },
  {
   "event": "callback_query",
+  "callback": "cb_help_documents",
+  "filters": [
+   "F.GetAttributeOperation(name='data').FunctionOperation(function=in_op, args=[['help:documents', 'help:back']], kwargs=dict())"
+  ]
+ },
+ {
+  "event": "callback_query",
   "callback": "cb_show_premium",
   "filters": [
    "F.GetAttributeOperation(name='data').ComparatorOperation(right='show_premium', comparator=eq)"

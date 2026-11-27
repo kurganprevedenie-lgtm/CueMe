@@ -248,8 +248,36 @@ def test_help_custom_icons_and_commands_preserved(edit):
     action, text, kwargs = calls[0]
     assert action == ("edit" if edit else "answer")
     assert kwargs["parse_mode"] == "HTML"
+    assert any(
+        button.callback_data == "help:documents"
+        for row in kwargs["reply_markup"].inline_keyboard
+        for button in row
+    )
     for role in ("support", "reply", "analysis", "date", "media", "edited", "premium", "gift", "settings", "more"):
         assert ui.icon(role) in text
     for command in ("/reply", "/deep_analysis", "/invite", "/contacts", "/connect", "/progress", "/redeem", "/myref", "/premium", "/rebuild", "/delete", "/start", "/help"):
         assert command in text
     assert "&lt;tg-emoji" not in text
+
+
+def test_help_documents_links_and_back():
+    from unittest.mock import AsyncMock, Mock
+
+    from handlers import service_cmds
+
+    message = Mock(spec=service_cmds.Message)
+    message.edit_text = AsyncMock()
+    call = Mock(message=message, data="help:documents", answer=AsyncMock())
+
+    asyncio.run(service_cmds.cb_help_documents(call))
+
+    call.answer.assert_awaited_once()
+    markup = message.edit_text.await_args.kwargs["reply_markup"]
+    agreement, privacy, back = (row[0] for row in markup.inline_keyboard)
+    assert agreement.url == "https://telegra.ph/Polzovatelskoe-soglashenie-CueMe-11-27"
+    assert privacy.url == "https://telegra.ph/Politika-konfidencialnosti-CueMe-11-27"
+
+    call.data = back.callback_data
+    asyncio.run(service_cmds.cb_help_documents(call))
+
+    assert "Помощь" in message.edit_text.await_args.args[0]
